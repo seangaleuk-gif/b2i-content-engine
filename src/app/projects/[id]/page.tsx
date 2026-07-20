@@ -388,13 +388,17 @@ export default function ProjectWorkspacePage() {
         setGenerating(false);
         setCurrentStep(-1);
       }, 800);
-    } catch (err) {
+    } catch (err: any) {
       clearInterval(stepInterval);
       setGenerating(false);
       setCurrentStep(-1);
-      setErrorMessage(
-        err instanceof Error ? err.message : "Failed to generate blog"
-      );
+      const msg = err instanceof Error ? err.message : "Failed to generate blog";
+      const failures = (err as any)?.data?.failures as string[] | undefined;
+      if (failures && failures.length > 0) {
+        setErrorMessage(`Validation failed — fix these and regenerate:\n${failures.map((f) => `  ✗ ${f}`).join("\n")}`);
+      } else {
+        setErrorMessage(msg);
+      }
     }
   }, [projectId, refetch, refetchVersions]);
 
@@ -579,7 +583,7 @@ export default function ProjectWorkspacePage() {
                   })}
                 </div>
                 {errorMessage && (
-                  <div className="mt-4 p-3 bg-accent-danger/10 rounded-[8px] text-[13px] text-accent-danger">
+                  <div className="mt-4 p-3 bg-accent-danger/10 rounded-[8px] text-[13px] text-accent-danger whitespace-pre-wrap">
                     {errorMessage}
                   </div>
                 )}

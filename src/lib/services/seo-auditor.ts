@@ -1,3 +1,6 @@
+import { cleanBodyText, countWords, splitSentences } from "./text-utils";
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, KEYPHRASE_MIN, KEYPHRASE_MAX, FLESCH_MIN, FLESCH_MAX } from "./generation-constants";
+
 export interface AuditCheck {
   label: string;
   description: string;
@@ -22,36 +25,14 @@ interface AuditInput {
   externalLinks?: string[];
 }
 
-function countWords(text: string): number {
-  const cleaned = stripHtml(text);
-  return cleaned.split(/\s+/).filter(Boolean).length;
-}
-
 function extractHeadings(html: string): { level: number; text: string }[] {
   const headings: { level: number; text: string }[] = [];
   const regex = /<h([1-6])[^>]*>(.*?)<\/h\1>/gi;
   let match;
   while ((match = regex.exec(html)) !== null) {
-    headings.push({ level: parseInt(match[1]), text: stripHtml(match[2]) });
+    headings.push({ level: parseInt(match[1]), text: cleanBodyText(match[2]) });
   }
   return headings;
-}
-
-function stripHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/g, "")
-    .replace(/<[^>]+>/g, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/```[\s\S]*?```/g, "")
-    .trim();
-}
-
-function splitSentences(text: string): string[] {
-  return text
-    .replace(/<[^>]+>/g, "")
-    .split(/[.!?]+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 10);
 }
 
 function countParagraphedSentences(html: string): { paraIndex: number; sentences: number }[] {
@@ -61,14 +42,15 @@ function countParagraphedSentences(html: string): { paraIndex: number; sentences
   let match;
   let idx = 0;
   while ((match = paraRegex.exec(cleaned)) !== null) {
-    const text = stripHtml(match[1]);
+    const text = cleanBodyText(match[1]);
     const sentences = text.split(/[.!?]+/).filter((s) => s.trim().length > 10).length;
     results.push({ paraIndex: idx++, sentences });
   }
   return results;
 }
 
-function fleshReadingEase(text: string): number {
+function fleshReadingEase(rawText: string): number {
+  const text = cleanBodyText(rawText);
   const words = text.split(/\s+/).filter(Boolean);
   const sentences = splitSentences(text);
   const syllables = words.reduce((sum, w) => sum + countSyllables(w), 0);
@@ -93,7 +75,7 @@ function countSyllables(word: string): number {
 export function runAudit(input: AuditInput): AuditResult {
   const { title, metaDescription, keyword, blog, externalLinks: storedExternalLinks } = input;
   const checks: AuditCheck[] = [];
-  const bodyText = stripHtml(blog);
+  const bodyText = cleanBodyText(blog);
   const bodyWords = countWords(blog);
   const keywordLower = keyword.toLowerCase().trim();
   const headings = extractHeadings(blog);
@@ -102,26 +84,26 @@ export function runAudit(input: AuditInput): AuditResult {
 
   // 1. SEO title length
   const titleLen = title.length;
-  if (titleLen >= 50 && titleLen <= 70) {
-    checks.push({ label: "SEO Title Length", description: `Title is ${titleLen} characters (target: 50-70).`, status: "pass", score: 100, fix: "", category: "Meta" });
-  } else if (titleLen > 0 && titleLen < 50) {
-    checks.push({ label: "SEO Title Length", description: `Title is ${titleLen} characters — too short.`, status: "warning", score: 50, fix: `Add ${50 - titleLen} more characters to the title. Include the focus keyphrase near the beginning.`, category: "Meta" });
-  } else if (titleLen > 70) {
-    checks.push({ label: "SEO Title Length", description: `Title is ${titleLen} characters — too long.`, status: "warning", score: 50, fix: `Trim ${titleLen - 70} characters. Google truncates titles longer than 70 characters.`, category: "Meta" });
+  if (titleLen >= SEO_TITLE_MIN && titleLen <= SEO_TITLE_MAX) {
+    checks.push({ label: "SEO Title Length", description: `Title is ${titleLen} characters (target: ${SEO_TITLE_MIN}-${SEO_TITLE_MAX}).`, status: "pass", score: 100, fix: "", category: "Meta" });
+  } else if (titleLen > 0 && titleLen < SEO_TITLE_MIN) {
+    checks.push({ label: "SEO Title Length", description: `Title is ${titleLen} characters — too short.`, status: "warning", score: 50, fix: `Add ${SEO_TITLE_MIN - titleLen} more characters to the title. Include the focus keyphrase near the beginning.`, category: "Meta" });
+  } else if (titleLen > SEO_TITLE_MAX) {
+    checks.push({ label: "SEO Title Length", description: `Title is ${titleLen} characters — too long.`, status: "warning", score: 50, fix: `Trim ${titleLen - SEO_TITLE_MAX} characters. Google truncates titles longer than ${SEO_TITLE_MAX} characters.`, category: "Meta" });
   } else {
-    checks.push({ label: "SEO Title Length", description: "No title found.", status: "fail", score: 0, fix: "Set an SEO title between 50-70 characters with the focus keyphrase.", category: "Meta" });
+    checks.push({ label: "SEO Title Length", description: "No title found.", status: "fail", score: 0, fix: `Set an SEO title between ${SEO_TITLE_MIN}-${SEO_TITLE_MAX} characters with the focus keyphrase.`, category: "Meta" });
   }
 
   // 2. Meta description length
   const metaLen = metaDescription.length;
-  if (metaLen >= 155 && metaLen <= 200) {
-    checks.push({ label: "Meta Description Length", description: `Meta description is ${metaLen} characters (target: 155-200).`, status: "pass", score: 100, fix: "", category: "Meta" });
-  } else if (metaLen > 0 && metaLen < 155) {
-    checks.push({ label: "Meta Description Length", description: `Meta description is ${metaLen} characters — too short.`, status: "warning", score: 40, fix: `Expand to 155-200 characters. Include the focus keyphrase and a compelling CTA.`, category: "Meta" });
-  } else if (metaLen > 200) {
-    checks.push({ label: "Meta Description Length", description: `Meta description is ${metaLen} characters — too long.`, status: "warning", score: 50, fix: `Trim to under 200 characters. Google truncates meta descriptions above ~160 on desktop and ~200 on mobile.`, category: "Meta" });
+  if (metaLen >= META_MIN && metaLen <= META_MAX) {
+    checks.push({ label: "Meta Description Length", description: `Meta description is ${metaLen} characters (target: ${META_MIN}-${META_MAX}).`, status: "pass", score: 100, fix: "", category: "Meta" });
+  } else if (metaLen > 0 && metaLen < META_MIN) {
+    checks.push({ label: "Meta Description Length", description: `Meta description is ${metaLen} characters — too short.`, status: "warning", score: 40, fix: `Expand to ${META_MIN}-${META_MAX} characters. Include the focus keyphrase and a compelling CTA.`, category: "Meta" });
+  } else if (metaLen > META_MAX) {
+    checks.push({ label: "Meta Description Length", description: `Meta description is ${metaLen} characters — too long.`, status: "warning", score: 50, fix: `Trim to under ${META_MAX} characters. Google truncates meta descriptions above ~160 on desktop and ~${META_MAX} on mobile.`, category: "Meta" });
   } else {
-    checks.push({ label: "Meta Description Length", description: "No meta description found.", status: "fail", score: 0, fix: "Add a meta description between 155-200 characters with the focus keyphrase.", category: "Meta" });
+    checks.push({ label: "Meta Description Length", description: "No meta description found.", status: "fail", score: 0, fix: `Add a meta description between ${META_MIN}-${META_MAX} characters with the focus keyphrase.`, category: "Meta" });
   }
 
   // 3. Focus keyphrase in H1
@@ -350,12 +332,12 @@ export function runAudit(input: AuditInput): AuditResult {
 
   // 12. Reading level (Flesch-Kincaid)
   const readingEase = fleshReadingEase(bodyText);
-  if (readingEase >= 60 && readingEase <= 70) {
-    checks.push({ label: "Reading Level", description: `Flesch Reading Ease score is ${Math.round(readingEase)} (target: 60-70 / Grade 8-10).`, status: "pass", score: 100, fix: "", category: "Readability" });
-  } else if (readingEase < 60) {
-    checks.push({ label: "Reading Level", description: `Flesch Reading Ease score is ${Math.round(readingEase)} — too complex (target: 60-70).`, status: "warning", score: 50, fix: "Simplify sentences. Use shorter words and shorter sentences. Avoid jargon.", category: "Readability" });
+  if (readingEase >= FLESCH_MIN && readingEase <= FLESCH_MAX) {
+    checks.push({ label: "Reading Level", description: `Flesch Reading Ease score is ${Math.round(readingEase)} (target: ${FLESCH_MIN}-${FLESCH_MAX} / Grade 8-10).`, status: "pass", score: 100, fix: "", category: "Readability" });
+  } else if (readingEase < FLESCH_MIN) {
+    checks.push({ label: "Reading Level", description: `Flesch Reading Ease score is ${Math.round(readingEase)} — too complex (target: ${FLESCH_MIN}-${FLESCH_MAX}).`, status: "warning", score: 50, fix: "Simplify sentences. Use shorter words and shorter sentences. Avoid jargon.", category: "Readability" });
   } else {
-    checks.push({ label: "Reading Level", description: `Flesch Reading Ease score is ${Math.round(readingEase)} — very easy to read (target: 60-70).`, status: "pass", score: 100, fix: "", category: "Readability" });
+    checks.push({ label: "Reading Level", description: `Flesch Reading Ease score is ${Math.round(readingEase)} — very easy to read (target: ${FLESCH_MIN}-${FLESCH_MAX}).`, status: "pass", score: 100, fix: "", category: "Readability" });
   }
 
   const overallScore = Math.round(checks.reduce((sum, c) => sum + c.score, 0) / checks.length);

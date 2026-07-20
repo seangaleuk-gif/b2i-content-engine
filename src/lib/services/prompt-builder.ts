@@ -1,3 +1,5 @@
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT, keyphraseTarget } from "./generation-constants";
+
 export interface PromptSection {
   key: string;
   label: string;
@@ -127,19 +129,36 @@ function formatKnowledge(knowledge: BlogContext["knowledge"], keyword: string): 
   return lines.join("\n").trim();
 }
 
-function buildSystemPrompt(context: BlogContext): string {
+export const STAGE_SYSTEM_PROMPTS: Record<string, string[]> = {
+  outline:      ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context", "blog_structure"],
+  introduction: ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context"],
+  section:      ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context", "blog_structure"],
+  faq:          ["brand_voice", "seo_rules", "formatting_rules"],
+  conclusion:   ["brand_voice", "formatting_rules", "cta"],
+};
+
+export function buildSystemPrompt(context: BlogContext, modules?: string[]): string {
   const sections = context.promptSections;
   const parts: string[] = [];
+  const isFull = modules === undefined;
+  const include = modules ? new Set(modules) : null;
 
-  // Production modules — assembled in order
+  // CRITICAL FORMAT — always included for every stage
   parts.push(`CRITICAL FORMAT REQUIREMENT: The blog content in your JSON response MUST use WordPress block format. Every heading must be <!-- wp:heading {"level":2} --> or <!-- wp:heading {"level":3} -->, every paragraph <!-- wp:paragraph -->, every list <!-- wp:list -->, every quote <!-- wp:quote -->, every table <!-- wp:table -->. Custom HTML (language switcher, CTA, FAQ schema) uses <!-- wp:html -->. NEVER use Markdown (##, **, backtick, [], etc.) or bare HTML tags. This is NON-NEGOTIABLE. If you output Markdown, the response is invalid.`);
-  const brandVoice = findSection(sections, "brand_voice");
-  parts.push(`## Brand Voice\n\n${brandVoice}`);
 
-  const hongKongContext = findSection(sections, "hong_kong_context");
-  parts.push(`## Regional Context\n\n${hongKongContext}`);
+  // Brand Voice
+  if (isFull || include?.has("brand_voice")) {
+    parts.push(`## Brand Voice\n\n${findSection(sections, "brand_voice")}`);
+  }
 
-  const internalLinking = `## Internal Linking Instructions
+  // Hong Kong Context
+  if (isFull || include?.has("hong_kong_context")) {
+    parts.push(`## Regional Context\n\n${findSection(sections, "hong_kong_context")}`);
+  }
+
+  // Internal Linking — full-context only (not for individual sections)
+  if (isFull) {
+    parts.push(`## Internal Linking Instructions
 
 You are an expert at naturally integrating internal links. Follow these rules:
 
@@ -156,34 +175,52 @@ You are an expert at naturally integrating internal links. Follow these rules:
     - /blog/where-hong-kong-micro-influencers-find-paid-brand-deals-platforms-outreach — use when discussing monetization, sponsorships, or finding brand deals
     - /blog/how-to-close-better-deals-negotiation-media-kits-b2i-hub-verification — use when discussing contracts, media kits, negotiation, or B2I Hub verification
 
-6. **Never force a link.** If no section naturally fits a resource, skip it. Quality over quantity.`;
-  parts.push(internalLinking);
+6. **Never force a link.** If no section naturally fits a resource, skip it. Quality over quantity.`);
+  }
 
-  const seoRules = findSection(sections, "seo_rules");
-  parts.push(`## SEO Rules\n\n${seoRules}`);
+  // SEO Rules
+  if (isFull || include?.has("seo_rules")) {
+    parts.push(`## SEO Rules\n\n${findSection(sections, "seo_rules")}`);
+  }
 
-  const formattingRules = findSection(sections, "formatting_rules");
-  parts.push(`## Formatting Rules\n\n${formattingRules}`);
+  // Formatting Rules
+  if (isFull || include?.has("formatting_rules")) {
+    parts.push(`## Formatting Rules\n\n${findSection(sections, "formatting_rules")}`);
+  }
 
-  const blogStructure = findSection(sections, "blog_structure");
-  parts.push(`## Blog Structure\n\n${blogStructure}`);
+  // Blog Structure
+  if (isFull || include?.has("blog_structure")) {
+    parts.push(`## Blog Structure\n\n${findSection(sections, "blog_structure")}`);
+  }
 
-  const cta = findSection(sections, "cta");
-  parts.push(`## CTA Block (Required)\n\n${cta}`);
+  // CTA
+  if (isFull || include?.has("cta")) {
+    parts.push(`## CTA Block (Required)\n\n${findSection(sections, "cta")}`);
+  }
 
-  const publishChecklist = findSection(sections, "publish_checklist");
-  parts.push(`## Pre-Publish Checklist\n\n${publishChecklist}`);
+  // Publish Checklist — full-context only
+  if (isFull) {
+    parts.push(`## Pre-Publish Checklist\n\n${findSection(sections, "publish_checklist")}`);
+  }
 
-  const socialRules = findSection(sections, "social_rules");
-  parts.push(`## Social Media Rules\n\n${socialRules}`);
+  // Social Rules — full-context only
+  if (isFull) {
+    parts.push(`## Social Media Rules\n\n${findSection(sections, "social_rules")}`);
+  }
 
-  const imageRules = findSection(sections, "image_rules");
-  parts.push(`## Image Rules\n\n${imageRules}`);
+  // Image Rules — full-context only
+  if (isFull) {
+    parts.push(`## Image Rules\n\n${findSection(sections, "image_rules")}`);
+  }
 
-  const translationRules = findSection(sections, "translation_rules");
-  parts.push(`## Translation Rules\n\n${translationRules}`);
+  // Translation Rules — full-context only
+  if (isFull) {
+    parts.push(`## Translation Rules\n\n${findSection(sections, "translation_rules")}`);
+  }
 
-  parts.push(`## MANDATORY OUTPUT REQUIREMENTS
+  // MANDATORY OUTPUT — full-context only (these are global article requirements)
+  if (isFull) {
+    parts.push(`## MANDATORY OUTPUT REQUIREMENTS
 
 The following elements are NON-NEGOTIABLE and MUST be present in every generated blog post. Failure to include any of them means the output is rejected.
 
@@ -201,6 +238,7 @@ The following elements are NON-NEGOTIABLE and MUST be present in every generated
 
 7. **Meta Description Length**: metaDescription MUST be 155-200 characters. Count every character. If under 155, expand. If over 200, shorten. Do NOT finalize until it's exactly in this range. This is a hard requirement — not a suggestion.
 `);
+  }
 
   return parts.join("\n\n---\n\n");
 }
@@ -212,6 +250,21 @@ function buildUserMessage(context: BlogContext): string {
   const projectDetails = formatProjectDetails(context.project);
   parts.push(`## Project Details\n\n${projectDetails}`);
 
+  const targetWords = context.project.wordCount > 0 ? context.project.wordCount : DEFAULT_WORD_COUNT;
+  const kpTarget = keyphraseTarget(targetWords);
+
+  parts.push(`## NON-NEGOTIABLE HARD REQUIREMENTS
+
+The following 4 requirements are NOT NEGOTIABLE. The blog is INVALID if any of them is not met. DO NOT SKIP any of these.
+
+1. **Focus keyphrase count**: The focus keyphrase MUST appear exactly ${kpTarget} times in the body. This is a hard requirement — the blog is INVALID if it appears fewer than ${kpTarget} times.
+
+2. **Focus keyphrase in H2**: The focus keyphrase MUST appear in at least one H2 heading. This is a hard requirement — the blog is INVALID if it doesn't. DO NOT SKIP THIS.
+
+3. **Reading ease**: Write at Flesch Reading Ease ${FLESCH_MIN}-${FLESCH_MAX}. Use simple words, short sentences. Avoid jargon. This is a hard requirement — the blog is INVALID if the score is below ${FLESCH_MIN}. DO NOT SKIP THIS.
+
+4. **SEO title length**: SEO title MUST be ${SEO_TITLE_MIN}-${SEO_TITLE_MAX} characters. Count characters. This is a hard requirement — the blog is INVALID if it's outside this range.`);
+
   const research = formatResearch(context.research);
   if (research) parts.push(`## Research Sources\n\n${research}`);
 
@@ -221,13 +274,17 @@ function buildUserMessage(context: BlogContext): string {
   const translationRules = findSection(sections, "translation_rules");
   parts.push(`## Translation Rules\n\n${translationRules}`);
 
-  const targetWords = context.project.wordCount > 0 ? context.project.wordCount.toLocaleString() : "2500";
-
   parts.push(`## Instructions
 
-CRITICAL — MANDATORY LENGTH REQUIREMENT: You MUST write at minimum ${targetWords} words of body content. "Body content" means readable text only — headings, paragraphs, list items, and table cells. Do NOT count: HTML markup, WordPress block comments (<!-- wp:... -->), JSON-LD schema code, Custom HTML blocks, or the internal/external links section. Count only the text a human would read. Every H2 section must be at least 200-300 words of body content. Use detailed examples, case studies, statistics, and thorough explanations. If the BODY TEXT word count is under ${targetWords}, you have failed. After completing the draft, count only the readable text words. If below ${targetWords}, expand the shortest sections until you reach the target. Do not stop until the body text exceeds ${targetWords} words.
+CRITICAL — MANDATORY LENGTH REQUIREMENT: You MUST write at minimum ${targetWords} words of body content. "Body content" means readable text only — headings, paragraphs, list items, and table cells. Do NOT count: HTML markup, WordPress block comments, JSON-LD schema code, Custom HTML blocks, or the internal/external links section. Count only the text a human would read. The application will assign exact word counts per section — plan your outline accordingly. If the BODY TEXT word count is under ${targetWords}, you have failed.
 
 Write a complete, publication-ready blog post based on the project details, research, and knowledge base above.
+
+**PRE-OUTPUT VALIDATION** — Before generating the JSON, verify ALL of these:
+- [ ] Focus keyphrase appears in at least one H2 heading → if NOT, rewrite an H2 to include it
+- [ ] Flesch Reading Ease is ${FLESCH_MIN}-${FLESCH_MAX} → if below ${FLESCH_MIN}, simplify sentences and use shorter words
+- [ ] Focus keyphrase appears ${kpTarget} times in body → if fewer, add more mentions naturally
+- [ ] SEO title is ${SEO_TITLE_MIN}-${SEO_TITLE_MAX} characters → if not, adjust
 
 **Output format**: You MUST respond with a valid JSON object with the following structure:
 

@@ -190,6 +190,13 @@ Run a 12-check SEO audit on the project's blog content. Clears old checks, store
 
 **Errors**: 400 (no blog content), 401, 404 (project not found), 500
 
+### `DELETE /api/projects/[id]/seo/audit`
+Clear all SEO checks for a project. Called after blog generation or version restore to ensure fresh audit data.
+
+**Response 200:** `{ "success": true }`
+
+**Errors**: 401, 404, 500
+
 ---
 
 ## Images (Phase 5)

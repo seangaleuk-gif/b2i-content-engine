@@ -1,5 +1,110 @@
 # Changelog
 
+## 2026-07-20 — Pipeline Reliability Refactor (Phases 1–7)
+
+### Phase 1 — Fix Validation Bugs
+- **Shared text cleaning** — `src/lib/services/text-utils.ts`: single `cleanBodyText()` function strips wp:html blocks, scripts, JSON-LD, HTML tags, URLs, code blocks, and markdown. Replaces 3 duplicate implementations in route.ts and seo-auditor.ts.
+- **Fixed JSON-LD corrupting Flesch** — JSON-LD schema text no longer inflates word count or breaks sentence detection.
+- **Fixed JSON-LD corrupting keyphrase count** — keyphrases in FAQ schema no longer counted toward density target.
+- **Fixed wp:html CTA text in validators** — CTA and language switcher HTML excluded from all body text analysis.
+- **Fixed URLs counted as words** — URLs stripped before word counting and Flesch calculation.
+
+### Phase 2A — Fix Prompt Distribution
+- **Stage-targeted prompt modules** — `buildSystemPrompt()` refactored to accept `modules?: string[]` parameter. Each generation stage receives only the modules it needs:
+  - Outline: brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure
+  - Introduction: brand_voice, seo_rules, formatting_rules, hong_kong_context
+  - Sections: brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure
+  - FAQ: brand_voice, seo_rules, formatting_rules
+  - Conclusion: brand_voice, formatting_rules, cta
+- **4 hardcoded one-liner system prompts removed** — Intro, Sections, FAQ, Conclusion now use `buildSystemPrompt()` instead of 60-70 char ad-hoc strings.
+- **`STAGE_SYSTEM_PROMPTS` constant** — module sets defined in prompt-builder.ts as single source of truth.
+- Token savings: 58% reduction vs sending full prompt everywhere (~23,300 chars per generation).
+
+### Phase 3 — Rewrite Default Prompt Modules
+- **Single-responsibility redesign** — every module now owns one concern:
+  - `brand_voice`: Tone/personality only (removed Flesch score, paragraph limits, validation language)
+  - `seo_rules`: Single source of SEO truth (title, meta, keyphrase, links, readability, heading hierarchy)
+  - `formatting_rules`: WordPress block syntax only
+  - `hong_kong_context`: Regional knowledge only (removed B2I Hub product info, brand colors)
+  - `blog_structure`: Section order only (removed SEO counts, formatting, specific URLs)
+  - `cta`: HTML blocks only (removed placement instruction → blog_structure)
+  - `publish_checklist`: 18 reference items pointing to authoritative modules
+- **17 duplicated instructions eliminated** — title length, meta length, internal link counts, Flesch target, brand colors, slug rules all reduced from 3-4 locations to 1.
+- **Deterministic language** — "average sentence length 12-16 words" instead of "write simply." Measurable guidance throughout.
+
+### Phase 4 — Application Owns Article Structure
+- **Application-owned H2 headings** — heading text modified in code before sending to AI. AI generates only body content, returns `{"body": "..."}`.
+- **Keyphrase H2 selection** — three-tier heuristic: semantic match → first non-structural heading → first heading. Replaces arbitrary `index 0 or 1`.
+- **Heading guaranteed** — application prepends keyphrase to H2 text in code. Zero AI involvement in heading decisions.
+- **Section context expanded** — AI receives previous heading + next heading + current heading for body generation.
+- **Removed `hasKeyphraseInH2` tracking** and `isH2WithKeyphrase` per-section flag.
+
+### Phase 5A–5B — Fixer Pipeline Audit & Surgical Editors
+- **`fixKeyphraseH2` removed** — obsolete since Phase 4 (app owns headings).
+- **`fixTitle` rewritten** — sends only title (200 chars), AI returns 5 alternatives, code picks first valid one. Was sending full article JSON (10K chars).
+- **`fixKeyphraseDensity` rewritten** — paragraph-scoped. Extracts paragraph blocks, ranks by keyphrase density, sends only target paragraph (~500 chars). Was sending full article.
+- **`fixReadability` rewritten** — paragraph-scoped. Splits article into paragraphs, scores each for Flesch, sends only 3 worst-scoring (~1,500 chars). Was sending full article with maxTokens=32768.
+- **FixerContext simplified** — removed `stripHtml`, `parseBlogJson`, `Specificity` type, `PROTECTED`, `DIFF_MINDSET`.
+- **Escalating specificity removed** — fixers no longer have general→location→replacement levels.
+- Token savings: 92-95% reduction in fixer prompt size.
+
+### Phase 6 — Benchmarking & Quality Validation
+- 5-article benchmark across diverse topics (AI creator marketing, restaurants, fitness, beauty, tech).
+- Measured: word count, Flesch ease, title/meta length, keyphrase count, H2 keyphrase presence, H2 count, generation time, fixer calls.
+- Results: Flesch 63-70 (100% in range), titles close to 50-70, meta 135-156 (below target), word count 1,385-1,744 (below 2,000-2,500 target).
+- One article failed mid-generation (JSON parse error — 80% reliability).
+
+### Phase 7 — Eliminate Remaining AI Weaknesses
+- **Dynamic word count targets** — `WORD_ALLOCATION` constant (intro 8%, conclusion 6%, FAQ 10%). Sections receive exact target: `(total − reserved) / h2Count` instead of hardcoded "200-300 words."
+- **Meta description code repair** — `repairMetaDescription()` appends CTA sentence if < 155 chars, truncates at sentence boundary if > 200 chars. Code-only, no AI.
+- **JSON repair** — `robustJsonParse()` tries 5 strategies (direct parse, code block extraction, object matching, trailing comma fix) before throwing. Outline gets one AI retry on failure.
+- **Deterministic keyphrase target** — `keyphraseTarget(wordCount)` returns exact count (e.g. 2,200 words → 4 mentions). AI receives "include exactly X times" instead of "3-5 times."
+- **Shared generation constants** — `src/lib/services/generation-constants.ts`: `SEO_TITLE_MIN/MAX`, `META_MIN/MAX`, `KEYPHRASE_MIN/MAX`, `FLESCH_MIN/MAX`, `DEFAULT_WORD_COUNT`. Used by route.ts, prompt-builder.ts, seo-auditor.ts.
+
+---
+
+### Added
+- **Section-by-section generation** — replaced single-shot DeepSeek call + continuation loop with phased pipeline: A. Outline (title + H2 headings) → B. Introduction → C. H2 Sections (one API call each, inline keyphrase injection) → D. FAQ → E. Conclusion → F. Assemble. Each section is smaller and more controlled (maxTokens: 4096-8192 vs old 32768).
+- **Deterministic editing pipeline** (`src/lib/services/fixers.ts`) — 4 surgical fixers with escalating specificity (general → location → replacement), diff mindset, protected sections, and exact deltas. Chain: title → H2 → density → readability.
+- **Validate-after-every-fix** — re-runs all checks after each fixer, with 3 attempts per check using escalating specificity. Catches cascading failures immediately.
+- **Deterministic title edits** — code truncates (too long: `lastIndexOf(" ") + "…"`) or prepends keyphrase (too short: `Keyphrase: Title`) before falling back to AI.
+- **10-step WorkflowStepper** — added "Blog Generation" tab after Research (links to `/projects/[id]` workspace editor), keeping all 9 original tabs.
+- **Project delete** — single delete button on each row + multi-select with bulk delete from projects list. Delete button in workspace toolbar. `DELETE /api/projects/[id]/seo/audit` endpoint.
+- **Version badge** — displays current version (v1, v2, v3) next to project name in workspace toolbar + editor area. Updates on generation, restore, and URL param.
+- **SEO audit meta description fix** — scoring gap (120-154 chars → score 0) closed. Unique internal link counting via `Set<string>`. wp:html block exclusion via character ranges. External links counted from `blog_versions.external_links` array + inline HTML.
+- **Settings page Refresh button** — re-fetches from Supabase without saving. `seedDefaults()` removed from GET handler (was overwriting user edits on every load).
+- **Tag filtering** — Blog tab accepts `?tag=` URL param for client-side filtering. Tags link to WordPress archive pages (`/blog/tag/` or `/blog/zh/tag/`).
+- **Post-generation validation** — 4 hard requirements (title 50-70, keyphrase 3-5, H2 keyphrase, Flesch 60-70) checked server-side. Blog rejected (422) if any fail after fixers.
+
+### Changed
+- **Internal link cap**: 15 → 5 (link-injector MAX_TOTAL_LINKS), 7 → 3-5 unique (prompt builder + SEO auditor)
+- **Prompt builder**: NON-NEGOTIABLE HARD REQUIREMENTS block at top of user message, PRE-OUTPUT VALIDATION before JSON output, meta description MUST 155-200 in seo_rules, blog_structure, and output format
+- **Prompt sections updated**: seo_rules (3-5 unique links, 50-70 title, HARD REQUIREMENT meta), formatting_rules (paragraphs HARD REQUIREMENT), blog_structure (50-70 H1, 3-5 UNIQUE links), publish_checklist (50-70 title)
+- **brand_voice**: added simple vs complex writing example, Flesch 60-70 HARD REQUIREMENT
+- **API client**: `ApiError` now carries `data` field with full response body for validation failure details
+- **WorkflowStepper**: removed `usePathname` dep (was causing 429 rate limit), fetches once on mount
+- **Link injector**: `MAX_TOTAL_LINKS = 5`, added `<script>` to skip selectors (FAQ schema protection)
+- **Blog versions**: `getNextVersionNumber` uses `Math.max()` over all versions (more reliable than order+limit)
+
+### Fixed
+- **Duplicate blog versions** — link injector now runs BEFORE version save (was creating two rows with same version_number)
+- **Settings save broken** — GET handler no longer calls `seedDefaults()` (was force-upserting defaults on every page load, destroying user edits). `PromptSection` interface uses camelCase (`sectionKey`) matching api-client normalization.
+- **Blog tab not refreshing** — explicit `useEffect` + `refreshData()` on mount and after generation instead of `window.location.reload()`
+- **Meta description 0/100 in SEO audit** — scoring gap at 120-154 chars closed (was falling to `else` with score 0)
+- **Internal links overcounted** — language switcher links excluded via wp:html character-range filtering + unique href dedup
+- **External links showing 0** — now counts from both `blog_versions.external_links` array + inline `<a href="https://...">` in HTML
+- **SEO page empty body** — now passes `blog` from target version in POST body to audit route
+- **SEO fields not populating** — workspace sidebar now reads from `blog_versions` (title, slug, metaDescription)
+- **Publish checklist meta description** — `metaDescriptionSet` now checks `latestEn?.metaDescription` instead of `hasContent`
+
+### Removed
+- **Continuation loop** — replaced by section-by-section expansion
+- **"Fix everything" retry** — replaced by targeted surgical fixers with escalating specificity
+- **Workspace auto-redirect** — removed redirect to Research for new projects (was blocking Blog Generation tab)
+- **`usePathname` dep in WorkflowStepper** — caused Supabase Auth 429 rate limiting
+
+---
+
 ## 2026-07-18 — Phase 5: SEO, WordPress & Media
 
 ### Added

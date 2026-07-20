@@ -88,14 +88,17 @@ b2i-content-engine/
 │       │   ├── deepseek.ts      # DeepSeek Chat V3.1 client (chat, chatWithRetry)
 │       │   ├── prompt-builder.ts   # Assembles prompts from 10 sections + context + inline linking instructions
 │       │   ├── default-prompts.ts  # 10 pre-seeded prompt section defaults (cta + publish_checklist added)
-│       │   ├── seo-auditor.ts      # Phase 5 — 12-check SEO analysis engine
-│       │   ├── link-injector.ts    # Phase 5 — injects active links into blog content
+│       │   ├── seo-auditor.ts      # Phase 5 — 12-check SEO analysis (unique 3-5 links, wp:html exclusion, dedup)
+│       │   ├── fixers.ts            # Phase 5 — 4 surgical fixers (title, H2, density, readability) with escalating specificity
+│       │   ├── link-injector.ts    # Phase 5 — injects active links into blog content (max 5 links, skips wp:html/script)
 │       │   ├── link-sync.ts        # Phase 5 — auto-extracts blog links on publish
 │       │   ├── link-suggester.ts   # Phase 5 — scans content for link opportunities
 │       │   ├── default-links.ts    # Phase 5 — 7 B2I Hub default links with seeding
 │       │   ├── wordpress.ts        # Phase 5 — WordPress REST API client (Application Password auth, Yoast meta)
 │       │   ├── image-generation.ts # Phase 5 — Hugging Face FLUX.1-dev image generation
-│       │   └── translation.ts      # Phase 5 — DeepSeek Traditional Chinese (zh-HK) translation
+│       │   ├── translation.ts      # Phase 5 — DeepSeek Traditional Chinese (zh-HK) translation
+│       │   ├── text-utils.ts       # Phase 1 — shared cleanBodyText(), robustJsonParse(), repairMetaDescription()
+│       │   └── generation-constants.ts # Phase 7 — shared numeric thresholds (SEO title, meta, keyphrase, Flesch)
 │       └── supabase/            # server, client, proxy utilities
 ```
 
@@ -161,31 +164,47 @@ Browser (React Client Component)
 ## Prompt Builder Architecture
 ```
 Default Prompts (default-prompts.ts)
-  → 10 sections: brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure, social_rules, image_rules, translation_rules, cta, publish_checklist
+  → 10 single-responsibility sections: brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure, social_rules, image_rules, translation_rules, cta, publish_checklist
   → Force-upserted into prompt_sections table via seedDefaults() on EVERY generation
+  → Each module owns one concern — no duplication across modules
 
 Prompt Builder (prompt-builder.ts)
   → Reads sections from context.promptSections (fetched from DB)
-  → buildSystemPrompt(): CRITICAL FORMAT REQUIREMENT (WordPress blocks) → brand_voice → hong_kong_context → Internal Linking Instructions (inline, 7 B2I URLs + context) → seo_rules → formatting_rules → blog_structure → cta → publish_checklist → social_rules → image_rules → translation_rules → MANDATORY OUTPUT REQUIREMENTS (CTA, links, FAQ schema, language switcher)
-  → buildUserMessage(): project details → research sources (grouped by category) → relevant knowledge (keyword-scored, top 5) → translation rules → word count instruction (body content only, default 2500)
+  → buildSystemPrompt(context, modules?): if modules array provided, returns only those sections + CRITICAL FORMAT. If omitted, returns full prompt (backward compatible).
+  → STAGE_SYSTEM_PROMPTS: defines module sets per generation stage:
+      outline      → brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure
+      introduction → brand_voice, seo_rules, formatting_rules, hong_kong_context
+      section      → brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure
+      faq          → brand_voice, seo_rules, formatting_rules
+      conclusion   → brand_voice, formatting_rules, cta
+  → buildUserMessage(): project details → NON-NEGOTIABLE HARD REQUIREMENTS (deterministic keyphrase target via keyphraseTarget()) → research sources → translation rules → word count instruction → PRE-OUTPUT VALIDATION checklist → JSON output format
   → Outputs { systemPrompt, userMessage }
 
 Blog Generation (POST /api/generate-blog)
-  → Receives projectId
-  → Fetches project, research, knowledge, prompt sections from DB
-  → seedDefaults() force-upserts all 10 sections
-  → Calls Prompt Builder → builds system + user prompts
-  → Calls DeepSeek API with { response_format: "json_object", max_tokens: 32768 }
-  → Parses JSON response → runs continuation loop if word count below target (up to 3 attempts, tiny JSON responses, no full article re-sending)
-  → Saves to blog_versions (title, slug, blog, faq, links, etc.)
-  → Updates project.content + project.word_count
-  → Logs full request/response metadata to ai_logs table
-  → Returns { success, version, title, blog, wordCount, model, tokenUsage, generationTimeMs, ... }
+  → Section-by-section pipeline:
+      A. Outline: title + H2 headings (maxTokens: 8192) — robustJsonParse with AI retry on failure
+      B. Introduction: dynamic word target = total × 8% (maxTokens: 4096)
+      C. H2 Sections: one call per heading, dynamic word target = (total − reserved) / h2Count. App pre-modifies keyphrase H2 heading in code. AI returns body only {"body": "..."}. (maxTokens: 8192 each)
+      D. FAQ: 4-6 QA + schema block (maxTokens: 8192)
+      E. Conclusion: dynamic word target = total × 6% (maxTokens: 4096)
+      F. Assemble: code joins all sections — app wraps headings in wp:heading blocks
+  → Meta repair: repairMetaDescription() in code (append CTA / truncate at sentence boundary)
+  → Validation: 3 checks (title, keyphrase count, Flesch). H2 keyphrase guaranteed by app (Phase 4).
+  → Surgical fixer pipeline:
+      fixTitle → fixKeyphraseDensity → fixReadability
+      3 attempts each, paragraph-scoped AI edits (not full article)
+  → Saves to blog_versions
+  → Updates project.content
+  → Returns { success, version, title, blog, etc. }
 
-Playground (POST /api/playground)
-  → Accepts raw systemPrompt + userPrompt
-  → Calls DeepSeek API directly (no versioning / logging / context assembly)
-  → Returns raw content string
+Surgical Fixers (src/lib/services/fixers.ts)
+  → 3 fixers: fixTitle, fixKeyphraseDensity, fixReadability
+  → fixTitle: deterministic truncation/prepend first. AI fallback sends only title (200 chars), returns 5 alternatives, code picks first valid one.
+  → fixKeyphraseDensity: extracts paragraph blocks, ranks by keyphrase count, sends only target paragraph (~500 chars) to AI.
+  → fixReadability: extracts paragraph blocks, scores each for Flesch individually, sends only 3 worst-scoring (~1,500 chars) to AI.
+  → Operates on smallest possible unit — never sends full article.
+  → fixKeyphraseH2 removed (obsoleted by app-owned headings in Phase 4).
+  → Escalating specificity per attempt: general → location → replacement
 ```
 
 ## SEO Audit Engine

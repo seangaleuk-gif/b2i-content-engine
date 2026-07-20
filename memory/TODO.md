@@ -66,15 +66,74 @@
 - [x] ~~Update word count to strip WordPress blocks, HTML, JSON-LD — "body content only"~~ (Jul 18)
 - [x] ~~Change word_count default from 0 to 2500~~ (Jul 18)
 - [x] ~~Update memory files with Phase 5 changes~~ (Jul 18)
-- [ ] Create automated/scheduled SEO audit runs
-- [ ] Auto-fix suggestions from SEO audit results
+- [x] ~~Create automated/scheduled SEO audit runs~~ (Jul 19 — deterministic editing pipeline replaces this)
+- [x] ~~Auto-fix suggestions from SEO audit results~~ (Jul 19 — surgical fixers with escalating specificity)
+- [x] ~~Replace continuation loop with section-by-section generation~~ (Jul 19)
+- [x] ~~Implement validate-after-every-fix pipeline~~ (Jul 19)
+- [x] ~~Add project delete + multi-select bulk delete~~ (Jul 19)
+- [x] ~~Fix duplicate blog versions, settings save, blog tab refresh~~ (Jul 19)
+- [x] ~~Add 10th tab (Blog Generation) to WorkflowStepper~~ (Jul 19)
+- [x] ~~Add version badge to workspace~~ (Jul 19)
+- [x] ~~Tag filtering on Blog tab~~ (Jul 19)
 
-## Next Sprint — Phase 6: WordPress Integration
+## Completed Sprint — Pipeline Reliability Refactor (Phases 1–7, Jul 20, 2026)
 
-- [ ] Add WordPress connection settings fields
-- [ ] Create WordPress REST API service
-- [ ] One-click publishing to WordPress
-- [ ] Post status syncing
+### Phase 1 — Fix Validation Bugs
+- [x] Create shared `cleanBodyText()` function (removes JSON-LD, wp:html, scripts, URLs)
+- [x] Fix JSON-LD corrupting Flesch Reading Ease scores
+- [x] Fix JSON-LD corrupting keyphrase count
+- [x] Fix wp:html CTA text included in body analysis
+- [x] Fix URLs counted as words in readability
+- [x] Replace 3 duplicate text-cleaning implementations
+
+### Phase 2A — Fix Prompt Distribution
+- [x] Refactor `buildSystemPrompt()` to accept module list
+- [x] Send targeted prompt modules to every generation stage
+- [x] Define `STAGE_SYSTEM_PROMPTS` per-stage module sets
+- [x] Replace 4 hardcoded one-liner system prompts
+- [x] ~58% token reduction in system prompts
+
+### Phase 3 — Rewrite Default Prompt Modules
+- [x] Single-responsibility redesign — every module owns one concern
+- [x] Move all SEO truth to `seo_rules` only
+- [x] `publish_checklist` becomes reference-based verification
+- [x] Remove B2I Hub product info from `hong_kong_context`
+- [x] Remove 17 duplicated instructions across modules
+- [x] Deterministic language throughout (measurable, not vague)
+
+### Phase 4 — Application Owns Article Structure
+- [x] Application selects best H2 for keyphrase (semantic matching)
+- [x] Application modifies H2 heading text in code (prepend keyphrase)
+- [x] AI generates body content only (`{"body": "..."}` not `{"heading": "...", "body": "..."}`)
+- [x] Remove `hasKeyphraseInH2` tracking and `isH2WithKeyphrase` flag
+- [x] Section prompt includes prev/next heading context
+
+### Phase 5A–5B — Fixer Audit & Surgical Editors
+- [x] Audit all 4 fixers — classify remove/replace/keep
+- [x] Remove `fixKeyphraseH2` (obsoleted by Phase 4)
+- [x] Rewrite `fixTitle` — sends only title (200 chars), AI returns 5 alternatives
+- [x] Rewrite `fixKeyphraseDensity` — paragraph-scoped (~500 chars)
+- [x] Rewrite `fixReadability` — paragraph-scoped, 3 worst paragraphs (~1,500 chars)
+- [x] Remove escalating specificity, PROTECTED, DIFF_MINDSET
+- [x] 92-95% fixer prompt size reduction
+
+### Phase 6 — Benchmarking
+- [x] 5-article benchmark across diverse topics
+- [x] Measure word count, Flesch, title/meta length, keyphrase, generation time
+- [x] Identify remaining weaknesses (word count below target, meta too short, JSON failures)
+
+### Phase 7 — Eliminate Remaining AI Weaknesses
+- [x] Dynamic word count targets per section
+- [x] `repairMetaDescription()` code-based (append CTA / truncate)
+- [x] `robustJsonParse()` 5-step JSON repair with AI retry on failure
+- [x] Deterministic keyphrase target (`keyphraseTarget(wordCount)`)
+- [x] Shared generation constants (`generation-constants.ts`)
+
+## Next Sprint — Phase 8: WordPress Integration (Actual Publishing)
+
+- [ ] WordPress REST API publish endpoint (exists — needs testing/refinement)
+- [ ] Post status syncing after publish
+- [ ] Bilingual publish flow (EN + ZH-HK)
 
 ## Future Ideas
 

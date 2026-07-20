@@ -1,7 +1,8 @@
 export class ApiError extends Error {
   constructor(
     message: string,
-    public status: number
+    public status: number,
+    public data?: Record<string, unknown>
   ) {
     super(message);
     this.name = "ApiError";
@@ -38,7 +39,8 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     const body = await response.json().catch(() => ({}));
     throw new ApiError(
       body.error ?? `Request failed with status ${response.status}`,
-      response.status
+      response.status,
+      body
     );
   }
 

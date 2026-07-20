@@ -4,7 +4,7 @@
 AI-powered content creation workflow for B2I Digital. Automates blog writing from research through publishing, with AI-driven SEO analysis, image generation, and social media content creation.
 
 ## Current Development Phase
-**Phase 5 — SEO, WordPress & Media** (in progress, Jul 18, 2026)
+**Phase 7 — Eliminate Remaining AI Weaknesses** (Jul 20, 2026)
 
 | Phase | Status | Completed |
 |-------|--------|-----------|
@@ -12,7 +12,8 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 | Phase 2 — Backend Foundation | Complete | Jul 16, 2026 |
 | Phase 3 — Research Engine | Complete | Jul 16, 2026 |
 | Phase 4 — Blog Generation | Complete | Jul 17, 2026 |
-| Phase 5 — SEO, WordPress & Media | In Progress | Jul 18, 2026 |
+| Phase 5 — SEO, WordPress & Media | Complete | Jul 19, 2026 |
+| Phases 1–7 (Pipeline Reliability) | Complete | Jul 20, 2026 |
 
 ## Features Completed
 
@@ -20,7 +21,8 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 - Dashboard with stats cards, recent projects, activity feed, resource gauges
 - Projects list with search, filtering, and status badges
 - Project workspace (3-column: workflow steps, markdown editor, context panel)
-- 9-stage workflow stepper: Research, Competitor Analysis, Outline, Blog, SEO Audit, Images, Social, Translation, Publish
+- 10-stage workflow stepper: Research, Blog Generation, Competitor Analysis, Outline, Blog, SEO Audit, Images, Social, Translation, Publish
+- Workflow progress computed from project data (research done, blog content, SEO checks, images, social posts)
 - Blog View as a standalone tab page (`/projects/[id]/blog`) — not part of the stepper
 - Dynamic workflow stepper — step statuses (complete/in-progress/pending) and progress bar computed from actual project data
 - Auto-redirect to Research step for newly created projects
@@ -61,34 +63,31 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 - Working Generate button with loading/error/success states
 
 ### Blog Generation (Phase 4)
-- **DeepSeek Chat V3.1** — AI LLM integration for structured JSON blog content generation (`max_tokens: 32768`)
-- **Continuation Loop** — up to 3 additional AI calls to expand content when word count is below target; continuation uses tiny JSON responses (no full article re-sending)
+- **DeepSeek Chat** — AI LLM integration for structured JSON blog content generation
+- **Section-by-section generation** — phased pipeline: Outline → Introduction → H2 Sections → FAQ → Conclusion → Assemble. Each section is a separate, focused DeepSeek call (maxTokens: 4096-8192 vs old 32768 single-shot).
 - **Prompt Builder** — assembles system and user prompts from 10 composable, user-editable prompt sections (brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure, social_rules, image_rules, translation_rules, cta, publish_checklist)
-- **CRITICAL FORMAT REQUIREMENT** at start of system prompt (WordPress blocks required)
-- **Internal Linking Instructions** inline section with 7 B2I Hub URLs and context
-- **Output format description** — WordPress blocks only (NO Markdown)
-- **MANDATORY OUTPUT REQUIREMENTS** at end (CTA, links, FAQ schema, language switcher)
+- **NON-NEGOTIABLE HARD REQUIREMENTS** block at top of user message (title 50-70, keyphrase 3-5, H2 keyphrase, Flesch 60-70) with PRE-OUTPUT VALIDATION checklist
+- **Internal Linking Instructions** — 3-5 UNIQUE internal links, max 5, language switcher excluded
+- **MANDATORY OUTPUT REQUIREMENTS** at end (CTA, links, FAQ schema, language switcher, meta 155-200)
 - **Prompt Sections** — pre-seeded defaults via `default-prompts.ts`, force-upserted on every generation via `seedDefaults()`, UNIQUE constraint on (user_id, section_key)
 - **Blog Versions** — sequential versioned content storage per project (title, slug, meta_description, blog, faq, links, categories, tags, reading_time, word_count, token_usage, etc.)
-- **AI Logging** — 5-step logging pipeline: STEP1 (database values) → STEP2 (prompt assembly) → STEP3 (DeepSeek request) → STEP4 (DeepSeek response) → STEP5 (blog output) with duration tracking
+- **Deterministic Editing Pipeline** — `src/lib/services/fixers.ts` with 4 surgical fixers (title, H2 keyphrase, density, readability) using escalating specificity (general → location → replacement), diff mindset, protected sections, exact deltas. Chain: validate → fixer → re-validate → repeat.
+- **Post-generation validation** — server-side checks after generation: title length, keyphrase count, H2 keyphrase presence, Flesch Reading Ease. Blog rejected (422) if any fail after targeted fixers.
+- **Version badge** — displays current version (v1, v2, v3) in workspace toolbar + editor area, updates on generation/restore/URL param
 - **Autosave** — debounced automatic content persistence in the project workspace editor
 - **Generator Progress** — loading states and progress feedback during blog generation
 - **AI Playground** — `POST /api/playground` endpoint + `/playground` page for raw prompt testing
 
 ### SEO Audit Engine (Phase 5)
-- **12-check analysis engine** (`seo-auditor.ts`) — title length, meta description length, keyphrase in H1/first 100 words/H2/density, internal links count, external links count, paragraph length, image alt text, FAQ schema presence, reading level (Flesch-Kincaid)
-- **`POST /api/projects/[id]/seo/audit`** — runs audit, clears old checks, stores results in `seo_checks` table
+- **12-check analysis engine** (`seo-auditor.ts`) — title length (50-70), meta description length (155-200, with 120-154 gap closed), keyphrase in H1/first 100 words/H2/density, unique internal links (3-5, wp:html blocks excluded, deduped by href), external links (counted from inline HTML + blog_versions.external_links array), paragraph length, image alt text, FAQ schema presence, reading level (Flesch-Kincaid 60-70)
+- **`POST /api/projects/[id]/seo/audit`** — runs audit, clears old checks, stores results in `seo_checks` table; reads meta_description from blog_versions (server-side priority); `DELETE` handler clears checks on version restore/generation
 - **SEO page** — working Run Audit button with score gauge, category breakdown, 12 detailed check cards
 
 ### Internal Linking System (Phase 5)
-- **`link-injector.ts`** — injects active links into blog content (skips headings/code, 500+ char spacing, max 15 links)
+- **`link-injector.ts`** — injects active links into blog content (skips headings/code/existing links/wp:html blocks, 500+ char spacing, max 5 links total)
 - **`link-sync.ts`** — auto-extracts blog links from content on publish
-- **`link-suggester.ts`** — scans content for link opportunities
-- **`default-links.ts`** — 7 B2I Hub default links with seeding per user (`created_by` column)
+- **`default-links.ts`** — 7 B2I Hub default links with seeding per user
 - **CRUD endpoints** — `GET/POST /api/internal-links`, `GET/PATCH/DELETE /api/internal-links/[id]`
-- **Suggested links** — `GET/POST /api/suggested-links` (approve/reject suggestions)
-- **Publish endpoint** — `POST /api/publish-blog` publishes project and syncs links
-- **Admin UI** — `/settings/links` full management page with stats, table, add/edit modal, pending suggestions
 
 ### WordPress Publishing (Phase 5)
 - **WordPress REST API** integration with Application Password authentication (`WORDPRESS_URL`, `WORDPRESS_USERNAME`, `WORDPRESS_APP_PASSWORD` env vars)
@@ -116,11 +115,19 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 - **Word count instruction** — explicitly says "body content only" (headings, paragraphs, list items, table cells — not HTML/JSON-LD/block comments)
 - **`word_count` default** — changed from 0 to 2500
 
-## Features Remaining
+### Pipeline Reliability Refactor (Phases 1–7, Jul 20, 2026)
+- **Shared text cleaning** — `cleanBodyText()` in `text-utils.ts` strips wp:html, scripts, JSON-LD, HTML, URLs, code blocks. Single source for all validators.
+- **Stage-targeted prompt modules** — `buildSystemPrompt()` accepts `modules[]` parameter. Each generation stage gets only needed modules (3-5 per stage). 58% token reduction vs full prompt.
+- **Single-responsibility prompt modules** — every module owns one concern. 17 duplicated instructions eliminated. Deterministic language throughout.
+- **Application-owned H2 headings** — code selects best H2 for keyphrase via semantic matching, modifies heading text in code. AI writes body only.
+- **Surgical fixers** — paragraph-scoped editing (not full article). `fixKeyphraseH2` removed. Title/density/readability send only target paragraphs (200-1,500 chars vs 10,000 chars before). 92-95% token reduction.
+- **Dynamic word count targets** — sections receive exact word targets: `(total − reserved) / h2Count` instead of "200-300 words."
+- **Meta description code repair** — `repairMetaDescription()` appends/truncates in code. No AI needed.
+- **JSON repair** — `robustJsonParse()` tries 5 strategies before throwing. Outline gets one AI retry on failure.
+- **Deterministic keyphrase target** — `keyphraseTarget(wordCount)` returns exact count. AI receives "include exactly X times."
+- **Shared generation constants** — `generation-constants.ts`: single source of truth for all numeric thresholds.
 
-### Phase 5 — Wrap-Up (in progress)
-- Auto-fix suggestions from SEO audit results
-- Scheduled/automated audit runs
+## Features Remaining
 
 ### Phase 6 — Social Media Publishing (not started)
 - AI social post generation
@@ -130,12 +137,12 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 ## Overall Workflow
 1. **Create Project** → Set topic, keyword, audience, country (via NewProjectModal)
 2. **Research** → Brave Search gathers web results, discussions, FAQ, news
-3. **Competitor Analysis** → Analyze competitor headlines and strategies
-4. **Outline** → AI builds content outline
-5. **Write Blog** → AI generates structured JSON blog (title, meta, body, FAQ, links, etc.) with continuation loop
-6. **SEO Audit** → Run 12-check analysis (title length, meta, keyphrase usage, links, readability, schema)
-7. **Generate Images** → AI creates featured/social images
-8. **Generate Social** → AI creates platform-specific posts
-9. **Translation** → Traditional Chinese (HK) translation with locale-appropriate rules
+3. **Outline** → AI generates title, slug, meta, and H2 headings
+4. **Blog Generation** → Phased pipeline: Outline → Introduction → H2 Sections → FAQ → Conclusion → Assemble. Application owns structure, AI writes content.
+5. **Validation & Fixing** → Code-based checks (title, keyphrase, Flesch) with surgical paragraph-scoped AI fixers
+6. **Link Injection** → Auto-injects internal links into blog content
+7. **SEO Audit** → 12-check analysis (title, meta, keyphrase, links, readability, schema)
+8. **Generate Images** → Hugging Face FLUX.1-dev image generation
+9. **Translation** → Traditional Chinese (HK) via DeepSeek API
 10. **Publish** → One-click publish + auto-sync internal links
 11. **View Blog** → Rendered blog post with WordPress block stripping, FAQ cards, link rendering
