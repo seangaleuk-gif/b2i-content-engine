@@ -1,5 +1,49 @@
 # Changelog
 
+## 2026-07-21 — Section Lifecycle, SEO Audit Rewrite, Null Scores
+
+### Section Lifecycle Fix
+- **Authoritative `GeneratedSection[]`** — Created once after outline with all sections as `"pending"`. Never filtered, compacted, or rebuilt from successful results. Failed sections remain at their original index with `body: ""` and `status: "missing"`.
+- **Indexed write-back** — Parallel results written into `authoritativeSections[i].body` by index. Recovery writes back by index. Expansion writes back by index.
+- **`logSectionState()`** — Logs `count`, `indexes`, `statuses` after every major stage. Ensures `sections.length === outline.length` invariant.
+- **Expansion fix** — No longer replaces section content. APPENDS additional blocks to existing body. Accepts only when `afterWC > beforeWC`. Missing sections get full-body generation with `Math.max(250, target * 0.75)` minimum.
+- **H2 ownership** — Assembly is the SOLE owner of main H2 headings. `stripMainH2Blocks()` applied to every AI section response, recovery response, and regenerated response.
+- **`assembleArticle()`** — Constructs full article from structured `{heading, body}[]` + `faqBlock` + `ctaBlock`. CTA and FAQ are singletons — inserted exactly once, never duplicated or removed.
+- **`validateWpBlocks()`** — Reports WordPress block opening/closing counts + mismatches after every reassembly.
+
+### SEO Audit Rewrite
+- **14 weighted checks** with category redistribution: SEO Fundamentals (35%), Content & Keyphrase (25%), Readability (15%), Links (10%), Structure & Schema (10%), Images (5%).
+- **"Focus Keyphrase in H1" → "Focus Keyphrase in SEO Title"** — checks `title` field, not `<h1>` in blog body.
+- **Keyphrase count and density separated** — Count shows occurrences vs. exact target (5). Density shows percentage to 2 decimal places (0.5%-1.5%).
+- **Canonical text extraction** — `extractReadableText()` strips wp:html, scripts, HTML tags, URLs, JSON-LD. All word count, keyphrase, and readability checks use this one function.
+- **FAQ schema parsing** — Parses `<script type="application/ld+json">` with actual `JSON.parse()`. Validates `@type: "FAQPage"` and `mainEntity` array.
+- **H2 close-variant matching** — Detects singular/plural variations as close matches (warning), not exact passes.
+- **`not_applicable` status** — Image alt text returns `not_applicable` when no images exist. Score: `null`. Weight redistributed across applicable categories.
+- **Word count audit row** — Separate check for body word count vs. target (≥ 95% = warning, ≥ 100% = pass).
+- **Null score support** — `seo_checks.score` now nullable (DB column + Drizzle schema). API sends `score: number | null`. UI shows "N/A" for not_applicable. Weighted scoring excludes null scores.
+
+### Generation Pipeline Improvements
+- **Buffered generation targets** — `GENERATION_WORD_BUFFER = 1.18`. Internal target = `ceil(requested * 1.18)`. Sections asked for 18% more to reliably hit minimum.
+- **`expandToMinimum()` / `trimToMaximum()`** — Section-level expansion/trimming with `originalSections` backup. Rankings use `Math.max(0, allocatedTarget - currentWords)`.
+- **Recovery debugging** — `[RECOVERY-STACK]` log captures 5 frames of stack trace. `[RECOVERY-TYPE]` inspects typeof on reduce errors.
+- **Language switcher** — Deterministic `renderLanguageSwitcher()` with `b2i-language-switcher` class. Paired slugs via `pairedSlugs()`. Excluded from internal link count.
+- **External research links** — `insertExternalResearchLinks()` uses only project research URLs. Filters out B2I-owned domains. Maximum 3 links.
+- **Title repair** — `containsExactPhrase()` check + deterministic prepend: `"Keyphrase: What You Need to Know"`. Falls back to AI only if deterministic fails.
+- **Paragraph normalization** — `splitLongParagraphs()` splits paragraphs at 3-sentence max. Preserves inline HTML. Applied after expansion and before final save.
+- **Link injection protection** — SKIP_SELECTORS already excludes `<h1>-<h6>` headings. Keyphrase protection via character-range skip logic.
+
+### Bug Fixes
+- **Section array shrinking** — Fixed: `sectionResults` (filtered to successful only) no longer replaces authoritative array.
+- **H2 count changing during expansion** — Fixed: revert to pre-expansion bodies on mismatch.
+- **FAQ/CTA disappearing** — Fixed: `assembleArticle()` includes `faqBlock` and `ctaBlock` in every reconstruction.
+- **Expansion reducing word count** — Fixed: accepts only when `afterWC > beforeWC`.
+- **Recovery `.reduce()` error** — Full stack trace logging added for diagnosis.
+- **Word count below target** — Fixed: buffered targets + section expansion.
+- **Internal links counted in wp:html** — Fixed: character-range exclusion.
+- **Meta description scoring gap** — Fixed: 120-154 now treated as "too short" (was score 0).
+
+---
+
 ## 2026-07-20 — Pipeline Reliability Refactor (Phases 1–7)
 
 ### Phase 1 — Fix Validation Bugs
@@ -238,3 +282,69 @@
 - **Empty states** — across all data views with action buttons
 - **Loading skeletons** — Skeleton component used across all pages during data fetching
 - **Documentation** — `docs/BACKEND.md` with architecture overview
+
+## 2026-07-22 — Keyphrase Budget System, Dynamic SEO Ranges, Normalizer Fixes
+
+### Per-Component Keyphrase Budgets
+- **`allocateComponentKeyphraseBudgets()`** — Deterministic 4-phase allocator distributes article-wide keyphrase target across components. Intro gets 1-2, designated H2 section gets 1-2, main sections get 0-2, FAQ/conclusion capped at 1. Invariants enforced: preferred total equals `min(articlePreferred, totalCapacity)` or throws.
+- **`buildComponentBudgetPrompt()`** — Injects local budget into each component generation prompt. "EXACT KEYPHRASE BUDGET FOR THIS COMPONENT" with preferred/max limits and natural-language guidance.
+- **Heading classification** — Detects Common Mistakes (`/mistake|avoid|pitfall/i`) and FAQ (`/faq|frequently|question/i`) headings. Prevents double-counting by removing synthetic components when headings match.
+- **Budget integrated into all 3 generation prompts** — intro, section, and conclusion prompts all receive their component's budget instructions. Removed the old "include exactly X times" global instruction.
+
+### Dynamic Keyphrase Range (Replaces Static 3-5)
+- **`keyphraseRangeForWordCount(wordCount)`** — Single source of truth for pass/fail range. 800 words: 3-5, 1200: 4-7, 1800: 6-10, 2500: 8-15, 3500: 10-20, 3501+: 12-25.
+- **`keyphrasePreferredTarget(wordCount)`** — Midpoint of range (e.g., 12 for 8-15). Used for generation targets, NOT pass/fail.
+- **Density-aware complementary scoring** — Count far outside range but density healthy (0.5-1.5%) → 60 warning (not 0 fail). Both metrics independent but no longer contradictory.
+- **All consumers consolidated**: quality-scorer, component-regenerator, prompt-builder, generate-blog route, seo-auditor all use the same `keyphraseRangeForWordCount()` from `generation-constants.ts`.
+
+### SEO Normalizer Hardening
+- **Tokenization/detokenization** — Protected blocks (scripts, wp:html, images, media) extracted before normalization, replaced with placeholders, restored byte-for-byte after. Normalizer never sees protected content → `protectedBlocksUnchanged` always true.
+- **Multi-pass keyphrase reduction** — `fixExcessiveKeyphrase` now handles paragraph-level AND global reduction (headings, lists, all block types). Retries up to 3 times.
+- **Pass/fail uses range** — Normalizer only adjusts when count is outside the `kpRange`, not when it differs from an exact target. Counts within range are left unchanged.
+
+### Article Integrity Pipeline
+- **`validateFinalArticleInvariants()`** — Non-destructive check before save. Verifies CTA=1, signup=1, FAQ=1, JSON-LD=1, balanced WP blocks, no nested `<p>`, no malformed H2.
+- **Stage guards** — Every mutation stage (assembly, expansion, trim, paragraphs, regeneration, switcher, links) validates output against baseline. Invalid output rejected, previous HTML restored.
+- **Integrity gate before save** — 3-tier cascade: accepted normalized HTML → pre-normalization fallback → 422 if both fail.
+
+### CTA/FAQ Extraction Rewrite
+- **`extractCtaFromConclusion(conclusion)`** — Searches conclusion only, finds signup URL by position, walks backward to nearest CTA heading. Prevents overmatching across wp:html blocks.
+- **`stripProtectedBlocksFromConclusion()`** — Removes exact extracted blocks from conclusion. CTA never duplicated during reassembly.
+- **`extractFaqBlock()`** — Extracts FAQ JSON-LD from full article using bounded regex.
+
+### Prompt Cleanup
+- **`seo_rules`** — Replaced static "3-5 occurrences" with dynamic range explanation. "Never use a static keyphrase count."
+- **`publish_checklist` item 6** — "Keyphrase density is 3-5" → "Exact keyphrase count is within the dynamic range."
+- **`blog_structure`** — Fixed CTA/FAQ ordering (CTA before FAQ). Clarified heading count excludes Common Mistakes, FAQ, CTA, conclusion.
+- **SQL seed** — Updated `phase5-blog-structure.sql` with dynamic range wording.
+
+### Paragraph Length Audit
+- **Bilingual sentence counting** — Added Chinese endings `。！？` to splitter. Mixed English/Chinese paragraphs handled correctly.
+- **Exclusion of FAQ/CTA/schema** — `wp:html` and `<script>` blocks excluded from paragraph count.
+- **Tiered scoring** — 0 long → 100, 1-2 → 80, 3-5 → 60, >5 → 0. Short articles (≤5 paragraphs) get lenient scoring.
+
+### Bug Fixes
+- **Frontend stale version** — Project `useEffect` no longer overwrites fresh content after generation (added `!generatedData` guard).
+- **SEO audit keyword** — Client now sends `keyword` in audit POST body. Server resolution: `clientKeyword || projectKeyword` with trim and type-check.
+- **Audit POST response discarded** — Client now uses `setLiveAuditResult(result)` immediately, not only waiting for DB refetch.
+- **`keyphraseH2Index` TDZ** — Moved H2 selection before budget computation to fix Temporal Dead Zone crash.
+- **JSON parse diagnostics** — `robustJsonParse` captures per-strategy errors with position and surrounding context.
+
+### Production Reliability Fixes (Jul 22 afternoon)
+- **Malformed JSON repair** — `extractMalformedJsonStringProperty()` in `text-utils.ts`. State-aware scanner tolerates unescaped quotes inside HTML/WP blocks within known JSON string properties (`body`, `intro`, `conclusion`). Runs only after normal parse fails.
+- **CTA heading count** — `countCtaHeadingTags()` in `seo-text-utils.ts` counts only actual `<h2>`/`<h3>` elements with CTA text. Wired into `article-final-invariants.ts` and `[QUALITY-CHECK]` diagnostic.
+- **Language switcher detection** — Quality scorer changed from visible text (`Read in|閱讀.*版`) to stable class attribute (`b2i-language-switcher`). `hasLanguageSwitcher()` shared helper available.
+- **H1/title keyphrase check** — Quality scorer now checks `title` field (SEO title) instead of searching blog body for `<h1>` tags.
+- **External links count** — Quality scorer regex now excludes `app.b2ihub.com` (CTA signup link). `countEditorialExternalLinks()` shared helper available.
+- **Shared content structure helpers** — `getFirstNReadableWords()`, `countCtaHeadingTags()`, `hasLanguageSwitcher()`, `countEditorialExternalLinks()` added to `seo-text-utils.ts`.
+
+### Diagnostics Added
+- `[QUALITY-CHECK]` — titleHasKeyphrase, first100HasKeyphrase, languageSwitcher, ctaHeadingCount, editorialExternalLinks, wordCount, acceptedRange, wpBlocksValid
+- `[JSON-PARSE:stage] malformed-string fallback succeeded property=` — when repair works
+- `[JSON-PARSE:stage] direct/outerObject/trailingComma FAILED:` — per-strategy error with position and context
+
+### Known Limitations (Jul 22)
+- **Word count range in quality scorer** — Uses `scoreMin` with fixed target, not `wordCountRange()`. Dynamic range used by generation.
+- **Validator inconsistency** — `validateContent` and integrity checker use different WordPress parsing logic. Need consolidation.
+- **Component budget honoring** — Prompts have local budgets but no post-generation validation enforces per-component limits.
+- **Normalizer link preservation** — Normalizer restores protected blocks byte-for-byte but link destination verification still runs post-restoration.

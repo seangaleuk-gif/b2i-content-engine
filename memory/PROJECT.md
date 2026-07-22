@@ -66,21 +66,29 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 - **DeepSeek Chat** — AI LLM integration for structured JSON blog content generation
 - **Section-by-section generation** — phased pipeline: Outline → Introduction → H2 Sections → FAQ → Conclusion → Assemble. Each section is a separate, focused DeepSeek call (maxTokens: 4096-8192 vs old 32768 single-shot).
 - **Prompt Builder** — assembles system and user prompts from 10 composable, user-editable prompt sections (brand_voice, seo_rules, formatting_rules, hong_kong_context, blog_structure, social_rules, image_rules, translation_rules, cta, publish_checklist)
-- **NON-NEGOTIABLE HARD REQUIREMENTS** block at top of user message (title 50-70, keyphrase 3-5, H2 keyphrase, Flesch 60-70) with PRE-OUTPUT VALIDATION checklist
+- **NON-NEGOTIABLE HARD REQUIREMENTS** block at top of user message (title 50-70, dynamic keyphrase count, H2 keyphrase, Flesch 60-70) with PRE-OUTPUT VALIDATION checklist
+- **Per-component keyphrase budgets** — deterministic 4-phase allocator distributes article-wide target across components. Each component prompt receives local budget preventing individual sections from trying to satisfy the article-wide target.
+- **Dynamic keyphrase range** — `keyphraseRangeForWordCount()` replaces static 3-5. Ranges scale with word count (800 words: 3-5, 2500: 8-15, 3500: 10-20). Density-aware scoring prevents contradictory count/density results.
 - **Internal Linking Instructions** — 3-5 UNIQUE internal links, max 5, language switcher excluded
 - **MANDATORY OUTPUT REQUIREMENTS** at end (CTA, links, FAQ schema, language switcher, meta 155-200)
 - **Prompt Sections** — pre-seeded defaults via `default-prompts.ts`, force-upserted on every generation via `seedDefaults()`, UNIQUE constraint on (user_id, section_key)
 - **Blog Versions** — sequential versioned content storage per project (title, slug, meta_description, blog, faq, links, categories, tags, reading_time, word_count, token_usage, etc.)
 - **Deterministic Editing Pipeline** — `src/lib/services/fixers.ts` with 4 surgical fixers (title, H2 keyphrase, density, readability) using escalating specificity (general → location → replacement), diff mindset, protected sections, exact deltas. Chain: validate → fixer → re-validate → repeat.
 - **Post-generation validation** — server-side checks after generation: title length, keyphrase count, H2 keyphrase presence, Flesch Reading Ease. Blog rejected (422) if any fail after targeted fixers.
+- **Final SEO Normalizer** — tokenization-based protected block preservation, multi-pass keyphrase reduction, paragraph splitting, readability improvement. Runs after all post-processing, before save.
+- **Article integrity pipeline** — structural validation at every mutation stage. Baseline captured post-assembly, verified after each stage. Final invariant check before save (CTA=1, signup=1, FAQ=1, balanced WP blocks).
+- **CTA/FAQ extraction** — bounded search prevents overmatching across WordPress blocks. Conclusion-only extraction for CTA blocks.
 - **Version badge** — displays current version (v1, v2, v3) in workspace toolbar + editor area, updates on generation/restore/URL param
 - **Autosave** — debounced automatic content persistence in the project workspace editor
 - **Generator Progress** — loading states and progress feedback during blog generation
 - **AI Playground** — `POST /api/playground` endpoint + `/playground` page for raw prompt testing
 
-### SEO Audit Engine (Phase 5)
-- **12-check analysis engine** (`seo-auditor.ts`) — title length (50-70), meta description length (155-200, with 120-154 gap closed), keyphrase in H1/first 100 words/H2/density, unique internal links (3-5, wp:html blocks excluded, deduped by href), external links (counted from inline HTML + blog_versions.external_links array), paragraph length, image alt text, FAQ schema presence, reading level (Flesch-Kincaid 60-70)
-- **`POST /api/projects/[id]/seo/audit`** — runs audit, clears old checks, stores results in `seo_checks` table; reads meta_description from blog_versions (server-side priority); `DELETE` handler clears checks on version restore/generation
+### SEO Audit Engine (Phase 5 — Rewritten Jul 21)
+- **14-check weighted analysis** — SEO Title Length, Meta Length, Keyphrase in SEO Title (not H1 — checks `title` field), Body Word Count, Keyphrase in First 100 Words, Exact Keyphrase in H2 (exact + close-variant matching), Exact Keyphrase Count (separate from density), Keyphrase Density (%), Paragraph Length (3-sentence max), Reading Level (Flesch 60-70), Internal Links (3-5 unique, wp:html + script blocks excluded, deduplicated by href), External Links (≥ 2), FAQ Schema (`JSON.parse()` with `@type: "FAQPage"` validation), Image Alt Text (`not_applicable` when no images)
+- **Weighted scoring**: SEO Fundamentals (35%), Content & Keyphrase (25%), Readability (15%), Links (10%), Structure & Schema (10%), Images (5%). `not_applicable` weight redistributed proportionally.
+- **Null score support**: `seo_checks.score` nullable. `not_applicable` → score: `null`. UI shows "N/A". Weighted scoring excludes nulls.
+- **Immutable audit snapshot**: Reads latest saved blog version once — doesn't mix request body or draft content.
+- **`POST /api/projects/[id]/seo/audit`** — runs audit, clears old checks, stores results; `DELETE` handler clears checks on version restore/generation
 - **SEO page** — working Run Audit button with score gauge, category breakdown, 12 detailed check cards
 
 ### Internal Linking System (Phase 5)
@@ -146,3 +154,35 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 9. **Translation** → Traditional Chinese (HK) via DeepSeek API
 10. **Publish** → One-click publish + auto-sync internal links
 11. **View Blog** → Rendered blog post with WordPress block stripping, FAQ cards, link rendering
+
+## Current State (2026-07-22)
+
+### Build & Tests
+- **Build**: Pass
+- **Tests**: 160/160
+- **Test file**: `src/lib/blog/final-seo-normalizer.test.ts`
+
+### Helpers Wired into Production
+
+| Helper | Location | Consumers |
+|--------|----------|-----------|
+| `extractMalformedJsonStringProperty()` | `text-utils.ts` | `robustJsonParse()` — called when normal parse fails |
+| `countCtaHeadingTags()` | `seo-text-utils.ts` | `article-final-invariants.ts`, `[QUALITY-CHECK]` diagnostic |
+| `hasLanguageSwitcher()` | `seo-text-utils.ts` | `quality-scorer.ts` (equivalent regex), route diagnostic |
+| `getFirstNReadableWords()` | `seo-text-utils.ts` | `[QUALITY-CHECK]` diagnostic |
+| `countEditorialExternalLinks()` | `seo-text-utils.ts` | `[QUALITY-CHECK]` diagnostic |
+| `keyphraseRangeForWordCount()` | `generation-constants.ts` | generate-blog route, SEO auditor, quality scorer, component regenerator |
+| `allocateComponentKeyphraseBudgets()` | `generation-constants.ts` | generate-blog route |
+| `extractCtaFromConclusion()` | `protected-block-extractor.ts` | generate-blog route |
+
+### Remaining Unfixed Checks
+1. Word count range in quality scorer uses `scoreMin` not `wordCountRange()`
+2. Content validator and integrity checker use separate WordPress parsing
+3. Normalizer link destination verification still needed despite block restoration
+
+### Next Priority
+1. Run one production generation with keyphrase "threads marketing hong kong"
+2. Capture `[KP-BUDGET]`, `[KP-COMPONENT]`, `[KP-RAW-ASSEMBLED]`, `[KP-FINAL]`, `[QUALITY-CHECK]`, `[JSON-PARSE]` logs
+3. Verify keyphrase count within dynamic range, no duplicate CTA, all structural checks pass
+4. Consolidate content validator with integrity checker's WordPress block parsing
+5. Wire `wordCountRange()` into quality scorer

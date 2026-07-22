@@ -53,9 +53,17 @@ Bad (complex): "The rapid evolution of Hong Kong's marketing landscape necessita
 - Unique per post. Do not reuse a keyphrase from another published post.
 - Must appear in: H1 title, first 100 words of body, at least one H2 heading, URL slug.
 
-## Keyphrase density
-- 3–5 occurrences in body text. Roughly one mention every 200–300 words.
-- Include 3–5 semantically related terms in addition to the exact keyphrase.
+## Keyphrase usage
+- The acceptable exact-keyphrase range is calculated dynamically from the final article word count and supplied separately by the generation pipeline.
+- The preferred target and acceptable range supplied in the active generation prompt are authoritative.
+- Never use a static keyphrase count such as 3–5 occurrences.
+- Treat the exact keyphrase as a limited resource.
+- Use semantic variations, shortened references, pronouns, and natural topic references throughout the article.
+- Never repeat the exact keyphrase simply to satisfy SEO.
+- Never use the exact keyphrase more than once in the same paragraph.
+- Do not force the exact keyphrase into grammatically unnatural sentences.
+- The exact keyphrase must still appear in the H1 title, first 100 words, at least one H2 heading, and URL slug.
+- Use 3–5 semantically related terms naturally throughout the article.
 
 ## Heading hierarchy
 - One H1 (the blog title).
@@ -155,16 +163,16 @@ The reader is typically: a shop owner in Mong Kok, a bakery in Sai Kung, a freel
    - Context: Why this matters for HK creators/businesses right now.
    - Promise: What the reader will gain.
 
-4. **H2 Sections** — 4–6 main points. Each section includes:
+4. **Main topic H2 sections** — 4–6 sections, excluding the required Common Mistakes section, FAQ section, CTA heading, and conclusion. Each section includes:
    - 2–3 paragraphs of explanation.
    - Bulleted implementation steps.
    - A concrete Hong Kong example or reference.
 
 5. **H2: Common Mistakes / What to Avoid** — 3–5 pitfalls with explanations and alternatives.
 
-6. **H2: FAQ** — 4–6 questions. Questions use bold paragraph text, not headings. Answers are 2–4 sentences each, practical and direct.
+6. **CTA Block** — Custom HTML block. Use the exact HTML from the CTA module. Place between the last body section and the FAQ. Include both English and Chinese versions.
 
-7. **CTA Block** — Custom HTML block. Use the exact HTML from the CTA module. Place between the last body section and FAQ. Include both English and Chinese versions.
+7. **H2: FAQ** — 4–6 questions. Questions use bold paragraph text, not headings. Answers are 2–4 sentences each, practical and direct.
 
 8. **FAQ Schema JSON-LD Block** — Custom HTML block containing \`<script type="application/ld+json">\` with FAQPage schema. Include the same 4–6 question/answer pairs from the FAQ section.
 
@@ -249,7 +257,7 @@ Start with the subject, then add style, lighting, and composition. Example templ
 3. ☐ URL slug is clean, keyword-friendly, no dates. Append -zh for Chinese → See SEO Rules.
 4. ☐ Focus keyphrase is unique and not reused from another published post → See SEO Rules.
 5. ☐ Focus keyphrase appears in H1, first 100 words, at least one H2 → See SEO Rules.
-6. ☐ Keyphrase density is 3–5 occurrences in body → See SEO Rules.
+6. ☐ Exact keyphrase count is within the dynamic range calculated for the final body word count → See SEO Rules.
 7. ☐ 3–5 unique internal links with descriptive anchor text → See SEO Rules.
 8. ☐ 2–3 external links to high-authority sources with target="_blank" → See SEO Rules.
 9. ☐ Flesch Reading Ease is 60–70 → See SEO Rules.

@@ -1,7 +1,7 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
 import { buildSystemPrompt, STAGE_SYSTEM_PROMPTS, type BlogContext } from "@/lib/services/prompt-builder";
 import { cleanBodyText, countWords, robustJsonParse } from "@/lib/services/text-utils";
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, KEYPHRASE_MIN, KEYPHRASE_MAX, FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
 
 // ── Types ──
 
@@ -148,17 +148,18 @@ export function validateComponents(
 
   // Density — identifies which section to regenerate
   const kc = blogCleaned.toLowerCase().split(kpLower).length - 1;
-  if (kc < KEYPHRASE_MIN || kc > KEYPHRASE_MAX) {
+  const kpRange = keyphraseRangeForWordCount(countWords(blogCleaned));
+  if (kc < kpRange.min || kc > kpRange.max) {
     const sections = extractSectionsSimple(blog);
     if (sections.length > 0) {
-      if (kc < KEYPHRASE_MIN) {
+      if (kc < kpRange.min) {
         // Find section with fewest keyphrases to add to
         let worstIdx = 0, worstCount = Infinity;
         for (const s of sections) {
           const count = cleanBodyText(s.bodyText).toLowerCase().split(kpLower).length - 1;
           if (count < worstCount) { worstCount = count; worstIdx = s.index; }
         }
-        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${KEYPHRASE_MIN}-${KEYPHRASE_MAX}`, actual: `${kc}` });
+        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${kpRange.min}-${kpRange.max}`, actual: `${kc}` });
       } else {
         // Find section with most keyphrases to regenerate
         let worstIdx = 0, worstCount = 0;
@@ -166,10 +167,10 @@ export function validateComponents(
           const count = cleanBodyText(s.bodyText).toLowerCase().split(kpLower).length - 1;
           if (count > worstCount) { worstCount = count; worstIdx = s.index; }
         }
-        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${KEYPHRASE_MIN}-${KEYPHRASE_MAX}`, actual: `${kc}` });
+        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${kpRange.min}-${kpRange.max}`, actual: `${kc}` });
       }
     } else {
-      failures.push({ component: "density", reason: `Count ${kc}`, target: `${KEYPHRASE_MIN}-${KEYPHRASE_MAX}`, actual: `${kc}` });
+      failures.push({ component: "density", reason: `Count ${kc}`, target: `${kpRange.min}-${kpRange.max}`, actual: `${kc}` });
     }
   }
 
@@ -285,14 +286,22 @@ export async function regenerateSection(
   keyphrase: string,
 ): Promise<string> {
   const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.section);
-  const userMsg = `Rewrite the body content for this section. Target exactly ${wordTarget} words. Include the keyphrase "${keyphrase}" naturally (target ${keyphraseTarget} across full article). WordPress block format.\n\nArticle title: ${title}\n\nThis section heading: ${heading}\nPrevious heading: ${prevHeading}\nNext heading: ${nextHeading}\n\nGUIDANCE:\n- This section is one independent part of a larger article.\n- Do NOT repeat statistics, examples, or explanations likely covered in other sections.\n- Assume the previous heading's topic has already been explained.\n- Focus exclusively on the content for THIS heading.\n- End this section with a smooth transition toward the next heading.\n\nReturn as JSON: {"body": "..."}`;
+  const sectionResearchPrompt = ctx.promptContext.research?.length
+    ? `\n\nREFERENCE SOURCES (use these URLs when referencing claims — cite with descriptive anchor text like "According to [Source Name]..." and link to the URL):\n${ctx.promptContext.research.map((r: any) => `- ${r.title || "Source"}: ${r.url || ""}`).join("\n")}`
+    : "";
+  const userMsg = `Return section BODY content only. Do NOT return the H2 heading. Start directly with a paragraph or list. The application will insert the heading.\n\nSection heading for context only (do NOT repeat):\n"${heading}"\n\nRewrite the body content for this section. Target exactly ${wordTarget} words. Include the keyphrase "${keyphrase}" naturally (target ${keyphraseTarget} across full article). WordPress block format.\n\nArticle title: ${title}\nPrevious heading: ${prevHeading}\nNext heading: ${nextHeading}\n\nGUIDANCE:\n- Do NOT repeat statistics, examples, or explanations from other sections.\n- Focus exclusively on the content for THIS heading.${sectionResearchPrompt}\n\nReturn as JSON: {"body": "..."}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],
     { responseFormat: { type: "json_object" }, maxTokens: 8192 }
   );
 
-  return (robustJsonParse(res.content) as Record<string, string>).body || "";
+  const raw = (robustJsonParse(res.content) as Record<string, string>).body || "";
+  const clean = raw
+    .replace(/<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*<h2[^>]*>[\s\S]*?<\/h2>\s*<!--\s*\/wp:heading\s*-->/gi, "")
+    .replace(/<h2[^>]*>[\s\S]*?<\/h2>/gi, "");
+  if (clean !== raw) console.log(`[component-regenerator:SANITIZE] Removed leaked H2 from regenerated section`);
+  return clean;
 }
 
 export async function regenerateFAQ(

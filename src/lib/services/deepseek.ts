@@ -197,6 +197,14 @@ export async function chat(
     total_tokens: 0,
   };
 
+  // ── Response path verification ──
+  console.log(`[deepseek:PATH] HTTP body → parseResponseBody() → ChatResponse`);
+  console.log(`[deepseek:PATH] ChatResponse.choices[0].message.content → typeof=${typeof content} length=${content.length}`);
+  console.log(`[deepseek:PATH] finish_reason=${finishReason}`);
+  if (typeof content !== "string") {
+    console.warn(`[deepseek:PATH] ⚠️ content is NOT a string — type is ${typeof content}`);
+  }
+
   console.log(
     `[deepseek:RES] model=${data.model} | finish_reason=${finishReason}`
   );

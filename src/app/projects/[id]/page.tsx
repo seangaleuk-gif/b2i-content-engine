@@ -223,7 +223,7 @@ export default function ProjectWorkspacePage() {
   } = useData<Project>(() => api.get(`/api/projects/${projectId}`));
 
   useEffect(() => {
-    if (project && !dirtyRef.current && project.content) {
+    if (project && !dirtyRef.current && !generatedData && project.content) {
       setContent(project.content);
     }
   }, [project]);

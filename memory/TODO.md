@@ -129,6 +129,29 @@
 - [x] Deterministic keyphrase target (`keyphraseTarget(wordCount)`)
 - [x] Shared generation constants (`generation-constants.ts`)
 
+## Completed Sprint — Section Lifecycle & SEO Audit Rewrite (Jul 21, 2026)
+
+- [x] Section lifecycle — authoritative `GeneratedSection[]` array, never filtered/compacted
+- [x] Indexed write-back — parallel/recovery/expansion results written by index
+- [x] `logSectionState()` — logs count, indexes, statuses after each stage
+- [x] Expansion appends (not replaces) — accepts only if word count increases
+- [x] Missing section placeholders — failed sections stay at index with `body: ""`
+- [x] SEO audit rewrite — 14 weighted checks with category redistribution
+- [x] "Focus Keyphrase in H1" → "Focus Keyphrase in SEO Title" (checks `title` field)
+- [x] Keyphrase count/density separated — occurrence count vs. percentage
+- [x] FAQ schema parsing — `JSON.parse()` with `@type: "FAQPage"` validation
+- [x] H2 close-variant matching — singular/plural variations treated as warning
+- [x] `not_applicable` status — null scores, weight redistribution
+- [x] Null score support — DB column nullable, Drizzle schema, API, UI
+- [x] `validateWpBlocks()` — opening/closing counts + mismatches after reassembly
+- [x] `assembleArticle()` — CTA/FAQ singletons, deterministic H2 ownership
+- [x] Buffered generation targets — `GENERATION_WORD_BUFFER = 1.18`
+- [x] Recovery debugging — full stack trace logging for `.reduce()` errors
+- [x] Paragraph normalization — `splitLongParagraphs()` code-based
+- [x] Language switcher — `renderLanguageSwitcher()` with `b2i-language-switcher` class
+- [x] External research links — `insertExternalResearchLinks()` with B2I domain filter
+- [x] Title repair — deterministic `Keyphrase: Subtitle` format
+
 ## Next Sprint — Phase 8: WordPress Integration (Actual Publishing)
 
 - [ ] WordPress REST API publish endpoint (exists — needs testing/refinement)

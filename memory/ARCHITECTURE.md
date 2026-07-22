@@ -88,9 +88,11 @@ b2i-content-engine/
 │       │   ├── deepseek.ts      # DeepSeek Chat V3.1 client (chat, chatWithRetry)
 │       │   ├── prompt-builder.ts   # Assembles prompts from 10 sections + context + inline linking instructions
 │       │   ├── default-prompts.ts  # 10 pre-seeded prompt section defaults (cta + publish_checklist added)
-│       │   ├── seo-auditor.ts      # Phase 5 — 12-check SEO analysis (unique 3-5 links, wp:html exclusion, dedup)
+│       │   ├── seo-auditor.ts      # Phase 5 — 14-check weighted SEO analysis (null scores, canonical text, FAQ schema parsing)
 │       │   ├── fixers.ts            # Phase 5 — 4 surgical fixers (title, H2, density, readability) with escalating specificity
-│       │   ├── link-injector.ts    # Phase 5 — injects active links into blog content (max 5 links, skips wp:html/script)
+│       │   ├── section-expander.ts  # Phase 5 — expandToMinimum / trimToMaximum with append-only expansion
+│       │   ├── article-postprocessors.ts  # Phase 5 — language switcher, external link inserter
+│       │   ├── component-regenerator.ts  # Phase 5 — regenerateSection, generateIntroduction, generateConclusion
 │       │   ├── link-sync.ts        # Phase 5 — auto-extracts blog links on publish
 │       │   ├── link-suggester.ts   # Phase 5 — scans content for link opportunities
 │       │   ├── default-links.ts    # Phase 5 — 7 B2I Hub default links with seeding
@@ -98,7 +100,15 @@ b2i-content-engine/
 │       │   ├── image-generation.ts # Phase 5 — Hugging Face FLUX.1-dev image generation
 │       │   ├── translation.ts      # Phase 5 — DeepSeek Traditional Chinese (zh-HK) translation
 │       │   ├── text-utils.ts       # Phase 1 — shared cleanBodyText(), robustJsonParse(), repairMetaDescription()
-│       │   └── generation-constants.ts # Phase 7 — shared numeric thresholds (SEO title, meta, keyphrase, Flesch)
+│       │   ├── generation-constants.ts # Phase 7 — shared numeric thresholds + keyphrase range + per-component budgets
+│       │   ├── deepseek-diagnostics.ts  # Phase 8 — detects malformed JSON patterns in AI responses
+│       ├── lib/blog/              # Blog assembly and normalization
+│       │   ├── final-seo-normalizer.ts    # Phase 8 — tokenization-based protected block preservation + multi-pass keyphrase reduction
+│       │   ├── article-integrity.ts       # Phase 8 — structural integrity baseline + validation against pre-normalization snapshot
+│       │   ├── article-final-invariants.ts # Phase 8 — non-destructive final invariant check (CTA, signup, FAQ, WP blocks)
+│       │   └── protected-block-extractor.ts # Phase 8 — bounded CTA/FAQ extraction from conclusion only
+│       ├── lib/seo/               # Shared SEO text utilities
+│       │   └── seo-text-utils.ts          # Phase 8 — canonical text extraction used by both auditor and normalizer
 │       └── supabase/            # server, client, proxy utilities
 ```
 
@@ -207,15 +217,39 @@ Surgical Fixers (src/lib/services/fixers.ts)
   → Escalating specificity per attempt: general → location → replacement
 ```
 
-## SEO Audit Engine
+## SEO Audit Engine (2026-07-21 rewrite, 2026-07-22 dynamic ranges)
 ```
-seo-auditor.ts → runAudit({ title, metaDescription, slug, keyword, blog })
-  → 12 checks: title length, meta length, keyphrase in H1, keyphrase in first 100 words,
-    keyphrase in H2, keyphrase density, internal links count, external links count,
-    paragraph length, image alt text, FAQ schema presence, Flesch-Kincaid reading level
-  → Returns { overallScore, checks[], summary: { passed, warnings, failed } }
-  → POST /api/projects/[id]/seo/audit clears old checks, inserts new to seo_checks table
+seo-auditor.ts → runAudit({ title, metaDescription, keyword, blog, faq, targetWordCount, targetKeyphraseCount })
+  → 14 checks: SEO Title Length, Meta Length, Keyphrase in SEO Title (not H1),
+    Body Word Count, Keyphrase in First 100 Words, Exact Keyphrase in H2,
+    Exact Keyphrase Count (dynamic range, density-aware scoring), Keyphrase Density (%),
+    Paragraph Length (bilingual, CTA/FAQ excluded, tiered scoring),
+    Reading Level (Flesch 60-70),
+    Internal Links (3-5 unique, wp:html excluded, deduplicated),
+    External Links (≥ 2), FAQ Schema (JSON.parse + @type validation),
+    Image Alt Text (not_applicable when no images)
+  → Keyphrase range: dynamic word-count-aware (keyphraseRangeForWordCount)
+  → Density-aware scoring: healthy density prevents harsh count failure
+  → Weighted scoring: SEO Fundamentals 35%, Content & Keyphrase 25%,
+    Readability 15%, Links 10%, Structure & Schema 10%, Images 5%
+  → not_applicable redistributes weight across applicable categories
+  → score: number | null (null for not_applicable — seo_checks.score is nullable)
+  → POST /api/projects/[id]/seo/audit — immutable snapshot from latest saved version
+  → DELETE /api/projects/[id]/seo/audit — clears checks on version restore/generation
 ```
+
+## Section Lifecycle (2026-07-21)
+```
+GeneratedSection[] — created once after outline, never filtered/compacted/rebuilt
+  → index: matches outline position (0,1,2,3,4,5)
+  → heading: from h2Headings[index], never rebuilt from HTML
+  → status: "pending" → "generated" | "recovered" | "missing" → "expanded" | "regenerated"
+  → body: written by index from parallel, recovery, expansion results
+
+Invariant: sections.length === outline.length at every lifecycle stage
+  → logSectionState("stage") logs count, indexes, statuses, body words
+  → Failed section stays at original index with body: "", status: "missing"
+  → Missing sections prioritized by expander for full-body generation
 
 ## Internal Linking System
 ```
@@ -243,4 +277,53 @@ Link Suggester (link-suggester.ts)
 - **Server-side**: `createServerClient` from `@supabase/ssr` with `cookies()` from `next/headers`
 - **Client-side**: `createBrowserClient` from `@supabase/ssr` with `document.cookie` fallback
 - **Auto-profile**: `handle_new_user()` trigger creates `profiles` row on signup
+
+## Final SEO Normalizer (2026-07-22)
+```
+normalizeFinalSeo({ html, focusKeyphrase, targetWordCount, targetKeyphraseCount, ... })
+  → Tokenization — scripts, wp:html, images, media blocks replaced with placeholders
+  → H2 keyphrase fix — ensures one H2 contains exact keyphrase
+  → Keyphrase reduction — paragraph-level + global reduction, multi-pass
+  → Word count expansion — AI-powered, unsupported statistics blocked
+  → Paragraph splitting — deterministic sentence-level splits
+  → Readability — targeted paragraph rewrites, max 3 attempts
+  → Detokenization — protected blocks restored byte-for-byte
+  → Pass/fail — uses dynamic kpRange, not exact target
+  → safety.protectedBlocksUnchanged always true (blocks never seen by normalizer)
+```
+
+## Per-Component Keyphrase Budgets (2026-07-22)
+```
+allocateComponentKeyphraseBudgets({ articleBudget, components })
+  → Phase 1: Required placements (intro 1-2, designated H2 1-2)
+  → Phase 2: Main sections with preferred=0 get 1
+  → Phase 3: Upgrade main-section maxes from 1 to 2
+  → Phase 4: Priority-based distribution of remaining budget
+  → Invariant: preferredTotal === min(articlePreferred, totalCapacity)
+  → Heading classification: detects mistakes/FAQ patterns to avoid double-counting
+
+buildComponentBudgetPrompt(budget, focusKeyphrase)
+  → Injects "EXACT KEYPHRASE BUDGET FOR THIS COMPONENT" into prompts
+  → Local budget (preferred, max), not article-wide target
+  → Designated H2: "Do not repeatedly restate the exact phrase"
+  → max=0: "Do not use the exact keyphrase anywhere in this component"
+```
+
+## Article Integrity Pipeline (2026-07-22)
+```
+createArticleIntegrityBaseline(html)
+  → Captures wp block counts, link hrefs, FAQ/switcher/CTA blocks, scripts
+
+validateFinalArticleIntegrity(html, baseline)
+  → Checks: wp block balance, nested <p>, bare H2, unclosed tags, link preservation
+  → Excludes <script> and wp:html blocks from tag counting
+
+validateFinalArticleInvariants(article)
+  → Non-destructive: CTA=1, signup=1, FAQ=1, balanced WP blocks
+  → Returns { valid, errors, counts } — never mutates
+
+Stage guards at: assembly, expansion, trim, paragraphs, regeneration, switcher, links
+  → guardStageOutput(currentHtml, previousHtml, baseline, stage)
+  → Invalid output rejected, previous valid HTML restored
+```
 - **Protected paths**: `proxy.ts` guards `/projects`, `/knowledge`, `/prompts`, `/settings`, `/api/*`

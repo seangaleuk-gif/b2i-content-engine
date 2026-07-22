@@ -12,3 +12,4 @@ export { blogVersionRepository } from "./blog-versions";
 export { aiLogRepository } from "./ai-logs";
 export { internalLinksRepository } from "./internal-links";
 export { suggestedLinksRepository } from "./suggested-links";
+export { generationAnalyticsRepository } from "./generation-analytics";

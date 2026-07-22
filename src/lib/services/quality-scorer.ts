@@ -1,5 +1,5 @@
 import { cleanBodyText, countWords } from "@/lib/services/text-utils";
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, KEYPHRASE_MIN, KEYPHRASE_MAX, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT } from "@/lib/services/generation-constants";
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT } from "@/lib/services/generation-constants";
 
 // ── Types ──
 
@@ -123,6 +123,7 @@ export function scoreArticle(
   keyword: string,
   targetWordCount: number,
   faqCount: number,
+  editorialH2Count?: number,
 ): QualityScore {
   const blogCleaned = cleanBodyText(blog);
   const actualWordCount = countWords(blog);
@@ -140,10 +141,9 @@ export function scoreArticle(
   // Meta length: 10 pts
   seoDetails.push(scoreInRange(metaDescription.length, META_MIN, META_MAX, 10, "Meta description length"));
 
-  // Keyphrase in H1: 5 pts
-  const h1Match = blog.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-  const kpInH1 = h1Match ? cleanBodyText(h1Match[1]).toLowerCase().includes(keywordLower) : false;
-  seoDetails.push(scoreBoolean(kpInH1, 5, "Keyphrase in H1", `Keyphrase found in H1`, `Keyphrase not found in H1: "${keyword}"`));
+  // Keyphrase in H1/title: 5 pts — check the SEO title field, not blog body's <h1>
+  const kpInTitle = keywordLower ? title.toLowerCase().includes(keywordLower) : false;
+  seoDetails.push(scoreBoolean(kpInTitle, 5, "Keyphrase in H1/title", `Keyphrase found in title`, `Keyphrase not found in title`));
 
   // Keyphrase in first 100 words: 5 pts
   const first100 = blogCleaned.split(/\s+/).slice(0, 100).join(" ").toLowerCase();
@@ -183,8 +183,8 @@ export function scoreArticle(
   // ── Structure (20 points) ──
   const structureDetails: ScoreDetail[] = [];
 
-  // H2 count 4-6: 5 pts
-  const h2Count = (blog.match(/<h2[^>]*>/gi) || []).length;
+  // H2 count 4-6: 5 pts — uses editorial H2 count when available (excludes CTA/FAQ headings)
+  const h2Count = editorialH2Count ?? (blog.match(/<h2[^>]*>/gi) || []).length;
   structureDetails.push(scoreCountInRange(h2Count, 4, 6, 5, "H2 sections"));
 
   // FAQ count 4-6: 5 pts
@@ -195,7 +195,7 @@ export function scoreArticle(
   structureDetails.push(scoreBoolean(ctaPresent, 5, "CTA block", "CTA block found", "CTA block missing — no B2I Hub signup link"));
 
   // Language switcher present: 5 pts
-  const langSwitcher = /Read in|閱讀.*版/i.test(blog);
+  const langSwitcher = /b2i-language-switcher/i.test(blog);
   structureDetails.push(scoreBoolean(langSwitcher, 5, "Language switcher", "Language switcher found", "Language switcher missing"));
 
   const structureScore = structureDetails.reduce((s, d) => s + d.score, 0);
@@ -230,12 +230,13 @@ export function scoreArticle(
   // Word count ≥ target: 5 pts
   contentDetails.push(scoreMin(actualWordCount, targetWordCount, 5, "Word count"));
 
-  // Keyphrase density 3-5: 5 pts
+  // Keyphrase density — using dynamic word-count-aware range
+  const kpRange = keyphraseRangeForWordCount(actualWordCount);
   const kpCount = keywordLower ? blogCleaned.toLowerCase().split(keywordLower).length - 1 : 0;
-  contentDetails.push(scoreCountInRange(kpCount, KEYPHRASE_MIN, KEYPHRASE_MAX, 5, "Keyphrase density"));
+  contentDetails.push(scoreCountInRange(kpCount, kpRange.min, kpRange.max, 5, "Keyphrase density"));
 
-  // External links 2-3: 5 pts
-  const extLinks = (blog.match(/href="https?:\/\/(?!b2ihub\.com)[^"]*"/gi) || []).length;
+  // External links 2-3: 5 pts — excludes B2I Hub signup and language switcher links
+  const extLinks = (blog.match(/href="https?:\/\/(?!b2ihub\.com|app\.b2ihub\.com)[^"]*"/gi) || []).length;
   contentDetails.push(scoreCountInRange(extLinks, 2, 3, 5, "External links"));
 
   const contentScore = contentDetails.reduce((s, d) => s + d.score, 0);
@@ -269,9 +270,10 @@ export function buildGenerationReport(
   componentRegenerations: number,
   warnings: string[],
   estimatedTokens: number,
+  editorialH2Count?: number,
 ): GenerationReport {
   return {
-    qualityScore: scoreArticle(blog, title, metaDescription, keyword, targetWordCount, faqCount),
+    qualityScore: scoreArticle(blog, title, metaDescription, keyword, targetWordCount, faqCount, editorialH2Count),
     generationTimeMs,
     retryCount,
     jsonRepairs,

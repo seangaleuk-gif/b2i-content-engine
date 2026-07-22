@@ -23,19 +23,29 @@ import { useData } from "@/lib/use-data";
 import { api } from "@/lib/api-client";
 
 interface SeoCheck {
-  id: number;
+  id: string;
   label: string;
-  description: string;
+  description?: string;
   status: string;
-  score: number;
-  fix: string;
+  score: number | null;
+  fix?: string;
   category: string;
+  measuredValue?: string;
+  targetValue?: string;
+  explanation?: string;
 }
 
 interface AuditResult {
   overallScore: number;
   checks: SeoCheck[];
   summary: { passed: number; warnings: number; failed: number };
+}
+
+function statusIcon(status: string) {
+  if (status === "pass") return <CheckCircle2 size={18} className="text-accent-success" />;
+  if (status === "warning") return <AlertTriangle size={18} className="text-accent-warning" />;
+  if (status === "not_applicable") return <XCircle size={18} className="text-text-secondary/30" />;
+  return <XCircle size={18} className="text-accent-danger" />;
 }
 
 function SeoSkeleton() {
@@ -65,8 +75,9 @@ export default function SEOAuditPage() {
   const targetVersion = searchParams.get("version") ? Number(searchParams.get("version")) : null;
   const [auditing, setAuditing] = useState(false);
   const [auditError, setAuditError] = useState<string | null>(null);
-  const [expandedChecks, setExpandedChecks] = useState<Set<number>>(new Set());
-  const [dismissedChecks, setDismissedChecks] = useState<Set<number>>(new Set());
+  const [liveAuditResult, setLiveAuditResult] = useState<AuditResult | null>(null);
+  const [expandedChecks, setExpandedChecks] = useState<Set<string>>(new Set());
+  const [dismissedChecks, setDismissedChecks] = useState<Set<string>>(new Set());
 
   const { data: checks, loading, refetch } = useData<SeoCheck[]>(() =>
     api.get(`/api/projects/${projectId}/seo`)
@@ -75,7 +86,13 @@ export default function SEOAuditPage() {
   const { data: blogVersions } = useData<{ id: number; versionNumber: number; title: string; metaDescription: string; slug: string; blog: string }[]>(() =>
     api.get(`/api/projects/${projectId}/versions`)
   );
+
+  const { data: project, loading: projectLoading } = useData<{ keyword?: string; name?: string }>(() =>
+    api.get(`/api/projects/${projectId}`)
+  );
   const latestEn = (blogVersions ?? []).find((v) => !v.slug?.endsWith("-zh"));
+
+  const resolvedKeyword = (project?.keyword ?? "").trim();
 
   const targetBlog = targetVersion
     ? (blogVersions ?? []).find((v) => v.versionNumber === targetVersion)?.blog ?? ""
@@ -85,30 +102,50 @@ export default function SEOAuditPage() {
     : "";
 
   const handleRunAudit = useCallback(async () => {
+    if (!resolvedKeyword) {
+      setAuditError("No focus keyphrase configured for this project. Set a keyphrase before running the SEO audit.");
+      return;
+    }
     setAuditing(true);
     setAuditError(null);
+    setLiveAuditResult(null);
     try {
-      await api.post<AuditResult>(`/api/projects/${projectId}/seo/audit`, {
+      const auditRunId = crypto.randomUUID();
+      console.log(`[SEO-AUDIT:${auditRunId}:client-request] keywordLen=${resolvedKeyword.length}`);
+
+      const result = await api.post<AuditResult>(`/api/projects/${projectId}/seo/audit`, {
+        keyword: resolvedKeyword,
         metaDescription: targetMeta || latestEn?.metaDescription || "",
         blog: targetBlog || undefined,
+        _auditRunId: auditRunId,
       });
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      await refetch();
+
+      console.log(`[SEO-AUDIT:${auditRunId}:client-response] score=${result.overallScore} checks=${result.checks?.length ?? 0}`);
+      const kpCheck = (result.checks ?? []).find((c: SeoCheck) => c.id === "keyphrase_count");
+      if (kpCheck) {
+        console.log(`[SEO-AUDIT:${auditRunId}:render] keyphraseCountStatus=${kpCheck.status} score=${kpCheck.score} measured="${kpCheck.measuredValue}"`);
+      }
+
+      // Apply POST result immediately — do not wait for DB refetch
+      setLiveAuditResult(result);
+      // Also refetch from DB for consistency
+      setTimeout(() => { refetch(); }, 500);
     } catch (err) {
       setAuditError(err instanceof Error ? err.message : "Audit failed");
     } finally {
       setAuditing(false);
     }
-  }, [projectId, refetch, latestEn?.metaDescription, targetMeta, targetBlog]);
+  }, [projectId, refetch, latestEn?.metaDescription, targetMeta, targetBlog, resolvedKeyword]);
 
-  if (loading) return <SeoSkeleton />;
+  if (loading && !liveAuditResult) return <SeoSkeleton />;
 
-  const auditChecks = (checks ?? []) as SeoCheck[];
+  const auditChecks = liveAuditResult?.checks ?? (checks ?? []) as SeoCheck[];
+  const applicableChecks = auditChecks.filter((c) => c.status !== "not_applicable");
   const overallScore =
-    auditChecks.length > 0
+    applicableChecks.length > 0
       ? Math.round(
-          auditChecks.reduce((sum, check) => sum + check.score, 0) /
-            auditChecks.length
+          applicableChecks.reduce((sum, c) => sum + (c.score ?? 0), 0) /
+            applicableChecks.length
         )
       : 0;
 
@@ -148,7 +185,7 @@ export default function SEOAuditPage() {
         <Button
           icon={auditing ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
           onClick={handleRunAudit}
-          disabled={auditing}
+          disabled={auditing || projectLoading}
         >
           {auditing ? "Running Audit..." : auditChecks.length > 0 ? "Re-run Audit" : "Run Audit"}
         </Button>
@@ -205,7 +242,7 @@ export default function SEOAuditPage() {
                         (c) => c.category === cat
                       );
                       const catScore = Math.round(
-                        catChecks.reduce((sum, c) => sum + c.score, 0) /
+                        catChecks.reduce((sum, c) => sum + (c.score ?? 0), 0) /
                           catChecks.length
                       );
                       return (
@@ -301,16 +338,23 @@ export default function SEOAuditPage() {
                             ? "success"
                             : check.status === "warning"
                             ? "warning"
+                            : check.status === "not_applicable"
+                            ? "neutral"
                             : "danger"
                         }
                       >
-                        {check.score}/100
+                        {check.status === "not_applicable" ? "N/A" : `${check.score}/100`}
                       </Badge>
                     </div>
                     <p className="text-[13px] text-text-secondary">
-                      {check.description}
+                      {check.measuredValue && check.targetValue
+                        ? `${check.measuredValue} (target: ${check.targetValue})`
+                        : check.measuredValue || check.explanation}
                     </p>
-                    {check.fix && isExpanded && (
+                    {check.explanation && check.measuredValue && check.targetValue && (
+                      <p className="text-[12px] text-text-secondary/70 mt-1">{check.explanation}</p>
+                    )}
+                    {check.status !== "not_applicable" && isExpanded && check.explanation && (
                       <div className="mt-3 p-3 bg-bg-surface-secondary rounded-[10px] border border-border-subtle">
                         <div className="flex items-start gap-2">
                           <Sparkles size={14} className="text-accent-primary mt-0.5 shrink-0" />

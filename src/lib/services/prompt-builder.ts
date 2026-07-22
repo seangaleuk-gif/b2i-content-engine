@@ -1,4 +1,4 @@
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT, keyphraseTarget } from "./generation-constants";
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT, keyphraseTarget, keyphraseRangeForWordCount } from "./generation-constants";
 
 export interface PromptSection {
   key: string;
@@ -251,13 +251,14 @@ function buildUserMessage(context: BlogContext): string {
   parts.push(`## Project Details\n\n${projectDetails}`);
 
   const targetWords = context.project.wordCount > 0 ? context.project.wordCount : DEFAULT_WORD_COUNT;
+  const kpRange = keyphraseRangeForWordCount(targetWords);
   const kpTarget = keyphraseTarget(targetWords);
 
   parts.push(`## NON-NEGOTIABLE HARD REQUIREMENTS
 
 The following 4 requirements are NOT NEGOTIABLE. The blog is INVALID if any of them is not met. DO NOT SKIP any of these.
 
-1. **Focus keyphrase count**: The focus keyphrase MUST appear exactly ${kpTarget} times in the body. This is a hard requirement — the blog is INVALID if it appears fewer than ${kpTarget} times.
+1. **Focus keyphrase count**: Use the exact keyphrase naturally approximately ${kpTarget} times throughout the body. The acceptable range is ${kpRange.min}–${kpRange.max}. Do not force repetitions — natural placement is more important than hitting an exact number.
 
 2. **Focus keyphrase in H2**: The focus keyphrase MUST appear in at least one H2 heading. This is a hard requirement — the blog is INVALID if it doesn't. DO NOT SKIP THIS.
 

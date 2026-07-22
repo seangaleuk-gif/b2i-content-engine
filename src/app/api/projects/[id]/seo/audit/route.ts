@@ -17,19 +17,29 @@ export async function POST(
     }
 
     const body = await request.json();
+    const auditRunId = body._auditRunId || "unknown";
+    console.log(`[SEO-AUDIT:${auditRunId}:api-input] keywordLen=${(body.keyword || "").length} blogLen=${(body.blog || "").length}`);
     const latestVersion = await blogVersionRepository.findLatest(Number(id));
 
-    console.log(`[seo:audit] latestVersion found: ${!!latestVersion}`);
-    console.log(`[seo:audit] latestVersion keys: ${latestVersion ? Object.keys(latestVersion as object).join(", ") : "N/A"}`);
-    console.log(`[seo:audit] latestVersion.meta_description: "${(latestVersion as any)?.meta_description}"`);
-    console.log(`[seo:audit] body.metaDescription: "${body.metaDescription}"`);
-
-    const title = body.title || (latestVersion as any)?.title || project.name || "";
+    // Build immutable audit snapshot from latest saved version only
+    const title = (latestVersion as any)?.title || body.title || project.name || "";
     const metaDescription = (latestVersion as any)?.meta_description || body.metaDescription || "";
-    const keyword = body.keyword || (project as any).keyword || "";
-    const blog = (latestVersion as any)?.blog || body.blog || (project as any).content || "";
+    // Explicit keyword resolution — priority: client body, then project DB
+    const clientKeyword = typeof body.keyword === "string" ? body.keyword.trim() : "";
+    const projectKeyword = typeof project.keyword === "string" ? project.keyword.trim() : "";
+    const keyword = clientKeyword || projectKeyword;
 
-    console.log(`[seo:audit] RESOLVED — title: "${title.substring(0, 60)}..." metaDescription: "${metaDescription.substring(0, 60)}..." metaLen: ${metaDescription.length} blogLen: ${blog.length}`);
+    console.log(`[KEYPHRASE-RESOLVE] client="${clientKeyword}" project="${projectKeyword}" resolved="${keyword}" len=${keyword.length}`);
+
+    if (!keyword) {
+      console.warn("[seo:audit] No focus keyphrase available — marking keyphrase checks as not_applicable");
+    }
+    const blog = (latestVersion as any)?.blog || body.blog || (project as any).content || "";
+    const faq = (latestVersion as any)?.faq || [];
+    const targetWordCount = (project as any).wordCount || (project as any).word_count || 2500;
+    const targetKeyphraseCount = 5;
+
+    console.log(`[seo:audit] versionId=${(latestVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}"`);
 
     if (!blog) {
       return NextResponse.json({ error: "No blog content to audit" }, { status: 400 });
@@ -38,10 +48,11 @@ export async function POST(
     const result = runAudit({
       title,
       metaDescription,
-      slug: body.slug || "",
       keyword,
       blog,
-      externalLinks: (latestVersion as any)?.external_links ?? [],
+      faq,
+      targetWordCount,
+      targetKeyphraseCount,
     });
 
     // Delete old checks
@@ -53,16 +64,19 @@ export async function POST(
       result.checks.map((c) => ({
         projectId: Number(id),
         label: c.label,
-        description: c.description,
+        description: `${c.measuredValue} (target: ${c.targetValue}) — ${c.explanation}`,
         status: c.status,
         score: c.score,
-        fix: c.fix,
+        fix: c.status !== "not_applicable" ? c.explanation : "",
         category: c.category,
       }))
     );
     console.log(`[seo:audit] Inserted ${inserted.length} checks for project ${id}`);
 
-    return NextResponse.json(result, { status: 201 });
+    const kpCheck = result.checks.find((c) => c.id === "keyphrase_count");
+    console.log(`[SEO-AUDIT:${auditRunId}:api-response] overallScore=${result.overallScore} kpStatus=${kpCheck?.status} kpScore=${kpCheck?.score} kpMeasured="${kpCheck?.measuredValue}"`);
+
+    return NextResponse.json({ ...result, _auditRunId: auditRunId, _engineVersion: "keyphrase-fix-1" }, { status: 201 });
   } catch (error) {
     console.error("[seo:audit]", error);
     if (error instanceof Error && error.message === "Not authenticated") {

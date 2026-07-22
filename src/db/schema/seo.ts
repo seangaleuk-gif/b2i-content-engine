@@ -6,7 +6,7 @@ export const seoChecks = pgTable("seo_checks", {
   label: text("label").notNull(),
   description: text("description").notNull().default(""),
   status: text("status").notNull().default("pending"),
-  score: integer("score").notNull().default(0),
+  score: integer("score"),
   fix: text("fix").notNull().default(""),
   category: text("category").notNull().default("general"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

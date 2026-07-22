@@ -67,7 +67,7 @@ SELECT
 - **Heading hierarchy**: Single H1 (the title). H2 for all major sections. No H4-H6 ever.
 - **Internal linking**: 5-7 internal links to specific B2I Hub blog posts — aim for 5, never exceed 7. Use descriptive, keyword-rich anchor text. Do not use generic anchors like "click here" or "read more."
 - **External linking**: 2-3 links to high-authority sources (government statistics, industry reports, official documentation). Use target="_blank" and rel="noopener".
-- **Keyword density**: Focus keyphrase should appear naturally every 200-300 words. Do not exceed 1% density. Include 3-5 semantically related terms.',
+- **Keyphrase usage**: The acceptable exact-keyphrase range is calculated dynamically from the final article word count. The generation pipeline supplies the preferred target and acceptable range. Use 3-5 semantically related terms naturally throughout the article.',
   NOW()
 ON CONFLICT (user_id, section_key)
 DO UPDATE SET content = EXCLUDED.content, updated_at = EXCLUDED.updated_at;
