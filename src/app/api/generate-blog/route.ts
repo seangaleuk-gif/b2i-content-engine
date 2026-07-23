@@ -19,7 +19,7 @@ import { runComponentRegeneration, regenerateIntroduction, regenerateSection, re
 import { buildGenerationReport, formatReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry, type AiCallRecord } from "@/lib/services/generation-telemetry";
 import { validateContent, type ContentValidationReport } from "@/lib/services/content-validator";
-import { ensureLanguageSwitcher, pairedSlugs, insertExternalResearchLinks, sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
+import { ensureLanguageSwitcher, pairedSlugs, insertExternalResearchLinks, sanitizeSectionUrls, deduplicateEditorialExternalLinks } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
 import { normalizeFinalSeo, type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { createArticleIntegrityBaseline, validateFinalArticleIntegrity, validateWordpressBlockPairs, type ArticleIntegrityBaseline } from "@/lib/blog/article-integrity";
@@ -1466,6 +1466,13 @@ export async function POST(request: Request) {
     generated.blog = extLinkGuard.html;
     console.log(`[generate-blog:EXTERNAL-LINKS] candidates=${researchItems.length} injected=${extLinkResult.linksInserted}`);
     console.log("[POST-N15 after external links, articleSize=" + generated.blog.length);
+
+    // ── Deduplicate editorial external links (same URL → keep first, plain text rest) ──
+    const dedupResult = deduplicateEditorialExternalLinks(generated.blog);
+    generated.blog = dedupResult.html;
+    if (dedupResult.removed > 0) {
+      console.log(`[generate-blog:EXTERNAL-LINKS] deduplicated ${dedupResult.removed} duplicate external link(s)`);
+    }
 
     // ── Post-processing: repair title ──
     console.log("[POST-N16 before title repair");

@@ -271,3 +271,43 @@ export function sanitizeSectionUrls(
     return text;
   });
 }
+
+// ── Editorial external link deduplication ──
+
+/**
+ * Remove duplicate editorial external links from article HTML.
+ * For each external URL appearing multiple times, keep only the first
+ * occurrence as an anchor; convert later occurrences to plain text
+ * while preserving the anchor text.
+ *
+ * Does NOT affect: internal links, CTA/signup, language-switcher, or schema links.
+ */
+export function deduplicateEditorialExternalLinks(html: string): { html: string; removed: number } {
+  const seenUrls = new Set<string>();
+  let removed = 0;
+
+  // Strip schema/script blocks for URL classification but process the full HTML
+  // We need to classify each <a> tag: is it editorial external?
+  const result = html.replace(
+    /<a\b[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi,
+    (match, href, text) => {
+      // Preserve internal links
+      if (href.startsWith("/") || href.startsWith("#")) return match;
+      // Preserve B2I domain links (CTA, signup, language-switcher)
+      if (B2I_DOMAINS.some((d) => href.toLowerCase().includes(d))) return match;
+
+      // Normalize URL for comparison
+      const normalized = href.replace(/\/$/, "").toLowerCase();
+
+      if (seenUrls.has(normalized)) {
+        removed++;
+        return text; // plain text, no link
+      }
+
+      seenUrls.add(normalized);
+      return match; // first occurrence — keep as link
+    }
+  );
+
+  return { html: result, removed };
+}

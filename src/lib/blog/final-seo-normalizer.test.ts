@@ -7,7 +7,7 @@ import { detectMalformedPatterns } from "@/lib/services/deepseek-diagnostics";
 import { validateFinalArticleInvariants } from "@/lib/blog/article-final-invariants";
 import { runAudit } from "@/lib/services/seo-auditor";
 import { allocateComponentKeyphraseBudgets, buildComponentBudgetPrompt, type ComponentKeyphraseBudget } from "@/lib/services/generation-constants";
-import { insertExternalResearchLinks, sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
+import { insertExternalResearchLinks, sanitizeSectionUrls, deduplicateEditorialExternalLinks } from "@/lib/services/article-postprocessors";
 import { countEditorialExternalLinks } from "@/lib/seo/seo-text-utils";
 import { renderFaqSchema, renderVisibleFaq, validateFaqParity, detectClaimConflicts, classifyHeadings, type ArticleDocument, renderArticleDocument, fingerprintHtml, detectNestedParagraphs, type FaqEntry } from "@/lib/blog/article-document";
 import {
@@ -3353,6 +3353,104 @@ describe("component regeneration iteration", () => {
     }
 
     expect(remainingFailed).toEqual([1, 3, 7]);
+  });
+});
+
+// ── Editorial external link deduplication tests ──
+
+describe("editorial external link deduplication", () => {
+  it("keeps first occurrence linked, converts later ones to plain text", () => {
+    const html = `<!-- wp:paragraph -->
+<p>According to <a href="https://example.com/article">Example</a>, growth continues.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Later, <a href="https://example.com/article">the same source</a> confirms the trend.</p>
+<!-- /wp:paragraph -->`;
+
+    const result = deduplicateEditorialExternalLinks(html);
+    expect(result.removed).toBe(1);
+    // First occurrence preserved as link
+    const firstIdx = result.html.indexOf('<a href="https://example.com/article">');
+    const secondIdx = result.html.indexOf('<a href="https://example.com/article">', firstIdx + 1);
+    expect(secondIdx).toBe(-1); // no second link
+    // Anchor text preserved
+    expect(result.html).toContain("the same source");
+    // But NOT as a link
+    expect(result.html).not.toContain('<a href="https://example.com/article">the same source</a>');
+  });
+
+  it("preserves different external URLs", () => {
+    const html = `<!-- wp:paragraph -->
+<p>See <a href="https://source-a.com/1">Source A</a> and <a href="https://source-b.com/2">Source B</a>.</p>
+<!-- /wp:paragraph -->`;
+
+    const result = deduplicateEditorialExternalLinks(html);
+    expect(result.removed).toBe(0);
+    expect(result.html).toContain('<a href="https://source-a.com/1">');
+    expect(result.html).toContain('<a href="https://source-b.com/2">');
+  });
+
+  it("does not affect internal links", () => {
+    const html = `<!-- wp:paragraph -->
+<p>See our <a href="/blog/other">other post</a> and <a href="/blog/other">our other post again</a>.</p>
+<!-- /wp:paragraph -->`;
+
+    const result = deduplicateEditorialExternalLinks(html);
+    expect(result.removed).toBe(0);
+    // Both internal links preserved (count <a href="/blog/other"> occurrences)
+    const internalLinks = (result.html.match(/<a href="\/blog\/other">/g) ?? []).length;
+    expect(internalLinks).toBe(2);
+  });
+
+  it("does not affect CTA or signup links", () => {
+    const html = `<!-- wp:html -->
+<div><a href="https://app.b2ihub.com/signup">Sign Up</a></div>
+<!-- /wp:html -->
+
+<!-- wp:paragraph -->
+<p>Our platform helps <a href="https://app.b2ihub.com/signup">you get started</a> quickly.</p>
+<!-- /wp:paragraph -->`;
+
+    const result = deduplicateEditorialExternalLinks(html);
+    expect(result.removed).toBe(0);
+    // Both CTA links preserved
+    const ctaLinks = (result.html.match(/app\.b2ihub\.com\/signup/g) ?? []).length;
+    expect(ctaLinks).toBe(2);
+  });
+
+  it("preserves WordPress block structure", () => {
+    const html = `<!-- wp:heading {"level":2} -->
+<h2>Research</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Study <a href="https://lab.com/report">one</a> shows growth.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Another <a href="https://lab.com/report">finding</a> from the study.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Conclusion paragraph.</p>
+<!-- /wp:paragraph -->`;
+
+    const result = deduplicateEditorialExternalLinks(html);
+    // WordPress blocks intact
+    expect((result.html.match(/<!--\s*wp:paragraph\s*-->/g) ?? []).length).toBe(3);
+    expect((result.html.match(/<!--\s*\/wp:paragraph\s*-->/g) ?? []).length).toBe(3);
+    expect((result.html.match(/<!--\s*wp:heading/g) ?? []).length).toBe(1);
+    expect((result.html.match(/<!--\s*\/wp:heading/g) ?? []).length).toBe(1);
+  });
+
+  it("returns zero removed when no duplicates exist", () => {
+    const html = `<!-- wp:paragraph -->
+<p>First <a href="https://unique.com/a">link</a> and second <a href="https://unique.com/b">link</a>.</p>
+<!-- /wp:paragraph -->`;
+
+    const result = deduplicateEditorialExternalLinks(html);
+    expect(result.removed).toBe(0);
   });
 });
 
