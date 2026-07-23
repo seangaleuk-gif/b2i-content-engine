@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
-import { toErrorResponse } from "@/lib/services/errors";
+import { getCurrentUserId } from "@/lib/services/auth";
+import { requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import {
   projectRepository,
   blogVersionRepository,
@@ -12,12 +13,12 @@ export async function POST(request: Request) {
   const startTime = Date.now();
 
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
 
     const body = await request.json();
     const projectId = body.projectId;
     if (!projectId) {
-      return NextResponse.json({ error: "projectId is required" }, { status: 400 });
+      throw AppError.badRequest("projectId is required");
     }
 
     await requireProjectAccess(userId, Number(projectId));
@@ -53,12 +54,11 @@ export async function POST(request: Request) {
       savedVersionId = (created as any).id ?? null;
       await projectRepository.update(Number(projectId), { content: finalBlogHtml });
     } catch (saveErr) {
-      const errMsg = saveErr instanceof Error ? saveErr.message : String(saveErr);
-      console.error(`[generate-blog:SAVE] Save failed: projectId=${projectId} versionId=${savedVersionId ?? "none"} error=${errMsg}`);
+      console.error(`[generate-blog:SAVE] Save failed: projectId=${projectId} versionId=${savedVersionId ?? "none"}`, saveErr);
       if (savedVersionId !== null) {
         try { await blogVersionRepository.delete(savedVersionId); } catch {}
       }
-      return NextResponse.json({ error: "Failed to save article", detail: errMsg }, { status: 500 });
+      throw AppError.internal("Failed to save article", saveErr);
     }
 
     try {

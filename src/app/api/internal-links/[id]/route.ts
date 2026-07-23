@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
-import { toErrorResponse } from "@/lib/services/errors";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { internalLinksRepository } from "@/lib/repositories";
 
 export async function PATCH(
@@ -15,7 +15,7 @@ export async function PATCH(
     const links = await internalLinksRepository.findByUser(userId);
     const existing = links.find((l) => l.id === Number(id));
     if (!existing) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
+      throw AppError.notFound("Internal link");
     }
 
     const updateData: Record<string, unknown> = {};
@@ -47,7 +47,7 @@ export async function DELETE(
     const links = await internalLinksRepository.findByUser(userId);
     const existing = links.find((l) => l.id === Number(id));
     if (!existing) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
+      throw AppError.notFound("Internal link");
     }
 
     await internalLinksRepository.delete(Number(id));

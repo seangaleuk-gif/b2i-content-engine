@@ -12,6 +12,9 @@ Automated blog article generation for the B2I Hub platform.
 | Document | `src/lib/blog/article-document.ts` | Canonical article model + HTML parser |
 | Validation | `src/lib/blog/final-article-policy.ts` | `analyzeFinalArticle()` + `evaluatePolicy()` |
 | AI | `src/lib/services/deepseek.ts` | `AiService` — single AI provider gateway |
+| Auth | `src/lib/services/auth.ts` | `getCurrentUserId()` — single identity resolver |
+| Authorization | `src/lib/services/project-authorization.ts` | `requireProjectAccess()` — project ownership |
+| Errors | `src/lib/services/errors.ts` | `AppError` + `toErrorResponse()` — single error model |
 
 ## Getting Started
 
@@ -27,5 +30,8 @@ bun test
 - `state.blog` is rendered only through `renderArticleDocument()`
 - Final validation uses only `analyzeFinalArticle()` and `evaluatePolicy()`
 - AI calls go through `AiService` only
+- Identity is resolved only by `getCurrentUserId()`; x-user-id headers are ignored
+- All API error responses go through `toErrorResponse()`; no route-local error construction
+- Internal error details are never exposed in API responses
 - No compatibility wrappers, stubs, or legacy execution paths
-- Build: 335 tests passing, 0 failing
+- Build: 390 tests passing, 0 failing

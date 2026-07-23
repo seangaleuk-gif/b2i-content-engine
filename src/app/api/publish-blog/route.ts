@@ -1,20 +1,21 @@
 import { NextResponse } from "next/server";
-import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
-import { toErrorResponse } from "@/lib/services/errors";
+import { getCurrentUserId } from "@/lib/services/auth";
+import { requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { projectRepository, activityRepository, blogVersionRepository } from "@/lib/repositories";
 import { syncLinksFromContent } from "@/lib/services/link-sync";
 import { publishBilingual } from "@/lib/services/wordpress";
 
 export async function POST(request: Request) {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const body = await request.json();
 
     const { projectId, status } = body;
     const publishStatus = (status as "publish" | "draft") || "publish";
 
     if (!projectId) {
-      return NextResponse.json({ error: "projectId is required" }, { status: 400 });
+      throw AppError.badRequest("projectId is required");
     }
 
     await requireProjectAccess(userId, Number(projectId));
@@ -25,7 +26,7 @@ export async function POST(request: Request) {
     const zhVersion = (versions as any[]).find((v: any) => v.slug && v.slug.endsWith("-zh"));
 
     if (!enVersion) {
-      return NextResponse.json({ error: "No English blog version to publish" }, { status: 400 });
+      throw AppError.badRequest("No English blog version to publish");
     }
 
     console.log(`[publish-blog] Publishing to WordPress (${publishStatus}): EN slug=${enVersion.slug}${zhVersion ? `, ZH slug=${zhVersion.slug}` : ""}`);

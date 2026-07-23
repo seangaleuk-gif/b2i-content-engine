@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
-import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
-import { toErrorResponse } from "@/lib/services/errors";
-import { projectRepository, researchRepository, activityRepository } from "@/lib/repositories";
+import { getCurrentUserId } from "@/lib/services/auth";
+import { requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
+import { researchRepository, activityRepository } from "@/lib/repositories";
 import { runBraveResearchWithRetry } from "@/lib/services/brave";
 
 export async function POST(
@@ -9,16 +10,13 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const { id } = await params;
 
     const project = await requireProjectAccess(userId, Number(id));
 
     if (!project.keyword && !project.name) {
-      return NextResponse.json(
-        { error: "Project has no keyword or topic to research" },
-        { status: 400 }
-      );
+      throw AppError.badRequest("Project has no keyword or topic to research");
     }
 
     const query = project.keyword || project.name;

@@ -20,11 +20,6 @@ describe("AppError", () => {
     const err = new AppError(500, "INTERNAL_ERROR", "Internal error", cause);
     expect(err.cause).toBe(cause);
   });
-
-  it("stores optional detail", () => {
-    const err = new AppError(400, "BAD_REQUEST", "Bad request", undefined, "Field x is missing");
-    expect(err.detail).toBe("Field x is missing");
-  });
 });
 
 describe("AppError factory methods", () => {
@@ -273,5 +268,76 @@ describe("service-layer errors", () => {
     expect(JSON.stringify(body)).not.toContain("Postgres");
     expect(JSON.stringify(body)).not.toContain("admin123");
     expect(JSON.stringify(body)).not.toContain("password");
+  });
+});
+
+describe("response shape verification", () => {
+  it("standard 401 response has error and code fields only", async () => {
+    const res = toErrorResponse(AppError.unauthorized());
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(["code", "error"]);
+    expect(body.error).toBe("Unauthorized");
+    expect(body.code).toBe("UNAUTHORIZED");
+  });
+
+  it("generic 500 response has error and code fields only", async () => {
+    const res = toErrorResponse(new Error("anything at all"));
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(["code", "error"]);
+    expect(body.error).toBe("Internal server error");
+    expect(body.code).toBe("INTERNAL_ERROR");
+  });
+
+  it("generic 500 response never contains the thrown message", async () => {
+    const res = toErrorResponse(new Error("Database connection to 10.x.x.x refused"));
+    const body = await res.json();
+    expect(body.error).toBe("Internal server error");
+    expect(JSON.stringify(body)).not.toContain("10.");
+    expect(JSON.stringify(body)).not.toContain("refused");
+  });
+
+  it("generic 500 response never contains provider error messages", async () => {
+    const res = toErrorResponse(new Error("Hugging Face API returned 503"));
+    const body = await res.json();
+    expect(body.error).toBe("Internal server error");
+    expect(JSON.stringify(body)).not.toContain("Hugging");
+    expect(JSON.stringify(body)).not.toContain("503");
+  });
+
+  it("generic 500 response never contains stack traces", async () => {
+    const err = new Error("boom");
+    err.stack = "Error: boom\n    at Object.<anonymous> (C:\\Users\\user\\src\\secret.ts:42:5)";
+    const res = toErrorResponse(err);
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain("secret.ts");
+    expect(JSON.stringify(body)).not.toContain("stack");
+  });
+
+  it("generic 500 response never contains filesystem paths", async () => {
+    const err = new Error("ENOENT: no such file, open '/etc/secrets/db.conf'");
+    const res = toErrorResponse(err);
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain("/etc/secrets");
+    expect(JSON.stringify(body)).not.toContain("ENOENT");
+  });
+
+  it("detailed cause logged but absent from response", async () => {
+    const cause = new Error("DB password is hunter2");
+    const err = AppError.internal("Service unavailable", cause);
+    const res = toErrorResponse(err);
+    const body = await res.json();
+    expect(body.error).toBe("Service unavailable");
+    expect(JSON.stringify(body)).not.toContain("hunter2");
+    expect(JSON.stringify(body)).not.toContain("password");
+  });
+
+  it("response has no detail field", async () => {
+    const res = toErrorResponse(AppError.internal("test"));
+    const body = await res.json();
+    expect(body).not.toHaveProperty("detail");
+    expect(body).not.toHaveProperty("cause");
+    expect(body).not.toHaveProperty("stack");
   });
 });

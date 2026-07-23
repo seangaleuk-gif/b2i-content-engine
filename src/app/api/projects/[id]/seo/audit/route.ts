@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
-import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
-import { toErrorResponse } from "@/lib/services/errors";
-import { projectRepository, seoRepository, blogVersionRepository } from "@/lib/repositories";
+import { getCurrentUserId } from "@/lib/services/auth";
+import { requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
+import { seoRepository, blogVersionRepository } from "@/lib/repositories";
 import { runAudit } from "@/lib/services/seo-auditor";
 
 export async function POST(
@@ -9,7 +10,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const { id } = await params;
     const project = await requireProjectAccess(userId, Number(id));
 
@@ -37,7 +38,7 @@ export async function POST(
     console.log(`[seo:audit] versionId=${(latestVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}"`);
 
     if (!blog) {
-      return NextResponse.json({ error: "No blog content to audit" }, { status: 400 });
+      throw AppError.badRequest("No blog content to audit");
     }
 
     const result = runAudit({
@@ -81,7 +82,7 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const { id } = await params;
     await requireProjectAccess(userId, Number(id));
 

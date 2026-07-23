@@ -48,9 +48,29 @@ All AI provider access goes through `AiService` (in `src/lib/services/deepseek.t
 
 `createDeepSeekClient()` is a private function within the `deepseek.ts` module. It must never be imported or called outside `AiService`.
 
+## Authentication
+
+`src/lib/services/auth.ts` is the single authentication authority. `getCurrentUserId()` resolves identity from Supabase-authenticated session cookie or bearer token. No other module may independently resolve user identity.
+
+Client-supplied `x-user-id` headers are ignored. Identity comes only from verified Supabase sessions.
+
+`src/lib/services/project-authorization.ts` provides `requireProjectAccess()` for project ownership checks. It delegates identity resolution to `auth.ts`. No route may duplicate ownership verification or session resolution.
+
+Route handlers import `getCurrentUserId` from `auth.ts` directly. There is no separate identity-resolution function in `project-authorization.ts`.
+
+## Error handling
+
+`src/lib/services/errors.ts` provides the single `AppError` class and the single `toErrorResponse()` converter. All API error responses must be constructed by `toErrorResponse()` only.
+
+`AppError` carries `status`, `code`, `message`, and optional internal `cause`. The `cause` is logged to the server console but never included in API responses.
+
+Routes must not construct `NextResponse.json({ error: ... })` directly. Route-level validation failures use `throw AppError.badRequest(...)`. Ownership failures use `throw AppError.forbidden()`. Not-found conditions use `throw AppError.notFound(...)`. Service failures use `throw AppError.internal(...)`.
+
+Non-`AppError` throws are mapped to a generic 500 response with `{ error: "Internal server error", code: "INTERNAL_ERROR" }`. Internal messages, provider errors, database errors, stack traces, and filesystem paths are never exposed in public responses.
+
 ## Build and tests
 
-Current build passes with **335 tests passing and 0 failing**.
+Current build passes with **390 tests passing and 0 failing**.
 
 ## Contributor rules
 
@@ -106,4 +126,7 @@ Current state (2026-07-23):
 - ArticleDocument is the canonical article model with HTML parser
 - FinalArticlePolicy centralizes all validation rules
 - AiService centralizes all AI provider access
+- auth.ts is the single authentication authority; x-user-id headers are ignored
+- project-authorization.ts provides requireProjectAccess() only; delegates identity to auth.ts
+- AppError + toErrorResponse() is the single error model; no route-local error response construction
 - Safe starting point: `src/lib/pipeline/blog-generation-pipeline.ts` for pipeline stages, `src/lib/services/blog-generation-service.ts` for generation flow

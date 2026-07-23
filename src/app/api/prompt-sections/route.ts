@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
-import { toErrorResponse } from "@/lib/services/errors";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { promptSectionRepository } from "@/lib/repositories";
 
 export async function GET() {
@@ -22,10 +22,7 @@ export async function POST(request: Request) {
 
     if (!body.sectionKey || body.content === undefined) {
       console.log(`[prompt-sections:POST] Missing fields — sectionKey=${!!body.sectionKey} content=${body.content !== undefined}`);
-      return NextResponse.json(
-        { error: "sectionKey and content are required" },
-        { status: 400 }
-      );
+      throw AppError.badRequest("sectionKey and content are required");
     }
 
     const section = await promptSectionRepository.upsert(

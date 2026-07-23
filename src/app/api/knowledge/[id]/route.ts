@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
-import { toErrorResponse } from "@/lib/services/errors";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { knowledgeRepository } from "@/lib/repositories";
 
 export async function GET(
@@ -13,7 +13,7 @@ export async function GET(
     const item = await knowledgeRepository.findByIdAndUser(Number(id), userId);
 
     if (!item) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
+      throw AppError.notFound("Knowledge item");
     }
 
     return NextResponse.json(item);
@@ -33,7 +33,7 @@ export async function PATCH(
 
     const existing = await knowledgeRepository.findByIdAndUser(Number(id), userId);
     if (!existing) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
+      throw AppError.notFound("Knowledge item");
     }
 
     const item = await knowledgeRepository.update(Number(id), body);
@@ -53,7 +53,7 @@ export async function DELETE(
     const existing = await knowledgeRepository.findByIdAndUser(Number(id), userId);
 
     if (!existing) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
+      throw AppError.notFound("Knowledge item");
     }
 
     await knowledgeRepository.delete(Number(id));

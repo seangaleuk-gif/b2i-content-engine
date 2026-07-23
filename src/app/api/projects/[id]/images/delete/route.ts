@@ -1,20 +1,21 @@
 import { NextResponse } from "next/server";
-import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
-import { toErrorResponse } from "@/lib/services/errors";
+import { getCurrentUserId } from "@/lib/services/auth";
+import { requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 
 export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const { id } = await params;
     await requireProjectAccess(userId, Number(id));
 
     const body = await request.json();
     const imageId = body.imageId;
     if (!imageId) {
-      return NextResponse.json({ error: "imageId is required" }, { status: 400 });
+      throw AppError.badRequest("imageId is required");
     }
 
     const { getDb } = await import("@/db");

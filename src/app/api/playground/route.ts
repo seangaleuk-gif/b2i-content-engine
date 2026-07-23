@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
-import { toErrorResponse } from "@/lib/services/errors";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { AiService } from "@/lib/services/deepseek";
 
 export async function POST(request: Request) {
@@ -11,10 +11,7 @@ export async function POST(request: Request) {
     const { systemPrompt, userMessage, model } = body;
 
     if (!systemPrompt || !userMessage) {
-      return NextResponse.json(
-        { error: "systemPrompt and userMessage are required" },
-        { status: 400 }
-      );
+      throw AppError.badRequest("systemPrompt and userMessage are required");
     }
 
     const ai = new AiService();

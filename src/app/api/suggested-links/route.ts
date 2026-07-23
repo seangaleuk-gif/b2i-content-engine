@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
-import { toErrorResponse } from "@/lib/services/errors";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { suggestedLinksRepository } from "@/lib/repositories";
 
 export async function GET() {
@@ -19,10 +19,7 @@ export async function POST(request: Request) {
     const body = await request.json();
 
     if (!body.id || !body.action) {
-      return NextResponse.json(
-        { error: "id and action are required" },
-        { status: 400 }
-      );
+      throw AppError.badRequest("id and action are required");
     }
 
     if (body.action === "approve") {
@@ -32,10 +29,7 @@ export async function POST(request: Request) {
       await suggestedLinksRepository.reject(body.id);
       return NextResponse.json({ success: true, rejected: true });
     } else {
-      return NextResponse.json(
-        { error: "Invalid action. Use 'approve' or 'reject'" },
-        { status: 400 }
-      );
+      throw AppError.badRequest("Invalid action. Use 'approve' or 'reject'");
     }
   } catch (error) {
     console.error("[suggested-links:POST]", error);

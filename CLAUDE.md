@@ -7,3 +7,6 @@ B2I Content Engine — See AGENTS.md for full architecture. Key entry points:
 - `src/lib/blog/article-document.ts` — canonical article model
 - `src/lib/blog/final-article-policy.ts` — centralized validation
 - `src/lib/services/deepseek.ts` — `AiService` (sole AI provider access)
+- `src/lib/services/auth.ts` — single authentication authority
+- `src/lib/services/project-authorization.ts` — project ownership checks
+- `src/lib/services/errors.ts` — `AppError` + `toErrorResponse()` (single error model)

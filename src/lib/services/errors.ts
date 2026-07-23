@@ -8,7 +8,6 @@ export class AppError extends Error {
     public readonly code: string,
     message: string,
     public readonly cause?: unknown,
-    public readonly detail?: string,
   ) {
     super(message);
   }
@@ -25,8 +24,8 @@ export class AppError extends Error {
     return new AppError(404, "NOT_FOUND", `${resource} not found`);
   }
 
-  static badRequest(message: string, detail?: string): AppError {
-    return new AppError(400, "BAD_REQUEST", message, undefined, detail);
+  static badRequest(message: string): AppError {
+    return new AppError(400, "BAD_REQUEST", message);
   }
 
   static conflict(message: string): AppError {

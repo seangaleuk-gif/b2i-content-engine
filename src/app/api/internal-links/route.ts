@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
-import { toErrorResponse } from "@/lib/services/errors";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { internalLinksRepository, suggestedLinksRepository } from "@/lib/repositories";
 
 export async function GET() {
@@ -20,10 +20,7 @@ export async function POST(request: Request) {
     const body = await request.json();
 
     if (!body.displayText || !body.url) {
-      return NextResponse.json(
-        { error: "displayText and url are required" },
-        { status: 400 }
-      );
+      throw AppError.badRequest("displayText and url are required");
     }
 
     const link = await internalLinksRepository.create({

@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
-import { resolveAuthenticatedUserId } from "@/lib/services/project-authorization";
+import { getCurrentUserId } from "@/lib/services/auth";
+import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse } from "@/lib/services/errors";
 import { projectRepository } from "@/lib/repositories";
 import { activityRepository } from "@/lib/repositories";
 
 export async function GET() {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const projects = await projectRepository.findByUser(userId);
     return NextResponse.json(projects);
   } catch (error) {
@@ -16,7 +17,7 @@ export async function GET() {
 
 export async function POST(request: Request) {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const body = await request.json();
 
     const project = await projectRepository.create({

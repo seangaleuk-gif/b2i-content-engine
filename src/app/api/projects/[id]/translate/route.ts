@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
-import { toErrorResponse } from "@/lib/services/errors";
+import { getCurrentUserId } from "@/lib/services/auth";
+import { requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { projectRepository, blogVersionRepository } from "@/lib/repositories";
 import { promptSectionRepository } from "@/lib/repositories";
 import { AiService } from "@/lib/services/deepseek";
@@ -10,14 +11,14 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await resolveAuthenticatedUserId();
+    const userId = await getCurrentUserId();
     const { id } = await params;
     const project = await requireProjectAccess(userId, Number(id));
 
     const versions = await blogVersionRepository.findByProject(Number(id));
     const latest = versions?.[0];
     if (!latest || !latest.blog) {
-      return NextResponse.json({ error: "No blog content to translate" }, { status: 400 });
+      throw AppError.badRequest("No blog content to translate");
     }
 
     const promptSections = await promptSectionRepository.findByUser(userId);
@@ -31,13 +32,13 @@ export async function POST(
     const systemPrompt = `You are a professional translator specializing in Hong Kong Traditional Chinese (zh-HK). Translate the following blog post accurately while preserving:
 
 - The original tone, personality, and voice
-- WordPress block format (<!-- wp:heading -->, <!-- wp:paragraph -->, etc.)
+- WordPress block format
 - All HTML structure, links, and formatting
-- Use full-width punctuation（，。）for Chinese text
+- Use full-width punctuation for Chinese text
 - Adapt idioms and expressions naturally for a Hong Kong audience
 - Use colloquial Hong Kong Cantonese phrasing where appropriate
 - Do NOT translate: brand names (B2I Hub), URLs, code, statistics, or proper nouns
-- Hong Kong Traditional Chinese characters（繁體中文）
+- Hong Kong Traditional Chinese characters
 
 ${rulesContent}`;
 
@@ -80,14 +81,14 @@ Output as a JSON object with these fields:
       const match = cleaned.match(/\{[\s\S]*\}/);
       if (!match) {
         console.error("[translate] No JSON pattern match found in response");
-        throw new Error("No JSON found in translation response");
+        throw AppError.internal("Translation failed");
       }
       console.log("[translate] JSON match length:", match[0].length);
       translated = JSON.parse(match[0]);
     } catch (parseErr) {
       console.error("[translate] Parse error:", parseErr);
       console.error("[translate] Full response:", result.content.substring(0, 2000));
-      throw new Error("Failed to parse translation JSON response");
+      throw AppError.internal("Translation failed", parseErr);
     }
 
     const enSlug = latest.slug ?? "";
