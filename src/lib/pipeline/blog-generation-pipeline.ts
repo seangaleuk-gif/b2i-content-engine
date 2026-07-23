@@ -125,17 +125,76 @@ function runStageValidation(html: string, baseline: ArticleIntegrityBaseline, st
     malformedHeadings: result.metrics.malformedHeadingCount, wpBlocksValid, unclosedTags, issues };
 }
 
+function logValidationFailure(
+  stage: string,
+  label: "Candidate" | "Fallback",
+  html: string,
+  validation: StageValidationResult,
+): void {
+  const entry = {
+    htmlLength: html.length,
+    fingerprint: fp(html),
+    valid: validation.valid,
+    wpBlocksValid: validation.wpBlocksValid,
+    nestedParagraphs: validation.nestedParagraphs,
+    malformedHeadings: validation.malformedHeadings,
+    unclosedTags: validation.unclosedTags,
+    issues: validation.issues,
+  };
+  console.error(`[PIPELINE:${stage}] ${label} validation failed`);
+  console.error(JSON.stringify(entry, null, 2));
+}
+
+function formatIssueSummary(validation: StageValidationResult, maxIssues = 5): string {
+  const count = validation.issues.length;
+  const shown = validation.issues.slice(0, maxIssues);
+  let summary = `${count} issue${count !== 1 ? "s" : ""}`;
+  if (shown.length > 0) {
+    summary += `: ${shown.join("; ")}`;
+    if (count > maxIssues) summary += ` ... and ${count - maxIssues} more`;
+  }
+  return summary;
+}
+
+function assertValidStageInput(
+  html: string,
+  baseline: ArticleIntegrityBaseline,
+  stageName: string,
+): void {
+  const validation = runStageValidation(html, baseline, stageName);
+  if (!validation.valid) {
+    logValidationFailure(stageName, "Candidate", html, validation);
+    throw new Error(
+      `Stage ${stageName} received invalid pre-stage HTML. ` +
+      `${formatIssueSummary(validation)}`,
+    );
+  }
+}
+
 export function guardStageOutput(
   currentHtml: string, previousHtml: string | null, baseline: ArticleIntegrityBaseline, stage: string,
 ): { html: string; accepted: boolean } {
   const validation = runStageValidation(currentHtml, baseline, stage);
   if (validation.valid) return { html: currentHtml, accepted: true };
+
+  logValidationFailure(stage, "Candidate", currentHtml, validation);
+
   if (previousHtml !== null) {
     const prevValidation = runStageValidation(previousHtml, baseline, `${stage}-fallback`);
     if (prevValidation.valid) return { html: previousHtml, accepted: false };
-    throw new Error(`Stage ${stage}: both candidate and fallback invalid`);
+
+    logValidationFailure(stage, "Fallback", previousHtml, prevValidation);
+
+    throw new Error(
+      `Stage ${stage}: both candidate and fallback invalid. ` +
+      `Candidate ${formatIssueSummary(validation)}. ` +
+      `Fallback ${formatIssueSummary(prevValidation)}.`,
+    );
   }
-  throw new Error(`Stage ${stage}: no fallback, candidate invalid`);
+  throw new Error(
+    `Stage ${stage}: no fallback available, candidate invalid. ` +
+    `${formatIssueSummary(validation)}`,
+  );
 }
 
 export function recordStage(state: PipelineState, stageName: string, inputFp: string, outputFp: string, accepted: boolean, fallbackSource?: string, metadata?: Record<string, unknown>): void {
@@ -205,6 +264,8 @@ function runTrackedHtmlStage(state: PipelineState, stageName: string, fn: (html:
   const stageBaseline = createArticleIntegrityBaseline(preHtml);
   const snap = preSnapshot ?? snapshotState(state);
 
+  assertValidStageInput(preHtml, stageBaseline, stageName);
+
   const resultHtml = fn(state.blog);
 
   // Parse back to ArticleDocument. If parsing fails, restore snapshot.
@@ -219,7 +280,6 @@ function runTrackedHtmlStage(state: PipelineState, stageName: string, fn: (html:
   if (!guard.accepted) {
     restoreSnapshot(state, snap);
   } else {
-    // Guard accepted — articleDoc already updated by applyHtmlToDocument
     state.blog = guard.html;
   }
   const outputFp = fp(state.blog);

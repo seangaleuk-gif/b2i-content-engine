@@ -78,7 +78,6 @@ function extractLinkHrefs(html: string): string[] {
   }
 
   const linkRe = /<a\b[^>]*href="([^"]*)"[^>]*>/gi;
-  console.log("[LINK-REGEX] source=" + linkRe.source + " flags=" + linkRe.flags + " global=" + linkRe.global);
 
   let lm: RegExpExecArray | null;
   let iteration = 0;
@@ -86,13 +85,6 @@ function extractLinkHrefs(html: string): string[] {
 
   while ((lm = linkRe.exec(html)) !== null) {
     iteration++;
-
-    console.log("[LINK-LOOP] iteration=" + iteration +
-      " regexLastIndex=" + linkRe.lastIndex +
-      " previousLastIndex=" + previousLastIndex +
-      " matchIndex=" + lm.index +
-      " matchLength=" + (lm[0]?.length ?? 0) +
-      " hrefsLength=" + hrefs.length);
 
     if (linkRe.lastIndex <= previousLastIndex) {
       throw new Error(
@@ -109,12 +101,7 @@ function extractLinkHrefs(html: string): string[] {
 
     previousLastIndex = linkRe.lastIndex;
 
-    const pushValue = lm[1];
-    console.log("[LINK-PUSH] before hrefsLength=" + hrefs.length + " valueType=" + typeof pushValue + " valueLen=" + pushValue.length);
-
-    hrefs.push(pushValue);
-
-    console.log("[LINK-PUSH] after hrefsLength=" + hrefs.length);
+    hrefs.push(lm[1]);
   }
 
   return hrefs.sort();
@@ -122,13 +109,10 @@ function extractLinkHrefs(html: string): string[] {
 
 /** Capture a structural baseline before any normalization run. */
 export function createArticleIntegrityBaseline(html: string): ArticleIntegrityBaseline {
-  console.log("[INTEGRITY] createArticleIntegrityBaseline start, htmlLength=" + html.length + " typeof=" + typeof html);
   const allHrefs = extractLinkHrefs(html);
-  console.log("[INTEGRITY] extractLinkHrefs done, count=" + allHrefs.length);
+  console.log(`[INTEGRITY] extractLinkHrefs completed, count=${allHrefs.length}`);
   const wpHtmlBlocks = extractWpHtmlBlocks(html);
-  console.log("[INTEGRITY] extractWpHtmlBlocks done, count=" + wpHtmlBlocks.length);
   const scriptBlocks = extractScriptBlocks(html);
-  console.log("[INTEGRITY] extractScriptBlocks done, count=" + scriptBlocks.length);
 
   const languageSwitcherBlocks = wpHtmlBlocks.filter((b) =>
     /b2i-language-switcher/i.test(b),

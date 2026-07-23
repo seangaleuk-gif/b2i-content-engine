@@ -23,6 +23,48 @@ import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/fin
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
 import { sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
 
+/** Strip ALL heading blocks (H2, H3, bare <h2>, bare <h3>) from section body content.
+ *  Handles complete blocks, orphaned openers/closers, and malformed heading markup
+ *  that the AI may produce despite explicit formatting instructions. */
+function stripHeadingBlocks(raw: string): string {
+  let cleaned = raw;
+
+  // Pass 1: strip well-formed H2 heading blocks (opener + <h2>...</h2> + closer)
+  cleaned = cleaned.replace(
+    /<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*\n?<h2[^>]*>[\s\S]*?<\/h2>\s*\n?<!--\s*\/wp:heading\s*-->/gi,
+    "",
+  );
+
+  // Pass 2: strip well-formed H3 heading blocks (opener + <h3>...</h3> + closer)
+  cleaned = cleaned.replace(
+    /<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*3[^}]*\}\s*-->\s*\n?<h3[^>]*>[\s\S]*?<\/h3>\s*\n?<!--\s*\/wp:heading\s*-->/gi,
+    "",
+  );
+
+  // Pass 3: strip any remaining <!-- wp:heading ... --> openers and <!-- /wp:heading --> closers
+  // (catches orphaned markers from malformed AI output)
+  cleaned = cleaned.replace(/<!--\s*wp:heading[^>]*-->/gi, "");
+  cleaned = cleaned.replace(/<!--\s*\/wp:heading\s*-->/gi, "");
+
+  // Pass 4: strip bare <h2> and <h3> tags (opener + content + closer)
+  cleaned = cleaned.replace(/<h2\b[^>]*>[\s\S]*?<\/h2>/gi, "");
+  cleaned = cleaned.replace(/<h3\b[^>]*>[\s\S]*?<\/h3>/gi, "");
+
+  // Pass 5: strip any remaining orphaned <h2>, <h3>, </h2>, </h3> tags
+  cleaned = cleaned.replace(/<\/?h[23]\b[^>]*>/gi, "");
+
+  // Pass 6: clean up empty paragraph blocks that may result from heading removal
+  cleaned = cleaned.replace(
+    /<!--\s*wp:paragraph\s*-->\s*\n?<p>\s*<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi,
+    "",
+  );
+
+  // Collapse multiple blank lines
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
+
+  return cleaned;
+}
+
 export { buildGenerationReport, buildPolicy, analyzeFinalArticle, evaluatePolicy, validatePipelineOrder };
 
 export interface GenerationResult {
@@ -172,8 +214,7 @@ export async function runBlogGeneration(
     tasks.push(trackedChat(`section_${i}`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: msg }], { responseFormat: { type: "json_object" }, maxTokens: 8192 })
       .then((res: any) => {
         const raw = (robustJsonParse(res.content, `section_${i}`) as any).body || "";
-        let clean = raw.replace(/<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*<h2[^>]*>[\s\S]*?<\/h2>\s*<!--\s*\/wp:heading\s*-->/gi, "");
-        clean = clean.replace(/<h2[^>]*>[\s\S]*?<\/h2>/gi, "");
+        let clean = stripHeadingBlocks(raw);
         if (researchUrls.length > 0) clean = sanitizeSectionUrls(clean, researchUrls);
         return { type: "section", index: i, heading: h2Text, content: clean };
       }));
