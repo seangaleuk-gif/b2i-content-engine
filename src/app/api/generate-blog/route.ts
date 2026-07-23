@@ -27,7 +27,7 @@ import { extractFaqBlock, extractCtaFromConclusion, stripProtectedBlocksFromConc
 import { validateFinalArticleInvariants } from "@/lib/blog/article-final-invariants";
 import { FLESCH_MIN, FLESCH_MAX, KEYPHRASE_MAX } from "@/lib/services/generation-constants";
 import { countExactPhrase, extractReadableText, getFirstNReadableWords, countCtaHeadingTags, hasLanguageSwitcher, countEditorialExternalLinks } from "@/lib/seo/seo-text-utils";
-import { type ArticleDocument, type ArticleSection, type ProtectedArticleBlock, renderArticleDocument, fingerprintHtml, classifyHeadings, renderFaqSchema, extractEditableContent, applyEditableContent, detectClaimConflicts, validateFaqParity, detectNestedParagraphs, type ClaimConflict } from "@/lib/blog/article-document";
+import { type ArticleDocument, type ArticleSection, type ProtectedArticleBlock, renderArticleDocument, fingerprintHtml, classifyHeadings, renderFaqSchema, extractEditableContent, applyEditableContent, detectClaimConflicts, validateFaqParity, detectNestedParagraphs, extractVisibleFaqFromArticle, type ClaimConflict } from "@/lib/blog/article-document";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -1676,19 +1676,31 @@ export async function POST(request: Request) {
       ].filter(Boolean) }, { status: 422 });
     }
 
-    // ── FAQ parity validation — visible FAQ and schema must match ──
-    if (articleDoc.visibleFaq.length > 0 && articleDoc.faqSchema) {
-      const parityResult = validateFaqParity(articleDoc.visibleFaq, articleDoc.faqSchema.html);
-      if (!parityResult.valid) {
-        console.error(`[generate-blog:FAQ-PARITY] FAQ schema/visible mismatch: ${parityResult.issues.map((i) => i.detail).join("; ")}`);
-        telemetry.recordWarning(`faqParityFailed:${parityResult.issues.length}`);
-        return NextResponse.json({
-          error: "FAQ parity validation failed",
-          detail: parityResult.issues.map((i) => i.detail).join("; "),
-          issues: parityResult.issues,
-        }, { status: 422 });
+    // ── FAQ parity validation — extract visible Q&A and schema from finalBlogHtml ──
+    const faqSchemaBlock = extractFaqBlock(finalBlogHtml);
+    if (faqSchemaBlock) {
+      // Extract visible FAQ questions AND answers from the FAQ section region only
+      const visibleFaqPairs = extractVisibleFaqFromArticle(finalBlogHtml);
+
+      if (visibleFaqPairs.length > 0) {
+        const visibleEntries = visibleFaqPairs.map((p) => ({
+          question: p.question,
+          answerHtml: "",
+          answerText: p.answerText,
+        }));
+
+        const parityResult = validateFaqParity(visibleEntries, faqSchemaBlock);
+        if (!parityResult.valid) {
+          console.error(`[generate-blog:FAQ-PARITY] FAQ schema/visible mismatch from final HTML: ${parityResult.issues.map((i) => i.detail).join("; ")}`);
+          telemetry.recordWarning(`faqParityFailed:${parityResult.issues.length}`);
+          return NextResponse.json({
+            error: "FAQ parity validation failed",
+            detail: parityResult.issues.map((i) => i.detail).join("; "),
+            issues: parityResult.issues,
+          }, { status: 422 });
+        }
+        console.log(`[generate-blog:FAQ-PARITY] FAQ schema matches visible entries in final HTML — valid (${visibleFaqPairs.length} questions, answers checked)`);
       }
-      console.log("[generate-blog:FAQ-PARITY] FAQ schema matches visible entries — valid");
     }
 
     // ── Final invariant check (must run BEFORE save — prevents invalid articles from being persisted) ──

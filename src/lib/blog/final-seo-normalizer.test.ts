@@ -9,7 +9,7 @@ import { runAudit } from "@/lib/services/seo-auditor";
 import { allocateComponentKeyphraseBudgets, buildComponentBudgetPrompt, type ComponentKeyphraseBudget } from "@/lib/services/generation-constants";
 import { insertExternalResearchLinks, sanitizeSectionUrls, deduplicateEditorialExternalLinks } from "@/lib/services/article-postprocessors";
 import { countEditorialExternalLinks } from "@/lib/seo/seo-text-utils";
-import { renderFaqSchema, renderVisibleFaq, validateFaqParity, detectClaimConflicts, classifyHeadings, type ArticleDocument, renderArticleDocument, fingerprintHtml, detectNestedParagraphs, type FaqEntry } from "@/lib/blog/article-document";
+import { renderFaqSchema, renderVisibleFaq, validateFaqParity, detectClaimConflicts, classifyHeadings, type ArticleDocument, renderArticleDocument, fingerprintHtml, detectNestedParagraphs, extractVisibleFaqFromArticle, type FaqEntry } from "@/lib/blog/article-document";
 import {
   extractReadableText,
   extractH2Texts,
@@ -3524,6 +3524,160 @@ describe("editorial external link deduplication", () => {
 
     const result = deduplicateEditorialExternalLinks(html);
     expect(result.removed).toBe(0);
+  });
+});
+
+// ── Final FAQ validation from rendered HTML tests ──
+
+describe("final FAQ validation from rendered HTML", () => {
+  it("matching visible FAQ and schema pass parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "What is it?", answerHtml: "", answerText: "It is a marketing tool for creators." },
+      { question: "How to use it?", answerHtml: "", answerText: "Sign up and connect your brand account." },
+    ]);
+    const html = `<!-- wp:heading {"level":2} -->
+<h2>Frequently Asked Questions</h2>
+<!-- /wp:heading -->
+
+<!-- wp:html -->
+<div class="faq-item"><h3>What is it?</h3><p>It is a marketing tool for creators.</p></div>
+<div class="faq-item"><h3>How to use it?</h3><p>Sign up and connect your brand account.</p></div>
+<!-- /wp:html -->
+
+${schemaHtml}`;
+
+    const visibleFaqPairs = extractVisibleFaqFromArticle(html);
+    expect(visibleFaqPairs.length).toBe(2);
+
+    // Use visibleFaqPairs directly with schemaHtml — both from same source
+    const result = validateFaqParity(
+      visibleFaqPairs.map((p) => ({ question: p.question, answerHtml: "", answerText: p.answerText })),
+      schemaHtml,
+    );
+    expect(result.issues).toEqual([]);
+    expect(result.valid).toBe(true);
+  });
+
+  it("changed visible answer fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "What is it?", answerHtml: "", answerText: "It is a marketing tool for creators." },
+    ]);
+    const html = `<!-- wp:heading {"level":2} -->
+<h2>Frequently Asked Questions</h2>
+<!-- /wp:heading -->
+
+<!-- wp:html -->
+<div class="faq-item"><h3>What is it?</h3><p>This answer is DIFFERENT from the schema.</p></div>
+<!-- /wp:html -->
+
+${schemaHtml}`;
+
+    const visibleFaqPairs = extractVisibleFaqFromArticle(html);
+    expect(visibleFaqPairs.length).toBe(1);
+    const result = validateFaqParity(
+      visibleFaqPairs.map((p) => ({ question: p.question, answerHtml: "", answerText: p.answerText })),
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+    expect(result.issues.some((i) => i.type === "answer-mismatch")).toBe(true);
+  });
+
+  it("changed visible question fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "What is it?", answerHtml: "", answerText: "It is a marketing tool for creators." },
+    ]);
+    const html = `<!-- wp:heading {"level":2} -->
+<h2>Frequently Asked Questions</h2>
+<!-- /wp:heading -->
+
+<!-- wp:html -->
+<div class="faq-item"><h3>Different question entirely?</h3><p>It is a marketing tool for creators.</p></div>
+<!-- /wp:html -->
+
+${schemaHtml}`;
+
+    const visibleFaqPairs = extractVisibleFaqFromArticle(html);
+    const result = validateFaqParity(
+      visibleFaqPairs.map((p) => ({ question: p.question, answerHtml: "", answerText: p.answerText })),
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+    expect(result.issues.some((i) => i.type === "wording-mismatch")).toBe(true);
+  });
+
+  it("ignores unrelated H3 headings outside the FAQ section", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Real FAQ Question?", answerHtml: "", answerText: "Real FAQ answer." },
+    ]);
+    const html = `<!-- wp:heading {"level":2} -->
+<h2>Section One</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Some content with a <h3>Subheading in body</h3> that is not a FAQ.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading {"level":2} -->
+<h2>Frequently Asked Questions</h2>
+<!-- /wp:heading -->
+
+<!-- wp:html -->
+<div class="faq-item"><h3>Real FAQ Question?</h3><p>Real FAQ answer.</p></div>
+<!-- /wp:html -->
+
+${schemaHtml}`;
+
+    const visibleFaqPairs = extractVisibleFaqFromArticle(html);
+    // Only 1 FAQ question extracted — the <h3> in section one is ignored
+    expect(visibleFaqPairs.length).toBe(1);
+    expect(visibleFaqPairs[0].question).toBe("Real FAQ Question?");
+  });
+
+  it("reordered FAQ entries fail parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "What is it?", answerHtml: "", answerText: "It is a marketing tool." },
+      { question: "How to use it?", answerHtml: "", answerText: "Sign up and connect." },
+    ]);
+    const html = `<!-- wp:heading {"level":2} -->
+<h2>Frequently Asked Questions</h2>
+<!-- /wp:heading -->
+
+<!-- wp:html -->
+<div class="faq-item"><h3>How to use it?</h3><p>Sign up and connect.</p></div>
+<div class="faq-item"><h3>What is it?</h3><p>It is a marketing tool.</p></div>
+<!-- /wp:html -->
+
+${schemaHtml}`;
+
+    const visibleFaqPairs = extractVisibleFaqFromArticle(html);
+    const result = validateFaqParity(
+      visibleFaqPairs.map((p) => ({ question: p.question, answerHtml: "", answerText: p.answerText })),
+      schemaHtml,
+    );
+    // Questions are in different order — mismatch on first question
+    expect(result.valid).toBe(false);
+    expect(result.issues.some((i) => i.type === "wording-mismatch")).toBe(true);
+  });
+
+  it("visible answers are NOT populated from schema", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q1?", answerHtml: "", answerText: "Answer text from the schema." },
+    ]);
+    const html = `<!-- wp:heading {"level":2} -->
+<h2>Frequently Asked Questions</h2>
+<!-- /wp:heading -->
+
+<!-- wp:html -->
+<div class="faq-item"><h3>Q1?</h3><p>Visible answer text from the page.</p></div>
+<!-- /wp:html -->
+
+${schemaHtml}`;
+
+    const visibleFaqPairs = extractVisibleFaqFromArticle(html);
+    expect(visibleFaqPairs.length).toBe(1);
+    // Visible answer comes from the page HTML, not from schema
+    expect(visibleFaqPairs[0].answerText).toContain("Visible answer text from the page");
+    expect(visibleFaqPairs[0].answerText).not.toContain("Answer text from the schema");
   });
 });
 

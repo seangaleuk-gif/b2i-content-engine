@@ -248,7 +248,86 @@ export function validateFaqParity(
     }
   }
 
+  // Compare answers (visible answerText vs schema answerText)
+  for (let i = 0; i < maxQuestions; i++) {
+    const entryAnswer = (entries[i].answerText || "").toLowerCase().trim();
+    const schemaAnswer = (schemaAnswers[i] || "").toLowerCase().trim();
+    if (entryAnswer && schemaAnswer && entryAnswer !== schemaAnswer) {
+      issues.push({
+        type: "answer-mismatch",
+        index: i,
+        detail: `Answer ${i + 1}: visible="${entryAnswer.substring(0, 60)}" vs schema="${schemaAnswer.substring(0, 60)}"`,
+      });
+    }
+  }
+
   return { valid: issues.length === 0, issues };
+}
+
+/**
+ * Extract visible FAQ question and answer pairs from the FAQ section region
+ * of rendered article HTML. Only matches <h3> elements within the FAQ section
+ * (between the FAQ H2 heading and the next H2 or schema block).
+ * Unrelated article H3 headings (outside the FAQ section) are ignored.
+ */
+export function extractVisibleFaqFromArticle(html: string): Array<{ question: string; answerText: string }> {
+  const result: Array<{ question: string; answerText: string }> = [];
+
+  // Find the FAQ section: look for H2 heading that reads "FAQ" / "Frequently Asked Questions"
+  const faqH2Re = /<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*\n?<h2\b[^>]*>[\s\S]*?(Frequently Asked Questions|FAQ|FAQs|常見問題)[\s\S]*?<\/h2>/i;
+  const faqMatch = html.match(faqH2Re);
+  if (!faqMatch) return result;
+
+  const faqStart = faqMatch.index! + faqMatch[0].length;
+
+  // FAQ section ends at the next H2 heading or at the conclusion
+  const nextH2Re = /<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->/g;
+  nextH2Re.lastIndex = faqStart;
+  const nextH2Match = nextH2Re.exec(html);
+  const faqEnd = nextH2Match ? nextH2Match.index : html.length;
+
+  // Stop before the FAQ schema block.
+  // Find "FAQPage" in the article, then find the nearest <!-- wp:html --> opener before it.
+  const faqPageIdx = html.indexOf("FAQPage", faqStart);
+  let effectiveEnd = faqEnd;
+  if (faqPageIdx > 0) {
+    // Find the last wp:html opener before FAQPage
+    const beforeFaqPage = html.substring(faqStart, faqPageIdx);
+    const lastWpHtmlMatch = beforeFaqPage.match(/<!--\s*wp:html\s*-->/gi);
+    if (lastWpHtmlMatch) {
+      const openerIdx = beforeFaqPage.lastIndexOf(lastWpHtmlMatch[lastWpHtmlMatch.length - 1]);
+      if (openerIdx >= 0) {
+        effectiveEnd = Math.min(effectiveEnd, faqStart + openerIdx);
+      }
+    }
+  }
+
+  const faqSection = html.substring(faqStart, effectiveEnd);
+
+  // Extract Q&A pairs: each question is an <h3>, answers follow until next <h3> or end
+  const h3Split = faqSection.split(/<\/h3>/i);
+  for (let i = 0; i < h3Split.length - 1; i++) {
+    const beforeH3Close = h3Split[i];
+    const afterH3Close = h3Split[i + 1];
+
+    // Extract question from before the closing </h3>
+    const h3OpenIdx = beforeH3Close.lastIndexOf("<h3");
+    if (h3OpenIdx < 0) continue;
+    const questionHtml = beforeH3Close.substring(h3OpenIdx).replace(/<h3\b[^>]*>/i, "");
+    const question = questionHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (!question) continue;
+
+    // Extract answer from after </h3> until the next <h3>
+    const nextH3Idx = afterH3Close.search(/<h3\b/i);
+    const answerHtml = nextH3Idx >= 0 ? afterH3Close.substring(0, nextH3Idx) : afterH3Close;
+    const answerText = answerHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+    if (answerText.length > 0) {
+      result.push({ question, answerText });
+    }
+  }
+
+  return result;
 }
 
 // ── Unified validation report ──
