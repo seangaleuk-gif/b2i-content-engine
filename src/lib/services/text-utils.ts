@@ -1,3 +1,5 @@
+import { AppError } from "./errors";
+
 export function countReadableWords(html: string): number {
   // Strip non-readable content first
   const readable = html
@@ -121,7 +123,10 @@ export function robustJsonParse(raw: string, stage?: string): unknown {
     console.log(`[JSON-PARSE:${stage}] ALL ATTEMPTS FAILED — rawLen=${raw.length}`);
   }
 
-  throw new Error(`Failed to parse JSON response from AI${stage ? ` [stage: ${stage}]` : ""}`);
+  throw AppError.internal(
+    "Article generation failed",
+    new Error(`Failed to parse JSON response from AI${stage ? ` [stage: ${stage}]` : ""}`)
+  );
 }
 
 function extractMalformedJsonStringProperty(raw: string, allowedProps: string[]): Record<string, string> | null {

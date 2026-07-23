@@ -5,7 +5,7 @@
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
-import { createDeepSeekClient } from "@/lib/services/deepseek";
+import { AiService } from "@/lib/services/deepseek";
 import { buildSystemPrompt, STAGE_SYSTEM_PROMPTS } from "@/lib/services/prompt-builder";
 import { cleanBodyText, countWords } from "@/lib/services/text-utils";
 import { DEFAULT_PROMPTS } from "@/lib/services/default-prompts";
@@ -100,7 +100,8 @@ async function generateArticle(topic: typeof TOPICS[0]): Promise<ArticleMetrics>
   let fixerCalls = 0;
   const failures: string[] = [];
 
-  const { chatWithRetry } = createDeepSeekClient();
+  const ai = new AiService();
+  const chatWithRetry = ai.chatWithRetry;
 
   // PHASE A: Outline
   const outlineSystemPrompt = buildSystemPrompt(context, STAGE_SYSTEM_PROMPTS.outline);

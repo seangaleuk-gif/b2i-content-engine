@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getCurrentUserId } from "@/lib/services/auth";
+import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse } from "@/lib/services/errors";
 import { blogVersionRepository } from "@/lib/repositories";
 
 export async function GET(
@@ -7,18 +8,13 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
+    await requireProjectAccess(userId, Number(id));
     const versions = await blogVersionRepository.findByProject(Number(id));
     return NextResponse.json(versions);
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to fetch versions" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -27,8 +23,9 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    await getCurrentUserId();
-    await params;
+    const userId = await resolveAuthenticatedUserId();
+    const { id } = await params;
+    await requireProjectAccess(userId, Number(id));
     const body = await request.json();
     const versionId = body.versionId;
 
@@ -42,12 +39,6 @@ export async function DELETE(
     await blogVersionRepository.delete(Number(versionId));
     return NextResponse.json({ success: true });
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to delete version" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

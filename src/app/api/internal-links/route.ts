@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
+import { toErrorResponse } from "@/lib/services/errors";
 import { internalLinksRepository, suggestedLinksRepository } from "@/lib/repositories";
 
 export async function GET() {
@@ -9,13 +10,7 @@ export async function GET() {
     const suggestions = await suggestedLinksRepository.findPendingByUser(userId);
     return NextResponse.json({ links, pendingSuggestions: suggestions.length });
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to fetch internal links" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -45,12 +40,6 @@ export async function POST(request: Request) {
     return NextResponse.json(link, { status: 201 });
   } catch (error) {
     console.error("[internal-links:POST]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to create internal link" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

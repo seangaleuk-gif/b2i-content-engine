@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
-import { createDeepSeekClient } from "@/lib/services/deepseek";
+import { toErrorResponse } from "@/lib/services/errors";
+import { AiService } from "@/lib/services/deepseek";
 
 export async function POST(request: Request) {
   try {
@@ -16,8 +17,8 @@ export async function POST(request: Request) {
       );
     }
 
-    const { chat } = createDeepSeekClient();
-    const result = await chat(
+    const ai = new AiService();
+    const result = await ai.chat(
       [
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },
@@ -32,15 +33,6 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error("[playground:POST]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      {
-        error: "Playground request failed",
-        detail: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

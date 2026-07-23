@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
+import { toErrorResponse } from "@/lib/services/errors";
 import { internalLinksRepository } from "@/lib/repositories";
 
 export async function PATCH(
@@ -31,13 +32,7 @@ export async function PATCH(
     return NextResponse.json(updated);
   } catch (error) {
     console.error("[internal-links:PATCH]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to update internal link" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -58,12 +53,6 @@ export async function DELETE(
     await internalLinksRepository.delete(Number(id));
     return NextResponse.json({ success: true });
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to delete internal link" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

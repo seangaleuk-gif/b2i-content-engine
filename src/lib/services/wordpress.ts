@@ -1,12 +1,14 @@
 const WP_API_BASE = process.env.NEXT_PUBLIC_WP_SITE_URL || "";
 
+import { AppError } from "./errors";
+
 function getCredentials() {
   const siteUrl = process.env.NEXT_PUBLIC_WP_SITE_URL;
   const username = process.env.WP_USERNAME;
   const appPassword = process.env.WP_APP_PASSWORD;
 
   if (!siteUrl || !username || !appPassword) {
-    throw new Error("WordPress credentials not configured. Set NEXT_PUBLIC_WP_SITE_URL, WP_USERNAME, and WP_APP_PASSWORD in .env.local");
+    throw AppError.internal("WordPress publish service is not configured");
   }
 
   const baseUrl = siteUrl.replace(/\/+$/, "");
@@ -59,7 +61,10 @@ async function getOrCreateTerm(
     return created.id;
   }
 
-  throw new Error(`Failed to create ${taxonomy}: ${name}`);
+  throw AppError.internal(
+    "Failed to save post metadata",
+    new Error(`Failed to create ${taxonomy}: ${name}`)
+  );
 }
 
 export async function publishToWordPress(input: WpPostInput): Promise<{ id: number; url: string }> {
@@ -107,9 +112,15 @@ export async function publishToWordPress(input: WpPostInput): Promise<{ id: numb
     const error = await response.text();
     console.error("[wp] Publish failed:", error.substring(0, 500));
     if (response.status === 401) {
-      throw new Error("WordPress authentication failed. Check your Application Password.");
+      throw AppError.internal(
+        "WordPress publish failed",
+        new Error("WordPress authentication failed")
+      );
     }
-    throw new Error(`WordPress API returned ${response.status}: ${error.substring(0, 200)}`);
+    throw AppError.internal(
+      "WordPress publish failed",
+      new Error(`WordPress API returned ${response.status}: ${error.substring(0, 200)}`)
+    );
   }
 
   const data = await response.json();

@@ -1,4 +1,6 @@
 export const SEO_TITLE_MIN = 50;
+
+import { AppError } from "./errors";
 export const SEO_TITLE_MAX = 70;
 export const META_MIN = 155;
 export const META_MAX = 200;
@@ -178,20 +180,25 @@ export function allocateComponentKeyphraseBudgets(input: {
   for (const l of phaseLogs) console.log(`[KP-ALLOC] ${l}`);
 
   if (preferredTotal !== expectedPreferred) {
-    throw new Error(
-      `Keyphrase allocation failed: expected preferred=${expectedPreferred}, got=${preferredTotal}, capacity=${totalCapacity}, articlePreferred=${articleBudget.preferred}`
+    throw AppError.internal(
+      "Article generation failed",
+      new Error(`Keyphrase allocation failed: expected preferred=${expectedPreferred}, got=${preferredTotal}, capacity=${totalCapacity}, articlePreferred=${articleBudget.preferred}`)
     );
   }
 
   if (totalCapacity >= articleBudget.min && preferredTotal < articleBudget.min) {
-    throw new Error(
-      `Keyphrase allocation below minimum: min=${articleBudget.min}, got=${preferredTotal}, capacity=${totalCapacity}`
+    throw AppError.internal(
+      "Article generation failed",
+      new Error(`Keyphrase allocation below minimum: min=${articleBudget.min}, got=${preferredTotal}, capacity=${totalCapacity}`)
     );
   }
 
   for (const r of results) {
     if (r.min < 0 || r.preferred < r.min || r.preferred > r.max) {
-      throw new Error(`Invalid budget for ${r.componentId}: min=${r.min} pref=${r.preferred} max=${r.max}`);
+      throw AppError.internal(
+        "Article generation failed",
+        new Error(`Invalid budget for ${r.componentId}: min=${r.min} pref=${r.preferred} max=${r.max}`)
+      );
     }
   }
 

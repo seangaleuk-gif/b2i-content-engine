@@ -1,20 +1,18 @@
 import { NextResponse } from "next/server";
-import { getCurrentUserId } from "@/lib/services/auth";
+import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse } from "@/lib/services/errors";
 import { projectRepository, blogVersionRepository } from "@/lib/repositories";
 import { promptSectionRepository } from "@/lib/repositories";
-import { createDeepSeekClient } from "@/lib/services/deepseek";
+import { AiService } from "@/lib/services/deepseek";
 
 export async function POST(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
-    const project = await projectRepository.findByIdAndUser(Number(id), userId);
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
-    }
+    const project = await requireProjectAccess(userId, Number(id));
 
     const versions = await blogVersionRepository.findByProject(Number(id));
     const latest = versions?.[0];
@@ -57,8 +55,8 @@ Output as a JSON object with these fields:
   "slug": "${targetSlug}"
 }`;
 
-    const { chatWithRetry } = createDeepSeekClient();
-    const result = await chatWithRetry(
+    const ai = new AiService();
+    const result = await ai.chatWithRetry(
       [
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },
@@ -95,20 +93,17 @@ Output as a JSON object with these fields:
     const enSlug = latest.slug ?? "";
     const zhSlug = translated.slug || targetSlug;
 
-    // Fix language switcher in Chinese version
     translated.blog = translated.blog.replace(
       /<a\s[^>]*href="[^"]*"[^>]*>.*?(?:English|EN).*?<\/a>\s*<a\s[^>]*href="[^"]*"[^>]*>.*?(?:中文|Chinese|ZH).*?<\/a>/gi,
       `<a href="/blog/${zhSlug}/">閱讀中文版</a> <a href="/blog/${enSlug}/">Read in English</a>`
     );
 
-    // Fix language switcher in English version
     let enBlog = latest.blog;
     enBlog = enBlog.replace(
       /<a\s[^>]*href="[^"]*"[^>]*>.*?(?:English|EN).*?<\/a>\s*<a\s[^>]*href="[^"]*"[^>]*>.*?(?:中文|Chinese|ZH).*?<\/a>/gi,
       `<a href="/blog/${enSlug}/">Read in English</a> <a href="/blog/${zhSlug}/">閱讀中文版</a>`
     );
 
-    // Update English version with fixed switcher
     if (enBlog !== latest.blog) {
       const { getDb } = await import("@/db");
       const db = getDb() as any;
@@ -151,12 +146,6 @@ Output as a JSON object with these fields:
     return NextResponse.json({ success: true, version: saved }, { status: 201 });
   } catch (error) {
     console.error("[translate]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Translation failed", detail: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

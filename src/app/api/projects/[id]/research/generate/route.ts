@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getCurrentUserId } from "@/lib/services/auth";
+import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse } from "@/lib/services/errors";
 import { projectRepository, researchRepository, activityRepository } from "@/lib/repositories";
 import { runBraveResearchWithRetry } from "@/lib/services/brave";
 
@@ -8,13 +9,10 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
 
-    const project = await projectRepository.findByIdAndUser(Number(id), userId);
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
-    }
+    const project = await requireProjectAccess(userId, Number(id));
 
     if (!project.keyword && !project.name) {
       return NextResponse.json(
@@ -65,16 +63,6 @@ export async function POST(
     );
   } catch (error) {
     console.error("[research:generate] Error:", error);
-
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    const message = error instanceof Error ? error.message : "Failed to generate research";
-
-    return NextResponse.json(
-      { error: message, retryable: message.includes("Brave Search") },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

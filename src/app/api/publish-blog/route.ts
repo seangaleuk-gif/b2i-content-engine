@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
-import { getCurrentUserId } from "@/lib/services/auth";
+import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse } from "@/lib/services/errors";
 import { projectRepository, activityRepository, blogVersionRepository } from "@/lib/repositories";
 import { syncLinksFromContent } from "@/lib/services/link-sync";
 import { publishBilingual } from "@/lib/services/wordpress";
 
 export async function POST(request: Request) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const body = await request.json();
 
     const { projectId, status } = body;
@@ -16,10 +17,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "projectId is required" }, { status: 400 });
     }
 
-    const project = await projectRepository.findByIdAndUser(Number(projectId), userId);
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
-    }
+    await requireProjectAccess(userId, Number(projectId));
 
     const versions = await blogVersionRepository.findByProject(Number(projectId));
 
@@ -32,38 +30,32 @@ export async function POST(request: Request) {
 
     console.log(`[publish-blog] Publishing to WordPress (${publishStatus}): EN slug=${enVersion.slug}${zhVersion ? `, ZH slug=${zhVersion.slug}` : ""}`);
 
-    let wpResult;
-    try {
-      wpResult = await publishBilingual(
-        enVersion.title || project.name,
-        enVersion.blog,
-        enVersion.slug,
-        (enVersion as any).categories || ["Creator Economy", "Resources"],
-        (enVersion as any).tags || [],
-        enVersion.title || project.name,
-        (enVersion as any).metaDescription || "",
-        (project as any).keyword || "",
-        zhVersion?.title || "",
-        zhVersion?.blog || "",
-        zhVersion?.slug || "",
-        (zhVersion as any)?.categories || ["Creator Economy", "Resources"],
-        (zhVersion as any)?.tags || [],
-        zhVersion?.title || project.name,
-        (zhVersion as any)?.metaDescription || "",
-        (project as any).keyword || "",
-        publishStatus
-      );
-      console.log(`[publish-blog] EN: ${wpResult.en.url}, ZH: ${wpResult.zh.url || "skipped"}`);
-    } catch (wpErr) {
-      console.error("[publish-blog] WordPress publish failed:", wpErr);
-      return NextResponse.json(
-        { error: "WordPress publish failed", detail: wpErr instanceof Error ? wpErr.message : String(wpErr) },
-        { status: 502 }
-      );
-    }
+    const wpResult = await publishBilingual(
+      enVersion.title || projectId,
+      enVersion.blog,
+      enVersion.slug,
+      (enVersion as any).categories || ["Creator Economy", "Resources"],
+      (enVersion as any).tags || [],
+      enVersion.title || projectId,
+      (enVersion as any).metaDescription || "",
+      "",
+      zhVersion?.title || "",
+      zhVersion?.blog || "",
+      zhVersion?.slug || "",
+      (zhVersion as any)?.categories || ["Creator Economy", "Resources"],
+      (zhVersion as any)?.tags || [],
+      zhVersion?.title || projectId,
+      (zhVersion as any)?.metaDescription || "",
+      "",
+      publishStatus
+    );
+    console.log(`[publish-blog] EN: ${wpResult.en.url}, ZH: ${wpResult.zh.url || "skipped"}`);
 
     if (publishStatus === "publish") {
-      await projectRepository.update(Number(projectId), { status: "published" } as any);
+      const project = await projectRepository.findById(Number(projectId));
+      if (project) {
+        await projectRepository.update(Number(projectId), { status: "published" } as any);
+      }
     }
 
     let linksSynced = 0;
@@ -76,7 +68,7 @@ export async function POST(request: Request) {
       userId,
       projectId: Number(projectId),
       action,
-      description: `${project.name} (EN: ${wpResult.en.url})${wpResult.zh.id ? ` + ZH` : ""}`,
+      description: `EN: ${wpResult.en.url}${wpResult.zh.id ? ` + ZH` : ""}`,
       type: "published",
     });
 
@@ -92,12 +84,6 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error("[publish-blog:POST]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to publish blog", detail: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

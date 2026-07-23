@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
+import { toErrorResponse } from "@/lib/services/errors";
 import { profileRepository } from "@/lib/repositories";
 
 export async function GET() {
@@ -10,12 +11,6 @@ export async function GET() {
     return NextResponse.json({ ...profile });
   } catch (error) {
     console.error("[profile] Error:", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to fetch profile", detail: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

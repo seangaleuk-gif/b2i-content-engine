@@ -1,5 +1,7 @@
 import { headers, cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
+import { projectRepository } from "@/lib/repositories";
+import type { Project } from "@/db/schema";
 import { AppError } from "./errors";
 
 async function getUserIdFromCookie(): Promise<string | null> {
@@ -42,7 +44,7 @@ async function getUserIdFromBearer(headersList: Headers): Promise<string | null>
   return data.user.id;
 }
 
-export async function getCurrentUserId(): Promise<string> {
+export async function resolveAuthenticatedUserId(): Promise<string> {
   const headersList = await headers();
 
   const bearerId = await getUserIdFromBearer(headersList);
@@ -52,4 +54,15 @@ export async function getCurrentUserId(): Promise<string> {
   if (cookieId) return cookieId;
 
   throw AppError.unauthorized();
+}
+
+export async function requireProjectAccess(
+  userId: string,
+  projectId: number,
+): Promise<Project> {
+  const project = await projectRepository.findByIdAndUser(projectId, userId);
+  if (!project) {
+    throw AppError.forbidden();
+  }
+  return project;
 }

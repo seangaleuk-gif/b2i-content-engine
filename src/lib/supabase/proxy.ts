@@ -46,12 +46,7 @@ export async function updateSession(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  const requestHeaders = new Headers(request.headers);
-  if (user) {
-    requestHeaders.set("x-user-id", user.id);
-  }
-
   return NextResponse.next({
-    request: { headers: requestHeaders },
+    request: { headers: request.headers },
   });
 }

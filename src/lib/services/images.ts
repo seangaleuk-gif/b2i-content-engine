@@ -1,7 +1,9 @@
+import { AppError } from "./errors";
+
 export async function generateImage(prompt: string, width: number = 1200, height: number = 630): Promise<string> {
   const apiKey = process.env.HF_TOKEN;
   if (!apiKey) {
-    throw new Error("HF_TOKEN environment variable is not configured");
+    throw AppError.internal("Image generation service is not configured");
   }
 
   const model = width <= 512 ? "black-forest-labs/FLUX.1-schnell" : "black-forest-labs/FLUX.1-dev";
@@ -31,9 +33,12 @@ export async function generateImage(prompt: string, width: number = 1200, height
     const error = await response.text();
     console.error("Hugging Face error:", error.substring(0, 300));
     if (response.status === 503) {
-      throw new Error("Model is loading. Please retry in 20-30 seconds.");
+      throw AppError.internal("Image generation service temporarily unavailable", new Error("Model is loading"));
     }
-    throw new Error(`Image generation failed: ${response.status}`);
+    throw AppError.internal(
+      "Image generation failed",
+      new Error(`Hugging Face API returned ${response.status}: ${error.substring(0, 200)}`)
+    );
   }
 
   const buffer = Buffer.from(await response.arrayBuffer());

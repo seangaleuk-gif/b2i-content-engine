@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { getCurrentUserId } from "@/lib/services/auth";
-import { projectRepository } from "@/lib/repositories";
+import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse } from "@/lib/services/errors";
 import { generateImage, saveImage, getImageDimensions } from "@/lib/services/images";
 
 export async function POST(
@@ -8,12 +8,9 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
-    const project = await projectRepository.findByIdAndUser(Number(id), userId);
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
-    }
+    const project = await requireProjectAccess(userId, Number(id));
 
     const body = await request.json();
     const type = body.type || "featured";
@@ -26,18 +23,11 @@ export async function POST(
 
     const url = await generateImage(prompt, dims.width, dims.height);
 
-    // Pollinations generates asynchronously — the URL returns immediately but may take seconds to render
     const saved = await saveImage(Number(id), type, prompt, url, dims.width, dims.height);
 
     return NextResponse.json(saved, { status: 201 });
   } catch (error) {
     console.error("[images:generate]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to generate image", detail: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

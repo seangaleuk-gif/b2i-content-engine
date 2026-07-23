@@ -262,6 +262,59 @@ export async function chatWithRetry(
   throw lastError ?? new DeepSeekError("api_failure", "DeepSeek request failed after all retries");
 }
 
-export function createDeepSeekClient() {
+function createDeepSeekClient() {
   return { chat, chatWithRetry };
+}
+
+// ── Unified AI Service ──
+// Single entry point for all AI model interactions.
+// Owns retries, metrics, tracing, and timeout handling.
+// No other module may call chat/chatWithRetry directly — use AiService.
+
+export interface AiCallTracer {
+  recordAiCall(record: { stage: string; durationMs: number; promptChars: number; completionChars: number; completed: boolean; jsonRepaired: boolean }): void;
+  startTimer(label: string): void;
+  endTimer(label: string): void;
+  recordMetric(key: string, value: number): void;
+}
+
+export class AiService {
+  private chatFn: typeof chat;
+  private chatWithRetryFn: typeof chatWithRetry;
+
+  constructor(
+    private tracer?: AiCallTracer,
+  ) {
+    const client = createDeepSeekClient();
+    this.chatFn = client.chat;
+    this.chatWithRetryFn = client.chatWithRetry;
+  }
+
+  /** Single entry point for all AI calls. Wraps chatWithRetry with metrics/tracing. */
+  async call(stage: string, messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult> {
+    const promptChars = messages.reduce((s, m) => s + m.content.length, 0);
+    try {
+      const result = await this.chatWithRetryFn(messages, options);
+      this.tracer?.recordAiCall({ stage, durationMs: 0, promptChars, completionChars: result.content.length, completed: true, jsonRepaired: false });
+      return result;
+    } catch (e) {
+      this.tracer?.recordAiCall({ stage, durationMs: 0, promptChars, completionChars: 0, completed: false, jsonRepaired: false });
+      throw e;
+    }
+  }
+
+  /** Returns a stage-fixed call function for use in GenContext-style signatures. */
+  makeCallerForStage(stage: string): (messages: ChatMessage[], options?: ChatOptions) => Promise<ChatResult> {
+    return (messages: ChatMessage[], options?: ChatOptions) => this.call(stage, messages, options);
+  }
+
+  /** Raw chat (no retry). Used by playground and SEO normalizer. */
+  get chat(): typeof chat {
+    return this.chatFn;
+  }
+
+  /** Retry-wrapped chat. Used by services that need retry. */
+  get chatWithRetry(): typeof chatWithRetry {
+    return this.chatWithRetryFn;
+  }
 }

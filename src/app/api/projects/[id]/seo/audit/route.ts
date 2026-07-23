@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getCurrentUserId } from "@/lib/services/auth";
+import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse } from "@/lib/services/errors";
 import { projectRepository, seoRepository, blogVersionRepository } from "@/lib/repositories";
 import { runAudit } from "@/lib/services/seo-auditor";
 
@@ -8,23 +9,17 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
-    const project = await projectRepository.findByIdAndUser(Number(id), userId);
-
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
-    }
+    const project = await requireProjectAccess(userId, Number(id));
 
     const body = await request.json();
     const auditRunId = body._auditRunId || "unknown";
     console.log(`[SEO-AUDIT:${auditRunId}:api-input] keywordLen=${(body.keyword || "").length} blogLen=${(body.blog || "").length}`);
     const latestVersion = await blogVersionRepository.findLatest(Number(id));
 
-    // Build immutable audit snapshot from latest saved version only
     const title = (latestVersion as any)?.title || body.title || project.name || "";
     const metaDescription = (latestVersion as any)?.meta_description || body.metaDescription || "";
-    // Explicit keyword resolution — priority: client body, then project DB
     const clientKeyword = typeof body.keyword === "string" ? body.keyword.trim() : "";
     const projectKeyword = typeof project.keyword === "string" ? project.keyword.trim() : "";
     const keyword = clientKeyword || projectKeyword;
@@ -55,11 +50,9 @@ export async function POST(
       targetKeyphraseCount,
     });
 
-    // Delete old checks
     await seoRepository.deleteByProject(Number(id));
     console.log(`[seo:audit] Deleted old checks for project ${id}`);
 
-    // Insert new checks
     const inserted = await seoRepository.createMany(
       result.checks.map((c) => ({
         projectId: Number(id),
@@ -79,13 +72,7 @@ export async function POST(
     return NextResponse.json({ ...result, _auditRunId: auditRunId, _engineVersion: "keyphrase-fix-1" }, { status: 201 });
   } catch (error) {
     console.error("[seo:audit]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to run SEO audit", detail: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -94,25 +81,15 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
-    const project = await projectRepository.findByIdAndUser(Number(id), userId);
-
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
-    }
+    await requireProjectAccess(userId, Number(id));
 
     await seoRepository.deleteByProject(Number(id));
     console.log(`[seo:audit] Deleted all checks for project ${id}`);
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("[seo:audit:DELETE]", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to delete SEO checks" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

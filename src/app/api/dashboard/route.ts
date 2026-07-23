@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
+import { toErrorResponse } from "@/lib/services/errors";
 import { projectRepository } from "@/lib/repositories";
 import { activityRepository } from "@/lib/repositories";
 import { profileRepository } from "@/lib/repositories";
@@ -37,12 +38,6 @@ export async function GET() {
     });
   } catch (error) {
     console.error("[dashboard] Error:", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to fetch dashboard data", detail: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getCurrentUserId } from "@/lib/services/auth";
+import { resolveAuthenticatedUserId, requireProjectAccess } from "@/lib/services/project-authorization";
+import { toErrorResponse } from "@/lib/services/errors";
 import { projectRepository } from "@/lib/repositories";
 import { activityRepository } from "@/lib/repositories";
 
@@ -8,23 +9,12 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
-    const project = await projectRepository.findByIdAndUser(Number(id), userId);
-
-    if (!project) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
-
+    const project = await requireProjectAccess(userId, Number(id));
     return NextResponse.json(project);
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to fetch project" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -33,14 +23,11 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
     const body = await request.json();
 
-    const existing = await projectRepository.findByIdAndUser(Number(id), userId);
-    if (!existing) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
+    const existing = await requireProjectAccess(userId, Number(id));
 
     const project = await projectRepository.update(Number(id), body);
 
@@ -66,13 +53,7 @@ export async function PATCH(
 
     return NextResponse.json(project);
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to update project" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -81,24 +62,15 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const userId = await getCurrentUserId();
+    const userId = await resolveAuthenticatedUserId();
     const { id } = await params;
-    const existing = await projectRepository.findByIdAndUser(Number(id), userId);
 
-    if (!existing) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
+    await requireProjectAccess(userId, Number(id));
 
     await projectRepository.delete(Number(id));
 
     return NextResponse.json({ success: true });
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to delete project" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

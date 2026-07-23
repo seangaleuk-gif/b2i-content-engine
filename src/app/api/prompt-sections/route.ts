@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
+import { toErrorResponse } from "@/lib/services/errors";
 import { promptSectionRepository } from "@/lib/repositories";
 
 export async function GET() {
@@ -8,13 +9,7 @@ export async function GET() {
     const sections = await promptSectionRepository.findByUser(userId);
     return NextResponse.json(sections);
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to fetch prompt sections" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -43,12 +38,6 @@ export async function POST(request: Request) {
     return NextResponse.json(section);
   } catch (error) {
     console.error("[prompt-sections:POST] Error:", error);
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to upsert prompt section" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

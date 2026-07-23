@@ -10,8 +10,10 @@ import {
   calculateKeyphraseDensity,
   containsExactPhrase,
   normalizeHtmlWhitespace,
+  getFirstNReadableWords,
 } from "@/lib/seo/seo-text-utils";
 import { keyphraseRangeForWordCount, keyphrasePreferredTarget } from "@/lib/services/generation-constants";
+import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 
 // ── Types ──
 
@@ -24,12 +26,7 @@ export interface FinalSeoNormalizerInput {
   maxReadingEase: number;
 }
 
-export interface SeoNormalizationMetrics {
-  readableWordCount: number;
-  exactKeyphraseCount: number;
-  keyphraseDensity: number;
-  exactKeyphraseInH2: boolean;
-  longParagraphCount: number;
+export interface SeoNormalizationMetrics extends FinalArticleMetrics {
   readingEase: number;
 }
 
@@ -351,18 +348,18 @@ function replaceStatisticsWithQualitative(text: string): string {
 
 // ── Metrics computation ──
 
-function computeMetrics(html: string, keyphrase: string): SeoNormalizationMetrics {
-  const readableText = extractReadableText(html);
-  const h2Texts = extractH2Texts(html);
-  const paraTexts = extractParagraphTexts(html);
-  const kpLower = keyphrase.toLowerCase().trim();
+// ── Metrics computation ──
 
+// ── Metrics computation ──
+// Delegates to the canonical analyzeFinalArticle() from final-article-policy.ts.
+// Adds keyphraseDensity and readingEase which are normalizer-specific.
+
+function computeMetrics(html: string, keyphrase: string): SeoNormalizationMetrics {
+  const base = analyzeFinalArticle(html, keyphrase);
+  const readableText = extractReadableText(html);
   return {
-    readableWordCount: countReadableWords(html),
-    exactKeyphraseCount: countExactPhrase(readableText, keyphrase),
+    ...base,
     keyphraseDensity: calculateKeyphraseDensity(readableText, keyphrase),
-    exactKeyphraseInH2: h2Texts.some((h) => h.toLowerCase().includes(kpLower)),
-    longParagraphCount: paraTexts.filter((t) => countSentences(t) > 3).length,
     readingEase: Math.round(calculateFleschReadingEase(readableText)),
   };
 }
@@ -894,6 +891,67 @@ function fixParagraphLength(html: string, changes: SeoNormalizationChange[]): st
   return resultHtml;
 }
 
+// ── Fix 5b: Ensure keyphrase in first 100 visible words ──
+
+function fixKeyphraseInFirst100Words(
+  html: string,
+  keyphrase: string,
+  changes: SeoNormalizationChange[],
+): string {
+  const kpLower = keyphrase.toLowerCase().trim();
+  const first100 = getFirstNReadableWords(html, 100).toLowerCase();
+  if (first100.includes(kpLower)) return html; // already present
+
+  // Find the first editable paragraph
+  const paraBlocks = extractParagraphBlocks(html);
+  if (paraBlocks.length === 0) return html;
+
+  // Insert keyphrase naturally into the first paragraph
+  const firstBlock = paraBlocks[0];
+  const paraText = extractReadableText(firstBlock.html);
+  const sentences = paraText.split(/(?<=[.!?])\s+/);
+
+  // Append keyphrase as a natural sentence after the first sentence
+  let modified: string;
+  if (sentences.length >= 1) {
+    const insertion = ` ${keyphrase.charAt(0).toUpperCase() + keyphrase.slice(1)} is a key focus area.`;
+    const firstSentenceEnd = firstBlock.html.indexOf(sentences[0]) + sentences[0].length;
+    modified =
+      firstBlock.html.substring(0, firstSentenceEnd) +
+      insertion +
+      firstBlock.html.substring(firstSentenceEnd);
+  } else {
+    // Wrap the entire block with an introductory lead-in
+    modified =
+      `<!-- wp:paragraph -->\n<p>When it comes to ${keyphrase}, understanding the fundamentals is essential. ${firstBlock.html.replace(/^<!--\s*wp:paragraph\s*-->\s*\n?/i, "").replace(/\n?\s*<!--\s*\/wp:paragraph\s*-->\s*$/i, "")}\n<!-- /wp:paragraph -->`;
+  }
+
+  if (modified !== firstBlock.html) {
+    changes.push({
+      type: "keyphrase_inserted",
+      description: `Inserted keyphrase into first 100 words`,
+    });
+    console.log(`[SEO-NORMALIZER] inserted keyphrase into first 100 words`);
+
+    // Replace the first paragraph block in the HTML
+    return html.replace(firstBlock.html, () => modified);
+  }
+
+  return html;
+}
+
+/** Extract paragraph blocks with their HTML content */
+function extractParagraphBlocks(html: string): Array<{ html: string }> {
+  const blocks: Array<{ html: string }> = [];
+  const re = /<!--\s*wp:paragraph\s*-->\s*\n?([\s\S]*?)\s*\n?<!--\s*\/wp:paragraph\s*-->/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(html)) !== null) {
+    const fullBlock = match[0];
+    blocks.push({ html: fullBlock });
+  }
+  return blocks;
+}
+
 // ── Fix 6: Readability improvement ──
 
 async function fixReadability(
@@ -1102,6 +1160,9 @@ export async function normalizeFinalSeo(
     currentHtml = await fixReadability(currentHtml, focusKeyphrase, minReadingEase, maxReadingEase, chat, changes);
   }
 
+  // Step 9b: Ensure keyphrase in first 100 visible words
+  currentHtml = fixKeyphraseInFirst100Words(currentHtml, focusKeyphrase, changes);
+
   // Step 10: Detokenize — restore protected blocks byte-for-byte
   currentHtml = detokenizeProtectedBlocks(currentHtml, tokens);
   console.log(`[SEO-NORMALIZER] protected blocks restored, tokens=${tokens.length}`);
@@ -1122,12 +1183,22 @@ export async function normalizeFinalSeo(
   // Protected blocks are guaranteed unchanged by tokenization/detokenization
   const blocksUnchanged = true;
 
-  // Determine pass/fail using the acceptable range, not an exact target
-  const kpCountOk = after.exactKeyphraseCount >= kpRange.min && after.exactKeyphraseCount <= kpRange.max;
-  const wcOk = after.readableWordCount >= targetWordCount;
+  // Determine pass/fail using the canonical policy evaluator
+  const policy = buildPolicy(targetWordCount, targetWordCount, undefined);
+  // Override with the actual kpRange computed from word count
+  policy.keyphraseCountMin = kpRange.min;
+  policy.keyphraseCountMax = kpRange.max;
+  const policyResult = evaluatePolicy(after, policy);
+
+  const kpCountOk = policyResult.passed || (
+    after.exactKeyphraseCount >= kpRange.min && after.exactKeyphraseCount <= kpRange.max
+  );
+  const wcOk = policyResult.passed || (after.readableWordCount >= targetWordCount);
   const h2Ok = after.exactKeyphraseInH2;
   const parasOk = after.longParagraphCount === 0;
   const readabilityInRange = after.readingEase >= minReadingEase && after.readingEase <= maxReadingEase;
+  const kpInFirst100Ok = after.keyphraseInFirst100Words;
+  const internalLinksOk = after.uniqueInternalLinkCount >= policy.internalLinkMin && after.uniqueInternalLinkCount <= policy.internalLinkMax;
 
   if (!kpCountOk) warnings.push(`Keyphrase count ${after.exactKeyphraseCount} outside range ${kpRange.min}-${kpRange.max}`);
   if (!wcOk) warnings.push(`Word count ${after.readableWordCount} < target ${targetWordCount}`);
@@ -1140,12 +1211,14 @@ export async function normalizeFinalSeo(
       warnings.push(`Reading ease ${after.readingEase} is outside range ${minReadingEase}-${maxReadingEase}`);
     }
   }
+  if (!kpInFirst100Ok) warnings.push("Exact keyphrase not found in first 100 visible words");
+  if (!internalLinksOk) warnings.push(`Unique internal link destinations ${after.uniqueInternalLinkCount} not in range ${policy.internalLinkMin}-${policy.internalLinkMax}`);
 
   // Structural check
   const { valid: structValid, issues: structIssues, faqPresent, switcherPresent, ctaPresent } = verifyStructuralIntegrity(currentHtml);
   warnings.push(...structIssues);
 
-  const passed = kpCountOk && wcOk && h2Ok && parasOk && blocksUnchanged && linksUnchanged && structValid;
+  const passed = kpCountOk && wcOk && h2Ok && parasOk && blocksUnchanged && linksUnchanged && structValid && kpInFirst100Ok && internalLinksOk;
   console.log(`[SEO-NORMALIZER] passed=${passed}`);
 
   const safety: SeoNormalizationSafety = {

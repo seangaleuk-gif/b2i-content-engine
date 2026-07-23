@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
+import { toErrorResponse } from "@/lib/services/errors";
 import { promptRepository } from "@/lib/repositories";
 
 export async function GET(
@@ -17,13 +18,7 @@ export async function GET(
 
     return NextResponse.json(item);
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to fetch prompt" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -44,13 +39,7 @@ export async function PATCH(
     const item = await promptRepository.update(Number(id), body);
     return NextResponse.json(item);
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to update prompt" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }
 
@@ -70,12 +59,6 @@ export async function DELETE(
     await promptRepository.delete(Number(id));
     return NextResponse.json({ success: true });
   } catch (error) {
-    if (error instanceof Error && error.message === "Not authenticated") {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.json(
-      { error: "Failed to delete prompt" },
-      { status: 500 }
-    );
+    return toErrorResponse(error);
   }
 }

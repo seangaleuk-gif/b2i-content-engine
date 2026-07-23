@@ -565,3 +565,187 @@ export function detectClaimConflicts(
 
   return conflicts;
 }
+
+// ── HTML parser: reconstruct ArticleDocument from rendered HTML ──
+
+export interface ParseResult {
+  doc: ArticleDocument | null;
+  errors: string[];
+}
+
+/**
+ * Parse rendered HTML back into an ArticleDocument. Fully reconstructs
+ * every mutable part from the HTML — headings, section bodies, conclusion,
+ * protected blocks, and introduction. No old mutable content is preserved.
+ * Returns null if the HTML cannot be parsed without losing required structure.
+ */
+export function parseArticleDocumentFromHtml(
+  html: string,
+  existingDoc: ArticleDocument,
+): ParseResult {
+  const errors: string[] = [];
+
+  // Extract language switcher (first wp:html with b2i-language-switcher)
+  const switcherMatch = html.match(/<!--\s*wp:html\s*-->[\s\S]*?b2i-language-switcher[\s\S]*?<!--\s*\/wp:html\s*-->/i);
+  const languageSwitcher: ProtectedArticleBlock | null = switcherMatch ? {
+    id: "language-switcher",
+    type: "language-switcher",
+    html: switcherMatch[0],
+    fingerprint: fingerprintHtml(switcherMatch[0]),
+  } : null;
+
+  // Extract CTA block (wp:html containing app.b2ihub.com/signup)
+  // Search from after the switcher to avoid matching the switcher's wp:html block.
+  const ctaSearchStart = languageSwitcher
+    ? html.indexOf(switcherMatch![0]) + switcherMatch![0].length
+    : 0;
+  const ctaMatch = html.substring(ctaSearchStart).match(/<!--\s*wp:html\s*-->[\s\S]*?app\.b2ihub\.com\/signup[\s\S]*?<!--\s*\/wp:html\s*-->/i);
+  const cta: ProtectedArticleBlock | null = ctaMatch ? {
+    id: "cta",
+    type: "cta",
+    html: ctaMatch[0],
+    fingerprint: fingerprintHtml(ctaMatch[0]),
+  } : null;
+
+  // Extract FAQ schema block (wp:html containing FAQPage JSON-LD)
+  // Search from after the CTA to avoid matching the CTA's wp:html block.
+  const faqSearchStart = ctaMatch
+    ? ctaSearchStart + ctaMatch.index! + ctaMatch[0].length
+    : ctaSearchStart;
+  const faqSchemaMatch = html.substring(faqSearchStart).match(/<!--\s*wp:html\s*-->[\s\S]*?FAQPage[\s\S]*?<!--\s*\/wp:html\s*-->/i);
+  const faqSchema: ProtectedArticleBlock | null = faqSchemaMatch ? {
+    id: "faq-schema",
+    type: "faq-schema",
+    html: faqSchemaMatch[0],
+    fingerprint: fingerprintHtml(faqSchemaMatch[0]),
+  } : null;
+
+  // Split HTML by H2 heading blocks
+  const headingBlockRe = /<!--\s*wp:heading\s*\{([^}]*"level"\s*:\s*2[^}]*)\}\s*-->\s*\n?<h2[^>]*>([\s\S]*?)<\/h2>\s*\n?<!--\s*\/wp:heading\s*-->/gi;
+  const headingMatches: Array<{ index: number; endIndex: number; heading: string }> = [];
+  let hm: RegExpExecArray | null;
+  while ((hm = headingBlockRe.exec(html)) !== null) {
+    headingMatches.push({ index: hm.index, endIndex: hm.index + hm[0].length, heading: hm[2].replace(/<[^>]+>/g, "").trim() });
+  }
+
+  if (headingMatches.length === 0) {
+    errors.push("No H2 heading blocks found in HTML");
+    return { doc: null, errors };
+  }
+
+  // Find CTA and FAQ schema positions for section boundary calculation
+  const ctaStartIdx = ctaMatch ? html.indexOf(ctaMatch[0]) : -1;
+  const faqSchemaStartIdx = faqSchemaMatch ? html.indexOf(faqSchemaMatch[0]) : -1;
+
+  // Extract introduction: everything from after language switcher to first heading
+  const introStart = languageSwitcher
+    ? html.indexOf(switcherMatch![0]) + switcherMatch![0].length
+    : 0;
+  const introEnd = headingMatches[0].index;
+  const introductionHtml = html.substring(introStart, introEnd).trim();
+  if (introductionHtml.length === 0) {
+    errors.push("Introduction section is empty");
+    return { doc: null, errors };
+  }
+
+  // Extract section bodies from between heading blocks
+  const newSections: ArticleSection[] = [];
+  const rawBodyEnds: number[] = []; // track raw body end positions in HTML
+  for (let i = 0; i < headingMatches.length; i++) {
+    const sectionStart = headingMatches[i].endIndex;
+    let sectionEnd = html.length;
+    if (i + 1 < headingMatches.length) {
+      sectionEnd = headingMatches[i + 1].index;
+    }
+    // Stop before CTA
+    if (ctaStartIdx > sectionStart && ctaStartIdx < sectionEnd) {
+      sectionEnd = ctaStartIdx;
+    }
+    // Stop before FAQ schema
+    if (faqSchemaStartIdx > sectionStart && faqSchemaStartIdx < sectionEnd) {
+      sectionEnd = faqSchemaStartIdx;
+    }
+
+    const bodyHtml = html.substring(sectionStart, sectionEnd).trim();
+    if (bodyHtml.length === 0) {
+      errors.push(`Section ${i} has empty body`);
+      return { doc: null, errors };
+    }
+    rawBodyEnds.push(sectionEnd);
+
+    // Use heading from HTML, section type from existing if available
+    const existing = existingDoc.sections[i];
+    newSections.push({
+      id: existing?.id ?? `section-${i}`,
+      heading: headingMatches[i].heading, // from HTML, not old doc
+      headingLevel: 2,
+      sectionType: existing?.sectionType ?? "main",
+      html: bodyHtml,
+      wordCount: 0,
+      status: existing?.status ?? "generated",
+    });
+  }
+
+  // Extract conclusion: the last WordPress block(s) after the CTA and FAQ schema.
+  // Find the conclusion by taking everything after both protected blocks (or after
+  // the last section body if no protected blocks are present) and before end of HTML.
+  let lastKnownBoundary = rawBodyEnds.length > 0 ? rawBodyEnds[rawBodyEnds.length - 1] : headingMatches[headingMatches.length - 1].endIndex;
+  // Skip past CTA block if present
+  if (ctaMatch) {
+    const ctaPos = html.indexOf(ctaMatch[0]);
+    if (ctaPos >= lastKnownBoundary - 10) {
+      lastKnownBoundary = Math.max(lastKnownBoundary, ctaPos + ctaMatch[0].length);
+    }
+  }
+  // Skip past FAQ schema block if present
+  if (faqSchemaMatch) {
+    const faqPos = html.indexOf(faqSchemaMatch[0]);
+    if (faqPos >= lastKnownBoundary - 10) {
+      lastKnownBoundary = Math.max(lastKnownBoundary, faqPos + faqSchemaMatch[0].length);
+    }
+  }
+  // If conclusion boundary equals the last body end and there's no protected block,
+  // the last section body included the conclusion. Split at the last WordPress block.
+  let conclusionHtml = html.substring(lastKnownBoundary).trim();
+  if (conclusionHtml.length === 0 && newSections.length > 0 && !ctaMatch && !faqSchemaMatch) {
+    const lastBody = newSections[newSections.length - 1].html;
+    // Find the last WordPress block opener that is NOT a heading
+    const blockRe = /(<!--\s*wp:\w+(?:\s[^>]*)?\s*-->)/gi;
+    const separators: number[] = [];
+    let bm: RegExpExecArray | null;
+    while ((bm = blockRe.exec(lastBody)) !== null) {
+      if (!/wp:heading/i.test(bm[1])) {
+        separators.push(bm.index);
+      }
+    }
+    if (separators.length >= 2) {
+      const splitAt = separators[separators.length - 1];
+      newSections[newSections.length - 1].html = lastBody.substring(0, splitAt).trim();
+      conclusionHtml = lastBody.substring(splitAt).trim();
+    }
+  }
+
+  if (conclusionHtml.length === 0) {
+    errors.push("Conclusion section is empty");
+    return { doc: null, errors };
+  }
+
+  const doc: ArticleDocument = {
+    metadata: { ...existingDoc.metadata },
+    languageSwitcher,
+    introduction: {
+      ...existingDoc.introduction,
+      html: introductionHtml,
+      wordCount: 0,
+    },
+    sections: newSections,
+    visibleFaq: existingDoc.visibleFaq,
+    conclusion: { ...existingDoc.conclusion, html: conclusionHtml },
+    cta,
+    faqSchema,
+    insertedLinks: existingDoc.insertedLinks,
+  };
+
+  return { doc, errors: [] };
+}
+
