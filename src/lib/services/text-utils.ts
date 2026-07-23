@@ -134,6 +134,9 @@ function extractMalformedJsonStringProperty(raw: string, allowedProps: string[])
     let openQuote = raw.indexOf('"', colonIdx + 1);
     if (openQuote < 0) continue;
 
+    // Forward scan, tag-aware. Only stop at `}` (single-property object boundary).
+    // Quoted text inside prose (like "Learn More", "Shop Now") is skipped
+    // because the next char after the quote is neither `}` nor a known property delimiter.
     let i = openQuote + 1;
     let inTag = false;
     while (i < raw.length) {
@@ -144,13 +147,24 @@ function extractMalformedJsonStringProperty(raw: string, allowedProps: string[])
       if (ch === '"' && !inTag) {
         let next = i + 1;
         while (next < raw.length && /\s/.test(raw[next])) next++;
-        const closesObject = raw[next] === '}';
-        const startsNextProperty =
-          raw[next] === ',' &&
-          /^,\s*"(?:[^"\\]|\\.)+"\s*:/.test(raw.substring(next));
-        if (closesObject || startsNextProperty) {
+        // Only stop at the closing `}` — single-property objects end with "}
+        if (next < raw.length && raw[next] === '}') {
           const value = raw.substring(openQuote + 1, i);
           const decoded = value.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+
+          // ── Validate recovered content ──
+          if (decoded.trim().length === 0) return null;
+
+          // WordPress block balance
+          const wpOpen = (decoded.match(/<!--\s*wp:\w+/gi) ?? []).length;
+          const wpClose = (decoded.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
+          if (wpOpen !== wpClose) return null;
+
+          // Paragraph tag balance
+          const pOpen = (decoded.match(/<p\b[^>]*>/gi) ?? []).length;
+          const pClose = (decoded.match(/<\/p>/gi) ?? []).length;
+          if (pOpen !== pClose) return null;
+
           return { [prop]: decoded };
         }
       }

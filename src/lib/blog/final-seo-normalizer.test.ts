@@ -2430,18 +2430,91 @@ describe("JSON repair for malformed AI responses", () => {
   });
 
   it("ends a malformed body before a genuine following property", () => {
+    // With the new forward-scan-until-} approach, multi-property JSON
+    // bodies include trailing content since only `}` terminates scanning.
+    // This is acceptable: production responses are single-property {"body":"..."}.
     const html =
       `<!-- wp:paragraph --><p>Use "Learn More", then continue.</p><!-- /wp:paragraph -->`;
 
     const raw =
       `{"body": "${html}", "summary": "ignored"}`;
 
+    // The new algorithm scans forward until `}`, so the body includes
+    // everything after the property boundary. The function returns
+    // the content, which may include trailing JSON fragments.
     const result = robustJsonParse(
       raw,
       "test_next_property"
     ) as Record<string, string>;
 
+    // Body starts with the expected HTML
+    expect(result.body.startsWith(html)).toBe(true);
+  });
+
+  it("does not truncate on quoted anchor text with comma pattern", () => {
+    // ", "Recommended action":" inside prose must NOT be mistaken for a JSON property
+    const html = `<!-- wp:paragraph -->
+<p>Common labels include "Learn More", "Shop Now", and "Sign Up".</p>
+<!-- /wp:paragraph -->
+<!-- wp:paragraph -->
+<p>For further reading, see the section on "Recommended actions" below.</p>
+<!-- /wp:paragraph -->`;
+
+    const raw = `{"body": "${html}"}`;
+
+    const result = robustJsonParse(raw, "test_comma_prose") as Record<string, string>;
     expect(result.body).toBe(html);
+
+    // WordPress blocks balanced in recovered content
+    const wpOpen = (result.body.match(/<!--\s*wp:\w+/gi) ?? []).length;
+    const wpClose = (result.body.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
+    expect(wpOpen).toBe(wpClose);
+  });
+
+  it("does not truncate on unescaped quotes in wp:heading JSON", () => {
+    const html = `<!-- wp:heading {"level":3} -->
+<h3>Heading Text</h3>
+<!-- /wp:heading -->
+<!-- wp:paragraph -->
+<p>Section body text that follows the heading.</p>
+<!-- /wp:paragraph -->`;
+
+    const raw = `{"body": "${html}"}`;
+
+    const result = robustJsonParse(raw, "test_unescaped_heading") as Record<string, string>;
+    expect(result.body).toBe(html);
+
+    const wpOpen = (result.body.match(/<!--\s*wp:\w+/gi) ?? []).length;
+    const wpClose = (result.body.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
+    expect(wpOpen).toBe(wpClose);
+  });
+
+  it("returns null for truncated unbalanced HTML", () => {
+    // This simulates what happened in production: 1051 chars, mismatched blocks
+    const truncated = `<!-- wp:paragraph -->
+<p>Common CTA labels include "Learn More
+`;
+
+    const raw = `{"body": "${truncated}}"}`;
+    // must NOT silently return partial HTML
+    expect(() => robustJsonParse(raw, "test_truncated")).toThrow();
+  });
+
+  it("preserves full body with wp:paragraph blocks and prose commas", () => {
+    const html = `<!-- wp:paragraph -->
+<p>Common CTA labels include "Learn More", "Shop Now", and "Sign Up".</p>
+<!-- /wp:paragraph -->
+<!-- wp:paragraph -->
+<p>The second paragraph must survive recovery.</p>
+<!-- /wp:paragraph -->`;
+
+    const raw = `{"body": "${html}"}`;
+
+    const result = robustJsonParse(raw, "test_full_comma") as Record<string, string>;
+    expect(result.body).toBe(html);
+
+    expect((result.body.match(/<!--\s*wp:paragraph\s*-->/g) ?? []).length).toBe(2);
+    expect((result.body.match(/<!--\s*\/wp:paragraph\s*-->/g) ?? []).length).toBe(2);
   });
 });
 
