@@ -81,14 +81,14 @@ Output as a JSON object with these fields:
       const match = cleaned.match(/\{[\s\S]*\}/);
       if (!match) {
         console.error("[translate] No JSON pattern match found in response");
-        throw AppError.internal("Translation failed");
+        throw AppError.internal();
       }
       console.log("[translate] JSON match length:", match[0].length);
       translated = JSON.parse(match[0]);
     } catch (parseErr) {
       console.error("[translate] Parse error:", parseErr);
       console.error("[translate] Full response:", result.content.substring(0, 2000));
-      throw AppError.internal("Translation failed", parseErr);
+      throw AppError.internal(parseErr);
     }
 
     const enSlug = latest.slug ?? "";

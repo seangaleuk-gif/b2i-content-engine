@@ -8,7 +8,7 @@ function getCredentials() {
   const appPassword = process.env.WP_APP_PASSWORD;
 
   if (!siteUrl || !username || !appPassword) {
-    throw AppError.internal("WordPress publish service is not configured");
+    throw AppError.internal();
   }
 
   const baseUrl = siteUrl.replace(/\/+$/, "");
@@ -61,10 +61,8 @@ async function getOrCreateTerm(
     return created.id;
   }
 
-  throw AppError.internal(
-    "Failed to save post metadata",
-    new Error(`Failed to create ${taxonomy}: ${name}`)
-  );
+  console.error(`[wp] Failed to create ${taxonomy}: ${name}`);
+  throw AppError.internal(new Error(`Failed to create ${taxonomy}: ${name}`));
 }
 
 export async function publishToWordPress(input: WpPostInput): Promise<{ id: number; url: string }> {
@@ -112,15 +110,11 @@ export async function publishToWordPress(input: WpPostInput): Promise<{ id: numb
     const error = await response.text();
     console.error("[wp] Publish failed:", error.substring(0, 500));
     if (response.status === 401) {
-      throw AppError.internal(
-        "WordPress publish failed",
-        new Error("WordPress authentication failed")
-      );
+      console.error("[wp] WordPress authentication failed");
+      throw AppError.internal(new Error("WordPress authentication failed"));
     }
-    throw AppError.internal(
-      "WordPress publish failed",
-      new Error(`WordPress API returned ${response.status}: ${error.substring(0, 200)}`)
-    );
+    console.error(`[wp] WordPress API returned ${response.status}: ${error.substring(0, 200)}`);
+    throw AppError.internal(new Error(`WordPress API returned ${response.status}: ${error.substring(0, 200)}`));
   }
 
   const data = await response.json();

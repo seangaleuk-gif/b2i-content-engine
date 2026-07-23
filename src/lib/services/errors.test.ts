@@ -17,7 +17,7 @@ describe("AppError", () => {
 
   it("stores optional cause", () => {
     const cause = new Error("DB down");
-    const err = new AppError(500, "INTERNAL_ERROR", "Internal error", cause);
+    const err = new AppError(500, "INTERNAL_ERROR", "Internal server error", cause);
     expect(err.cause).toBe(cause);
   });
 });
@@ -82,23 +82,26 @@ describe("AppError factory methods", () => {
     expect(err.message).toBe("API limit exceeded");
   });
 
-  it("internal() returns 500", () => {
+  it("internal() returns 500 with fixed message and optional cause", () => {
     const err = AppError.internal();
     expect(err.status).toBe(500);
     expect(err.code).toBe("INTERNAL_ERROR");
     expect(err.message).toBe("Internal server error");
+    expect(err.cause).toBeUndefined();
   });
 
-  it("internal() accepts custom message and cause", () => {
+  it("internal() stores cause", () => {
     const cause = new Error("DB timeout");
-    const err = AppError.internal("Database unavailable", cause);
-    expect(err.message).toBe("Database unavailable");
+    const err = AppError.internal(cause);
+    expect(err.status).toBe(500);
+    expect(err.code).toBe("INTERNAL_ERROR");
+    expect(err.message).toBe("Internal server error");
     expect(err.cause).toBe(cause);
   });
 });
 
 describe("toErrorResponse", () => {
-  it("maps AppError to its status, message, and code", async () => {
+  it("maps 403 correctly with custom message", async () => {
     const err = AppError.forbidden();
     const res = toErrorResponse(err);
     expect(res.status).toBe(403);
@@ -112,9 +115,10 @@ describe("toErrorResponse", () => {
     expect(res.status).toBe(401);
     const body = await res.json();
     expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.error).toBe("Unauthorized");
   });
 
-  it("maps 400 correctly", async () => {
+  it("maps 400 correctly with custom message", async () => {
     const res = toErrorResponse(AppError.badRequest("Missing field"));
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -122,10 +126,12 @@ describe("toErrorResponse", () => {
     expect(body.code).toBe("BAD_REQUEST");
   });
 
-  it("maps 500 correctly", async () => {
-    const res = toErrorResponse(AppError.internal());
+  it("maps 500 to fixed message regardless of AppError.message", async () => {
+    const err = new AppError(500, "INTERNAL_ERROR", "custom message here", new Error("cause"));
+    const res = toErrorResponse(err);
     expect(res.status).toBe(500);
     const body = await res.json();
+    expect(body.error).toBe("Internal server error");
     expect(body.code).toBe("INTERNAL_ERROR");
   });
 
@@ -154,12 +160,12 @@ describe("toErrorResponse", () => {
     expect(body.error).toBe("Internal server error");
   });
 
-  it("never exposes internal cause in response body", async () => {
+  it("never exposes internal cause in 500 response body", async () => {
     const cause = new Error("DB connection refused at 10.0.0.1:5432");
-    const err = AppError.internal("Database unavailable", cause);
+    const err = AppError.internal(cause);
     const res = toErrorResponse(err);
     const body = await res.json();
-    expect(body.error).toBe("Database unavailable");
+    expect(body.error).toBe("Internal server error");
     expect(JSON.stringify(body)).not.toContain("10.0.0.1");
     expect(JSON.stringify(body)).not.toContain("5432");
   });
@@ -182,21 +188,23 @@ describe("toErrorResponse", () => {
 });
 
 describe("service-layer errors", () => {
-  it("AppError.internal preserves message and code in response", async () => {
-    const err = AppError.internal("WordPress publish failed", new Error("401 auth"));
+  it("500 response always has fixed message regardless of AppError.message", async () => {
+    const cause = new Error("Brave Search API returned 401: Invalid API key abc123");
+    const err = new AppError(500, "INTERNAL_ERROR", "Research request failed", cause);
     const res = toErrorResponse(err);
     expect(res.status).toBe(500);
     const body = await res.json();
+    expect(body.error).toBe("Internal server error");
     expect(body.code).toBe("INTERNAL_ERROR");
-    expect(body.error).toBe("WordPress publish failed");
   });
 
-  it("provider error details never reach response body", async () => {
+  it("AppError.internal() with cause never leaks cause in response", async () => {
     const cause = new Error("Brave Search API returned 401: Invalid API key abc123");
-    const err = AppError.internal("Research request failed", cause);
+    const err = AppError.internal(cause);
     const res = toErrorResponse(err);
     const body = await res.json();
-    expect(body.error).toBe("Research request failed");
+    expect(body.error).toBe("Internal server error");
+    expect(body.code).toBe("INTERNAL_ERROR");
     expect(JSON.stringify(body)).not.toContain("Brave");
     expect(JSON.stringify(body)).not.toContain("abc123");
     expect(JSON.stringify(body)).not.toContain("API key");
@@ -245,17 +253,8 @@ describe("service-layer errors", () => {
     expect(body.code).toBe("UNPROCESSABLE");
   });
 
-  it("AppError with arbitrary status preserves that status", async () => {
-    const err = new AppError(502, "BAD_GATEWAY", "Upstream service unavailable");
-    const res = toErrorResponse(err);
-    expect(res.status).toBe(502);
-    const body = await res.json();
-    expect(body.code).toBe("BAD_GATEWAY");
-    expect(body.error).toBe("Upstream service unavailable");
-  });
-
   it("only toErrorResponse constructs NextResponse — AppError has no toResponse method", () => {
-    const err = AppError.internal("test");
+    const err = AppError.internal();
     expect((err as any).toResponse).toBeUndefined();
   });
 
@@ -323,21 +322,111 @@ describe("response shape verification", () => {
     expect(JSON.stringify(body)).not.toContain("ENOENT");
   });
 
-  it("detailed cause logged but absent from response", async () => {
+  it("500 cause logged but absent from response", async () => {
     const cause = new Error("DB password is hunter2");
-    const err = AppError.internal("Service unavailable", cause);
+    const err = AppError.internal(cause);
     const res = toErrorResponse(err);
     const body = await res.json();
-    expect(body.error).toBe("Service unavailable");
+    expect(body.error).toBe("Internal server error");
     expect(JSON.stringify(body)).not.toContain("hunter2");
     expect(JSON.stringify(body)).not.toContain("password");
   });
 
   it("response has no detail field", async () => {
-    const res = toErrorResponse(AppError.internal("test"));
+    const res = toErrorResponse(AppError.internal());
     const body = await res.json();
     expect(body).not.toHaveProperty("detail");
     expect(body).not.toHaveProperty("cause");
     expect(body).not.toHaveProperty("stack");
+  });
+});
+
+describe("500 hardening — status >= 500 always returns fixed shape", () => {
+  it("AppError(500) with custom message returns fixed response", async () => {
+    const error = new AppError(
+      500,
+      "INTERNAL_ERROR",
+      "password=hunter2 database connection failed",
+      new Error("private provider failure"),
+    );
+    const res = toErrorResponse(error);
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body).toEqual({
+      error: "Internal server error",
+      code: "INTERNAL_ERROR",
+    });
+    const json = JSON.stringify(body);
+    expect(json).not.toContain("hunter2");
+    expect(json).not.toContain("database");
+    expect(json).not.toContain("provider");
+    expect(json).not.toContain("cause");
+    expect(json).not.toContain("detail");
+    expect(json).not.toContain("stack");
+  });
+
+  it("AppError(503) returns fixed 500 shape", async () => {
+    const error = new AppError(503, "BAD_GATEWAY", "Upstream failed", new Error("wp timeout"));
+    const res = toErrorResponse(error);
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error).toBe("Internal server error");
+    expect(body.code).toBe("INTERNAL_ERROR");
+  });
+
+  it("400 messages remain available to clients", async () => {
+    const res = toErrorResponse(AppError.badRequest("Missing field x"));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Missing field x");
+    expect(body.code).toBe("BAD_REQUEST");
+  });
+
+  it("401 messages remain available to clients", async () => {
+    const res = toErrorResponse(AppError.unauthorized());
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+    expect(body.code).toBe("UNAUTHORIZED");
+  });
+
+  it("403 messages remain available to clients", async () => {
+    const res = toErrorResponse(AppError.forbidden());
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe("Access denied");
+    expect(body.code).toBe("FORBIDDEN");
+  });
+
+  it("404 messages remain available to clients", async () => {
+    const res = toErrorResponse(AppError.notFound("Wombat"));
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe("Wombat not found");
+    expect(body.code).toBe("NOT_FOUND");
+  });
+
+  it("409 messages remain available to clients", async () => {
+    const res = toErrorResponse(AppError.conflict("Duplicate"));
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("Duplicate");
+    expect(body.code).toBe("CONFLICT");
+  });
+
+  it("422 messages remain available to clients", async () => {
+    const res = toErrorResponse(AppError.unprocessable("Bad format"));
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toBe("Bad format");
+    expect(body.code).toBe("UNPROCESSABLE");
+  });
+
+  it("429 messages remain available to clients", async () => {
+    const res = toErrorResponse(AppError.tooManyRequests("Limit hit"));
+    expect(res.status).toBe(429);
+    const body = await res.json();
+    expect(body.error).toBe("Limit hit");
+    expect(body.code).toBe("RATE_LIMITED");
   });
 });

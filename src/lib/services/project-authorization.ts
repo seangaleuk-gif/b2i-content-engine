@@ -1,4 +1,3 @@
-import { getCurrentUserId } from "@/lib/services/auth";
 import { projectRepository } from "@/lib/repositories";
 import type { Project } from "@/db/schema";
 import { AppError } from "./errors";

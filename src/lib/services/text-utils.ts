@@ -124,7 +124,6 @@ export function robustJsonParse(raw: string, stage?: string): unknown {
   }
 
   throw AppError.internal(
-    "Article generation failed",
     new Error(`Failed to parse JSON response from AI${stage ? ` [stage: ${stage}]` : ""}`)
   );
 }

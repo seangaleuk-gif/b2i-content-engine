@@ -13,7 +13,7 @@ export interface ResearchItem {
 function getApiKey(): string {
   const key = process.env.BRAVE_API_KEY;
   if (!key) {
-    throw AppError.internal("Brave Search API key is not configured");
+    throw AppError.internal();
   }
   return key;
 }
@@ -44,12 +44,11 @@ export async function runBraveResearch(query: string): Promise<ResearchItem[]> {
   } catch (err) {
     clearTimeout(timeout);
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw AppError.internal("Research request timed out", err instanceof Error ? err : undefined);
+      console.error("[brave] Research request timed out");
+      throw AppError.internal(err instanceof Error ? err : undefined);
     }
-    throw AppError.internal(
-      "Research request failed",
-      new Error(`Brave Search network error: ${err instanceof Error ? err.message : String(err)}`)
-    );
+    console.error("[brave] Research network error:", err instanceof Error ? err.message : String(err));
+    throw AppError.internal(new Error(`Brave Search network error: ${err instanceof Error ? err.message : String(err)}`));
   }
   clearTimeout(timeout);
 
@@ -58,18 +57,13 @@ export async function runBraveResearch(query: string): Promise<ResearchItem[]> {
     try { errorBody = await response.text(); } catch {}
     console.error(`[brave:FAIL] HTTP ${response.status}: ${errorBody.substring(0, 300)}`);
     if (response.status === 401 || response.status === 403) {
-      throw AppError.internal(
-        "Research request failed",
-        new Error(`Brave Search API authentication failed (${response.status})`)
-      );
+      console.error(`[brave] API authentication failed (${response.status})`);
+      throw AppError.internal(new Error(`Brave Search API authentication failed (${response.status})`));
     }
     if (response.status === 429) {
       throw AppError.tooManyRequests("Research rate limit exceeded");
     }
-    throw AppError.internal(
-      "Research request failed",
-      new Error(`Brave Search API returned ${response.status}: ${errorBody.substring(0, 200)}`)
-    );
+    throw AppError.internal(new Error(`Brave Search API returned ${response.status}: ${errorBody.substring(0, 200)}`));
   }
 
   const data = await response.json() as import("./brave-types").BraveSearchResponse;
@@ -154,5 +148,6 @@ export async function runBraveResearchWithRetry(
     }
   }
 
-  throw lastError ?? AppError.internal("Research request failed after all retries");
+  console.error("[brave] Research request failed after all retries");
+  throw lastError ?? AppError.internal(new Error("Brave research failed after all retries"));
 }

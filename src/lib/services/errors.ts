@@ -40,13 +40,25 @@ export class AppError extends Error {
     return new AppError(429, "RATE_LIMITED", message);
   }
 
-  static internal(message = "Internal server error", cause?: unknown): AppError {
-    return new AppError(500, "INTERNAL_ERROR", message, cause);
+  static internal(cause?: unknown): AppError {
+    return new AppError(500, "INTERNAL_ERROR", "Internal server error", cause);
   }
 }
 
+const FIXED_500 = { error: "Internal server error", code: "INTERNAL_ERROR" as const };
+
 export function toErrorResponse(error: unknown): NextResponse {
   if (error instanceof AppError) {
+    if (error.status >= 500) {
+      if (error.cause) {
+        console.error(`[AppError ${error.code}]`, error.cause);
+      }
+      if (error.message !== FIXED_500.error) {
+        console.error(`[AppError ${error.code}] suppressed message:`, error.message);
+      }
+      return NextResponse.json(FIXED_500, { status: error.status });
+    }
+
     if (error.cause) {
       console.error(`[AppError ${error.code}]`, error.cause);
     }
@@ -57,8 +69,5 @@ export function toErrorResponse(error: unknown): NextResponse {
   }
 
   console.error("[unhandled]", error instanceof Error ? error.message : String(error));
-  return NextResponse.json(
-    { error: "Internal server error", code: "INTERNAL_ERROR" },
-    { status: 500 },
-  );
+  return NextResponse.json(FIXED_500, { status: 500 });
 }

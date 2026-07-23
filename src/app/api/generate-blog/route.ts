@@ -58,7 +58,7 @@ export async function POST(request: Request) {
       if (savedVersionId !== null) {
         try { await blogVersionRepository.delete(savedVersionId); } catch {}
       }
-      throw AppError.internal("Failed to save article", saveErr);
+      throw AppError.internal(saveErr);
     }
 
     try {

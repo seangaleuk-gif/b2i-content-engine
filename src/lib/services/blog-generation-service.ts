@@ -52,7 +52,7 @@ export async function runBlogGeneration(
   telemetry.startTimer("total");
 
   const project = await projectRepository.findById(Number(projectId));
-  if (!project) throw AppError.internal("Project data unavailable");
+  if (!project) throw AppError.internal();
 
   const ai = new AiService(telemetry);
   const trackedChat = (stage: string, messages: ChatMessage[], options?: ChatOptions) => ai.call(stage, messages, options);
@@ -103,7 +103,10 @@ export async function runBlogGeneration(
   }
   
   const h2Headings: string[] = outline?.h2Headings ?? [];
-  if (h2Headings.length === 0) throw AppError.internal("Article generation failed", new Error("No H2 headings generated"));
+  if (h2Headings.length === 0) {
+    console.error("[blog-generation] No H2 headings generated");
+    throw AppError.internal(new Error("No H2 headings generated"));
+  }
 
   const repairedMeta = repairMetaDescription(outline.metaDescription || "", META_MIN, META_MAX);
 
