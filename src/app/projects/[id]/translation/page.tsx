@@ -41,6 +41,11 @@ function TranslationSkeleton() {
 }
 
 export default function TranslationPage() {
+  const wcLabel = (count: number, slug?: string) =>
+    slug?.endsWith("-zh")
+      ? `${count.toLocaleString()} Chinese characters`
+      : `${count.toLocaleString()} words`;
+
   const params = useParams();
   const projectId = params.id as string;
   const [translating, setTranslating] = useState(false);
@@ -138,7 +143,7 @@ export default function TranslationPage() {
                   )}
                 </div>
                 <div className="flex items-center gap-4 text-[12px] text-text-secondary mb-3">
-                  <span className="flex items-center gap-1"><Hash size={12} />{v.wordCount.toLocaleString()} words</span>
+                  <span className="flex items-center gap-1"><Hash size={12} />{wcLabel(v.wordCount, v.slug)}</span>
                   {v.slug && (
                     <span className="flex items-center gap-1"><Globe size={12} />{v.slug}</span>
                   )}

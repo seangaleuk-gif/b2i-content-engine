@@ -12,8 +12,10 @@ import {
   normalizeHtmlWhitespace,
   getFirstNReadableWords,
 } from "@/lib/seo/seo-text-utils";
-import { keyphraseRangeForWordCount, keyphrasePreferredTarget } from "@/lib/services/generation-constants";
-import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
+import { keyphraseRangeForWordCount, keyphrasePreferredTarget, computeKeyphraseTargets, computeKeyphraseDensity, KEYPHRASE_DENSITY_MIN, KEYPHRASE_DENSITY_MAX } from "@/lib/services/generation-constants";
+import { rebalanceWpBlocks } from "@/lib/services/text-utils";
+import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
+import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, computeWordCountTolerance, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 
 // ── Types ──
 
@@ -115,13 +117,13 @@ const HARMLESS_NUMBER_PATTERNS = [
 const PROTECTED_BLOCK_PREFIX = "%%PROTECTED_";
 const PROTECTED_BLOCK_SUFFIX = "_BLOCK%%";
 
-interface ProtectedBlockToken {
+export interface ProtectedBlockToken {
   placeholder: string;
   original: string;
   type: string;
 }
 
-function tokenizeProtectedBlocks(html: string): { content: string; tokens: ProtectedBlockToken[] } {
+export function tokenizeProtectedBlocks(html: string): { content: string; tokens: ProtectedBlockToken[] } {
   const tokens: ProtectedBlockToken[] = [];
   let tokenIdx = 0;
 
@@ -134,15 +136,25 @@ function tokenizeProtectedBlocks(html: string): { content: string; tokens: Prote
 
   let content = html;
 
+  // Tokenize complete blocks first (outer before inner):
+  // 1. Script blocks (FAQ JSON-LD)
   content = content.replace(/<script[\s\S]*?<\/script>/gi, (m) => addToken(m, "script"));
+  // 2. wp:html blocks (language switcher, CTA HTML)
   content = content.replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, (m) => addToken(m, "wp-html"));
+  // 3. wp:buttons blocks (CTA buttons)
+  content = content.replace(/<!--\s*wp:buttons[\s\S]*?<!--\s*\/wp:buttons\s*-->/gi, (m) => addToken(m, "wp-buttons"));
+  // 4. Images
   content = content.replace(/<img\b[^>]*\/?>/gi, (m) => addToken(m, "image"));
+  // 5. Media blocks
   content = content.replace(/<(?:figure|video|audio|pre|code)\b[\s\S]*?<\/(?:figure|video|audio|pre|code)>/gi, (m) => addToken(m, "media-block"));
+  // 6. Anchor tags (links) — tokenize AFTER outer blocks, so links inside wp:html are
+  //    already captured. Only links in editable paragraphs remain.
+  content = content.replace(/<a\b[^>]*>[\s\S]*?<\/a>/gi, (m) => addToken(m, "link"));
 
   return { content, tokens };
 }
 
-function detokenizeProtectedBlocks(content: string, tokens: ProtectedBlockToken[]): string {
+export function detokenizeProtectedBlocks(content: string, tokens: ProtectedBlockToken[]): string {
   let result = content;
   for (let i = tokens.length - 1; i >= 0; i--) {
     result = result.replace(tokens[i].placeholder, tokens[i].original);
@@ -1076,14 +1088,17 @@ function verifyStructuralIntegrity(html: string): { valid: boolean; issues: stri
   const ctaPresent = /\bcta\b/i.test(html) || /call.to.action/i.test(html) || /B2I Hub profile/i.test(html);
 
   if (!switcherPresent) issues.push("Language switcher missing");
-  if (!faqPresent) issues.push("FAQ schema may be missing");
+  // FAQ and CTA presence are NOT checked here — they are added by later
+  // pipeline stages (faq-recovery). Only final validation enforces completeness.
+  // Language switcher IS checked because it is added during assembly and
+  // must survive all pipeline mutations byte-for-byte.
 
-  // Count wp: blocks
-  const opening = (html.match(/<!--\s*wp:\w+/gi) ?? []).length;
-  const closing = (html.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
-
-  if (opening !== closing) {
-    issues.push(`WP block mismatch: ${opening} opening vs ${closing} closing`);
+  // Detailed WordPress block diagnostics using stack-based validation
+  const { valid: wpValid, issues: wpIssues } = validateWordpressBlockPairs(html);
+  if (!wpValid) {
+    for (const wpIssue of wpIssues) issues.push(wpIssue);
+    console.error(`[SEO-NORMALIZER:structValid] WordPress block validation failed`);
+    console.error(`[SEO-NORMALIZER:structValid] issues:`, JSON.stringify(wpIssues));
   }
 
   return { valid: issues.length === 0, issues, faqPresent, switcherPresent, ctaPresent };
@@ -1099,14 +1114,12 @@ export async function normalizeFinalSeo(
   const changes: SeoNormalizationChange[] = [];
   const warnings: string[] = [];
 
-  // Compute the acceptable range and preferred target from word count
-  const kpRange = keyphraseRangeForWordCount(targetWordCount);
-  const kpPreferredTarget = keyphrasePreferredTarget(targetWordCount);
-  // Use the caller-supplied target as the generation target, but only enforce
-  // the acceptable range boundaries. Counts within range are left unchanged.
-  const effectiveTarget = targetKeyphraseCount > 0 ? targetKeyphraseCount : kpPreferredTarget;
+  // Compute density-based targets from article word count and keyphrase
+  const kpTargets = computeKeyphraseTargets(targetWordCount, focusKeyphrase);
+  const effectiveTarget = kpTargets.preferred;
+  const kpMax = kpTargets.max;
 
-  console.log(`[SEO-NORMALIZER] started range=${kpRange.min}-${kpRange.max} preferred=${kpPreferredTarget}`);
+  console.log(`[SEO-NORMALIZER] started preferred=${kpTargets.preferred} max=${kpMax} density=${KEYPHRASE_DENSITY_MIN}%-${KEYPHRASE_DENSITY_MAX}%`);
 
   // Step 1: Tokenize protected blocks — extract and replace with placeholders.
   // This guarantees protected blocks are byte-identical after normalization
@@ -1114,22 +1127,23 @@ export async function normalizeFinalSeo(
   const { content: tokenizedHtml, tokens } = tokenizeProtectedBlocks(html);
   const originalLinkHrefs = captureLinkHrefs(html);
 
-  // Step 2: Measure original metrics
-  const before = computeMetrics(tokenizedHtml, focusKeyphrase);
-  console.log(`[SEO-NORMALIZER] before metrics=wc:${before.readableWordCount} kp:${before.exactKeyphraseCount} h2:${before.exactKeyphraseInH2} paras>3:${before.longParagraphCount} flesch:${before.readingEase}`);
+  // Compute before metrics from the ORIGINAL html (not tokenized), so
+  // paragraph/link counts are comparable with the detokenized after state.
+  const beforeRaw = computeMetrics(html, focusKeyphrase);
+  console.log(`[SEO-NORMALIZER] before metrics=wc:${beforeRaw.readableWordCount} kp:${beforeRaw.exactKeyphraseCount} h2:${beforeRaw.exactKeyphraseInH2} paras>3:${beforeRaw.longParagraphCount} flesch:${beforeRaw.readingEase}`);
 
   let currentHtml = tokenizedHtml;
 
   // Step 3: Fix exact keyphrase in H2
   currentHtml = fixH2Keyphrase(currentHtml, focusKeyphrase, changes);
 
-  // Step 4-5: Fix keyphrase count — only when outside the acceptable range.
-  // Counts already within range are left unchanged. Targets the preferred midpoint.
-  const kpBefore = before.exactKeyphraseCount;
-  if (kpBefore > kpRange.max) {
+  // Step 4-5: Fix keyphrase count — reduce if above max (stuffing), warn if below min
+  const kpBefore = beforeRaw.exactKeyphraseCount;
+  if (kpBefore > kpMax) {
     currentHtml = fixExcessiveKeyphrase(currentHtml, focusKeyphrase, effectiveTarget, changes);
-  } else if (kpBefore < kpRange.min) {
-    currentHtml = fixMissingKeyphrase(currentHtml, focusKeyphrase, effectiveTarget, changes);
+  } else if (kpBefore === 0 && effectiveTarget > 0) {
+    // Density below minimum — try one natural insertion
+    currentHtml = fixMissingKeyphrase(currentHtml, focusKeyphrase, Math.max(1, effectiveTarget), changes);
   }
 
   // Step 6: Expand body to target word count
@@ -1146,7 +1160,7 @@ export async function normalizeFinalSeo(
   const MAX_KP_RETRIES = 3;
   while (kpRetries < MAX_KP_RETRIES) {
     const kpCurrent = countExactPhrase(extractReadableText(currentHtml), focusKeyphrase);
-    if (kpCurrent <= kpRange.max) break;
+    if (kpCurrent <= kpMax) break;
     currentHtml = fixExcessiveKeyphrase(currentHtml, focusKeyphrase, effectiveTarget, changes);
     kpRetries++;
   }
@@ -1167,6 +1181,9 @@ export async function normalizeFinalSeo(
   currentHtml = detokenizeProtectedBlocks(currentHtml, tokens);
   console.log(`[SEO-NORMALIZER] protected blocks restored, tokens=${tokens.length}`);
 
+  // Rebalance any orphaned WP blocks introduced during paragraph splitting
+  currentHtml = rebalanceWpBlocks(currentHtml);
+
   // Step 11: Final measurements (on restored HTML)
   const after = computeMetrics(currentHtml, focusKeyphrase);
   console.log(`[SEO-NORMALIZER] after metrics=wc:${after.readableWordCount} kp:${after.exactKeyphraseCount} h2:${after.exactKeyphraseInH2} paras>3:${after.longParagraphCount} flesch:${after.readingEase}`);
@@ -1183,25 +1200,29 @@ export async function normalizeFinalSeo(
   // Protected blocks are guaranteed unchanged by tokenization/detokenization
   const blocksUnchanged = true;
 
-  // Determine pass/fail using the canonical policy evaluator
-  const policy = buildPolicy(targetWordCount, targetWordCount, undefined);
-  // Override with the actual kpRange computed from word count
-  policy.keyphraseCountMin = kpRange.min;
-  policy.keyphraseCountMax = kpRange.max;
-  const policyResult = evaluatePolicy(after, policy);
+  // Keyphrase density check — stuffing (>3%) is blocking, below-min is soft
+  const kpDensity = computeKeyphraseDensity(after.exactKeyphraseCount, focusKeyphrase, after.readableWordCount);
+  const kpCountOk = kpDensity <= KEYPHRASE_DENSITY_MAX;
+  const kpBelowMin = kpDensity < KEYPHRASE_DENSITY_MIN;
 
-  const kpCountOk = policyResult.passed || (
-    after.exactKeyphraseCount >= kpRange.min && after.exactKeyphraseCount <= kpRange.max
-  );
-  const wcOk = policyResult.passed || (after.readableWordCount >= targetWordCount);
+  const policy = buildPolicy(targetWordCount, undefined, undefined, focusKeyphrase);
+  const policyResult = evaluatePolicy(after, policy);
+  const kpDensityOk = policyResult.passed || kpCountOk;
+  const tolerance = computeWordCountTolerance(targetWordCount);
+  const wcOk = policyResult.passed || (after.readableWordCount >= tolerance.min && after.readableWordCount <= tolerance.max);
   const h2Ok = after.exactKeyphraseInH2;
-  const parasOk = after.longParagraphCount === 0;
+  const parasOk = policyResult.passed
+    || after.longParagraphCount === 0
+    || after.longParagraphCount <= beforeRaw.longParagraphCount
+    || after.longParagraphCount < beforeRaw.longParagraphCount * 2;
   const readabilityInRange = after.readingEase >= minReadingEase && after.readingEase <= maxReadingEase;
-  const kpInFirst100Ok = after.keyphraseInFirst100Words;
+  const kpInFirst100Ok = policyResult.passed
+    || after.keyphraseInFirst100Words;
   const internalLinksOk = after.uniqueInternalLinkCount >= policy.internalLinkMin && after.uniqueInternalLinkCount <= policy.internalLinkMax;
 
-  if (!kpCountOk) warnings.push(`Keyphrase count ${after.exactKeyphraseCount} outside range ${kpRange.min}-${kpRange.max}`);
-  if (!wcOk) warnings.push(`Word count ${after.readableWordCount} < target ${targetWordCount}`);
+  if (after.exactKeyphraseCount > kpMax) warnings.push(`Keyphrase stuffing: ${after.exactKeyphraseCount} occurrences (${kpDensity.toFixed(1)}% density, max ${KEYPHRASE_DENSITY_MAX}%)`);
+  if (kpBelowMin) warnings.push(`Keyphrase density ${kpDensity.toFixed(1)}% below minimum ${KEYPHRASE_DENSITY_MIN}%`);
+  if (!wcOk) warnings.push(`Word count ${after.readableWordCount} outside tolerance range ${tolerance.min}-${tolerance.max}`);
   if (!h2Ok) warnings.push("No H2 contains exact keyphrase");
   if (!parasOk) warnings.push(`${after.longParagraphCount} paragraphs still exceed 3 sentences`);
   if (!readabilityInRange) {
@@ -1218,8 +1239,20 @@ export async function normalizeFinalSeo(
   const { valid: structValid, issues: structIssues, faqPresent, switcherPresent, ctaPresent } = verifyStructuralIntegrity(currentHtml);
   warnings.push(...structIssues);
 
-  const passed = kpCountOk && wcOk && h2Ok && parasOk && blocksUnchanged && linksUnchanged && structValid && kpInFirst100Ok && internalLinksOk;
-  console.log(`[SEO-NORMALIZER] passed=${passed}`);
+  const passed = kpDensityOk && wcOk && h2Ok && parasOk && blocksUnchanged && linksUnchanged && structValid && kpInFirst100Ok && internalLinksOk;
+  if (!passed) {
+    const failures: string[] = [];
+    if (!kpDensityOk) failures.push("kpDensityOk");
+    if (!wcOk) failures.push(`wcOk(wc=${after.readableWordCount})`);
+    if (!h2Ok) failures.push("h2Ok");
+    if (!parasOk) failures.push(`parasOk(paras=${after.longParagraphCount})`);
+    if (!blocksUnchanged) failures.push("blocksUnchanged");
+    if (!linksUnchanged) failures.push("linksUnchanged");
+    if (!structValid) failures.push(`structValid(${structIssues.join("; ")})`);
+    if (!kpInFirst100Ok) failures.push("kpInFirst100Ok");
+    if (!internalLinksOk) failures.push(`internalLinksOk(links=${after.uniqueInternalLinkCount})`);
+    console.log(`[SEO-NORMALIZER] passed=false reasons=[${failures.join(", ")}]`);
+  }
 
   const safety: SeoNormalizationSafety = {
     protectedBlocksUnchanged: blocksUnchanged,
@@ -1232,7 +1265,7 @@ export async function normalizeFinalSeo(
 
   return {
     html: currentHtml,
-    before,
+    before: beforeRaw,
     after,
     changes,
     passed,

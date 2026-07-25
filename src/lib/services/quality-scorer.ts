@@ -1,5 +1,5 @@
 import { cleanBodyText, countWords } from "@/lib/services/text-utils";
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT } from "@/lib/services/generation-constants";
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT, wordCountRange, KEYPHRASE_DENSITY_MIN, KEYPHRASE_DENSITY_MAX } from "@/lib/services/generation-constants";
 
 // ── Types ──
 
@@ -124,11 +124,13 @@ export function scoreArticle(
   targetWordCount: number,
   faqCount: number,
   editorialH2Count?: number,
+  slug?: string,
 ): QualityScore {
+  const isChinese = slug ? slug.endsWith("-zh") : false;
   const blogCleaned = cleanBodyText(blog);
   const actualWordCount = countWords(blog);
   const keywordLower = keyword.toLowerCase().trim();
-  const fleshScore = Math.round(fleschOnText(blog));
+  const fleshScore = isChinese ? 100 : Math.round(fleschOnText(blog));
   const avgSentLen = avgSentenceLength(blog);
   const longParagraphs = countParagraphsWithExcessiveSentences(blog);
 
@@ -155,8 +157,12 @@ export function scoreArticle(
   // ── Readability (20 points) ──
   const readabilityDetails: ScoreDetail[] = [];
 
-  // Flesch 60-70: 10 pts
-  readabilityDetails.push(scoreInRange(fleshScore, FLESCH_MIN, FLESCH_MAX, 10, "Flesch Reading Ease"));
+  // Flesch 60-70 (skipped for Chinese): 10 pts
+  readabilityDetails.push(
+    isChinese
+      ? { label: "Flesch Reading Ease", score: 10, max: 10, status: "pass", message: "✓ Flesch skipped — Chinese content" }
+      : scoreInRange(fleshScore, FLESCH_MIN, FLESCH_MAX, 10, "Flesch Reading Ease"),
+  );
 
   // Sentence length ≤ 20 avg: 5 pts
   const slScore = avgSentLen <= 20 ? 5 : avgSentLen <= 25 ? 3 : avgSentLen <= 30 ? 1 : 0;
@@ -227,13 +233,24 @@ export function scoreArticle(
   // ── Content (15 points) ──
   const contentDetails: ScoreDetail[] = [];
 
-  // Word count ≥ target: 5 pts
-  contentDetails.push(scoreMin(actualWordCount, targetWordCount, 5, "Word count"));
+  // Word count within tolerance range (±15% for ≥2000, ±10% for <2000): 5 pts
+  const wcRange = wordCountRange(targetWordCount);
+  contentDetails.push(scoreInRange(actualWordCount, wcRange.min, wcRange.max, 5, "Word count"));
 
-  // Keyphrase density — using dynamic word-count-aware range
-  const kpRange = keyphraseRangeForWordCount(actualWordCount);
+  // Keyphrase density — use weighted density formula
   const kpCount = keywordLower ? blogCleaned.toLowerCase().split(keywordLower).length - 1 : 0;
-  contentDetails.push(scoreCountInRange(kpCount, kpRange.min, kpRange.max, 5, "Keyphrase density"));
+  const kpWords = keywordLower ? keywordLower.split(/\s+/).length : 1;
+  const density = actualWordCount > 0 ? (kpCount * kpWords / actualWordCount) * 100 : 0;
+  const densityOk = density >= KEYPHRASE_DENSITY_MIN && density <= KEYPHRASE_DENSITY_MAX;
+  contentDetails.push({
+    label: "Keyphrase density",
+    score: densityOk ? 5 : density > KEYPHRASE_DENSITY_MAX ? 1 : Math.max(1, Math.round(5 * density / KEYPHRASE_DENSITY_MIN)),
+    max: 5,
+    status: densityOk ? "pass" : density > KEYPHRASE_DENSITY_MAX ? "fail" : "warning",
+    message: densityOk
+      ? `✓ Keyphrase density: ${density.toFixed(2)}% (target: ${KEYPHRASE_DENSITY_MIN}%-${KEYPHRASE_DENSITY_MAX}%)`
+      : `⚠ Keyphrase density: ${density.toFixed(2)}% — ${density > KEYPHRASE_DENSITY_MAX ? "too high" : "below minimum ${KEYPHRASE_DENSITY_MIN}%"}`,
+  });
 
   // External links 2-3: 5 pts — excludes B2I Hub signup and language switcher links
   const extLinks = (blog.match(/href="https?:\/\/(?!b2ihub\.com|app\.b2ihub\.com)[^"]*"/gi) || []).length;

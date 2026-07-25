@@ -4,7 +4,7 @@ export interface LinkInjectionResult {
   modifiedContent: string;
 }
 
-const MAX_TOTAL_LINKS = 5;
+const MAX_TOTAL_LINKS = 4;
 const MIN_DISTANCE_CHARS = 500;
 
 const SKIP_SELECTORS = [
@@ -92,6 +92,13 @@ export async function injectLinks(
   for (const link of links) {
     if (totalInjected >= MAX_TOTAL_LINKS) break;
 
+    // Skip if article already contains a link to this destination URL
+    const existingUrlPattern = new RegExp(
+      `<a\\b[^>]*href=["']${escapeRegex(link.url_slug)}["'][^>]*>`,
+      "i"
+    );
+    if (existingUrlPattern.test(content)) continue;
+
     const keywords: string[] = link.keywords && Array.isArray(link.keywords) ? link.keywords : [];
     if (keywords.length === 0) {
       keywords.push(link.displayText);
@@ -128,6 +135,10 @@ export async function injectLinks(
           (ins) => matchPos < ins.pos + ins.length && matchPos + matchLen > ins.pos
         );
         if (conflicting) continue;
+
+        // Also skip if an insertion already links to the same URL (duplicate destination prevention)
+        const sameUrlInserted = insertions.some((ins) => ins.replacement.includes(link.url_slug));
+        if (sameUrlInserted) break; // Don't add another link to the same URL
 
         const prevPositions = positionsForThisLink;
         let tooClose = false;

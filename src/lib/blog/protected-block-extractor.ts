@@ -9,7 +9,7 @@
  */
 export function extractFaqBlock(article: string): string {
   if (!article) return "";
-  const match = article.match(/<!--\s*wp:html\s*-->[\s\S]*?FAQ[\s\S]*?<!--\s*\/wp:html\s*-->/i);
+  const match = article.match(/<!--\s*wp:html\s*-->[\s\S]*?FAQPage[\s\S]*?<!--\s*\/wp:html\s*-->/i);
   return match ? match[0] : "";
 }
 
@@ -110,6 +110,8 @@ export function stripProtectedBlocksFromConclusion(
   if (ctaBlock && cleaned.includes(ctaBlock)) {
     cleaned = cleaned.replace(ctaBlock, "");
   }
+  // Fallback: remove any remaining signup <a> tags not removed by block-level extraction
+  cleaned = cleaned.replace(/<a\b[^>]*href="[^"]*\/signup[^"]*"[^>]*>[\s\S]*?<\/a>/gi, "");
   return cleaned;
 }
 

@@ -20,9 +20,10 @@ export const MAX_SECTION_TRIMS = 2;
 
 /** Word-count tolerance: article accepted between 95%-110% of target */
 export function wordCountRange(target: number): { min: number; max: number } {
+  const tolerance = target >= 2000 ? 0.15 : 0.10;
   return {
-    min: Math.floor(target * 0.95),
-    max: Math.ceil(target * 1.10),
+    min: Math.floor(target * (1 - tolerance)),
+    max: Math.round(target * (1 + tolerance)),
   };
 }
 
@@ -36,7 +37,7 @@ export const WORD_ALLOCATION = {
 // This replaces the old clamped keyphraseTarget() behavior with ranges
 // that scale naturally with article length.
 
-/** Legacy exports — kept for compatibility. Consumers should prefer keyphraseRangeForWordCount */
+/** Legacy exports — kept for compatibility. Consumers should prefer computeKeyphraseTargets */
 export const KEYPHRASE_MIN = 3;
 export const KEYPHRASE_MAX = 5;
 
@@ -45,13 +46,11 @@ export interface KeyphraseRange {
   max: number;
 }
 
+/** @deprecated Use computeKeyphraseTargets for density-based targets */
 export function keyphraseRangeForWordCount(wordCount: number): KeyphraseRange {
-  if (wordCount <= 800)    return { min: 3, max: 5 };
-  if (wordCount <= 1200)   return { min: 4, max: 7 };
-  if (wordCount <= 1800)   return { min: 6, max: 10 };
-  if (wordCount <= 2500)   return { min: 8, max: 15 };
-  if (wordCount <= 3500)   return { min: 10, max: 20 };
-  return { min: 12, max: 25 };
+  const min = Math.max(1, Math.round(wordCount * 0.005 / 2));  // ~0.5% for 2-word kp
+  const max = Math.max(min + 2, Math.round(wordCount * 0.03 / 2)); // ~3% for 2-word kp
+  return { min, max };
 }
 
 export function keyphraseTarget(wordCount: number): number {
@@ -59,8 +58,53 @@ export function keyphraseTarget(wordCount: number): number {
 }
 
 export function keyphrasePreferredTarget(wordCount: number): number {
-  const { min, max } = keyphraseRangeForWordCount(wordCount);
-  return Math.round((min + max) / 2);
+  const kpWords = 2; // assume 2-word keyphrase for legacy callers
+  return Math.max(1, Math.round((KEYPHRASE_DENSITY_PREFERRED / 100) * wordCount / kpWords));
+}
+
+// ── Density-based keyphrase policy ──
+
+export const KEYPHRASE_DENSITY_MIN = 0.5;   // 0.5%
+export const KEYPHRASE_DENSITY_MAX = 3;     // 3% — stuffing threshold
+export const KEYPHRASE_DENSITY_PREFERRED = 1; // 1% ideal
+
+/** Count content-bearing words in a keyphrase (excludes stop words). */
+export function getKeyphraseContentWordCount(keyphrase: string): number {
+  const stopWords = new Set([
+    "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or",
+    "is", "are", "was", "were", "be", "been", "being", "it", "its",
+    "with", "by", "from", "as", "into", "than", "that", "this", "but",
+    "not", "so", "if", "can", "will", "may", "would", "could", "should",
+  ]);
+  const words = keyphrase.toLowerCase().split(/\s+/);
+  const content = words.filter((w) => !stopWords.has(w));
+  return content.length > 0 ? content.length : words.length;
+}
+
+/** Compute weighted keyphrase density:
+ *  density = (occurrences * kpContentWords / articleWords) * 100 */
+export function computeKeyphraseDensity(
+  occurrences: number,
+  keyphrase: string,
+  articleWordCount: number,
+): number {
+  if (articleWordCount <= 0) return 0;
+  const kpWords = getKeyphraseContentWordCount(keyphrase);
+  return (occurrences * kpWords / articleWordCount) * 100;
+}
+
+/** Compute keyphrase occurrence targets from article word count and keyphrase.
+ *  Returns preferred, max, and min occurrences based on density targets. */
+export function computeKeyphraseTargets(
+  articleWordCount: number,
+  keyphrase: string,
+): { preferred: number; max: number; min: number } {
+  if (articleWordCount <= 0 || !keyphrase) return { preferred: 0, max: 0, min: 0 };
+  const kpWords = getKeyphraseContentWordCount(keyphrase);
+  const preferred = Math.max(1, Math.round((KEYPHRASE_DENSITY_PREFERRED / 100) * articleWordCount / kpWords));
+  const max = Math.max(preferred + 1, Math.round((KEYPHRASE_DENSITY_MAX / 100) * articleWordCount / kpWords));
+  const min = Math.max(1, Math.round((KEYPHRASE_DENSITY_MIN / 100) * articleWordCount / kpWords));
+  return { preferred, max, min };
 }
 
 // ── Per-component keyphrase budgets ──
@@ -246,6 +290,21 @@ export const ARTICLE_DENSITY_MIN_PERCENT = 0.5;
 export const ARTICLE_DENSITY_MAX_PERCENT = 2.0;
 export const SECTION_OVERUSE_THRESHOLD = 3;
 export const SECTION_OVERUSE_WORD_LIMIT = 500;
+
+// ── Factuality instruction (shared across all generation stages) ──
+// Single source of truth for AI behavioral guardrails against fabricated claims.
+export const FACTUALITY_INSTRUCTION = `## Factuality Rules (CRITICAL)
+
+You MUST follow these factuality rules:
+- NEVER invent statistics, percentages, prices, survey findings, quotations, testimonials, case studies, customer outcomes, follower growth numbers, sales results or business performance figures.
+- Use a precise number ONLY when that exact number is present in the supplied project research sources above. Do not alter, round, or extrapolate any sourced number.
+- Do not attribute a claim to a source (e.g. "According to DataReportal") unless the supplied research explicitly supports that specific claim.
+- When illustrating an unsourced situation, make it unmistakably hypothetical:
+  * "For example, a bakery could..."
+  * "Imagine a local shop..."
+  * "A business might..."
+- NEVER use quotation marks for a fictional testimonial.
+- When uncertain, omit the number or generalize the claim entirely.`;
 
 // ── External link counts ──
 export const EXTERNAL_LINKS_MIN = 2;

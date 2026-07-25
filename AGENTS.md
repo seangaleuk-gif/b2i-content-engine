@@ -27,6 +27,43 @@ Full pipeline state (articleDoc, title, metaDescription, counters, normalization
 
 Final article validation uses only `analyzeFinalArticle()` and `evaluatePolicy()` (in `final-article-policy.ts`). All structural invariants, FAQ parity, CTA/signup counts, WordPress block balance, and nested paragraph checks are metrics within `FinalArticleMetrics` and thresholds within `FinalArticlePolicy`. No separate validator, invariant check, or fallback gate overrides this result.
 
+### Hard vs soft validation
+
+Hard failures (block article): WordPress block imbalance, nested paragraphs, malformed headings, severe keyphrase stuffing (>3% density), FAQ block count mismatch, FAQ JSON-LD mismatch, CTA/signup count mismatch, internal link count above max.
+
+Soft warnings (do not block): long paragraphs exceeding sentence limit, keyphrase not in first 100 words, keyphrase density below 0.5%, keyphrase missing from some headings, word count slightly outside tolerance.
+
+`evaluatePolicy()` is the single pass/fail gate. No module may independently reject an article for soft SEO quality issues.
+
+### FAQ requirements
+
+Every blog article must include a visible FAQ section and matching `FAQPage` JSON-LD schema. FAQ is guaranteed by:
+- Outline prompt requires final FAQ H2 heading
+- Post-outline processing appends FAQ heading if AI omits it
+- FAQ-recovery stage extracts visible Q&A, generates `FAQPage` JSON-LD, inserts before conclusion
+- Final validation enforces FAQ block count, JSON-LD presence, and visible/schema parity
+
+### Keyphrase policy
+
+Article-wide weighted keyphrase density replaces fixed occurrence ranges:
+- `density = (occurrences × kpContentWords / articleWordCount) × 100`
+- Below 0.5%: soft warning
+- ~1%: preferred target
+- Above 3%: hard stuffing failure
+
+Per-section keyphrase budget allocation is removed. No section is forced to contain the exact keyphrase.
+
+### Link policy
+
+Internal links: 0–4 unique B2I Hub blog destinations. `wp:html` blocks stripped before counting (excludes language switcher, CTA, signup, navigation). External source links counted separately. Duplicate destinations prevented.
+
+### Word count policy
+
+User-selected word count treated as tolerance range:
+- Below 2,000 words: ±10%
+- 2,000 words or more: ±15%
+- Both minimum and maximum enforced.
+
 ## Route orchestration
 
 `src/app/api/generate-blog/route.ts` is approximately 110 lines and contains only:
@@ -70,7 +107,7 @@ Non-`AppError` throws are mapped to a generic 500 response with `{ error: "Inter
 
 ## Build and tests
 
-Current build passes with **390 tests passing and 0 failing**.
+Current build passes with **481 tests passing and 0 failing**.
 
 ## Contributor rules
 
@@ -120,13 +157,23 @@ Every refactor must leave the codebase simpler than before. Never increase archi
 
 ## Handoff
 
-Current state (2026-07-23):
+Current state (2026-07-24):
 - Route orchestration extracted to ~110 lines
 - Pipeline module handles all post-assembly stages with fingerprint tracking
 - ArticleDocument is the canonical article model with HTML parser
-- FinalArticlePolicy centralizes all validation rules
+- FinalArticlePolicy centralizes all validation rules (hard vs soft)
 - AiService centralizes all AI provider access
 - auth.ts is the single authentication authority; x-user-id headers are ignored
 - project-authorization.ts provides requireProjectAccess() only; delegates identity to auth.ts
 - AppError + toErrorResponse() is the single error model; no route-local error response construction
+- Article-wide keyphrase density replaces fixed 8–15 occurrence range; per-section quotas removed
+- Word count uses tolerance ranges: ±10% below 2,000, ±15% at 2,000+
+- Internal links: 0–4 unique B2I Hub destinations; external links counted separately
+- FAQ guaranteed: outline requires FAQ H2, post-processing appends if missing, recovery generates JSON-LD
+- Long paragraphs and keyphrase-in-first-100 are soft warnings, not hard failures
+- Visibility metrics strip wp:html and scripts before counting
+- Single signup CTA enforced with structural extraction + fallback stripping
+- `rebalanceWpBlocks()` with stack-based matching validates WP blocks at 3 boundaries
+- `verifyStructuralIntegrity` checks WP blocks and language switcher only; FAQ/CTA completeness deferred to final validation
+- Protected blocks tokenized/detokenized; `<a>` tag and `<strong>` FAQ extraction handle multiple formats
 - Safe starting point: `src/lib/pipeline/blog-generation-pipeline.ts` for pipeline stages, `src/lib/services/blog-generation-service.ts` for generation flow

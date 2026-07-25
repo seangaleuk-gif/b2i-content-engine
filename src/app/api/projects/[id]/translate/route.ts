@@ -2,9 +2,9 @@ import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/services/auth";
 import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse, AppError } from "@/lib/services/errors";
-import { projectRepository, blogVersionRepository } from "@/lib/repositories";
-import { promptSectionRepository } from "@/lib/repositories";
-import { AiService } from "@/lib/services/deepseek";
+import { projectRepository, blogVersionRepository, researchRepository } from "@/lib/repositories";
+import { translateArticle } from "@/lib/services/translation-service";
+import { countReadableWords } from "@/lib/services/text-utils";
 
 export async function POST(
   _request: Request,
@@ -21,88 +21,56 @@ export async function POST(
       throw AppError.badRequest("No blog content to translate");
     }
 
-    const promptSections = await promptSectionRepository.findByUser(userId);
-    const translationRules = (promptSections as Record<string, unknown>[]).find(
-      (s) => (s as Record<string, unknown>).section_key === "translation_rules"
-    );
-    const rulesContent = (translationRules as Record<string, unknown>)?.content as string ?? "";
-
     const targetSlug = (latest.slug ?? project.name.replace(/\s+/g, "-").toLowerCase()) + "-zh";
 
-    const systemPrompt = `You are a professional translator specializing in Hong Kong Traditional Chinese (zh-HK). Translate the following blog post accurately while preserving:
+    // Build a minimal ArticleDocument from the existing version metadata
+    const existingDoc = {
+      metadata: {
+        title: latest.title || "",
+        slug: latest.slug || "",
+        metaDescription: (latest as any).meta_description || "",
+        excerpt: (latest as any).excerpt || "",
+        targetWordCount: (latest as any).word_count || 0,
+        focusKeyphrase: (latest as any).keyword || project.keyword || "",
+      },
+      languageSwitcher: null as any,
+      introduction: { id: "intro", html: "", wordCount: 0, status: "generated" as const },
+      sections: [],
+      visibleFaq: (latest as any).faq || [],
+      conclusion: { id: "conc", html: "", wordCount: 0, status: "generated" as const },
+      cta: null as any,
+      faqSchema: null as any,
+      insertedLinks: [],
+    };
 
-- The original tone, personality, and voice
-- WordPress block format
-- All HTML structure, links, and formatting
-- Use full-width punctuation for Chinese text
-- Adapt idioms and expressions naturally for a Hong Kong audience
-- Use colloquial Hong Kong Cantonese phrasing where appropriate
-- Do NOT translate: brand names (B2I Hub), URLs, code, statistics, or proper nouns
-- Hong Kong Traditional Chinese characters
-
-${rulesContent}`;
-
-    const userMessage = `Translate this blog post to Traditional Chinese (Hong Kong):
-
-Title: ${latest.title || project.name}
-
-${latest.blog}
-
-Output as a JSON object with these fields:
-{
-  "title": "translated title in Traditional Chinese",
-  "metaDescription": "translated meta description in Traditional Chinese",
-  "blog": "translated blog content in WordPress block format",
-  "slug": "${targetSlug}"
-}`;
-
-    const ai = new AiService();
-    const result = await ai.chatWithRetry(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage },
-      ],
-      { responseFormat: { type: "json_object" }, maxTokens: 32768 }
+    // Component-based translation
+    const research = await researchRepository.findByProject(Number(id));
+    const allVersions = await blogVersionRepository.findByProject(Number(id));
+    const zhSlugs = new Set(
+      (allVersions || [])
+        .filter((v: any) => v.slug?.endsWith("-zh"))
+        .map((v: any) => v.slug!.replace(/-zh$/, ""))
     );
+    const result = await translateArticle(latest.blog, existingDoc, research, zhSlugs);
 
-    let translated: { title: string; metaDescription: string; blog: string; slug: string };
-    try {
-      console.log("[translate] Raw response length:", result.content.length);
-      console.log("[translate] First 500 chars:", result.content.substring(0, 500));
-
-      const cleaned = result.content
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "")
-        .trim();
-
-      console.log("[translate] Cleaned length:", cleaned.length);
-      console.log("[translate] Cleaned first 500:", cleaned.substring(0, 500));
-
-      const match = cleaned.match(/\{[\s\S]*\}/);
-      if (!match) {
-        console.error("[translate] No JSON pattern match found in response");
-        throw AppError.internal();
-      }
-      console.log("[translate] JSON match length:", match[0].length);
-      translated = JSON.parse(match[0]);
-    } catch (parseErr) {
-      console.error("[translate] Parse error:", parseErr);
-      console.error("[translate] Full response:", result.content.substring(0, 2000));
-      throw AppError.internal(parseErr);
+    if (result.failedComponents.length > 0) {
+      console.log("[translate] Components below threshold:", result.failedComponents);
+      console.log("[translate] Translation metrics:", JSON.stringify(result.metrics, null, 2));
     }
 
+    // Update language switcher in the translated HTML
     const enSlug = latest.slug ?? "";
-    const zhSlug = translated.slug || targetSlug;
-
-    translated.blog = translated.blog.replace(
-      /<a\s[^>]*href="[^"]*"[^>]*>.*?(?:English|EN).*?<\/a>\s*<a\s[^>]*href="[^"]*"[^>]*>.*?(?:中文|Chinese|ZH).*?<\/a>/gi,
-      `<a href="/blog/${zhSlug}/">閱讀中文版</a> <a href="/blog/${enSlug}/">Read in English</a>`
+    const zhSlug = targetSlug;
+    let zhBlog = result.html.replace(
+      /b2i-language-switcher[\s\S]*?<\/div>/i,
+      `b2i-language-switcher" data-language="zh"><a href="/blog/${enSlug}/">English</a> | <span>繁體中文</span></div>`
     );
 
+    // Also update language switcher in the English source blog
     let enBlog = latest.blog;
     enBlog = enBlog.replace(
-      /<a\s[^>]*href="[^"]*"[^>]*>.*?(?:English|EN).*?<\/a>\s*<a\s[^>]*href="[^"]*"[^>]*>.*?(?:中文|Chinese|ZH).*?<\/a>/gi,
-      `<a href="/blog/${enSlug}/">Read in English</a> <a href="/blog/${zhSlug}/">閱讀中文版</a>`
+      /b2i-language-switcher[\s\S]*?<\/div>/i,
+      `b2i-language-switcher" data-language="en"><span>English</span> | <a href="/blog/${zhSlug}/">繁體中文</a></div>`
     );
 
     if (enBlog !== latest.blog) {
@@ -119,29 +87,37 @@ Output as a JSON object with these fields:
       }
     }
 
+    // Extract internal/external links from translated HTML
+    const { internalLinks, externalLinks } = extractLinks(zhBlog);
+
+    // Inherit categories/tags
+    const categories = (latest as any).categories || [];
+    const tags = (latest as any).tags || [];
+
     const nextVersion = await blogVersionRepository.getNextVersionNumber(Number(id));
 
     const saved = await blogVersionRepository.create({
       projectId: Number(id),
       userId,
       versionNumber: nextVersion,
-      title: translated.title || latest.title,
-      slug: translated.slug || targetSlug,
-      metaDescription: translated.metaDescription || latest.metaDescription || "",
+      title: result.title || latest.title,
+      slug: zhSlug,
+      metaDescription: result.metaDescription || (latest as any).meta_description || "",
       excerpt: "",
-      blog: translated.blog,
-      faq: [],
-      internalLinks: [],
-      externalLinks: [],
-      categories: ["Creator Economy", "Resources"],
-      tags: [],
-      readingTime: "",
-      wordCount: translated.blog?.split(/\s+/).filter(Boolean).length ?? 0,
+      blog: zhBlog,
+      faq: extractVisibleFaqAsArray(zhBlog),
+      internalLinks,
+      externalLinks,
+      categories,
+      tags,
+      readingTime: `${result.estimatedReadingMinutes} min`,
+      // wordCount stores CJK character count for Chinese content (not English whitespace words)
+      wordCount: result.zhCharCount,
       summary: "",
-      model: result.model,
-      promptVersion: "translation-v1",
+      model: "deepseek-v4-flash",
+      promptVersion: "translation-v3",
       generationTimeMs: 0,
-      tokenUsage: result.usage,
+      tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     } as any);
 
     return NextResponse.json({ success: true, version: saved }, { status: 201 });
@@ -149,4 +125,41 @@ Output as a JSON object with these fields:
     console.error("[translate]", error);
     return toErrorResponse(error);
   }
+}
+
+// ── Helpers ──
+
+function extractLinks(html: string): { internalLinks: string[]; externalLinks: string[] } {
+  const internalLinks: string[] = [];
+  const externalLinks: string[] = [];
+  const seenInternal = new Set<string>();
+  const seenExternal = new Set<string>();
+  const hrefRe = /<a\b[^>]*href="([^"]*)"[^>]*>/gi;
+  let m;
+  while ((m = hrefRe.exec(html)) !== null) {
+    const href = m[1];
+    if (href.startsWith("/blog/") && !href.includes("wp:") && !seenInternal.has(href)) {
+      internalLinks.push(href);
+      seenInternal.add(href);
+    } else if (href.startsWith("http") && !href.includes("b2ihub.com") && !href.includes("schema.org") && !seenExternal.has(href)) {
+      externalLinks.push(href);
+      seenExternal.add(href);
+    }
+  }
+  return { internalLinks, externalLinks };
+}
+
+function extractVisibleFaqAsArray(html: string): Array<{ question: string; answer: string }> {
+  const faq: Array<{ question: string; answer: string }> = [];
+  const qaRe = /<strong\b[^>]*>([\s\S]*?)<\/strong>\s*(?:<\/p>\s*<!--\s*\/wp:paragraph\s*-->\s*<!--\s*wp:paragraph\s*-->\s*<p>)?\s*([\s\S]*?)(?=<strong\b|<h2\b|<!--\s*wp:heading|<!--\s*wp:html|$)/gi;
+  let m;
+  while ((m = qaRe.exec(html)) !== null) {
+    const question = m[1].replace(/<[^>]+>/g, "").trim();
+    const answerRaw = m[2].replace(/<\/p>\s*<!--\s*\/wp:paragraph\s*-->/i, "");
+    const answer = answerRaw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if ((question.endsWith("?") || question.endsWith("？")) && answer.length > 10) {
+      faq.push({ question, answer });
+    }
+  }
+  return faq;
 }

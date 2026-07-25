@@ -1,5 +1,5 @@
-import { countReadableWords } from "./text-utils";
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, type KeyphraseRange, FLESCH_MIN, FLESCH_MAX } from "./generation-constants";
+import { countReadableWords, countLongParagraphs } from "./text-utils";
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, type KeyphraseRange, FLESCH_MIN, FLESCH_MAX, KEYPHRASE_DENSITY_MIN, KEYPHRASE_DENSITY_MAX, KEYPHRASE_DENSITY_PREFERRED, getKeyphraseContentWordCount, wordCountRange } from "./generation-constants";
 
 export type AuditStatus = "pass" | "warning" | "fail" | "not_applicable";
 
@@ -55,19 +55,7 @@ function extractH2Texts(html: string): string[] {
   return texts;
 }
 
-function extractParagraphTexts(html: string): string[] {
-  const cleaned = html
-    .replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<!--[\s\S]*?-->/g, "");
-  const paraRegex = /<p[^>]*>([\s\S]*?)<\/p>/gi;
-  const texts: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = paraRegex.exec(cleaned)) !== null) {
-    texts.push(m[1].replace(/<[^>]+>/g, "").trim());
-  }
-  return texts;
-}
+// ── Canonical text extraction ──
 
 function countExactPhrase(text: string, phrase: string): number {
   if (!phrase) return 0;
@@ -113,13 +101,6 @@ function closeVariant(phrase: string, heading: string): boolean {
   return h.includes(p) || p.includes(h);
 }
 
-function countSentences(paragraphText: string): number {
-  // Split on English (. ! ?) and Chinese (。！？) sentence endings.
-  // Handles mixed-language paragraphs correctly.
-  const sentences = paragraphText.split(/[.!?。！？]+/).filter((s) => s.trim().length > 0);
-  return sentences.length;
-}
-
 // ── Category weights ──
 const CATEGORY_WEIGHTS: Record<string, number> = {
   "SEO Fundamentals": 35,
@@ -138,15 +119,15 @@ interface KeyphraseScore {
   message: string;
 }
 
-const DENSITY_MIN = 0.5;
-const DENSITY_MAX = 1.5;
+const DENSITY_DISPLAY_MAX = 1.5;
+const KP_DENSITY_STUFFING = KEYPHRASE_DENSITY_MAX; // 3% — hard failure
 
 function scoreKeyphraseCount(
   exactCount: number,
   range: KeyphraseRange,
   densityPct: number | null,
 ): KeyphraseScore {
-  const densityHealthy = densityPct !== null && densityPct >= DENSITY_MIN && densityPct <= DENSITY_MAX;
+  const densityHealthy = densityPct !== null && densityPct >= KEYPHRASE_DENSITY_MIN && densityPct <= DENSITY_DISPLAY_MAX;
 
   if (exactCount >= range.min && exactCount <= range.max) {
     return { score: 100, status: "pass", message: "The exact keyphrase usage is appropriate for the article length." };
@@ -209,7 +190,6 @@ export function runAudit(input: AuditInput): AuditResult {
   const readableWords = countReadableWords(blog);
   const keywordLower = keyword?.toLowerCase().trim() ?? "";
   const h2Texts = extractH2Texts(blog);
-  const paraTexts = extractParagraphTexts(blog);
 
   const makeCheck = (
     id: string, label: string, score: number | null, status: AuditStatus,
@@ -254,15 +234,17 @@ export function runAudit(input: AuditInput): AuditResult {
     checks.push(makeCheck("keyphrase_title", "Focus Keyphrase in SEO Title", null, "not_applicable", "No keyphrase", "Exact phrase in title", "No focus keyphrase set for this project.", "SEO Fundamentals"));
   }
 
-  // 4. Body Word Count
+  // 4. Body Word Count — uses tolerance range matching the generation pipeline
+  // (±10% below 2000, ±15% at 2000+)
   if (targetWordCount > 0) {
-    const wcRatio = readableWords / targetWordCount;
-    if (wcRatio >= 1) {
-      checks.push(makeCheck("word_count", "Body Word Count", 100, "pass", `${readableWords} words`, `≥ ${targetWordCount}`, "Meets or exceeds the target word count.", "SEO Fundamentals"));
-    } else if (wcRatio >= 0.95) {
-      checks.push(makeCheck("word_count", "Body Word Count", 60, "warning", `${readableWords} words`, `≥ ${targetWordCount}`, "Close to target but slightly under.", "SEO Fundamentals"));
+    const { min: wcMin, max: wcMax } = wordCountRange(targetWordCount);
+    const targetLabel = `${wcMin.toLocaleString()}–${wcMax.toLocaleString()}`;
+    if (readableWords >= wcMin && readableWords <= wcMax) {
+      checks.push(makeCheck("word_count", "Body Word Count", 100, "pass", `${readableWords.toLocaleString()} words`, targetLabel, "Word count is within the accepted tolerance range.", "SEO Fundamentals"));
+    } else if (readableWords >= Math.floor(wcMin * 0.90) && readableWords <= Math.ceil(wcMax * 1.05)) {
+      checks.push(makeCheck("word_count", "Body Word Count", 60, "warning", `${readableWords.toLocaleString()} words`, targetLabel, "Word count is slightly outside the tolerance range.", "SEO Fundamentals"));
     } else {
-      checks.push(makeCheck("word_count", "Body Word Count", 0, "fail", `${readableWords} words`, `≥ ${targetWordCount}`, "Significantly below the target word count.", "SEO Fundamentals"));
+      checks.push(makeCheck("word_count", "Body Word Count", 0, "fail", `${readableWords.toLocaleString()} words`, targetLabel, "Word count is significantly outside the tolerance range.", "SEO Fundamentals"));
     }
   } else {
     checks.push(makeCheck("word_count", "Body Word Count", null, "not_applicable", "No target", "N/A", "No target word count configured.", "SEO Fundamentals"));
@@ -270,14 +252,14 @@ export function runAudit(input: AuditInput): AuditResult {
 
   // ── Content & Keyphrase (25%) ──
 
-  // 5. Keyphrase in First 100 Words
+  // 5. Keyphrase in First 100 Words — soft warning per pipeline policy
   if (keywordLower) {
     const first100 = readableText.split(/\s+/).slice(0, 100).join(" ").toLowerCase();
     const inFirst100 = first100.includes(keywordLower);
     if (inFirst100) {
       checks.push(makeCheck("keyphrase_first100", "Keyphrase in First 100 Words", 100, "pass", "Found", "First 100 words", "The keyphrase appears early in the content.", "Content & Keyphrase"));
     } else {
-      checks.push(makeCheck("keyphrase_first100", "Keyphrase in First 100 Words", 0, "fail", "Not found", "First 100 words", "The keyphrase should appear within the first paragraph.", "Content & Keyphrase"));
+      checks.push(makeCheck("keyphrase_first100", "Keyphrase in First 100 Words", 60, "warning", "Not found", "First 100 words", "The keyphrase should appear within the first paragraph (quality target, not a hard requirement).", "Content & Keyphrase"));
     }
   } else {
     checks.push(makeCheck("keyphrase_first100", "Keyphrase in First 100 Words", null, "not_applicable", "No keyphrase", "First 100 words", "", "Content & Keyphrase"));
@@ -293,7 +275,7 @@ export function runAudit(input: AuditInput): AuditResult {
     } else if (closeInH2) {
       checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", `Close match: "${matchedHeading}"`, "Exact phrase in H2", "A close variant of the keyphrase was found in an H2, but not the exact phrase.", "Content & Keyphrase"));
     } else if (h2Texts.length > 0) {
-      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 0, "fail", "Not found", "Exact phrase in H2", "The keyphrase is missing from all H2 headings.", "Content & Keyphrase"));
+      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", "Not found", "Exact phrase in H2", "The keyphrase is missing from all H2 headings (quality target, not a hard requirement).", "Content & Keyphrase"));
     } else {
       checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", "No H2 headings", "Exact phrase in H2", "No H2 headings found. Add H2s to structure your content.", "Content & Keyphrase"));
     }
@@ -320,51 +302,58 @@ export function runAudit(input: AuditInput): AuditResult {
     checks.push(makeCheck("keyphrase_count", "Exact Keyphrase Count", null, "not_applicable", "No keyphrase", "Recommended range based on word count", "", "Content & Keyphrase"));
   }
 
-  // 8. Keyphrase Density (percentage) — uses same exactCount, recalculated for independence
+  // 8. Keyphrase Density (percentage) — matches pipeline policy:
+  //    <0.5% = soft warning, ~1% = preferred, >3% = hard stuffing failure
   if (keywordLower && readableWords > 0) {
     const exactCount = countExactPhrase(readableText, keywordLower);
-    const densityPct = (exactCount / readableWords) * 100;
+    const kpWords = getKeyphraseContentWordCount(keywordLower);
+    const densityPct = (exactCount * kpWords / readableWords) * 100;
     const densityStr = `${densityPct.toFixed(2)}%`;
-    if (densityPct >= DENSITY_MIN && densityPct <= DENSITY_MAX) {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 100, "pass", densityStr, "0.5%-1.5%", "Density is within the optimal range.", "Content & Keyphrase"));
-    } else if (densityPct >= 0.3 && densityPct <= 2.0) {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, "0.5%-1.5%", "Density is slightly outside the optimal range.", "Content & Keyphrase"));
+    const targetStr = `${KEYPHRASE_DENSITY_MIN}%–${KEYPHRASE_DENSITY_PREFERRED}% (stuffing at ${KP_DENSITY_STUFFING}%)`;
+    if (densityPct >= KEYPHRASE_DENSITY_MIN && densityPct <= DENSITY_DISPLAY_MAX) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 100, "pass", densityStr, targetStr, "Density is within the healthy range.", "Content & Keyphrase"));
+    } else if (densityPct >= 0.3 && densityPct < KEYPHRASE_DENSITY_MIN) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is slightly below the minimum (soft SEO warning).", "Content & Keyphrase"));
+    } else if (densityPct > DENSITY_DISPLAY_MAX && densityPct <= KP_DENSITY_STUFFING) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is above the preferred range but below stuffing threshold.", "Content & Keyphrase"));
+    } else if (densityPct > KP_DENSITY_STUFFING) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 0, "fail", densityStr, targetStr, "Density exceeds the stuffing threshold (hard failure). Reduce keyphrase occurrences.", "Content & Keyphrase"));
     } else {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 0, "fail", densityStr, "0.5%-1.5%", densityPct > 2 ? "Density is too high — possible keyword stuffing." : "Density is too low — keyphrase is nearly absent.", "Content & Keyphrase"));
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 0, "fail", densityStr, targetStr, "Density is critically low — keyphrase is nearly absent.", "Content & Keyphrase"));
     }
   } else {
-    checks.push(makeCheck("keyphrase_density", "Keyphrase Density", null, "not_applicable", "N/A", "0.5%-1.5%", "", "Content & Keyphrase"));
+    checks.push(makeCheck("keyphrase_density", "Keyphrase Density", null, "not_applicable", "N/A", `${KEYPHRASE_DENSITY_MIN}%–${DENSITY_DISPLAY_MAX}%`, "", "Content & Keyphrase"));
   }
 
   // ── Readability (15%) ──
 
   // 9. Paragraph Length
-  const paraSentenceCounts = paraTexts.map((t) => countSentences(t)).filter((c) => c > 0);
-  const longParas = paraSentenceCounts.filter((c) => c > 3);
-  const totalParas = paraSentenceCounts.length;
+  // Uses countLongParagraphs — the same function as the post-save readback
+  // and pipeline's paragraphs-final stage. Ensures audit UI matches actual enforcement.
+  const totalParas = (blog.match(/<!--\s*wp:paragraph\s*-->/gi) ?? []).length;
+  const longParas = countLongParagraphs(blog, 3);
 
   let paraScore: number;
   let paraStatus: AuditStatus;
   let paraMsg: string;
 
-  if (longParas.length === 0) {
+  // Long paragraphs are a SOFT warning per pipeline policy — never a hard failure.
+  if (longParas === 0) {
     paraScore = 100;
     paraStatus = "pass";
     paraMsg = "All analysed paragraphs stay within the recommended sentence limit.";
-  } else if (longParas.length <= 2) {
+  } else if (longParas <= 2) {
     paraScore = 80;
     paraStatus = "warning";
-    paraMsg = `${longParas.length} paragraph(s) contain more than 3 sentences. Consider splitting longer paragraphs into shorter sections to improve readability on desktop and mobile.`;
-  } else if (longParas.length <= 5) {
+    paraMsg = `${longParas} paragraph(s) contain more than 3 sentences. Consider splitting longer paragraphs into shorter sections to improve readability on desktop and mobile.`;
+  } else if (longParas <= 5) {
     paraScore = 60;
     paraStatus = "warning";
-    paraMsg = `${longParas.length} paragraphs exceed 3 sentences. Breaking these into shorter blocks will help readers scan the content more easily.`;
+    paraMsg = `${longParas} paragraphs exceed 3 sentences. Breaking these into shorter blocks will help readers scan the content more easily.`;
   } else {
-    paraScore = totalParas <= 5 ? 60 : 0;
-    paraStatus = totalParas <= 5 ? "warning" : "fail";
-    paraMsg = totalParas <= 5
-      ? `Most paragraphs exceed 3 sentences, but the article is short enough that this may be acceptable.`
-      : `${longParas.length} of ${totalParas} paragraphs exceed 3 sentences. This makes the article difficult to scan. Split longer paragraphs into shorter sections.`;
+    paraScore = 60;
+    paraStatus = "warning";
+    paraMsg = `${longParas} of ${totalParas} paragraphs exceed 3 sentences. This makes the article difficult to scan. Split longer paragraphs into shorter sections.`;
   }
 
   checks.push(makeCheck(
@@ -372,7 +361,7 @@ export function runAudit(input: AuditInput): AuditResult {
     paraScore, paraStatus,
     `${totalParas} paragraphs analysed`,
     "Max 3 sentences per paragraph",
-    `${totalParas} paragraphs analysed. ${longParas.length === 0 ? "All within the sentence limit." : `${longParas.length} paragraph(s) contain more than 3 sentences.`} ${paraMsg}`,
+    `${totalParas} paragraphs analysed. ${longParas === 0 ? "All within the sentence limit." : `${longParas} paragraph(s) contain more than 3 sentences.`} ${paraMsg}`,
     "Readability",
   ));
 
@@ -424,12 +413,10 @@ export function runAudit(input: AuditInput): AuditResult {
     }
   }
   const intLinkCount = uniqueInternal.size;
-  if (intLinkCount >= 3 && intLinkCount <= 5) {
-    checks.push(makeCheck("internal_links", "Internal Links", 100, "pass", `${intLinkCount} unique`, "3-5", "Optimal number of unique internal links.", "Links"));
-  } else if (intLinkCount < 3) {
-    checks.push(makeCheck("internal_links", "Internal Links", intLinkCount > 0 ? 50 : 0, "warning", `${intLinkCount} unique`, "3-5", "Add more internal links to relevant B2I Hub content.", "Links"));
+  if (intLinkCount >= 0 && intLinkCount <= 4) {
+    checks.push(makeCheck("internal_links", "Internal Links", 100, "pass", `${intLinkCount} unique`, "0–4", "Internal link count is within the accepted range.", "Links"));
   } else {
-    checks.push(makeCheck("internal_links", "Internal Links", 70, "warning", `${intLinkCount} unique`, "3-5", "Too many internal links. Keep to 3-5 unique.", "Links"));
+    checks.push(makeCheck("internal_links", "Internal Links", 0, "fail", `${intLinkCount} unique`, "0–4", "More than 4 unique internal links — exceeds the maximum (hard failure).", "Links"));
   }
 
   // 12. External Links
@@ -442,10 +429,10 @@ export function runAudit(input: AuditInput): AuditResult {
     if (href.startsWith("http")) externalSet.add(href);
   }
   const extLinkCount = externalSet.size;
-  if (extLinkCount >= 2) {
-    checks.push(makeCheck("external_links", "External Links", 100, "pass", `${extLinkCount} unique`, "≥ 2", "Sufficient authoritative external links.", "Links"));
+  if (extLinkCount > 0) {
+    checks.push(makeCheck("external_links", "External Links", 100, "pass", `${extLinkCount} unique`, "0+ accepted", "External links are present — this supports editorial credibility.", "Links"));
   } else {
-    checks.push(makeCheck("external_links", "External Links", extLinkCount > 0 ? 50 : 0, "warning", `${extLinkCount} unique`, "≥ 2", "Add 2-3 links to high-authority external sources.", "Links"));
+    checks.push(makeCheck("external_links", "External Links", 100, "pass", "0 unique", "0+ accepted", "No external links found — 0 is acceptable per policy.", "Links"));
   }
 
   // ── Structure & Schema (10%) ──

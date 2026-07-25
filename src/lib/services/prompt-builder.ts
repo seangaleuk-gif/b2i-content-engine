@@ -1,4 +1,4 @@
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT, keyphraseTarget, keyphraseRangeForWordCount } from "./generation-constants";
+import { SEO_TITLE_MIN, SEO_TITLE_MAX, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT, keyphraseTarget, keyphraseRangeForWordCount, FACTUALITY_INSTRUCTION } from "./generation-constants";
 
 export interface PromptSection {
   key: string;
@@ -142,6 +142,9 @@ export function buildSystemPrompt(context: BlogContext, modules?: string[]): str
   const parts: string[] = [];
   const isFull = modules === undefined;
   const include = modules ? new Set(modules) : null;
+
+  // Factuality — always included for every stage
+  parts.push(FACTUALITY_INSTRUCTION);
 
   // CRITICAL FORMAT — always included for every stage
   parts.push(`CRITICAL FORMAT REQUIREMENT: The blog content in your JSON response MUST use WordPress block format. Every heading must be <!-- wp:heading {"level":2} --> or <!-- wp:heading {"level":3} -->, every paragraph <!-- wp:paragraph -->, every list <!-- wp:list -->, every quote <!-- wp:quote -->, every table <!-- wp:table -->. Custom HTML (language switcher, CTA, FAQ schema) uses <!-- wp:html -->. NEVER use Markdown (##, **, backtick, [], etc.) or bare HTML tags. This is NON-NEGOTIABLE. If you output Markdown, the response is invalid.`);

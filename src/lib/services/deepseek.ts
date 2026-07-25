@@ -129,7 +129,7 @@ export async function chat(
   options: ChatOptions = {}
 ): Promise<ChatResult> {
   const apiKey = getApiKey();
-  const model = options.model ?? "deepseek-chat";
+  const model = options.model ?? "deepseek-v4-flash";
 
   const body: Record<string, unknown> = {
     model,

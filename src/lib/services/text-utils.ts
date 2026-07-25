@@ -141,14 +141,28 @@ function extractMalformedJsonStringProperty(raw: string, allowedProps: string[])
     // Forward scan, tag-aware. Only stop at `}` (single-property object boundary).
     // Quoted text inside prose (like "Learn More", "Shop Now") is skipped
     // because the next char after the quote is neither `}` nor a known property delimiter.
+    // Script blocks are tracked separately: their JSON content (FAQPage schema)
+    // contains `"}` patterns that would falsely trigger truncation.
     let i = openQuote + 1;
     let inTag = false;
+    let inScript = false;
     while (i < raw.length) {
       const ch = raw[i];
       if (ch === '\\') { i += 2; continue; }
-      if (ch === '<') inTag = true;
+      // Check </script> close before generic < opener
+      if (ch === '<' && raw.substring(i, i + 9).toLowerCase() === '</script>') {
+        inScript = false;
+        inTag = true;
+        i++;
+        continue;
+      }
+      if (ch === '<') {
+        inTag = true;
+        const tagStart = raw.substring(i, Math.min(i + 8, raw.length)).toLowerCase();
+        if (tagStart.startsWith('<script')) inScript = true;
+      }
       if (ch === '>') inTag = false;
-      if (ch === '"' && !inTag) {
+      if (ch === '"' && !inTag && !inScript) {
         let next = i + 1;
         while (next < raw.length && /\s/.test(raw[next])) next++;
         // Only stop at the closing `}` — single-property objects end with "}
@@ -159,17 +173,31 @@ function extractMalformedJsonStringProperty(raw: string, allowedProps: string[])
           // ── Validate recovered content ──
           if (decoded.trim().length === 0) return null;
 
-          // WordPress block balance
-          const wpOpen = (decoded.match(/<!--\s*wp:\w+/gi) ?? []).length;
-          const wpClose = (decoded.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
-          if (wpOpen !== wpClose) return null;
+          // WordPress block balance — lenient: if unbalanced, try to balance
+          // by trimming content after the last unmatched opener. This handles
+          // cases where unescaped quotes inside HTML cause premature stopping.
+          let extract = decoded;
+          let wpOpen = (extract.match(/<!--\s*wp:\w+(?:\s[^>]*)?-->/gi) ?? []).length;
+          let wpClose = (extract.match(/<!--\s*\/wp:\w+-->/gi) ?? []).length;
+          if (wpOpen !== wpClose) {
+            // Try to rebalance by removing content from the last unbalanced block
+            const openers = [...extract.matchAll(/<!--\s*wp:\w+(?:\s[^>]*)?-->/gi)];
+            const closers = [...extract.matchAll(/<!--\s*\/wp:\w+-->/gi)];
+            // If we have more openers than closers, the last opener is incomplete
+            if (openers.length > closers.length && closers.length > 0) {
+              const lastClose = closers[closers.length - 1];
+              extract = extract.substring(0, lastClose.index + lastClose[0].length);
+              wpOpen = (extract.match(/<!--\s*wp:\w+(?:\s[^>]*)?-->/gi) ?? []).length;
+              wpClose = (extract.match(/<!--\s*\/wp:\w+-->/gi) ?? []).length;
+            }
+          }
 
-          // Paragraph tag balance
-          const pOpen = (decoded.match(/<p\b[^>]*>/gi) ?? []).length;
-          const pClose = (decoded.match(/<\/p>/gi) ?? []).length;
-          if (pOpen !== pClose) return null;
+          // Paragraph tag balance — lenient: count only block-level <p> usage
+          const pOpen = (extract.match(/<!--\s*wp:paragraph\s*-->/gi) ?? []).length;
+          const pClose = (extract.match(/<!--\s*\/wp:paragraph\s*-->/gi) ?? []).length;
+          if (pOpen !== pClose && (pOpen === 0 || pClose === 0)) return null;
 
-          return { [prop]: decoded };
+          return { [prop]: extract };
         }
       }
       i++;
@@ -199,15 +227,41 @@ export function repairMetaDescription(meta: string, min: number, max: number): s
  *  Preserves inline HTML (<strong>, <em>, <a>, <br>). Never splits lists/headings/tables/quotes/html blocks. */
 export function splitLongParagraphs(html: string, maxSentences: number = 3): { html: string; splitCount: number } {
   let splitCount = 0;
+  const noSplitBefore = /\b(?:Mr|Ms|Mrs|Dr|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|inc|ltd|co|corp|ave|blvd|rd|st|sq|dept|univ|inst|assn|tel|ext|no|vol|pg|pp|ed|par|chap|sec|fig|ref|e\.g|i\.e|viz|al)\.$/i;
 
   const result = html.replace(
     /<!--\s*wp:paragraph\s*-->\s*<p>([\s\S]*?)<\/p>\s*<!--\s*\/wp:paragraph\s*-->/gi,
     (match: string, content: string) => {
-      // Count sentences
-      const sentences = content.split(/(?<=[.!?])\s+/).filter((s: string) => s.trim().length > 0);
+      const trimmed = content.trim();
+      if (!trimmed) return match;
+
+      // Build sentence list by scanning character by character
+      const sentences: string[] = [];
+      let current = "";
+      const chars = [...trimmed];
+      for (let i = 0; i < chars.length; i++) {
+        current += chars[i];
+        const ch = chars[i];
+        // Check for sentence-ending punctuation
+        if (/[.!?！？。]/.test(ch)) {
+          // Don't split on known abbreviations
+          if (ch === "." && noSplitBefore.test(current)) continue;
+          // Check if this is truly the end of a sentence:
+          // Strip inline HTML tags (e.g. </strong>, </em>, </a>) and whitespace
+          // before checking the next content character.
+          const rest = trimmed.substring(i + 1);
+          const restContent = rest.replace(/<[^>]+>/g, "").trimStart();
+          const isBoundary = restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent);
+          if (isBoundary) {
+            sentences.push(current.trim());
+            current = "";
+          }
+        }
+      }
+      if (current.trim()) sentences.push(current.trim());
+
       if (sentences.length <= maxSentences) return match;
 
-      // Split into groups of maxSentences
       const blocks: string[] = [];
       for (let i = 0; i < sentences.length; i += maxSentences) {
         const chunk = sentences.slice(i, i + maxSentences).join(" ");
@@ -221,4 +275,116 @@ export function splitLongParagraphs(html: string, maxSentences: number = 3): { h
   );
 
   return { html: result, splitCount };
+}
+
+/** Return human-readable word count label based on slug language.
+ *  English slugs display "N words", Chinese slugs display "N Chinese characters". */
+export function formatWordCount(count: number, slug?: string): string {
+  const isChinese = slug ? /-zh$/i.test(slug) : false;
+  return isChinese
+    ? `${count.toLocaleString()} Chinese characters`
+    : `${count.toLocaleString()} words`;
+}
+
+/** Remove excess WordPress block closers and rebalance <li>/</li> tags.
+ *  AI-generated content can contain orphaned closers when heading blocks
+ *  are stripped or when the model produces malformed markup.
+ *  Also normalizes doubled block prefixes like <!-- /wp:wp:paragraph -->
+ *  to their correct form <!-- /wp:paragraph -->. */
+export function rebalanceWpBlocks(html: string): string {
+  let cleaned = html;
+
+  // Pass 1: Normalize doubled "wp:wp:" prefixes to "wp:"
+  // The AI sometimes generates <!-- wp:wp:paragraph --> or <!-- /wp:wp:paragraph -->
+  // which causes structural validation failures.
+  cleaned = cleaned.replace(
+    /(<!--\s*\/?)\s*wp:wp:([\w-]+)/gi,
+    "$1wp:$2",
+  );
+
+  // Stack-based matching: track opener positions and types, remove mismatched closers.
+  const tokenRe = /<!--\s*(\/?)(wp:[\w-]+)(?:\s[^>]*)?\s*-->/gi;
+  type WpPos = { pos: number; len: number; type: string; isOpener: boolean };
+  const tokens: WpPos[] = [];
+  let tm: RegExpExecArray | null;
+  while ((tm = tokenRe.exec(cleaned)) !== null) {
+    tokens.push({
+      pos: tm.index,
+      len: tm[0].length,
+      type: tm[2],
+      isOpener: tm[1] !== "/",
+    });
+  }
+
+  // Stack-based validation — mark orphaned closers (no matching opener) and
+  // unclosed openers (no matching closer).
+  const orphaned = new Set<number>();
+  const stack: WpPos[] = [];
+  for (const t of tokens) {
+    if (t.isOpener) {
+      stack.push(t);
+    } else {
+      if (stack.length > 0 && stack[stack.length - 1].type === t.type) {
+        stack.pop();
+      } else {
+        orphaned.add(t.pos);
+      }
+    }
+  }
+  for (const t of stack) orphaned.add(t.pos);
+
+  // Remove orphaned markers in reverse order
+  const sorted = [...orphaned].sort((a, b) => b - a);
+  for (const pos of sorted) {
+    const t = tokens.find((x) => x.pos === pos);
+    if (t) cleaned = cleaned.substring(0, t.pos) + cleaned.substring(t.pos + t.len);
+  }
+
+  // Rebalance <li> vs </li>
+  const liOpen = (cleaned.match(/<li\b[^>]*>/gi) ?? []).length;
+  const liClose = (cleaned.match(/<\/li>/gi) ?? []).length;
+  if (liClose > liOpen) {
+    let excessLI = liClose - liOpen;
+    let liPos = cleaned.length;
+    while (excessLI > 0 && liPos > 0) {
+      liPos = cleaned.lastIndexOf("</li>", liPos - 1);
+      if (liPos < 0) break;
+      cleaned = cleaned.substring(0, liPos) + cleaned.substring(liPos + 5);
+      excessLI--;
+    }
+  }
+
+  return cleaned;
+}
+
+/** Count editorial WordPress paragraph blocks that exceed maxSentences.
+ *  Uses the exact same sentence-counting logic as splitLongParagraphs.
+ *  Shared by: paragraphs-final pipeline stage, SEO audit, final validation, post-save readback. */
+export function countLongParagraphs(html: string, maxSentences: number = 3): number {
+  const paraRe = /<!--\s*wp:paragraph\s*-->\s*<p>([\s\S]*?)<\/p>\s*<!--\s*\/wp:paragraph\s*-->/gi;
+  let count = 0;
+  let m: RegExpExecArray | null;
+  const noSplitBefore = /\b(?:Mr|Ms|Mrs|Dr|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|inc|ltd|co|corp|ave|blvd|rd|sq|dept|univ|inst|assn|tel|ext|no|vol|pg|pp|ed|par|chap|sec|fig|ref|e\.g|i\.e|viz|al)\.$/i;
+  while ((m = paraRe.exec(html)) !== null) {
+    const content = m[1].trim();
+    if (!content) continue;
+    const sentences: string[] = [];
+    let current = "";
+    const chars = [...content];
+    for (let i = 0; i < chars.length; i++) {
+      current += chars[i];
+      if (/[.!?！？。]/.test(chars[i])) {
+        if (chars[i] === "." && noSplitBefore.test(current)) continue;
+        const rest = content.substring(i + 1);
+        const restContent = rest.replace(/<[^>]+>/g, "").trimStart();
+        if (restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent)) {
+          sentences.push(current.trim());
+          current = "";
+        }
+      }
+    }
+    if (current.trim()) sentences.push(current.trim());
+    if (sentences.length > maxSentences) count++;
+  }
+  return count;
 }

@@ -218,7 +218,7 @@ export default function BlogViewPage() {
           </span>
           <span className="flex items-center gap-1.5">
             <Hash size={14} />
-            {wordCount.toLocaleString()} words
+            {wordCount.toLocaleString()} {lang === "zh" ? "Chinese characters" : "words"}
           </span>
           <span className="flex items-center gap-1.5">
             <Eye size={14} />

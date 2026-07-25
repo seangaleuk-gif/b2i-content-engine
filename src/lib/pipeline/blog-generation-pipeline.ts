@@ -19,12 +19,22 @@ import {
 import type { FinalArticlePolicy, FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { countReadableWords, containsExactPhrase } from "@/lib/services/text-utils";
-import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences } from "@/lib/seo/seo-text-utils";
+import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
 import { keyphraseRangeForWordCount, MAX_SENTENCES_PER_PARAGRAPH } from "@/lib/services/generation-constants";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, ensureLanguageSwitcher, pairedSlugs } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
 import { runComponentRegeneration, regenerateSection } from "@/lib/services/component-regenerator";
+import { scanFactualRisks, removeUnsupportedSentences, formatClaimLog } from "@/lib/blog/factual-risk-scanner";
+import { enforceInternalLinkLimit } from "@/lib/blog/final-article-policy";
+
+const CANONICAL_CTA_HTML = `<!-- wp:html -->
+<div style="background: #1E3A8A; color: #fff; padding: 32px 28px; border-radius: 12px; margin: 40px 0; text-align: center;">
+  <h2 style="color: #fff; margin-top: 0; font-size: 22px;">Ready to grow your brand with Hong Kong creators?</h2>
+  <p style="font-size: 16px; line-height: 1.6; margin-bottom: 24px;">B2I Hub connects businesses directly with verified creators — no agencies, no commissions, no middlemen. Create your free profile and start collaborating today.</p>
+  <a href="https://app.b2ihub.com/signup" style="display: inline-block; background: #F97316; color: #fff; padding: 14px 36px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px;" target="_blank" rel="noopener">Create Your Free Profile →</a>
+</div>
+<!-- /wp:html -->`;
 
 // ── Types ──
 
@@ -321,7 +331,7 @@ export function createPipelineState(params: {
 export function validatePipelineOrder(state: PipelineState): Array<{ code: string; message: string; stage: string }> {
   const issues: Array<{ code: string; message: string; stage: string }> = [];
   const stages = state.stageOutputs.map((s) => s.stage);
-  const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "seo-normalization", "final-validation"];
+  const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "cta-preserve", "factual-scan", "link-enforce", "seo-normalization", "faq-recovery", "paragraphs-final", "final-validation"];
   for (const req of required) {
     if (!stages.includes(req)) issues.push({ code: "MISSING_STAGE", message: `Required stage "${req}" not found`, stage: req });
   }
@@ -376,24 +386,236 @@ export async function runPostAssemblyPipeline(
   state = await runSeoNormalization(state, deps);
 
   // Title repair: non-HTML mutation (title only)
+  // Uses one AI retry maximum, then deterministic fallback.
+  // Titles 40–49 characters are accepted with a soft warning (not a 500 error).
   state = runTrackedHtmlStage(state, "title-repair", (html) => {
+    const titleOk = state.title.length >= 40 && state.title.length <= 70 && containsExactPhrase(state.title, state.keyphrase);
+    if (titleOk) return html;
+    
+    // One deterministic attempt: prepend keyphrase if missing and within length
     if (!containsExactPhrase(state.title, state.keyphrase)) {
       const titlePhrase = state.keyphrase.charAt(0).toUpperCase() + state.keyphrase.slice(1);
-      const candidate = `${titlePhrase}: What You Need to Know`;
-      if (candidate.length >= 40 && candidate.length <= 70) state.title = candidate;
+      const candidate = `${titlePhrase}: ${state.title}`;
+      if (candidate.length >= 40 && candidate.length <= 70) {
+        state.title = candidate;
+        console.log(`[title-repair] deterministic prepend: "${state.title}"`);
+        return html;
+      }
+      // Try shorter suffix format
+      const shortCandidate = `${titlePhrase}: What You Need to Know`;
+      if (shortCandidate.length >= 40 && shortCandidate.length <= 70) {
+        state.title = shortCandidate;
+        console.log(`[title-repair] deterministic suffix: "${state.title}"`);
+        return html;
+      }
     }
+    
+    // Accept 40-49 as soft warning (don't throw, don't loop)
+    if (state.title.length >= 40 && state.title.length < 50) {
+      console.log(`[title-repair] soft-warning: title length ${state.title.length} accepted`);
+      return html;
+    }
+    
+    console.log(`[title-repair] no fix applied — title="${state.title}" len=${state.title.length}`);
     return html;
   });
 
-  // FAQ recovery: HTML-returning
+  // Paragraph normalization moved to after faq-recovery (after all stages
+  // that modify section bodies). See paragraphs-final stage below.
+
+  // Factual-risk scan and repair: HTML-returning
+  state = runTrackedHtmlStage(state, "factual-scan", (html) => {
+    const research = deps.context?.research || [];
+    const risk = scanFactualRisks(html, state.keyphrase, research);
+    console.log(`[factual-scan] ${formatClaimLog(risk.claims)}`);
+    
+    if (risk.hasHighRisk) {
+      const unsupported = risk.claims.filter((c: any) => !c.supported);
+      // Group unsupported claims by section index
+      const bySection = new Map<number, typeof unsupported>();
+      for (const c of unsupported) {
+        if (!bySection.has(c.sectionIndex)) bySection.set(c.sectionIndex, []);
+        bySection.get(c.sectionIndex)!.push(c);
+      }
+      
+      // Attempt targeted repair for each affected section
+      for (const [sectionIdx, sectionClaims] of bySection) {
+        const section = state.articleDoc.sections[sectionIdx];
+        if (!section || section.status === "missing") continue;
+        
+        // Remove unsupported sentences from the section
+        const { html: cleanedHtml, sentencesRemoved } = removeUnsupportedSentences(section.html, sectionClaims);
+        if (sentencesRemoved > 0 && cleanedHtml.length > 50) {
+          console.log(`[factual-scan] section=${sectionIdx} removed ${sentencesRemoved} unsupported sentence(s)`);
+          state.articleDoc.sections[sectionIdx].html = cleanedHtml;
+          state.articleDoc.sections[sectionIdx].wordCount = countReadableWords(cleanedHtml);
+          state.articleDoc.sections[sectionIdx].status = "normalized";
+        }
+      }
+      syncBlogFromDocument(state);
+    }
+    return state.blog;
+  });
+
+  // Internal-link limit enforcement: HTML-returning
+  state = runTrackedHtmlStage(state, "link-enforce", (html) => {
+    const result = enforceInternalLinkLimit(html, 4);
+    console.log(`[link-enforce] retained=${result.retained.length} removed=${result.removed.length}`);
+    return result.html;
+  });
+
+  // Deterministic final trim: HTML-returning
+  // Removes repetition, filler and redundant examples from editable sections
+  // while preserving headings, FAQ, conclusion, CTA, sourced claims, links, and protected blocks.
+  // Runs after all editorial link enforcement but BEFORE FAQ recovery (which adds schema).
+  state = runTrackedHtmlStage(state, "final-trim", (html) => {
+    const currentWc = countReadableWords(html);
+    if (currentWc <= state.wordMax) {
+      console.log(`[final-trim] skipped (wc=${currentWc} <= ${state.wordMax})`);
+      return html;
+    }
+    
+    // Process sections in rounds until under limit
+    const excess = currentWc - state.wordMax;
+    let totalRemoved = 0;
+    const maxPasses = Math.min(8, Math.ceil(excess / 100) + 1);
+    for (let pass = 0; pass < maxPasses; pass++) {
+      const currentWcNow = countReadableWords(state.blog);
+      if (currentWcNow <= state.wordMax) break;
+      const stillExcess = currentWcNow - state.wordMax;
+      const targetPerPass = Math.max(30, Math.ceil(stillExcess / Math.max(1, state.articleDoc.sections.length)));
+      let passRemoved = 0;
+      for (let i = 0; i < state.articleDoc.sections.length; i++) {
+        if (passRemoved >= targetPerPass * 1.5) break;
+        const section = state.articleDoc.sections[i];
+        if (!section.html || section.html.length < 100) continue;
+        if (/faq|frequently.asked/i.test(section.heading)) continue;
+        const sectionWc = countReadableWords(section.html);
+        if (sectionWc < 80) continue;
+        const paraBlocks = section.html.match(
+          /<!--\s*wp:paragraph\s*-->\s*\n?<p>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi,
+        );
+        if (!paraBlocks || paraBlocks.length <= 1) continue;
+        const lastPara = paraBlocks[paraBlocks.length - 1];
+        const lastParaWc = countReadableWords(lastPara);
+        if (lastParaWc < 10) continue;
+        if (/<a\b/i.test(lastPara) || /\d+\s*(?:%|percent|times)/i.test(lastPara)) continue;
+        const lastIdx = section.html.lastIndexOf(lastPara);
+        if (lastIdx < 0) continue;
+        const trimmed = section.html.substring(0, lastIdx).trim() + section.html.substring(lastIdx + lastPara.length);
+        state.articleDoc.sections[i].html = trimmed;
+        state.articleDoc.sections[i].wordCount = countReadableWords(trimmed);
+        state.articleDoc.sections[i].status = "trimmed";
+        totalRemoved += lastParaWc;
+        passRemoved += lastParaWc;
+        console.log(`[final-trim] pass=${pass} section=${i} removed ${lastParaWc} words`);
+      }
+      if (passRemoved === 0) break;
+    }
+    
+    if (totalRemoved > 0) {
+      syncBlogFromDocument(state);
+      const finalWc = countReadableWords(state.blog);
+      console.log(`[final-trim] total removed=${totalRemoved} final wc=${finalWc} target=${state.wordMax}`);
+    } else {
+      console.log(`[final-trim] no paragraphs removed — excess=${excess}`);
+    }
+    return state.blog;
+  });
+
+  // FAQ recovery: HTML-returning.
+  // After all content-changing stages, extracts visible FAQ and ensures
+  // the FAQPage JSON-LD schema matches. Rebuilds if missing or parity mismatched.
   state = runTrackedHtmlStage(state, "faq-recovery", (html) => {
-    if (extractFaqBlock(html)) return html;
+    const existingFaqBlock = extractFaqBlock(html);
+
+    // Extract visible FAQ using the SAME HTML-scanning method that analyzeFinalArticle uses.
+    // Passing no doc parameter ensures the FAQ count here matches what final-validation will compute.
     const visibleFaq = extractVisibleFaqFromArticle(html);
-    if (visibleFaq.length === 0) return html;
+
+    // Check parity even when schema already exists — paragraph splitting,
+    // trimming, or factual-scan may have changed visible FAQ structure.
+    if (existingFaqBlock && visibleFaq.length > 0) {
+      const schemaQuestionCount = (existingFaqBlock.match(/"name"\s*:\s*"/gi) ?? []).length;
+      if (schemaQuestionCount === visibleFaq.length) {
+        console.log(`[faq-recovery] FAQ parity valid (${visibleFaq.length} visible = ${schemaQuestionCount} schema) — skipping`);
+        return html;
+      }
+      // Parity mismatch — rebuild schema from final visible FAQ.
+      console.log(`[faq-recovery] FAQ parity mismatch: ${visibleFaq.length} visible vs ${schemaQuestionCount} schema — rebuilding`);
+    } else if (existingFaqBlock && visibleFaq.length === 0) {
+      console.log(`[faq-recovery] Schema exists but no visible FAQ — keeping existing schema`);
+      return html;
+    } else if (!existingFaqBlock) {
+      console.log(`[faq-recovery] No existing FAQ schema found`);
+    }
+
+    if (visibleFaq.length === 0) {
+      console.log(`[faq-recovery] No visible FAQ found — skipping`);
+      return html;
+    }
+
+    // Build FAQPage JSON-LD from visible FAQ pairs.
+    console.log(`[faq-recovery] Rebuilding FAQ schema from ${visibleFaq.length} visible entries`);
     const rebuilt = renderFaqSchema(visibleFaq.map((p: any) => ({ question: p.question, answerHtml: "", answerText: p.answerText })));
-    const concIdx = html.lastIndexOf(state.articleDoc.conclusion.html.substring(0, 60));
-    if (concIdx >= 0) return html.substring(0, concIdx) + rebuilt + "\n\n" + html.substring(concIdx);
-    return html + "\n\n" + rebuilt;
+
+    // Remove any existing FAQ schema block (stale/wrong-parity) before inserting the new one.
+    let targetHtml = html;
+    if (existingFaqBlock) {
+      targetHtml = targetHtml.replace(existingFaqBlock, "");
+    }
+
+    // Insert before the CTA block (last wp:html block containing signup URL).
+    const signupIdx = targetHtml.lastIndexOf("app.b2ihub.com/signup");
+    let insertAt = targetHtml.length;
+    if (signupIdx >= 0) {
+      // Find the nearest <!-- wp:html --> opener before the signup URL
+      const beforeSignup = targetHtml.substring(0, signupIdx);
+      const wpHtmlOpeners = beforeSignup.match(/<!--\s*wp:html\s*-->/g);
+      if (wpHtmlOpeners && wpHtmlOpeners.length > 0) {
+        const lastOpener = beforeSignup.lastIndexOf(wpHtmlOpeners[wpHtmlOpeners.length - 1]);
+        if (lastOpener >= 0) insertAt = lastOpener;
+      }
+    } else {
+      // Fallback: insert before the last wp:html block if no signup URL found
+      const wpHtmlIdx = targetHtml.lastIndexOf("<!-- /wp:html -->");
+      if (wpHtmlIdx >= 0) {
+        const openerAt = targetHtml.lastIndexOf("<!-- wp:html -->", wpHtmlIdx);
+        if (openerAt >= 0) insertAt = openerAt;
+      }
+    }
+
+    return targetHtml.substring(0, insertAt) + rebuilt + "\n\n" + targetHtml.substring(insertAt);
+  });
+
+  // Paragraph normalization — LAST content-changing stage before CTA and validation.
+  // Runs after factorial-scan, final-trim, and faq-recovery so no later
+  // syncBlogFromDocument() can rejoin split paragraphs.
+  state = runTrackedHtmlStage(state, "paragraphs-final", (html) => {
+    const result = normalizeParagraphs(html, MAX_SENTENCES_PER_PARAGRAPH);
+    return result.html;
+  });
+
+  // CTA preservation: runs after ALL content-changing stages and FAQ recovery.
+  // Ensures exactly one CTA block with one CTA heading and one signup URL.
+  // If the CTA is missing or damaged, sets it on the canonical ArticleDocument
+  // and re-renders — avoiding fragile HTML string surgery that can break WP blocks.
+  state = runTrackedHtmlStage(state, "cta-preserve", (html) => {
+    const signupCount = (html.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
+    const headingCount = countCtaHeadingTags(html);
+    const ctaOk = signupCount === 1 && headingCount >= 1;
+    if (ctaOk) return html;
+
+    console.log(`[cta-preserve] CTA check failed: signup=${signupCount} headings=${headingCount} — re-injecting`);
+
+    // Set CTA on the canonical ArticleDocument and re-render.
+    // renderArticleDocument() places CTA at the correct position
+    // (after conclusion, before FAQ schema). No HTML surgery needed.
+    if (!state.articleDoc.cta) {
+      state.articleDoc.cta = { id: "cta", type: "cta", html: CANONICAL_CTA_HTML, fingerprint: fingerprintHtml(CANONICAL_CTA_HTML) };
+    }
+    syncBlogFromDocument(state);
+    return state.blog;
   });
 
   // Final validation
@@ -555,6 +777,6 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
 
 export function runFinalValidation(state: PipelineState): { passed: boolean; reasons: string[] } {
   const metrics = analyzeFinalArticle(state.blog, state.keyphrase);
-  const policy = buildPolicy(state.requestedWordCount, state.wordMin, state.wordMax);
+  const policy = buildPolicy(state.requestedWordCount, state.wordMin, state.wordMax, state.keyphrase);
   return evaluatePolicy(metrics, policy);
 }

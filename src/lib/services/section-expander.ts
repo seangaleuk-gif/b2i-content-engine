@@ -1,5 +1,5 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
-import { countReadableWords, robustJsonParse, splitLongParagraphs } from "@/lib/services/text-utils";
+import { countReadableWords, robustJsonParse, splitLongParagraphs, rebalanceWpBlocks } from "@/lib/services/text-utils";
 import { MAX_SECTION_EXPANSIONS, MAX_SECTION_TRIMS, MAX_SENTENCES_PER_PARAGRAPH } from "@/lib/services/generation-constants";
 
 const stripMainH2Blocks = (html: string): string =>
@@ -106,6 +106,7 @@ export async function expandToMinimum(
       }
 
       if (afterWC > beforeWC) {
+        mergedBody = rebalanceWpBlocks(mergedBody);
         workingSections[target.origIndex] = { ...workingSections[target.origIndex], body: mergedBody };
         results.push({ accepted: true, beforeSection: beforeWC, afterSection: afterWC, sectionIndex: target.origIndex });
         console.log(`[section-expander:EXPAND] section=${target.origIndex} beforeSection=${beforeWC} addition=${additionWC} afterSection=${afterWC} accepted=true`);
@@ -168,6 +169,7 @@ export async function trimToMaximum(
 
       let newBody = (robustJsonParse(res.content) as Record<string, string>).body || target.body;
       newBody = stripMainH2Blocks(newBody);
+      newBody = rebalanceWpBlocks(newBody);
       workingSections[target.origIndex] = { ...workingSections[target.origIndex], body: newBody };
 
       const allHtml = [intro, ...workingSections.map((s) => s.body), conclusion].join("\n\n");

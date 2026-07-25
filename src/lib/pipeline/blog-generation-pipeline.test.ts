@@ -6,6 +6,7 @@ import {
   parseArticleDocumentFromHtml,
   detectNestedParagraphs,
   renderFaqSchema,
+  extractVisibleFaqFromArticle,
 } from "@/lib/blog/article-document";
 import {
   createArticleIntegrityBaseline,
@@ -14,11 +15,14 @@ import {
   type ArticleIntegrityBaseline,
 } from "@/lib/blog/article-integrity";
 import { normalizeParagraphs } from "@/lib/services/section-expander";
-import { countReadableWords } from "@/lib/services/text-utils";
+import { countReadableWords, rebalanceWpBlocks, countLongParagraphs } from "@/lib/services/text-utils";
+import { wordCountRange } from "@/lib/services/generation-constants";
 import {
   guardStageOutput,
   validatePipelineOrder,
 } from "@/lib/pipeline/blog-generation-pipeline";
+import { enforceInternalLinkLimit, analyzeFinalArticle, evaluatePolicy, buildPolicy } from "@/lib/blog/final-article-policy";
+import { countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
 
 // ── Test helpers ──
 
@@ -164,6 +168,25 @@ describe("pipeline: paragraph normalization", () => {
     const result = normalizeParagraphs(html, 3);
     const wpResult = validateWordpressBlockPairs(result.html);
     expect(wpResult.valid).toBe(true);
+  });
+
+  it("D. splits paragraphs with inline HTML tags between sentences", () => {
+    // Bug: inline tags like </strong> after punctuation were blocking sentence detection
+    const longPara = `<!-- wp:paragraph --><p>First sentence introduces the concept. <strong>Second sentence with emphasis about key benefits.</strong> Third sentence provides additional context. Fourth sentence concludes the thought.</p><!-- /wp:paragraph -->`;
+    const result = normalizeParagraphs(longPara, 3);
+    expect(result.splitCount).toBeGreaterThan(0);
+    const wpResult = validateWordpressBlockPairs(result.html);
+    expect(wpResult.valid).toBe(true);
+    // After splitting into 3+1 sentence blocks, no single block should have 4+ sentences
+    const longCount = countLongParagraphs(result.html, 3);
+    expect(longCount).toBe(0);
+  });
+
+  it("D. countLongParagraphs correctly handles inline tags between sentences", () => {
+    // Same bug as split function — inline tags blocked sentence detection
+    const para = `<!-- wp:paragraph --><p>First sentence here. <strong>Second sentence.</strong> Third sentence follows. <a href="/blog/test">Fourth sentence link.</a> Fifth sentence finishes.</p><!-- /wp:paragraph -->`;
+    const longCount = countLongParagraphs(para, 3);
+    expect(longCount).toBe(1); // 5 sentences → exceeds max
   });
 });
 
@@ -455,5 +478,580 @@ describe("pipeline error hardening", () => {
     expect(json).not.toContain("fallback");
     expect(json).not.toContain("paragraphs");
     expect(json).not.toContain("issue");
+  });
+});
+
+describe("FAQ generation guarantees", () => {
+  const faqHeadingPattern = /faq|frequently.asked|common.question/i;
+
+  function articleWithFaqSection(faqBody: string) {
+    const ls = `<!-- wp:html --><div class="b2i-language-switcher"><span>EN</span></div><!-- /wp:html -->`;
+    const intro = `<!-- wp:paragraph --><p>Introduction text with keyphrase.</p><!-- /wp:paragraph -->`;
+    const sections: ArticleDocument["sections"] = [
+      { id: "s0", heading: "Topic Overview", headingLevel: 2, sectionType: "main", html: `<!-- wp:paragraph --><p>Body content.</p><!-- /wp:paragraph -->`, wordCount: 3, status: "generated" },
+      { id: "s1", heading: "Frequently Asked Questions", headingLevel: 2, sectionType: "faq-heading", html: faqBody, wordCount: faqBody.split(/\s+/).length, status: "generated" },
+    ];
+    return {
+      metadata: { title: "Test", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 500, focusKeyphrase: "test keyphrase" },
+      languageSwitcher: { id: "ls", type: "language-switcher", html: ls, fingerprint: "ls" },
+      introduction: { id: "intro", html: intro, wordCount: 3, status: "generated" },
+      sections,
+      visibleFaq: [],
+      conclusion: { id: "conc", html: `<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->`, wordCount: 2, status: "generated" },
+      cta: null, faqSchema: null,
+      insertedLinks: [],
+    };
+  }
+
+  it("visible FAQ using canonical format is extracted correctly", () => {
+    const faqBody = `<!-- wp:paragraph --><p><strong>What is the benefit?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>It saves time and money.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p><strong>How do I start?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Sign up and follow the guide.</p><!-- /wp:paragraph -->`;
+    const doc = articleWithFaqSection(faqBody);
+    const html = renderArticleDocument(doc);
+    const visible = extractVisibleFaqFromArticle(html);
+    expect(visible.length).toBe(2);
+    expect(visible[0].question).toContain("What is the benefit");
+    expect(visible[1].question).toContain("How do I start");
+  });
+
+  it("FAQ schema generated from visible FAQ matches questions", () => {
+    const faqBody = `<!-- wp:paragraph --><p><strong>What is it?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Answer one.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p><strong>Why use it?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Answer two.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p><strong>When to start?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Answer three.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p><strong>Where to apply?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Answer four.</p><!-- /wp:paragraph -->`;
+    const doc = articleWithFaqSection(faqBody);
+    const html = renderArticleDocument(doc);
+    const visible = extractVisibleFaqFromArticle(html);
+    const schema = renderFaqSchema(visible.map((v) => ({ question: v.question, answerHtml: "", answerText: v.answerText })));
+    expect(schema).toContain("FAQPage");
+    expect((schema.match(/"name"/g) ?? []).length).toBe(4);
+  });
+
+  it("full article with FAQ passes final validation (structural + FAQ)", () => {
+    const faqBody = `<!-- wp:paragraph --><p><strong>What is the benefit?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>It saves time and money.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p><strong>How do I start?</strong></p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Simply sign up and follow the guided setup process.</p><!-- /wp:paragraph -->`;
+    const doc = articleWithFaqSection(faqBody);
+    doc.cta = { id: "cta", type: "cta", html: `<!-- wp:html --><div class="cta"><a href="https://app.b2ihub.com/signup">Sign up</a></div><!-- /wp:html -->`, fingerprint: "cta" };
+    const html = renderArticleDocument(doc);
+
+    // FAQ recovery: extract visible FAQ, generate schema, insert before conclusion
+    const visible = extractVisibleFaqFromArticle(html);
+    expect(visible.length).toBe(2);
+    const rebuilt = renderFaqSchema(visible.map((v) => ({ question: v.question, answerHtml: "", answerText: v.answerText })));
+    const concIdx = html.lastIndexOf("Conclusion.");
+    const finalHtml = concIdx >= 0 ? html.substring(0, concIdx) + rebuilt + "\n\n" + html.substring(concIdx) : html + "\n\n" + rebuilt;
+
+    // Validate
+    const wpResult = validateWordpressBlockPairs(finalHtml);
+    expect(wpResult.valid).toBe(true);
+    expect(finalHtml).toContain("FAQPage");
+    expect(finalHtml).toContain("b2i-language-switcher");
+    expect(finalHtml).toContain("app.b2ihub.com/signup");
+  });
+
+  it("FAQ parity after parse→render round-trip", () => {
+    const faqBody = `<!-- wp:paragraph --><p><strong>Question One?</strong> Answer.</p><!-- /wp:paragraph -->`;
+    const doc = articleWithFaqSection(faqBody);
+    const html = renderArticleDocument(doc);
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+    expect(parsed.doc).not.toBeNull();
+    if (!parsed.doc) return;
+    const html2 = renderArticleDocument(parsed.doc);
+    // FAQ section should still be present
+    expect(html2).toContain("Frequently Asked Questions");
+    expect(html2).toContain("Question One");
+  });
+
+  it("FAQ section without visible questions logs and returns empty", () => {
+    const faqBody = `<!-- wp:paragraph --><p>This FAQ section has no visible questions in the expected format. Just text.</p><!-- /wp:paragraph -->`;
+    const doc = articleWithFaqSection(faqBody);
+    const html = renderArticleDocument(doc);
+    const visible = extractVisibleFaqFromArticle(html);
+    expect(visible.length).toBe(0);
+  });
+
+  it("outline without FAQ heading gets one appended (generation guarantee)", () => {
+    const topic = "Hong Kong Digital Marketing";
+    const h2Headings = ["Overview", "Strategy", "Platforms", "Conclusion"];
+    const faqPattern = /faq|frequently.asked|common.question/i;
+    const hasFaq = h2Headings.some((h) => faqPattern.test(h));
+    expect(hasFaq).toBe(false);
+    // Simulate the append logic
+    const nonFaqEnd = /conclusion|summary|final|wrap.?up|takeaway/i;
+    let faqIdx = h2Headings.length;
+    for (let i = h2Headings.length - 1; i >= 0; i--) {
+      if (nonFaqEnd.test(h2Headings[i])) { faqIdx = i; break; }
+    }
+    const faqHeading = `Frequently Asked Questions About ${topic}`;
+    if (faqIdx < h2Headings.length && nonFaqEnd.test(h2Headings[faqIdx])) {
+      h2Headings[faqIdx] = faqHeading;
+    } else {
+      h2Headings.push(faqHeading);
+    }
+    expect(h2Headings[h2Headings.length - 1]).toContain("Frequently Asked Questions");
+    expect(faqPattern.test(h2Headings[h2Headings.length - 1])).toBe(true);
+    expect(h2Headings).toContain("Frequently Asked Questions About Hong Kong Digital Marketing");
+  });
+
+  it("verifyStructuralIntegrity does NOT reject HTML missing FAQ JSON-LD (recovery runs later)", () => {
+    // SEO normalization runs BEFORE faq-recovery. The absence of FAQ JSON-LD
+    // during normalization must not cause structValid=false.
+    const html = `<!-- wp:html --><div class="b2i-language-switcher"><span>EN</span></div><!-- /wp:html -->
+<!-- wp:paragraph --><p>Article text with keyphrase.</p><!-- /wp:paragraph -->
+<!-- wp:heading {"level":2} -->
+<h2>Topic Heading</h2>
+<!-- /wp:heading -->
+<!-- wp:paragraph --><p>Body content.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>In conclusion, key takeaways here.</p><!-- /wp:paragraph -->`;
+    const { valid, issues } = validateWordpressBlockPairs(html);
+    // WordPress blocks must be structurally valid
+    expect(valid).toBe(true);
+    // FAQ JSON-LD is absent (expected — recovery hasn't run yet)
+    expect(html).not.toContain("FAQPage");
+    // But the article HTML is still valid WordPress
+    expect(issues).toHaveLength(0);
+  });
+
+  it("extractVisibleFaqFromArticle <strong> fallback ignores inline keyphrase <strong> in answers", () => {
+    // Regression: the <strong> fallback mode must only match <strong> elements
+    // that look like questions (end with "?"). Inline keyphrase highlights
+    // inside answer text like "planning your <strong>threads marketing hong kong</strong>
+    // strategy" must NOT be split into separate FAQ entries.
+    const faqBody = `<!-- wp:paragraph --><p><strong>What kind of content works best?</strong></p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>Authentic real-time updates. This is handy for planning your <strong>strategy approach</strong> in advance.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>How often should I post?</strong></p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>Consistency matters more than frequency. Focus on <strong>quality content</strong> for best results.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>Can scheduling tools help?</strong></p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>Not natively yet, but third-party tools like Hootsuite now support <strong>advanced scheduling</strong> features. Just remember to check in daily.</p><!-- /wp:paragraph -->`;
+    const doc = articleWithFaqSection(faqBody);
+    const html = renderArticleDocument(doc);
+    const visible = extractVisibleFaqFromArticle(html);
+    // Should be exactly 3 Q&A pairs (only those with "?" after <strong>)
+    expect(visible.length).toBe(3);
+    expect(visible[0].question).toContain("What kind of content works best");
+    expect(visible[1].question).toContain("How often should I post");
+    expect(visible[2].question).toContain("Can scheduling tools help");
+    // Each answer should NOT contain another question text
+    for (const v of visible) {
+      expect(v.answerText).not.toContain("What kind of");
+      expect(v.answerText).not.toContain("How often should");
+      expect(v.answerText).not.toContain("Can scheduling");
+    }
+  });
+
+  it("FAQ schema from extracted visible FAQ has correct entry count", () => {
+    // When extractVisibleFaqFromArticle correctly returns 3 items,
+    // renderFaqSchema must produce exactly 3 schema entries.
+    const faqBody = `<!-- wp:paragraph --><p><strong>What is the benefit?</strong></p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>It saves time. The <strong>key concept</strong> is efficiency.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>Why use this approach?</strong></p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>It works better. Our <strong>proven methodology</strong> delivers results.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>When to get started?</strong></p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>Start today. Just <strong>begin with a plan</strong> and execute.</p><!-- /wp:paragraph -->`;
+    const doc = articleWithFaqSection(faqBody);
+    const html = renderArticleDocument(doc);
+    const visible = extractVisibleFaqFromArticle(html);
+    expect(visible.length).toBe(3);
+    const schema = renderFaqSchema(visible.map((v) => ({ question: v.question, answerHtml: "", answerText: v.answerText })));
+    // Count schema entries (questions)
+    const questionCount = (schema.match(/"@type": "Question"/g) || []).length;
+    expect(questionCount).toBe(3);
+    // No answer should contain text from another question
+    expect(schema).not.toContain("key concept");
+    expect(schema).not.toContain("proven methodology");
+    expect(schema).not.toContain("begin with a plan");
+  });
+
+  it("robustJsonParse: unescaped double quotes in body HTML are recovered", () => {
+    // Regression: AI output with unescaped quotes inside HTML content
+    const malformed = `{"body": "<!-- wp:paragraph --><p>For example, a Wan Chai coffee shop might post: "We tried a new single-origin from Colombia today. Tasting notes?" The response was great.</p><!-- /wp:paragraph -->"}`;
+    // Should not throw
+    const result = (() => {
+      try {
+        return JSON.parse(malformed);
+      } catch {
+        // Use the same fallback as robustJsonParse
+        const objMatch = malformed.match(/\{[\s\S]*\}/);
+        if (objMatch) {
+          const outer = objMatch[0];
+          const repaired = outer.replace(/,(\s*[}\]])/g, "$1");
+          try { return JSON.parse(repaired); } catch {
+            // Try extractMalformedJsonStringProperty logic (simplified)
+            const marker = '"body"';
+            const startIdx = outer.indexOf(marker);
+            const colonIdx = outer.indexOf(":", startIdx + marker.length);
+            const openQuote = outer.indexOf('"', colonIdx + 1);
+            if (openQuote >= 0) {
+              let i = openQuote + 1;
+              let inTag = false;
+              while (i < outer.length) {
+                const ch = outer[i];
+                if (ch === '<') inTag = true;
+                if (ch === '>') inTag = false;
+                if (ch === '"' && !inTag) {
+                  let next = i + 1;
+                  while (next < outer.length && /\s/.test(outer[next])) next++;
+                  if (next < outer.length && outer[next] === '}') {
+                    return { body: outer.substring(openQuote + 1, i) };
+                  }
+                }
+                i++;
+              }
+            }
+          }
+        }
+        return null;
+      }
+    })();
+    expect(result).not.toBeNull();
+    if (result) expect((result as any).body).toContain("wp:paragraph");
+  });
+
+  it("robustJsonParse: unescaped quotes in intro JSON are recovered", () => {
+    const malformed = `{"intro": "<!-- wp:paragraph --><p>We asked: "What's your favourite coffee?" and got answers.</p><!-- /wp:paragraph -->"}`;
+    const result = (() => {
+      try { return JSON.parse(malformed); } catch {
+        const objMatch = malformed.match(/\{[\s\S]*\}/);
+        if (objMatch) {
+          const outer = objMatch[0];
+          const marker = '"intro"';
+          const startIdx = outer.indexOf(marker);
+          const colonIdx = outer.indexOf(":", startIdx + marker.length);
+          const openQuote = outer.indexOf('"', colonIdx + 1);
+          if (openQuote >= 0) {
+            let i = openQuote + 1;
+            let inTag = false;
+            while (i < outer.length) {
+              const ch = outer[i];
+              if (ch === '<') inTag = true;
+              if (ch === '>') inTag = false;
+              if (ch === '"' && !inTag) {
+                let next = i + 1;
+                while (next < outer.length && /\s/.test(outer[next])) next++;
+                if (next < outer.length && outer[next] === '}') {
+                  return { intro: outer.substring(openQuote + 1, i) };
+                }
+              }
+              i++;
+            }
+          }
+        }
+        return null;
+      }
+    })();
+    expect(result).not.toBeNull();
+    if (result) expect((result as any).intro).toContain("favourite coffee");
+  });
+
+  it("enforceInternalLinkLimit keeps max 4 unique destinations", () => {
+    // Create HTML with 5 unique editorial internal links
+    const html = `<!-- wp:paragraph --><p>Text with <a href="/blog/article-1">link one</a> and <a href="/blog/article-2">link two</a> and <a href="/blog/article-3">link three</a> and <a href="/blog/article-4">link four</a> and <a href="/blog/article-5">link five</a></p><!-- /wp:paragraph -->
+<!-- wp:html --><div class="b2i-language-switcher"><a href="/blog/zh-page">中文</a></div><!-- /wp:html -->
+<!-- wp:html --><div class="cta"><a href="https://app.b2ihub.com/signup">Sign up</a></div><!-- /wp:html -->`;
+    const result = enforceInternalLinkLimit(html, 4);
+    // Count unique editorial internal links in result
+    const stripped = result.html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "");
+    const uniqueDests = new Set<string>();
+    const hrefRe = /<a\b[^>]*href="([^"]*)"[^>]*>/gi;
+    let m: RegExpExecArray | null;
+    while ((m = hrefRe.exec(stripped)) !== null) {
+      const h = m[1];
+      if (/^\/blog\//.test(h)) uniqueDests.add(h.replace(/\/$/, ""));
+    }
+    expect(uniqueDests.size).toBeLessThanOrEqual(4);
+    expect(result.removed.length).toBe(1); // one link removed
+    // Anchor text preserved (link unwrapped, text stays)
+    expect(result.html).toContain("link five");
+    expect(result.html).not.toContain(`<a href="/blog/article-5"`);
+  });
+
+  it("final-trim removes last paragraph without breaking WP blocks", () => {
+    // Create a section with multiple paragraphs
+    const sectionHtml = `<!-- wp:paragraph --><p>First paragraph with important content about the topic. This provides genuine value to the reader about key concepts covered here.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>Second paragraph that continues the discussion. It adds more useful information about the subject matter being discussed in this section.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>Third paragraph with filler content that is less essential. This is the type of repetitive text that can be safely removed when trimming word count. It doesn't add much value to the overall article content.</p><!-- /wp:paragraph -->`;
+    const beforeWc = countReadableWords(sectionHtml);
+    expect(beforeWc).toBeGreaterThan(60);
+    
+    // Simulate trim: remove last paragraph
+    const paras = sectionHtml.match(/<!--\s*wp:paragraph\s*-->\s*\n?<p>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi);
+    expect(paras).not.toBeNull();
+    expect(paras!.length).toBe(3);
+    
+    const lastPara = paras![paras!.length - 1];
+    const lastIdx = sectionHtml.lastIndexOf(lastPara);
+    const trimmed = sectionHtml.substring(0, lastIdx).trim() + sectionHtml.substring(lastIdx + lastPara.length);
+    
+    const afterWc = countReadableWords(trimmed);
+    expect(afterWc).toBeLessThan(beforeWc);
+    expect(afterWc).toBeGreaterThan(30); // Still has substantial content
+    // WP blocks remain balanced
+    const wpOpen = (trimmed.match(/<!--\s*wp:\w+/gi) ?? []).length;
+    const wpClose = (trimmed.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
+    expect(wpOpen).toBe(wpClose);
+  });
+
+  it("rebalanceWpBlocks normalizes wp:wp: prefixes", () => {
+    const html = `<!-- wp:wp:paragraph --><p>Content with doubled prefix.</p><!-- /wp:wp:paragraph -->
+<!-- wp:heading {"level":2} --><h2>Normal heading</h2><!-- /wp:heading -->
+<!-- /wp:wp:heading -->`;
+    const normalized = rebalanceWpBlocks(html);
+    // Doubled prefixes should be normalized to single prefix
+    expect(normalized).not.toContain("wp:wp:");
+    expect(normalized).toContain("<!-- wp:paragraph -->");
+    expect(normalized).toContain("<!-- /wp:paragraph -->");
+    expect(normalized).toContain("<!-- wp:heading");
+    // The orphaned closer (no matching opener) should be removed by rebalance logic
+    expect(normalized.split("<!-- /wp:heading").length - 1).toBeLessThanOrEqual(1);
+  });
+
+  it("wordCountRange uses ±15% for 2500-word target", () => {
+    const range = wordCountRange(2500);
+    // ±15% → 2125-2875
+    expect(range.min).toBe(2125);
+    expect(range.max).toBe(2875);
+  });
+
+  it("wordCountRange uses ±10% for 1500-word target", () => {
+    const range = wordCountRange(1500);
+    // ±10% → 1350-1650
+    expect(range.min).toBe(1350);
+    expect(range.max).toBe(1650);
+  });
+
+  it("renderArticleDocument places conclusion before CTA and FAQ schema", () => {
+    const doc = makeArticleDoc({
+      conclusion: { id: "conc", html: "<!-- wp:paragraph --><p>Conclusion text here.</p><!-- /wp:paragraph -->", wordCount: 5, status: "generated" },
+      cta: { id: "cta", type: "cta", html: "<!-- wp:html --><div><a href='https://app.b2ihub.com/signup'>Sign up</a></div><!-- /wp:html -->", fingerprint: "x" },
+      faqSchema: { id: "faq", type: "faq-schema", html: "<!-- wp:html --><script type='application/ld+json'>{\"@type\":\"FAQPage\"}</script><!-- /wp:html -->", fingerprint: "y" },
+    });
+    const html = renderArticleDocument(doc);
+    const concPos = html.indexOf("Conclusion text");
+    const ctaPos = html.indexOf("app.b2ihub.com/signup");
+    const schemaPos = html.indexOf("FAQPage");
+    expect(concPos).toBeGreaterThan(0);
+    expect(ctaPos).toBeGreaterThan(0);
+    expect(schemaPos).toBeGreaterThan(0);
+    // Conclusion must appear before CTA
+    expect(concPos).toBeLessThan(ctaPos);
+    // CTA must appear before FAQ schema
+    expect(ctaPos).toBeLessThan(schemaPos);
+  });
+});
+
+// ── Regression tests: CTA preservation, FAQ parity, word count validation ──
+
+import {
+  runFinalValidation,
+} from "@/lib/pipeline/blog-generation-pipeline";
+
+describe("CTA preservation", () => {
+  it("CTA survives after syncBlogFromDocument in factual-scan or trim stages", () => {
+    // Simulate what happens when cta-preserve re-injects a CTA and then
+    // a later stage calls syncBlogFromDocument(). The CTA should persist
+    // through parseArticleDocumentFromHtml because the regex correctly
+    // extracts it from the `wp:html` block.
+    const ctaHtml = `<!-- wp:html --><div class="cta-block"><h2>Ready to Start?</h2><p><a href="https://app.b2ihub.com/signup">Create Free Account</a></p></div><!-- /wp:html -->`;
+    const html = `<!-- wp:html --><div class="b2i-language-switcher"><span>EN</span> | <a href="/blog/test-zh">中文</a></div><!-- /wp:html -->
+
+<!-- wp:paragraph --><p>This is an intro paragraph about the topic being discussed in this article today.</p><!-- /wp:paragraph -->
+
+<!-- wp:heading {"level":2} --><h2>First Section</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>First section content with several sentences of useful information for the reader about this subject.</p><!-- /wp:paragraph -->
+
+<!-- wp:heading {"level":2} --><h2>Frequently Asked Questions</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p><strong>What is the main benefit?</strong><br>It helps save time and money in real scenarios.</p><!-- /wp:paragraph -->
+
+<!-- wp:paragraph --><p>In conclusion this is a summary paragraph with closing thoughts for readers.</p><!-- /wp:paragraph -->
+
+${ctaHtml}
+
+<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is the main benefit?","acceptedAnswer":{"@type":"Answer","text":"It helps."}}]}</script><!-- /wp:html -->`;
+
+    // Parse HTML back to ArticleDocument (simulates what applyHtmlToDocument does)
+    const doc = makeArticleDoc();
+    const parseResult = parseArticleDocumentFromHtml(html, doc);
+    expect(parseResult.doc).not.toBeNull();
+    expect(parseResult.errors.length).toBe(0);
+
+    // CTA should be extracted from HTML
+    expect(parseResult.doc!.cta).not.toBeNull();
+    expect(parseResult.doc!.cta!.html).toContain("app.b2ihub.com/signup");
+
+    // Render again — CTA should survive the round-trip
+    const rendered = renderArticleDocument(parseResult.doc!);
+    expect(rendered).toContain("app.b2ihub.com/signup");
+    expect(rendered).toContain("FAQPage");
+
+    // Parse AGAIN (simulates what happens in factual-scan after syncBlogFromDocument)
+    const parseResult2 = parseArticleDocumentFromHtml(rendered, parseResult.doc!);
+    expect(parseResult2.doc).not.toBeNull();
+    expect(parseResult2.doc!.cta).not.toBeNull();
+    expect(parseResult2.doc!.cta!.html).toContain("app.b2ihub.com/signup");
+  });
+
+  it("CTA is detected by countCtaHeadingTags", () => {
+    const ctaHtml = `<!-- wp:html --><div class="cta-block"><h2>Ready to grow your brand with B2I Hub?</h2><p><a href="https://app.b2ihub.com/signup">Sign Up</a></p></div><!-- /wp:html -->`;
+    const headings = countCtaHeadingTags(ctaHtml);
+    expect(headings).toBeGreaterThanOrEqual(1);
+  });
+
+  it("signup URL count is exact in canonical CTA", () => {
+    const ctaHtml = `<!-- wp:html --><div style="background: #1E3A8A;"><h2>Ready to grow your brand?</h2><a href="https://app.b2ihub.com/signup">Create Profile</a></div><!-- /wp:html -->`;
+    const signupCount = (ctaHtml.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
+    expect(signupCount).toBe(1);
+  });
+});
+
+describe("FAQ parity", () => {
+  it("extractVisibleFaqFromArticle handles FAQ after paragraph splitting", () => {
+    // FAQ with each Q&A pair in its own paragraph (split by normalizeParagraphs)
+    const faqHtml = `<!-- wp:paragraph --><p><strong>What is the main benefit?</strong><br>It helps you save time and money. The solution is proven to work effectively.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>How do I get started?</strong><br>Simply sign up and follow setup. It takes less than five minutes.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>Is it suitable for small businesses?</strong><br>Yes, it scales to any size. Many small teams use it daily.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>What support is available?</strong><br>24/7 email and chat support. Phone support during business hours.</p><!-- /wp:paragraph -->`;
+
+    const doc = makeArticleDoc({
+      sections: [{
+        id: "section-0", heading: "Frequently Asked Questions", headingLevel: 2 as const,
+        sectionType: "faq-heading" as const,
+        html: faqHtml, wordCount: countReadableWords(faqHtml), status: "generated",
+      }],
+    });
+
+    const visibleFaq = extractVisibleFaqFromArticle("", doc);
+    expect(visibleFaq.length).toBe(4);
+    expect(visibleFaq[0].question).toBe("What is the main benefit");
+    expect(visibleFaq[3].question).toBe("What support is available");
+    expect(visibleFaq[0].answerText).toContain("save time");
+  });
+
+  it("FAQ parity mismatch detected when schema has 6 questions but visible has 4", () => {
+    // Schema with 6 questions, visible with only 4
+    const schemaQuestions = 6;
+    const visibleFaq = [
+      { question: "Q1", answerText: "A1" },
+      { question: "Q2", answerText: "A2" },
+      { question: "Q3", answerText: "A3" },
+      { question: "Q4", answerText: "A4" },
+    ];
+    expect(visibleFaq.length).not.toBe(schemaQuestions);
+    // faq-recovery should detect this and rebuild
+  });
+
+  it("FAQ extraction from ArticleDocument section boundary excludes conclusion text", () => {
+    const faqBody = `<!-- wp:paragraph --><p><strong>What is it?</strong><br>It works well for users. Very effective approach here.</p><!-- /wp:paragraph -->`;
+    // Simulate doc with FAQ section
+    const doc = makeArticleDoc({
+      sections: [
+        {
+          id: "section-main", heading: "Main Section", headingLevel: 2 as const,
+          sectionType: "main" as const,
+          html: "<!-- wp:paragraph --><p>Main content here with details about the topic.</p><!-- /wp:paragraph -->",
+          wordCount: 12, status: "generated",
+        },
+        {
+          id: "section-faq", heading: "Frequently Asked Questions", headingLevel: 2 as const,
+          sectionType: "faq-heading" as const,
+          html: faqBody + `<!-- wp:paragraph --><p>Ready to grow your brand? Sign up at B2I Hub today. Create your free account now.</p><!-- /wp:paragraph -->`,
+          wordCount: countReadableWords(faqBody), status: "generated",
+        },
+      ],
+      conclusion: { id: "conc", html: "<!-- wp:paragraph --><p>This is the conclusion. Sign up now for access.</p><!-- /wp:paragraph -->", wordCount: 12, status: "generated" },
+    });
+
+    const visibleFaq = extractVisibleFaqFromArticle("", doc);
+    // FAQ extraction should use the structured section boundary and not
+    // pull in the CTA-like text that follows the last Q&A
+    expect(visibleFaq.length).toBe(1);
+    expect(visibleFaq[0].question).toBe("What is it");
+  });
+});
+
+describe("Word count validation", () => {
+  it("evaluatePolicy rejects word count above 2875", () => {
+    // Build a policy for 2500-word target
+    const policy = buildPolicy(2500, 2125, 2875, "test keyphrase");
+
+    // Metrics above the max
+    const metricsAbove = {
+      readableWordCount: 2876,
+      exactKeyphraseCount: 25,
+      keyphraseDensity: 1.2,
+      exactKeyphraseInH2: true,
+      longParagraphCount: 0,
+      keyphraseInFirst100Words: true,
+      uniqueInternalLinkCount: 3,
+      externalSourceLinkCount: 2,
+      ctaHeadingCount: 1,
+      signupUrlCount: 1,
+      faqBlockCount: 1,
+      faqJsonLdCount: 1,
+      nestedParagraphCount: 0,
+      malformedHeadingCount: 0,
+      wpBlockCountMismatch: false,
+      faqParityValid: true,
+    };
+    const resultAbove = evaluatePolicy(metricsAbove, policy);
+    expect(resultAbove.passed).toBe(false);
+    expect(resultAbove.reasons.some((r) => r.includes("word count"))).toBe(true);
+  });
+
+  it("evaluatePolicy accepts word count at 2875 (exact max)", () => {
+    const policy = buildPolicy(2500, 2125, 2875, "test keyphrase");
+
+    const metricsAtMax = {
+      readableWordCount: 2875,
+      exactKeyphraseCount: 25,
+      keyphraseDensity: 1.2,
+      exactKeyphraseInH2: true,
+      longParagraphCount: 0,
+      keyphraseInFirst100Words: true,
+      uniqueInternalLinkCount: 3,
+      externalSourceLinkCount: 2,
+      ctaHeadingCount: 1,
+      signupUrlCount: 1,
+      faqBlockCount: 1,
+      faqJsonLdCount: 1,
+      nestedParagraphCount: 0,
+      malformedHeadingCount: 0,
+      wpBlockCountMismatch: false,
+      faqParityValid: true,
+    };
+    const resultAtMax = evaluatePolicy(metricsAtMax, policy);
+    expect(resultAtMax.passed).toBe(true);
+  });
+
+  it("evaluatePolicy rejects word count below 2125", () => {
+    const policy = buildPolicy(2500, 2125, 2875, "test keyphrase");
+
+    const metricsBelow = {
+      readableWordCount: 2124,
+      exactKeyphraseCount: 18,
+      keyphraseDensity: 1.1,
+      exactKeyphraseInH2: true,
+      longParagraphCount: 0,
+      keyphraseInFirst100Words: true,
+      uniqueInternalLinkCount: 3,
+      externalSourceLinkCount: 2,
+      ctaHeadingCount: 1,
+      signupUrlCount: 1,
+      faqBlockCount: 1,
+      faqJsonLdCount: 1,
+      nestedParagraphCount: 0,
+      malformedHeadingCount: 0,
+      wpBlockCountMismatch: false,
+      faqParityValid: true,
+    };
+    const resultBelow = evaluatePolicy(metricsBelow, policy);
+    expect(resultBelow.passed).toBe(false);
+    expect(resultBelow.reasons.some((r) => r.includes("word count"))).toBe(true);
+  });
+
+  it("countReadableWords excludes wp:html blocks from count", () => {
+    // Content that has wp:html CTA and FAQ schema — these should not contribute
+    const html = `<!-- wp:html --><div class="cta"><h2>Ready?</h2><a href="https://app.b2ihub.com/signup">Sign Up</a></div><!-- /wp:html -->
+<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is it?","acceptedAnswer":{"@type":"Answer","text":"It works."}}]}</script><!-- /wp:html -->
+<!-- wp:paragraph --><p>This is the only readable content that should be counted for word count purposes.</p><!-- /wp:paragraph -->`;
+    const wc = countReadableWords(html);
+    // Only the paragraph text should count: "This is the only readable content that should be counted for word count purposes." = 14 words
+    expect(wc).toBe(14);
   });
 });

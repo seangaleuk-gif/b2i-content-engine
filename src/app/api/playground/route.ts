@@ -20,7 +20,7 @@ export async function POST(request: Request) {
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },
       ],
-      { model: model ?? "deepseek-chat" }
+      { model: model ?? "deepseek-v4-flash" }
     );
 
     return NextResponse.json({
