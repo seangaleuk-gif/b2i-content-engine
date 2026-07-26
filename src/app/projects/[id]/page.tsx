@@ -29,6 +29,7 @@ import {
   History,
   Gauge,
   Eye,
+  Globe,
 } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -103,6 +104,7 @@ const workflowStepDefs: { id: string; label: string; icon: React.ReactNode }[] =
   { id: "images", label: "Images", icon: <Image size={16} /> },
   { id: "social", label: "Social", icon: <Share2 size={16} /> },
   { id: "translation", label: "Translation", icon: <Languages size={16} /> },
+  { id: "chinese-seo", label: "Chinese SEO", icon: <Globe size={16} /> },
   { id: "publish", label: "Publish", icon: <Send size={16} /> },
 ];
 

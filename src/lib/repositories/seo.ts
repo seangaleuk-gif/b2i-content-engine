@@ -22,6 +22,33 @@ export const seoRepository = {
     return data;
   },
 
+  /** Find checks for a language. English uses no prefix, Chinese uses `zh-` category prefix. */
+  async findByProjectAndLanguage(projectId: number, language: string): Promise<SeoCheck[]> {
+    const db = getDb() as any;
+    const query = db.from("seo_checks").select("*").eq("project_id", projectId);
+    if (language === "zh") {
+      query.like("category", "zh-%");
+    } else {
+      query.not("category", "like", "zh-%");
+    }
+    const { data, error } = await query.order("id");
+    if (error) throw error;
+    return data;
+  },
+
+  /** Delete checks for a language. English uses no prefix, Chinese uses `zh-` category prefix. */
+  async deleteByProjectAndLanguage(projectId: number, language: string): Promise<void> {
+    const db = getDb() as any;
+    const query = db.from("seo_checks").delete().eq("project_id", projectId);
+    if (language === "zh") {
+      query.like("category", "zh-%");
+    } else {
+      query.not("category", "like", "zh-%");
+    }
+    const { error } = await query;
+    if (error) throw error;
+  },
+
   async findByProjectAndCategory(projectId: number, category: string): Promise<SeoCheck[]> {
     const db = getDb() as any;
     const { data, error } = await db

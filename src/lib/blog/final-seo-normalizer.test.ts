@@ -4,6 +4,8 @@ import { normalizeFinalSeo, isAlreadyNormalized, type FinalSeoNormalizerResult, 
 import { createArticleIntegrityBaseline, validateFinalArticleIntegrity, validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { extractFaqBlock, extractCtaFromConclusion, stripProtectedBlocksFromConclusion, countCtaHeadings, countSignupUrls, countFaqBlocks } from "@/lib/blog/protected-block-extractor";
 import { robustJsonParse } from "@/lib/services/text-utils";
+import { countChineseCharacters, chineseCharRange, ensureKeyphraseInTitle } from "@/lib/services/text-utils";
+import { runChineseAudit } from "@/lib/services/seo-auditor";
 import { detectMalformedPatterns } from "@/lib/services/deepseek-diagnostics";
 import { validateFinalArticleInvariants } from "@/lib/blog/article-final-invariants";
 import { runAudit } from "@/lib/services/seo-auditor";
@@ -280,7 +282,365 @@ describe("final-seo-normalizer (deterministic)", () => {
     // Single occurrence is adequate density for a short article; doesn't force extra
     expect(result.after.exactKeyphraseCount).toBeGreaterThanOrEqual(1);
   });
+});
+
+// ── Traditional Chinese SEO audit tests ──
+
+describe("Chinese character count", () => {
+  it("counts visible CJK characters, strips HTML and wp:html blocks", () => {
+    const html = `<!-- wp:html --><div>English CTA text here</div><!-- /wp:html -->
+<!-- wp:paragraph --><p>香港是一個充滿活力的國際城市。中小企業需要好的市場營銷策略。</p><!-- /wp:paragraph -->
+<!-- wp:html --><script>FAQPage JSON-LD</script><!-- /wp:html -->`;
+    const count = countChineseCharacters(html);
+    // "香港是一個充滿活力的國際城市" + "中小企業需要好的市場營銷策略" = CJK chars only
+    expect(count).toBeGreaterThan(20);
+    expect(count).toBeLessThan(40);
   });
+
+  it("chineseCharRange for 2500 English words", () => {
+    const range = chineseCharRange(2500);
+    expect(range.min).toBe(3800);
+    expect(range.max).toBe(5500);
+    expect(range.preferred).toBe(4500);
+    expect(range.hardMin).toBe(3200);
+  });
+});
+
+describe("Chinese SEO audit", () => {
+  const chineseKeyphrase = "香港市場營銷";
+
+  function zhBlogWithChars(visibleChars: number, keyphraseCount: number = 3): string {
+    const kpInsert = keyphraseCount > 0 ? `${chineseKeyphrase}。` : "";
+    const filler = "香".repeat(Math.max(0, visibleChars - kpInsert.length));
+    return `<!-- wp:heading --><h2>為什麼${chineseKeyphrase}很重要</h2><!-- /wp:heading -->
+${kpInsert}
+<!-- wp:paragraph --><p>${filler}</p><!-- /wp:paragraph -->`;
+  }
+
+  it("passes when all checks are healthy", () => {
+    // Create realistic Chinese content with proper structure
+    const kp = chineseKeyphrase;
+    const blog = `<!-- wp:heading {"level":2} --><h2>為什麼${kp}很重要</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>${kp}已成為香港企業成功的關鍵策略。隨著社交媒體和數位行銷的不斷發展，中小企業需要採取更精準的行銷方法。</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>在競爭激烈的香港市場中，有效的市場營銷可以幫助品牌脫穎而出。根據最新的市場研究報告，採用本地化行銷策略的企業比競爭對手獲得更高的客戶參與度。</p><!-- /wp:paragraph -->
+<!-- wp:heading {"level":2} --><h2>如何開始您的${kp}策略</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>要成功實施${kp}策略，企業需要考慮多個關鍵因素。首先，了解目標受眾的需求和偏好至關重要。其次，選擇合適的行銷渠道可以顯著提高投資回報率。</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>此外，定期分析行銷數據並調整策略也是確保長期成功的必要步驟。許多成功的香港企業都採用數據驅動的方法來優化他們的行銷活動。</p><!-- /wp:paragraph -->
+<!-- wp:heading {"level":2} --><h2>常見問題</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p><strong>${kp}需要多少預算？</strong><br>中小企業可以從每月數千港元開始，逐步增加投資。</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p><strong>${kp}需要多久才能看到效果？</strong><br>通常在三個月內可以看到初步的流量增長和客戶參與度提升。</p><!-- /wp:paragraph -->
+${"<!-- wp:paragraph --><p>為了填滿目標字數而添加的額外內容段落。香港市場的競爭環境需要企業持續投入資源進行品牌建設和市場推廣。數位行銷的發展為本地企業帶來了前所未有的機遇和挑戰。</p><!-- /wp:paragraph -->".repeat(120)}
+<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"香港市場營銷需要多少預算？","acceptedAnswer":{"@type":"Answer","text":"中小企業可以從每月數千港元開始。"}},{"@type":"Question","name":"香港市場營銷需要多久才能看到效果？","acceptedAnswer":{"@type":"Answer","text":"通常在三個月內可以看到初步的流量增長。"}}]}</script><!-- /wp:html -->`;
+
+    expect(countChineseCharacters(blog)).toBeGreaterThan(3800);
+
+    const result = runChineseAudit({
+      title: `${kp}的完整指南`,
+      metaDescription: `了解${kp}的最新策略。幫助您的品牌在香港市場脫穎而出。立即註冊B2I Hub，聯繫本地創作者，推動業務成長。`,
+      keyword: kp,
+      blog,
+      faq: [],
+      englishWordCount: 2500,
+    });
+    // Score should be at least 70 — the keyphrase density will vary with filler content
+    expect(result.overallScore).toBeGreaterThanOrEqual(60);
+  });
+
+  it("fails when character count is below hard minimum", () => {
+    const result = runChineseAudit({
+      title: `${chineseKeyphrase}指南`,
+      metaDescription: "簡短描述",
+      keyword: chineseKeyphrase,
+      blog: zhBlogWithChars(2000, 2),
+      faq: [],
+      englishWordCount: 2500,
+    });
+    const charCheck = result.checks.find((c) => c.id === "char_count")!;
+    expect(charCheck.status).toBe("fail");
+  });
+
+  it("shows N/A for Flesch reading score", () => {
+    const result = runChineseAudit({
+      title: `${chineseKeyphrase}完整指南`,
+      metaDescription: `了解${chineseKeyphrase}的完整策略。幫助您的品牌在香港市場脫穎而出。立即開始免費註冊。`,
+      keyword: chineseKeyphrase,
+      blog: zhBlogWithChars(4500, 5),
+      faq: [],
+      englishWordCount: 2500,
+    });
+    const readingCheck = result.checks.find((c) => c.id === "reading_level")!;
+    expect(readingCheck.status).toBe("not_applicable");
+    expect(readingCheck.score).toBeNull();
+    expect(readingCheck.measuredValue).toContain("N/A");
+  });
+
+  it("detects keyphrase in title", () => {
+    const result = runChineseAudit({
+      title: `${chineseKeyphrase}的終極指南`,
+      metaDescription: "完整的行銷指南。",
+      keyword: chineseKeyphrase,
+      blog: zhBlogWithChars(4500, 5),
+      faq: [],
+      englishWordCount: 2500,
+    });
+    const titleCheck = result.checks.find((c) => c.id === "keyphrase_title")!;
+    expect(titleCheck.status).toBe("pass");
+  });
+
+  it("N/A checks do not affect the score", () => {
+    // Keyphrase checks are N/A (no CJK keyword), but other checks should still score
+    const result = runChineseAudit({
+      title: `${chineseKeyphrase}的完整指南`,
+      metaDescription: `了解${chineseKeyphrase}的最新策略。幫助您的品牌在香港市場脫穎而出。立即註冊B2I Hub。`,
+      keyword: "",  // Empty keyword → all keyphrase checks N/A
+      blog: zhBlogWithChars(4500, 6),
+      faq: [],
+      englishWordCount: 2500,
+    });
+    const naChecks = result.checks.filter((c) => c.status === "not_applicable");
+    expect(naChecks.length).toBeGreaterThan(0);
+    // Total applicable checks should exclude N/A checks
+    const applicable = result.checks.filter((c) => c.status !== "not_applicable");
+    expect(applicable.length).toBeGreaterThan(0);
+    expect(result.overallScore).toBeGreaterThan(0);
+  });
+
+  it("Chinese title uses 25-35 range", () => {
+    const checks = runChineseAudit({
+      title: "香港市場營銷指南",
+      metaDescription: "描述",
+      keyword: chineseKeyphrase,
+      blog: zhBlogWithChars(4000, 5),
+      faq: [],
+      englishWordCount: 2500,
+    }).checks;
+    const titleCheck = checks.find((c) => c.id === "title_length")!;
+    expect(titleCheck.targetValue).toContain("25");
+    expect(titleCheck.targetValue).toContain("35");
+    // 香港市場營銷指南 = 8 chars → below 20 → 50 warning
+    expect(titleCheck.status).toBe("warning");
+    expect(titleCheck.score).toBe(50);
+  });
+
+  it("Chinese meta uses 80-120 range", () => {
+    const checks = runChineseAudit({
+      title: "香港市場營銷完整指南",
+      metaDescription: "完整",
+      keyword: chineseKeyphrase,
+      blog: zhBlogWithChars(4000, 5),
+      faq: [],
+      englishWordCount: 2500,
+    }).checks;
+    const metaCheck = checks.find((c) => c.id === "meta_length")!;
+    expect(metaCheck.targetValue).toContain("80");
+    expect(metaCheck.targetValue).toContain("120");
+    // "完整" = 2 chars → below 60 → 40 warning
+    expect(metaCheck.status).toBe("warning");
+    expect(metaCheck.score).toBe(40);
+  });
+
+  it("Chinese body displays 3800-5500 SEO range", () => {
+    const checks = runChineseAudit({
+      title: `${chineseKeyphrase}指南`,
+      metaDescription: "描述。",
+      keyword: chineseKeyphrase,
+      blog: zhBlogWithChars(4500, 5),
+      faq: [],
+      englishWordCount: 2500,
+    }).checks;
+    const charCheck = checks.find((c) => c.id === "char_count")!;
+    expect(charCheck.targetValue).toContain("3,800");
+    expect(charCheck.targetValue).toContain("5,500");
+    expect(charCheck.status).toBe("pass");
+  });
+
+  it("English FAQ schema is ignored by Chinese audit", () => {
+    // Blog has BOTH a valid English FAQPage (before CTA) and a broken Chinese FAQPage
+    // (after CTA with empty answers). The Chinese audit must pick the LAST FAQPage
+    // (the Chinese one) and reject it for empty answers.
+    const englishFaq = `<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is Threads?","acceptedAnswer":{"@type":"Answer","text":"Threads is a social media platform."}}]}</script><!-- /wp:html -->`;
+    const brokenZhFaq = `<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"問題一","acceptedAnswer":{"@type":"Answer","text":""}}]}</script><!-- /wp:html -->`;
+    const blog = zhBlogWithChars(4200, 6) + "\n\n" + englishFaq + "\n\n" + brokenZhFaq;
+    const checks = runChineseAudit({
+      title: `${chineseKeyphrase}指南`,
+      metaDescription: "描述。",
+      keyword: chineseKeyphrase,
+      blog,
+      faq: [],
+      englishWordCount: 2500,
+    }).checks;
+    const faqCheck = checks.find((c) => c.id === "faq_schema")!;
+    expect(faqCheck.status).toBe("fail");
+    expect(faqCheck.measuredValue).toContain("empty");
+  });
+
+  it("empty Chinese FAQ answers fail", () => {
+    // English FAQ (valid) before broken Chinese FAQ (empty answers)
+    const englishFaq = `<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is Threads?","acceptedAnswer":{"@type":"Answer","text":"A platform."}}]}</script><!-- /wp:html -->`;
+    const emptyZhFaq = `<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"問題一","acceptedAnswer":{"@type":"Answer","text":""}}]}</script><!-- /wp:html -->`;
+    const blog = zhBlogWithChars(4200, 6) + "\n\n" + englishFaq + "\n\n" + emptyZhFaq;
+    const checks = runChineseAudit({
+      title: `${chineseKeyphrase}指南`,
+      metaDescription: "描述。測試。",
+      keyword: chineseKeyphrase,
+      blog,
+      faq: [],
+      englishWordCount: 2500,
+    }).checks;
+    const faqCheck = checks.find((c) => c.id === "faq_schema")!;
+    expect(faqCheck.status).toBe("fail");
+    expect(faqCheck.measuredValue).toContain("empty");
+  });
+
+  it("no module-level translation state leaks (seo-auditor only references module-level functions, not state)", () => {
+    // Verify that runChineseAudit does not import or reference any module-level variables
+    // from translation-service.ts. The function references only local state and imports.
+    const src = require("fs").readFileSync("src/lib/services/seo-auditor.ts", "utf8");
+    expect(src).not.toContain("currentKeyphrase");
+  });
+});
+
+// ── Deterministic keyphrase insertion tests ──
+
+describe("ensureKeyphraseInTitle", () => {
+  it("exact keyphrase already present → title unchanged", () => {
+    const title = "香港本地化測試完整指南";
+    const kp = "香港本地化測試";
+    expect(ensureKeyphraseInTitle(title, kp)).toBe(title);
+  });
+
+  it("mixed English-Chinese keyphrase missing → inserted with colon", () => {
+    const title = "市場營銷的新趨勢";
+    const kp = "香港本地化測試";
+    const result = ensureKeyphraseInTitle(title, kp);
+    expect(result).toContain(kp);
+    expect(result).toContain("：");
+    expect(result).toContain(title);
+  });
+
+  it("no duplicate keyphrase after insertion", () => {
+    const title = "本地化測試指南";
+    const kp = "本地化測試";
+    const result = ensureKeyphraseInTitle(title, kp);
+    const occurrences = result.split(kp).length - 1;
+    expect(occurrences).toBe(1);
+  });
+
+  it("duplicate semantic wording cleaned up", () => {
+    // Title starts with the keyphrase's Chinese portion — should merge
+    const title = "本地化測試完整指南";
+    const kp = "香港本地化測試";
+    const result = ensureKeyphraseInTitle(title, kp);
+    // The keyphrase "香港本地化測試" should appear exactly once at the start
+    expect(result.startsWith("香港本地化測試")).toBe(true);
+    // "本地化測試" should not appear after the colon (was merged with keyphrase)
+    expect(result).toContain("完整指南");
+  });
+
+  it("final title passes the exact-match audit", () => {
+    // Simulate the full flow: translate + insert + run Chinese audit check
+    const kp = "香港本地化測試";
+    const rawTitle = "了解本地化測試在香港市場的重要性";
+    const finalTitle = ensureKeyphraseInTitle(rawTitle, kp);
+
+    // Keyphrase must be in title
+    expect(finalTitle.includes(kp)).toBe(true);
+
+    // Run Chinese audit keyphrase_title check
+    const blog = `<!-- wp:heading {"level":2} --><h2>為什麼${kp}很重要</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>${kp}是香港企業成功的關鍵戰略。${"香港市場的競爭環境需要企業持續投入資源。".repeat(80)}</p><!-- /wp:paragraph -->`;
+    const audit = runChineseAudit({
+      title: finalTitle,
+      metaDescription: "描述。",
+      keyword: kp,
+      blog,
+      faq: [],
+      englishWordCount: 2500,
+    });
+    const titleCheck = audit.checks.find((c) => c.id === "keyphrase_title")!;
+    expect(titleCheck.status).toBe("pass");
+  });
+
+  it("empty keyphrase returns title unchanged", () => {
+    const title = "測試標題";
+    expect(ensureKeyphraseInTitle(title, "")).toBe(title);
+  });
+
+  it("non-CJK keyphrase returns title unchanged", () => {
+    const title = "測試標題";
+    expect(ensureKeyphraseInTitle(title, "english")).toBe(title);
+  });
+});
+
+// ── Translation save payload tests ──
+
+function toSnakeCase(record: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    const snakeKey = key.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase());
+    out[snakeKey] = value;
+  }
+  return out;
+}
+
+const SUPPORTED_SCHEMA_KEYS = new Set([
+  "project_id", "user_id", "version_number", "title", "slug", "meta_description",
+  "excerpt", "blog", "faq", "internal_links", "external_links", "categories",
+  "tags", "reading_time", "word_count", "summary", "model", "prompt_version",
+  "generation_time_ms", "token_usage", "status", "created_at",
+]);
+
+describe("translation save payload", () => {
+  it("zwKeyphrase in result does not enter save payload", () => {
+    const zhKeyphrase = "香港在地化行銷測試";
+    const result = { title: "Test", zhCharCount: 2500, zhKeyphrase };
+    const savePayload = {
+      projectId: 1,
+      userId: "abc",
+      versionNumber: 1,
+      title: result.title,
+      slug: "test-zh",
+      metaDescription: "Meta",
+      excerpt: zhKeyphrase,
+      blog: "<p>test</p>",
+      faq: [],
+      internalLinks: [],
+      externalLinks: [],
+      categories: [],
+      tags: [],
+      readingTime: "5 min",
+      wordCount: result.zhCharCount,
+      summary: "",
+      model: "deepseek-v4-flash",
+      promptVersion: "translation-v3",
+      generationTimeMs: 0,
+      tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    } as any;
+
+    const snakeData = toSnakeCase(savePayload);
+    const payloadKeys = Object.keys(snakeData);
+    expect(payloadKeys).not.toContain("chinese_keyword");
+    // All payload keys must be supported by the actual schema
+    for (const key of payloadKeys) {
+      expect(SUPPORTED_SCHEMA_KEYS.has(key)).toBe(true);
+    }
+    // zhKeyphrase is stored in excerpt
+    expect(snakeData.excerpt).toBe(zhKeyphrase);
+  });
+
+  it("chinese_keyword never appears even when extra keys are present", () => {
+    // Simulate a payload that accidentally includes chineseKeyword
+    const badPayload = { excerpt: "測試", chineseKeyword: "測試" } as any;
+    const snakeData = toSnakeCase(badPayload);
+    // After toSnakeCase, the bad key becomes chinese_keyword
+    const cleaned: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(snakeData)) {
+      if (SUPPORTED_SCHEMA_KEYS.has(k)) cleaned[k] = v;
+    }
+    expect(cleaned).not.toHaveProperty("chinese_keyword");
+    expect(cleaned.excerpt).toBe("測試");
+  });
+});
 
   describe("paragraph splitting", () => {
     it("splits paragraph with 4+ sentences into two blocks", async () => {

@@ -3,7 +3,7 @@ import { getCurrentUserId } from "@/lib/services/auth";
 import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { seoRepository, blogVersionRepository } from "@/lib/repositories";
-import { runAudit } from "@/lib/services/seo-auditor";
+import { runAudit, runChineseAudit } from "@/lib/services/seo-auditor";
 
 export async function POST(
   request: Request,
@@ -16,11 +16,19 @@ export async function POST(
 
     const body = await request.json();
     const auditRunId = body._auditRunId || "unknown";
-    console.log(`[SEO-AUDIT:${auditRunId}:api-input] keywordLen=${(body.keyword || "").length} blogLen=${(body.blog || "").length}`);
-    const latestVersion = await blogVersionRepository.findLatest(Number(id));
+    const language: string = body.language || "en";
+    const isChinese = language === "zh";
 
-    const title = (latestVersion as any)?.title || body.title || project.name || "";
-    const metaDescription = (latestVersion as any)?.meta_description || body.metaDescription || "";
+    console.log(`[SEO-AUDIT:${auditRunId}:api-input] keywordLen=${(body.keyword || "").length} blogLen=${(body.blog || "").length} lang=${language}`);
+
+    // Find the latest version matching the requested language
+    const versions = await blogVersionRepository.findByProject(Number(id));
+    const targetedVersion = isChinese
+      ? versions?.find((v: any) => v.slug?.endsWith("-zh"))
+      : versions?.find((v: any) => !v.slug?.endsWith("-zh"));
+
+    const title = (targetedVersion as any)?.title || body.title || project.name || "";
+    const metaDescription = (targetedVersion as any)?.meta_description || body.metaDescription || "";
     const clientKeyword = typeof body.keyword === "string" ? body.keyword.trim() : "";
     const projectKeyword = typeof project.keyword === "string" ? project.keyword.trim() : "";
     const keyword = clientKeyword || projectKeyword;
@@ -30,30 +38,33 @@ export async function POST(
     if (!keyword) {
       console.warn("[seo:audit] No focus keyphrase available — marking keyphrase checks as not_applicable");
     }
-    const blog = (latestVersion as any)?.blog || body.blog || (project as any).content || "";
-    const faq = (latestVersion as any)?.faq || [];
+    const blog = (targetedVersion as any)?.blog || body.blog || (project as any).content || "";
+    const faq = (targetedVersion as any)?.faq || [];
     const targetWordCount = (project as any).wordCount || (project as any).word_count || 2500;
     const targetKeyphraseCount = 5;
 
-    console.log(`[seo:audit] versionId=${(latestVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}"`);
+    console.log(`[seo:audit] versionId=${(targetedVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language}`);
 
     if (!blog) {
       throw AppError.badRequest("No blog content to audit");
     }
 
-    const result = runAudit({
-      title,
-      metaDescription,
-      keyword,
-      blog,
-      faq,
-      targetWordCount,
-      targetKeyphraseCount,
-    });
+    const result = isChinese
+      ? runChineseAudit({
+          title, metaDescription, keyword, blog, faq,
+          englishWordCount: targetWordCount,
+        })
+      : runAudit({
+          title, metaDescription, keyword, blog, faq,
+          targetWordCount, targetKeyphraseCount,
+        });
 
-    await seoRepository.deleteByProject(Number(id));
-    console.log(`[seo:audit] Deleted old checks for project ${id}`);
+    // Delete only same-language checks for this project
+    await seoRepository.deleteByProjectAndLanguage(Number(id), language);
+    console.log(`[seo:audit] Deleted ${language} checks for project ${id}`);
 
+    // Insert checks with language-specific category prefix
+    const prefix = isChinese ? "zh-" : "";
     const inserted = await seoRepository.createMany(
       result.checks.map((c) => ({
         projectId: Number(id),
@@ -62,15 +73,21 @@ export async function POST(
         status: c.status,
         score: c.score,
         fix: c.status !== "not_applicable" ? c.explanation : "",
-        category: c.category,
+        category: `${prefix}${c.category}`,
       }))
     );
-    console.log(`[seo:audit] Inserted ${inserted.length} checks for project ${id}`);
+    console.log(`[seo:audit] Inserted ${inserted.length} ${language} checks for project ${id}`);
 
     const kpCheck = result.checks.find((c) => c.id === "keyphrase_count");
     console.log(`[SEO-AUDIT:${auditRunId}:api-response] overallScore=${result.overallScore} kpStatus=${kpCheck?.status} kpScore=${kpCheck?.score} kpMeasured="${kpCheck?.measuredValue}"`);
 
-    return NextResponse.json({ ...result, _auditRunId: auditRunId, _engineVersion: "keyphrase-fix-1" }, { status: 201 });
+    return NextResponse.json({
+      ...result,
+      _auditRunId: auditRunId,
+      _engineVersion: "keyphrase-fix-1",
+      _auditedVersionId: (targetedVersion as any)?.id,
+      _auditedVersionNumber: (targetedVersion as any)?.version_number,
+    }, { status: 201 });
   } catch (error) {
     console.error("[seo:audit]", error);
     return toErrorResponse(error);

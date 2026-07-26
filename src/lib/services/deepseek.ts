@@ -39,6 +39,7 @@ export interface ChatOptions {
 
 export interface ChatResult {
   content: string;
+  finishReason?: string;
   usage: {
     promptTokens: number;
     completionTokens: number;
@@ -223,6 +224,7 @@ export async function chat(
 
   return {
     content,
+    finishReason,
     usage: {
       promptTokens: usage.prompt_tokens,
       completionTokens: usage.completion_tokens,

@@ -388,3 +388,73 @@ export function countLongParagraphs(html: string, maxSentences: number = 3): num
   }
   return count;
 }
+
+/** Count visible CJK characters in HTML for Chinese content.
+ *  Strips wp:html blocks, scripts, styles, HTML tags, URLs, and non-CJK text.
+ *  Returns count of characters in the CJK Unified Ideographs range plus full-width forms. */
+export function countChineseCharacters(html: string): number {
+  const readable = html
+    .replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/[a-zA-Z0-9]/g, "")
+    .replace(/\s+/g, "");
+  let count = 0;
+  for (const ch of readable) {
+    const code = ch.charCodeAt(0);
+    if ((code >= 0x4E00 && code <= 0x9FFF) ||
+        (code >= 0x3400 && code <= 0x4DBF) ||
+        (code >= 0x3000 && code <= 0x303F) ||
+        (code >= 0xFF00 && code <= 0xFFEF) ||
+        (code >= 0xF900 && code <= 0xFAFF)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/** Map English word-count target to Traditional Chinese character-count range.
+ *  For 2,500 English words: SEO pass 3,800–5,500, hard fail <3,200, preferred ~4,500. */
+export function chineseCharRange(englishWordCount: number): {
+  min: number; max: number; preferred: number; hardMin: number;
+} {
+  const r = { pref: 1.80, min: 1.52, max: 2.20, hardMin: 1.28 };
+  return {
+    min: Math.round(englishWordCount * r.min),
+    max: Math.round(englishWordCount * r.max),
+    preferred: Math.round(englishWordCount * r.pref),
+    hardMin: Math.round(englishWordCount * r.hardMin),
+  };
+}
+
+/** Deterministically insert zhKeyphrase into a Chinese title if missing.
+ *  Returns the title with keyphrase prepended as `{keyphrase}：{title}`.
+ *  Removes duplicate keyphrase occurrences and duplicate separators. */
+export function ensureKeyphraseInTitle(title: string, keyphrase: string): string {
+  if (!keyphrase || !title) return title || keyphrase;
+  if (!/[\u4e00-\u9fff]/.test(keyphrase)) return title;
+  if (title.includes(keyphrase)) return title;
+
+  // Prepend: keyphrase + colon + space + title
+  let result = `${keyphrase}：${title}`;
+
+  // Remove any duplicate keyphrase occurrences (keep first)
+  const kpEscaped = keyphrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const kpRe = new RegExp(`(${kpEscaped}).*?(${kpEscaped})`, "g");
+  result = result.replace(kpRe, "$1");
+
+  // Clean duplicate separators
+  result = result.replace(/([：:-])\s*\1/g, "$1");
+
+  // Remove separator followed by same-semantics content (if title starts with keyphrase's Chinese portion)
+  // e.g. if keyphrase="來源本地化" and title="來源本地化完整指南" → "來源本地化：完整指南"
+  const cjkKp = keyphrase.replace(/[a-zA-Z\s]+/g, "");
+  if (cjkKp && result.includes(`：${cjkKp}`)) {
+    result = result.replace(`：${cjkKp}`, `${cjkKp}`);
+  }
+
+  return result;
+}

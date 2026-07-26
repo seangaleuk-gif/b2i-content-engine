@@ -16,6 +16,7 @@ import {
   Languages,
   Send,
   Sparkles,
+  Globe,
 } from "lucide-react";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { useData } from "@/lib/use-data";
@@ -40,6 +41,7 @@ const stepDefs = [
   { id: "images", label: "Images", icon: <Image size={16} />, path: "images" },
   { id: "social", label: "Social", icon: <Share2 size={16} />, path: "social" },
   { id: "translation", label: "Translation", icon: <Languages size={16} />, path: "translation" },
+  { id: "chinese-seo", label: "Chinese SEO", icon: <Globe size={16} />, path: "chinese-seo" },
   { id: "publish", label: "Publish", icon: <Send size={16} />, path: "publish" },
 ];
 
@@ -54,6 +56,7 @@ export function WorkflowStepper() {
   const { data: seoItems } = useData<any[]>(() => api.get(`/api/projects/${projectId}/seo`));
   const { data: imageItems } = useData<any[]>(() => api.get(`/api/projects/${projectId}/images`));
   const { data: socialItems } = useData<any[]>(() => api.get(`/api/projects/${projectId}/social`));
+  const { data: zhSeoItems } = useData<any[]>(() => api.get(`/api/projects/${projectId}/seo?version=zh`));
 
   const steps: WorkflowStep[] = useMemo(() => {
     const researchDone = (researchItems?.length ?? 0) > 0;
@@ -62,6 +65,8 @@ export function WorkflowStepper() {
     const seoDone = (seoItems?.length ?? 0) > 0;
     const imagesDone = (imageItems?.length ?? 0) > 0;
     const socialDone = (socialItems?.length ?? 0) > 0;
+    const translationDone = (versions ?? []).some((v: any) => v.slug?.endsWith("-zh"));
+    const zhSeoDone = (zhSeoItems?.length ?? 0) > 0;
 
     const statuses: Record<string, StepStatus> = {
       research: researchDone ? "complete" : "in-progress",
@@ -72,12 +77,13 @@ export function WorkflowStepper() {
       seo: seoDone ? "complete" : blogDone ? "in-progress" : "pending",
       images: imagesDone ? "complete" : blogDone ? "in-progress" : "pending",
       social: socialDone ? "complete" : blogDone ? "in-progress" : "pending",
-      translation: "pending",
-      publish: project?.status === "published" ? "complete" : blogDone ? "in-progress" : "pending",
+      translation: translationDone ? "complete" : socialDone ? "in-progress" : "pending",
+      "chinese-seo": zhSeoDone ? "complete" : translationDone ? "in-progress" : "pending",
+      publish: project?.status === "published" ? "complete" : zhSeoDone ? "in-progress" : "pending",
     };
 
     return stepDefs.map((def) => ({ ...def, status: statuses[def.id] || "pending" }));
-  }, [researchItems, seoItems, imageItems, socialItems, versions, project]);
+  }, [researchItems, seoItems, imageItems, socialItems, zhSeoItems, versions, project]);
 
   const completedCount = steps.filter((s) => s.status === "complete").length;
   const progressPercent = Math.round((completedCount / steps.length) * 100);

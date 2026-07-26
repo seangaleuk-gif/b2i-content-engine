@@ -80,7 +80,7 @@ export default function SEOAuditPage() {
   const [dismissedChecks, setDismissedChecks] = useState<Set<string>>(new Set());
 
   const { data: checks, loading, refetch } = useData<SeoCheck[]>(() =>
-    api.get(`/api/projects/${projectId}/seo`)
+    api.get(`/api/projects/${projectId}/seo?language=en`)
   );
 
   const { data: blogVersions } = useData<{ id: number; versionNumber: number; title: string; metaDescription: string; slug: string; blog: string }[]>(() =>

@@ -1,5 +1,6 @@
-import { countReadableWords, countLongParagraphs } from "./text-utils";
+import { countReadableWords, countLongParagraphs, countChineseCharacters, chineseCharRange } from "./text-utils";
 import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, type KeyphraseRange, FLESCH_MIN, FLESCH_MAX, KEYPHRASE_DENSITY_MIN, KEYPHRASE_DENSITY_MAX, KEYPHRASE_DENSITY_PREFERRED, getKeyphraseContentWordCount, wordCountRange } from "./generation-constants";
+import { extractVisibleFaqFromArticle } from "../blog/article-document";
 
 export type AuditStatus = "pass" | "warning" | "fail" | "not_applicable";
 
@@ -505,6 +506,308 @@ export function runAudit(input: AuditInput): AuditResult {
     weightedSum *= redistributionFactor;
   }
 
+  const overallScore = applicableWeight > 0 ? Math.round(weightedSum) : 0;
+
+  return {
+    overallScore,
+    checks,
+    summary: {
+      passed: checks.filter((c) => c.status === "pass").length,
+      warnings: checks.filter((c) => c.status === "warning").length,
+      failed: checks.filter((c) => c.status === "fail").length,
+      notApplicable: checks.filter((c) => c.status === "not_applicable").length,
+    },
+  };
+}
+
+// ── Traditional Chinese SEO audit ──
+// Shares the same scoring framework as runAudit() with Chinese-specific rules.
+
+export interface ChineseAuditInput {
+  title: string;
+  metaDescription: string;
+  keyword: string;
+  blog: string;
+  faq?: Array<{ question: string; answer: string }>;
+  englishWordCount: number;
+}
+
+export function runChineseAudit(input: ChineseAuditInput): AuditResult {
+  const { title, metaDescription, keyword, blog, faq, englishWordCount } = input;
+  const checks: AuditCheck[] = [];
+  const keywordLower = keyword?.toLowerCase().trim() ?? "";
+  const keywordHasCjk = /[\u4e00-\u9fff]/.test(keywordLower);
+  const h2Texts = extractH2Texts(blog);
+  const zhCharCount = countChineseCharacters(blog);
+  const zhRange = chineseCharRange(englishWordCount);
+
+  const makeCheck = (id: string, label: string, score: number | null, status: AuditStatus, measuredValue: string, targetValue: string, explanation: string, category: string): AuditCheck => ({ id, label, score, status, measuredValue, targetValue, explanation, category });
+
+  // 1. SEO Title Length — Chinese range: 25–35 visible Chinese characters
+  const titleLen = title.length;
+  const ZH_TITLE_MIN = 25;
+  const ZH_TITLE_MAX = 35;
+  if (titleLen >= ZH_TITLE_MIN && titleLen <= ZH_TITLE_MAX) {
+    checks.push(makeCheck("title_length", "SEO Title Length", 100, "pass", `${titleLen} chars`, `${ZH_TITLE_MIN}–${ZH_TITLE_MAX}`, "Title length is within the recommended Chinese range.", "SEO Fundamentals"));
+  } else if (titleLen >= 20 && titleLen < ZH_TITLE_MIN) {
+    checks.push(makeCheck("title_length", "SEO Title Length", 90, "warning", `${titleLen} chars`, `${ZH_TITLE_MIN}–${ZH_TITLE_MAX}`, "Title is slightly short for Chinese content.", "SEO Fundamentals"));
+  } else if (titleLen > ZH_TITLE_MAX && titleLen <= 40) {
+    checks.push(makeCheck("title_length", "SEO Title Length", 90, "warning", `${titleLen} chars`, `${ZH_TITLE_MIN}–${ZH_TITLE_MAX}`, "Title is slightly long for Chinese SEO.", "SEO Fundamentals"));
+  } else if (titleLen > 0 && titleLen < 20) {
+    checks.push(makeCheck("title_length", "SEO Title Length", 50, "warning", `${titleLen} chars`, `${ZH_TITLE_MIN}–${ZH_TITLE_MAX}`, "Title is too short for Chinese content.", "SEO Fundamentals"));
+  } else if (titleLen > 40) {
+    checks.push(makeCheck("title_length", "SEO Title Length", 50, "warning", `${titleLen} chars`, `${ZH_TITLE_MIN}–${ZH_TITLE_MAX}`, "Title is too long for Chinese SEO.", "SEO Fundamentals"));
+  } else {
+    checks.push(makeCheck("title_length", "SEO Title Length", 0, "fail", "0 chars", `${ZH_TITLE_MIN}–${ZH_TITLE_MAX}`, "No SEO title found.", "SEO Fundamentals"));
+  }
+
+  // 2. Meta Description Length — Chinese range: 80–120 visible Chinese characters
+  const metaLen = metaDescription.length;
+  const ZH_META_MIN = 80;
+  const ZH_META_MAX = 120;
+  if (metaLen >= ZH_META_MIN && metaLen <= ZH_META_MAX) {
+    checks.push(makeCheck("meta_length", "Meta Description Length", 100, "pass", `${metaLen} chars`, `${ZH_META_MIN}–${ZH_META_MAX}`, "Meta description is within the recommended Chinese range.", "SEO Fundamentals"));
+  } else if (metaLen >= 60 && metaLen < ZH_META_MIN) {
+    checks.push(makeCheck("meta_length", "Meta Description Length", 90, "warning", `${metaLen} chars`, `${ZH_META_MIN}–${ZH_META_MAX}`, "Meta description is slightly short for Chinese content.", "SEO Fundamentals"));
+  } else if (metaLen > ZH_META_MAX && metaLen <= 140) {
+    checks.push(makeCheck("meta_length", "Meta Description Length", 90, "warning", `${metaLen} chars`, `${ZH_META_MIN}–${ZH_META_MAX}`, "Meta description is slightly long for Chinese SEO.", "SEO Fundamentals"));
+  } else if (metaLen > 0 && metaLen < 60) {
+    checks.push(makeCheck("meta_length", "Meta Description Length", 40, "warning", `${metaLen} chars`, `${ZH_META_MIN}–${ZH_META_MAX}`, "Meta description is too short for Chinese content.", "SEO Fundamentals"));
+  } else if (metaLen > 140) {
+    checks.push(makeCheck("meta_length", "Meta Description Length", 50, "warning", `${metaLen} chars`, `${ZH_META_MIN}–${ZH_META_MAX}`, "Meta description is too long for Chinese SEO.", "SEO Fundamentals"));
+  } else {
+    checks.push(makeCheck("meta_length", "Meta Description Length", 0, "fail", "0 chars", `${ZH_META_MIN}–${ZH_META_MAX}`, "No meta description found.", "SEO Fundamentals"));
+  }
+
+  // 3. Focus Keyphrase in SEO Title
+  if (!keywordHasCjk) {
+    checks.push(makeCheck("keyphrase_title", "Keyphrase in SEO Title", null, "not_applicable", "No CJK keyword", "Exact phrase in title", "Keyword has no CJK characters — set a Chinese focus keyphrase for this project.", "SEO Fundamentals"));
+  } else if (keywordLower) {
+    const inTitle = title.toLowerCase().includes(keywordLower);
+    if (inTitle) {
+      checks.push(makeCheck("keyphrase_title", "Keyphrase in SEO Title", 100, "pass", `"${keyword}" found`, "Exact phrase in title", "The focus keyphrase appears in the SEO title.", "SEO Fundamentals"));
+    } else {
+      checks.push(makeCheck("keyphrase_title", "Keyphrase in SEO Title", 0, "fail", `"${keyword}" not found`, "Exact phrase in title", "The focus keyphrase is missing from the SEO title.", "SEO Fundamentals"));
+    }
+  } else {
+    checks.push(makeCheck("keyphrase_title", "Keyphrase in SEO Title", null, "not_applicable", "No keyphrase", "Exact phrase in title", "No focus keyphrase configured for this project.", "SEO Fundamentals"));
+  }
+
+  // 4. Body Character Count — Chinese char range
+  if (englishWordCount > 0) {
+    const rangeLabel = `${zhRange.min.toLocaleString()}–${zhRange.max.toLocaleString()} chars`;
+    if (zhCharCount >= zhRange.min && zhCharCount <= zhRange.max) {
+      checks.push(makeCheck("char_count", "Chinese Character Count", 100, "pass", `${zhCharCount.toLocaleString()} characters`, rangeLabel, "Character count is within the accepted tolerance range.", "SEO Fundamentals"));
+    } else if (zhCharCount >= zhRange.hardMin && zhCharCount <= zhRange.max * 1.05) {
+      checks.push(makeCheck("char_count", "Chinese Character Count", 60, "warning", `${zhCharCount.toLocaleString()} characters`, rangeLabel, "Character count is slightly outside the target range.", "SEO Fundamentals"));
+    } else {
+      checks.push(makeCheck("char_count", "Chinese Character Count", 0, "fail", `${zhCharCount.toLocaleString()} characters`, rangeLabel, "Character count is significantly outside the target range.", "SEO Fundamentals"));
+    }
+  } else {
+    checks.push(makeCheck("char_count", "Chinese Character Count", null, "not_applicable", "No target", "N/A", "No target word count configured.", "SEO Fundamentals"));
+  }
+
+  // 5. Keyphrase in First 200 Characters
+  if (keywordHasCjk && keywordLower) {
+    const readableText = extractReadableText(blog);
+    const first200 = readableText.substring(0, 200).toLowerCase();
+    const inFirst200 = first200.includes(keywordLower);
+    if (inFirst200) {
+      checks.push(makeCheck("keyphrase_first200", "Keyphrase in First 200 Characters", 100, "pass", "Found", "First 200 Chinese characters", "The keyphrase appears early in the content.", "Content & Keyphrase"));
+    } else {
+      checks.push(makeCheck("keyphrase_first200", "Keyphrase in First 200 Characters", 60, "warning", "Not found", "First 200 Chinese characters", "The focus keyphrase should appear within the first 200 characters (quality target, not a hard requirement).", "Content & Keyphrase"));
+    }
+  } else {
+    checks.push(makeCheck("keyphrase_first200", "Keyphrase in First 200 Characters", null, "not_applicable", "No CJK keyword", "First 200 Chinese characters", "Keyword has no CJK characters — set a Chinese focus keyphrase for this project.", "Content & Keyphrase"));
+  }
+
+  // 6. Keyphrase in H2
+  if (keywordHasCjk && keywordLower) {
+    const exactInH2 = h2Texts.some((h) => h.toLowerCase().includes(keywordLower));
+    const matchedHeading = h2Texts.find((h) => h.toLowerCase().includes(keywordLower)) ?? "";
+    if (exactInH2) {
+      checks.push(makeCheck("keyphrase_h2", "Keyphrase in H2", 100, "pass", `"${matchedHeading}"`, "Exact phrase in H2", "The exact keyphrase appears in an H2 heading.", "Content & Keyphrase"));
+    } else if (h2Texts.length > 0) {
+      checks.push(makeCheck("keyphrase_h2", "Keyphrase in H2", 60, "warning", "Not found", "Exact phrase in H2", "The keyphrase is missing from all H2 headings (quality target, not a hard requirement).", "Content & Keyphrase"));
+    } else {
+      checks.push(makeCheck("keyphrase_h2", "Keyphrase in H2", 60, "warning", "No H2 headings", "Exact phrase in H2", "No H2 headings found — add H2s to structure your content.", "Content & Keyphrase"));
+    }
+  } else {
+    checks.push(makeCheck("keyphrase_h2", "Keyphrase in H2", null, "not_applicable", "No CJK keyword", "Exact phrase in H2", "Keyword has no CJK characters — set a Chinese focus keyphrase for this project.", "Content & Keyphrase"));
+  }
+
+  // 7. Keyphrase Occurrences (density-aware for Chinese)
+  if (keywordHasCjk && keywordLower) {
+    const readableText = extractReadableText(blog);
+    const exactCount = countExactPhrase(readableText, keywordLower);
+    const kpCharLen = [...keywordLower].filter((c) => c.charCodeAt(0) >= 0x4E00).length || keywordLower.length;
+    const densityPct = zhCharCount > 0 ? (exactCount * kpCharLen / zhCharCount) * 100 : null;
+    const densityHealthy = densityPct !== null && densityPct >= KEYPHRASE_DENSITY_MIN && densityPct <= DENSITY_DISPLAY_MAX;
+
+    let kpScore: number;
+    let kpStatus: AuditStatus;
+    let kpMsg: string;
+
+    if (densityHealthy) {
+      kpScore = 100;
+      kpStatus = "pass";
+      kpMsg = `Keyphrase density is healthy (${densityPct!.toFixed(2)}%) for this article length.`;
+    } else if (densityPct !== null && densityPct >= 0.3 && densityPct < KEYPHRASE_DENSITY_MIN) {
+      kpScore = 60;
+      kpStatus = "warning";
+      kpMsg = `Keyphrase density is slightly low (${densityPct.toFixed(2)}%). Consider naturally increasing keyphrase frequency.`;
+    } else if (densityPct !== null && densityPct > DENSITY_DISPLAY_MAX && densityPct <= KP_DENSITY_STUFFING) {
+      kpScore = 60;
+      kpStatus = "warning";
+      kpMsg = `Keyphrase density is above the preferred range but below stuffing threshold (${densityPct.toFixed(2)}%). Consider using variations.`;
+    } else if (densityPct !== null && densityPct > KP_DENSITY_STUFFING) {
+      kpScore = 0;
+      kpStatus = "fail";
+      kpMsg = `Keyphrase density exceeds stuffing threshold (${densityPct.toFixed(2)}%) — hard failure. Reduce keyphrase occurrences.`;
+    } else {
+      kpScore = 0;
+      kpStatus = "fail";
+      kpMsg = "Keyphrase density is critically low — keyphrase is nearly absent.";
+    }
+
+    checks.push(makeCheck("keyphrase_count", "Keyphrase Occurrences", kpScore, kpStatus, `${exactCount} occurrences`, `Density ${KEYPHRASE_DENSITY_MIN}%–${DENSITY_DISPLAY_MAX}% (preferred ~${KEYPHRASE_DENSITY_PREFERRED}%, stuffing at ${KP_DENSITY_STUFFING}%)`, kpMsg, "Content & Keyphrase"));
+  } else {
+    checks.push(makeCheck("keyphrase_count", "Keyphrase Occurrences", null, "not_applicable", "No CJK keyword", "Density 0.5%–1.5%", "", "Content & Keyphrase"));
+  }
+
+  // 8. Keyphrase Density (weighted) — Chinese-adapted calculation
+  if (keywordHasCjk && keywordLower && zhCharCount > 0) {
+    const readableText = extractReadableText(blog);
+    const exactCount = countExactPhrase(readableText, keywordLower);
+    const cjkLen = [...keywordLower].filter((c) => c.charCodeAt(0) >= 0x4E00).length || keywordLower.length;
+    const kpUnits = Math.max(2, Math.ceil(cjkLen / 2));
+    const densityPct = (exactCount * kpUnits / zhCharCount) * 100;
+    const densityStr = `${densityPct.toFixed(2)}%`;
+    const targetStr = `${KEYPHRASE_DENSITY_MIN}%–${KEYPHRASE_DENSITY_PREFERRED}% (stuffing at ${KP_DENSITY_STUFFING}%)`;
+    if (densityPct >= KEYPHRASE_DENSITY_MIN && densityPct <= DENSITY_DISPLAY_MAX) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 100, "pass", densityStr, targetStr, "Density is within the healthy range.", "Content & Keyphrase"));
+    } else if (densityPct >= 0.3 && densityPct < KEYPHRASE_DENSITY_MIN) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is slightly below the minimum (soft warning).", "Content & Keyphrase"));
+    } else if (densityPct > DENSITY_DISPLAY_MAX && densityPct <= KP_DENSITY_STUFFING) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is above the preferred range but below stuffing threshold.", "Content & Keyphrase"));
+    } else if (densityPct > KP_DENSITY_STUFFING) {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 0, "fail", densityStr, targetStr, "Density exceeds stuffing threshold (hard failure). Reduce keyphrase occurrences.", "Content & Keyphrase"));
+    } else {
+      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 0, "fail", densityStr, targetStr, "Density is critically low — keyphrase is nearly absent.", "Content & Keyphrase"));
+    }
+  } else {
+    checks.push(makeCheck("keyphrase_density", "Keyphrase Density", null, "not_applicable", "N/A", `${KEYPHRASE_DENSITY_MIN}%–${DENSITY_DISPLAY_MAX}%`, "", "Content & Keyphrase"));
+  }
+
+  // 9. Paragraph Length
+  const totalParas = (blog.match(/<!--\s*wp:paragraph\s*-->/gi) ?? []).length;
+  const longParas = countLongParagraphs(blog, 3);
+  let paraScore: number; let paraStatus: AuditStatus; let paraMsg: string;
+  if (longParas === 0) { paraScore = 100; paraStatus = "pass"; paraMsg = "All paragraphs stay within the recommended sentence limit."; }
+  else if (longParas <= 2) { paraScore = 80; paraStatus = "warning"; paraMsg = `${longParas} paragraph(s) contain more than 3 sentences. Consider splitting longer paragraphs.`; }
+  else if (longParas <= 5) { paraScore = 60; paraStatus = "warning"; paraMsg = `${longParas} paragraphs exceed 3 sentences. Breaking these into shorter blocks improves readability.`; }
+  else { paraScore = 60; paraStatus = "warning"; paraMsg = `${longParas} of ${totalParas} paragraphs exceed 3 sentences. Split longer paragraphs into shorter sections.`; }
+  checks.push(makeCheck("paragraph_length", "Paragraph Length", paraScore, paraStatus, `${totalParas} paragraphs analysed`, "Max 3 sentences per paragraph", `${totalParas} paragraphs analysed. ${longParas === 0 ? "All within the sentence limit." : `${longParas} paragraph(s) contain more than 3 sentences.`} ${paraMsg}`, "Readability"));
+
+  // 10. Reading Level — N/A for Chinese (excluded from scoring)
+  checks.push(makeCheck("reading_level", "Reading Level", null, "not_applicable", "N/A (Chinese content)", "N/A", "Flesch reading score does not apply to Chinese content.", "Readability"));
+
+  // 11. Internal Links
+  const wpHtmlRanges: [number, number][] = [];
+  let wm3: RegExpExecArray | null;
+  const wpHtmlRegex3 = /<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi;
+  while ((wm3 = wpHtmlRegex3.exec(blog)) !== null) wpHtmlRanges.push([wm3.index, wm3.index + wm3[0].length]);
+  const scriptRegex3 = /<script[\s\S]*?<\/script>/gi;
+  while ((wm3 = scriptRegex3.exec(blog)) !== null) wpHtmlRanges.push([wm3.index, wm3.index + wm3[0].length]);
+  const uniqueInternal3 = new Set<string>();
+  const linkRegex3 = /<a\b[^>]*href="([^"]*)"[^>]*>/gi;
+  let lm3: RegExpExecArray | null;
+  while ((lm3 = linkRegex3.exec(blog)) !== null) { const href = lm3[1]; const pos = lm3.index; if (wpHtmlRanges.some(([s, e]) => pos >= s && pos < e)) continue; if (href.startsWith("/blog/")) uniqueInternal3.add(href); }
+  const intLinkCount3 = uniqueInternal3.size;
+  if (intLinkCount3 >= 0 && intLinkCount3 <= 4) {
+    checks.push(makeCheck("internal_links", "Internal Links", 100, "pass", `${intLinkCount3} unique`, "0–4", "Internal link count is within the accepted range.", "Links"));
+  } else {
+    checks.push(makeCheck("internal_links", "Internal Links", 0, "fail", `${intLinkCount3} unique`, "0–4", "More than 4 unique internal links — exceeds the maximum (hard failure).", "Links"));
+  }
+
+  // 12. External Links
+  const externalSet3 = new Set<string>();
+  let lm4: RegExpExecArray | null;
+  while ((lm4 = linkRegex3.exec(blog)) !== null) { const href = lm4[1]; const pos = lm4.index; if (wpHtmlRanges.some(([s, e]) => pos >= s && pos < e)) continue; if (href.startsWith("http")) externalSet3.add(href); }
+  const extLinkCount3 = externalSet3.size;
+  if (extLinkCount3 > 0) {
+    checks.push(makeCheck("external_links", "External Links", 100, "pass", `${extLinkCount3} unique`, "0+ accepted", "External links are present — supports editorial credibility.", "Links"));
+  } else {
+    checks.push(makeCheck("external_links", "External Links", 100, "pass", "0 unique", "0+ accepted", "No external links found — 0 is acceptable per policy.", "Links"));
+  }
+
+  // 13. FAQ Schema — Chinese-only: audit only the LAST FAQPage JSON-LD block
+  // (the Chinese schema, inserted after CTA). Reject empty answers and enforce
+  // exact parity with the visible Chinese FAQ content.
+  const scriptMatches3 = blog.match(/<script\s[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi) ?? [];
+  let chineseFaqValid = false;
+  let chineseFaqIssues: string[] = [];
+  const allScripts = scriptMatches3.map((s) => {
+    try { const jsonStr = s.replace(/<script[^>]*>/, "").replace(/<\/script>/, ""); return JSON.parse(jsonStr); } catch { return null; }
+  }).filter(Boolean);
+  // Find ALL FAQPage blocks, then pick the LAST one (Chinese, after CTA)
+  const faqPages = allScripts.filter((p: any) => p?.["@type"] === "FAQPage" && Array.isArray(p?.mainEntity));
+  if (faqPages.length > 0) {
+    const lastFaqPage = faqPages[faqPages.length - 1] as any;
+    const entities = lastFaqPage.mainEntity as Array<any>;
+    // Check for empty answers
+    const emptyAnswers = entities.filter((e: any) => !e.acceptedAnswer?.text?.trim());
+    if (emptyAnswers.length > 0) {
+      chineseFaqIssues.push(`${emptyAnswers.length} FAQ entr${emptyAnswers.length === 1 ? 'y has' : 'ies have'} empty acceptedAnswer.text`);
+    }
+    // Check parity: visible Chinese FAQ count should match schema question count
+    const zhVisibleFaq = extractVisibleFaqFromArticle(blog);
+    if (zhVisibleFaq.length > 0) {
+      const schemaQuestionCount = entities.length;
+      if (zhVisibleFaq.length !== schemaQuestionCount) {
+        chineseFaqIssues.push(`Visible FAQ count (${zhVisibleFaq.length}) differs from schema question count (${schemaQuestionCount})`);
+      } else {
+        // Check exact Q&A match (normalizing whitespace and punctuation spacing)
+        for (let i = 0; i < zhVisibleFaq.length; i++) {
+          const norm = (s: string) => s.replace(/\s+/g, " ").replace(/\s*([,、。？！，])/g, "$1").trim();
+          const vQ = norm(zhVisibleFaq[i].question);
+          const sQ = norm(entities[i].name || "");
+          const vA = norm(zhVisibleFaq[i].answerText);
+          const sA = norm(entities[i].acceptedAnswer?.text || "");
+          if (vQ !== sQ) { chineseFaqIssues.push(`FAQ #${i+1} question mismatch: visible="${vQ}" vs schema="${sQ}"`); }
+          if (vA !== sA) { chineseFaqIssues.push(`FAQ #${i+1} answer mismatch: visible="${vA.substring(0, 40)}..." vs schema="${sA.substring(0, 40)}..."`); }
+        }
+      }
+    }
+    chineseFaqValid = chineseFaqIssues.length === 0;
+  }
+
+  if (chineseFaqValid) {
+    checks.push(makeCheck("faq_schema", "FAQ Schema", 100, "pass", "Valid Chinese FAQPage JSON-LD", "FAQPage schema", `Valid Chinese FAQPage structured data with ${faqPages[faqPages.length - 1].mainEntity.length} entries.`, "Structure & Schema"));
+  } else if (faqPages.length > 0) {
+    checks.push(makeCheck("faq_schema", "FAQ Schema", 0, "fail", `Chinese FAQ issues: ${chineseFaqIssues.join("; ")}`, "FAQPage schema", chineseFaqIssues.join(". "), "Structure & Schema"));
+  } else {
+    checks.push(makeCheck("faq_schema", "FAQ Schema", 0, "fail", "No Chinese FAQPage JSON-LD found", "FAQPage schema", "No FAQPage schema found in the Chinese article.", "Structure & Schema"));
+  }
+
+  // ── Weighted scoring ──
+  let weightedSum = 0;
+  let applicableWeight = 0;
+  const categoryScores = new Map<string, { sum: number; weight: number; count: number }>();
+  for (const check of checks) {
+    if (!categoryScores.has(check.category)) { categoryScores.set(check.category, { sum: 0, weight: CATEGORY_WEIGHTS[check.category] ?? 10, count: 0 }); }
+    const cs = categoryScores.get(check.category)!;
+    if (check.status !== "not_applicable" && check.score !== null) { cs.sum += check.score; cs.count++; }
+  }
+  for (const [cat, cs] of categoryScores) {
+    const catWeight = CATEGORY_WEIGHTS[cat] ?? 10;
+    if (cs.count > 0) { const avg = cs.sum / cs.count; weightedSum += (avg / 100) * catWeight; applicableWeight += catWeight; }
+  }
+  const naCategories = [...categoryScores.entries()].filter(([_, cs]) => cs.count === 0);
+  if (naCategories.length > 0 && applicableWeight > 0) {
+    const naWeight = naCategories.reduce((s, [cat]) => s + (CATEGORY_WEIGHTS[cat] ?? 10), 0);
+    weightedSum *= (1 + naWeight / applicableWeight);
+  }
   const overallScore = applicableWeight > 0 ? Math.round(weightedSum) : 0;
 
   return {
