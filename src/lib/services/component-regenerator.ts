@@ -1,7 +1,8 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
 import { buildSystemPrompt, STAGE_SYSTEM_PROMPTS, type BlogContext } from "@/lib/services/prompt-builder";
 import { cleanBodyText, countWords, robustJsonParse } from "@/lib/services/text-utils";
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
+import { FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
+import { englishTitleRange, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount } from "@/lib/content-standards";
 
 // ── Types ──
 
@@ -129,16 +130,19 @@ export function validateComponents(
 ): ComponentFailure[] {
   const failures: ComponentFailure[] = [];
 
+  const { min: titleMin, max: titleMax } = englishTitleRange();
+  const { min: metaMin, max: metaMax } = englishMetaRange();
+
   // Title
   const tl = title.length;
-  if (tl < SEO_TITLE_MIN || tl > SEO_TITLE_MAX) {
-    failures.push({ component: "title", reason: `Length ${tl}`, target: `${SEO_TITLE_MIN}-${SEO_TITLE_MAX}`, actual: `${tl}` });
+  if (tl < titleMin || tl > titleMax) {
+    failures.push({ component: "title", reason: `Length ${tl}`, target: `${titleMin}-${titleMax}`, actual: `${tl}` });
   }
 
   // Meta
   const ml = meta.length;
-  if (ml < META_MIN || ml > META_MAX) {
-    failures.push({ component: "meta", reason: `Length ${ml}`, target: `${META_MIN}-${META_MAX}`, actual: `${ml}` });
+  if (ml < metaMin || ml > metaMax) {
+    failures.push({ component: "meta", reason: `Length ${ml}`, target: `${metaMin}-${metaMax}`, actual: `${ml}` });
   }
 
   if (!keyphrase) return failures;
@@ -148,18 +152,19 @@ export function validateComponents(
 
   // Density — identifies which section to regenerate
   const kc = blogCleaned.toLowerCase().split(kpLower).length - 1;
-  const kpRange = keyphraseRangeForWordCount(countWords(blogCleaned));
-  if (kc < kpRange.min || kc > kpRange.max) {
+  const wc = countWords(blogCleaned);
+  const kpTargets = computeKeyphraseTargets(wc, keyphrase);
+  if (kc < kpTargets.min || kc > kpTargets.max) {
     const sections = extractSectionsSimple(blog);
     if (sections.length > 0) {
-      if (kc < kpRange.min) {
+      if (kc < kpTargets.min) {
         // Find section with fewest keyphrases to add to
         let worstIdx = 0, worstCount = Infinity;
         for (const s of sections) {
           const count = cleanBodyText(s.bodyText).toLowerCase().split(kpLower).length - 1;
           if (count < worstCount) { worstCount = count; worstIdx = s.index; }
         }
-        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${kpRange.min}-${kpRange.max}`, actual: `${kc}` });
+        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${kpTargets.min}-${kpTargets.max}`, actual: `${kc}` });
       } else {
         // Find section with most keyphrases to regenerate
         let worstIdx = 0, worstCount = 0;
@@ -167,10 +172,10 @@ export function validateComponents(
           const count = cleanBodyText(s.bodyText).toLowerCase().split(kpLower).length - 1;
           if (count > worstCount) { worstCount = count; worstIdx = s.index; }
         }
-        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${kpRange.min}-${kpRange.max}`, actual: `${kc}` });
+        failures.push({ component: `section:${worstIdx}`, reason: `Density ${kc} (section ${worstIdx} has ${worstCount})`, target: `${kpTargets.min}-${kpTargets.max}`, actual: `${kc}` });
       }
     } else {
-      failures.push({ component: "density", reason: `Count ${kc}`, target: `${kpRange.min}-${kpRange.max}`, actual: `${kc}` });
+      failures.push({ component: "density", reason: `Count ${kc}`, target: `${kpTargets.min}-${kpTargets.max}`, actual: `${kc}` });
     }
   }
 
@@ -215,7 +220,8 @@ export async function regenerateTitle(
   currentTitle: string,
   keyphrase: string,
 ): Promise<string> {
-  const prompt = `Generate 5 alternative SEO titles that are ${SEO_TITLE_MIN}-${SEO_TITLE_MAX} characters and include the keyphrase "${keyphrase}".\n\nCurrent title (${currentTitle.length} chars): "${currentTitle}"\n\nReturn as JSON: {"alternatives": ["title 1", "title 2", "title 3", "title 4", "title 5"]}`;
+  const { min: titleMin, max: titleMax } = englishTitleRange();
+  const prompt = `Generate 5 alternative SEO titles that are ${titleMin}-${titleMax} characters and include the keyphrase "${keyphrase}".\n\nCurrent title (${currentTitle.length} chars): "${currentTitle}"\n\nReturn as JSON: {"alternatives": ["title 1", "title 2", "title 3", "title 4", "title 5"]}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: "You are an SEO title writer. Return only valid JSON." }, { role: "user", content: prompt }],
@@ -227,7 +233,7 @@ export async function regenerateTitle(
   const kpLower = keyphrase.toLowerCase();
 
   for (const alt of alternatives) {
-    if (alt.length >= SEO_TITLE_MIN && alt.length <= SEO_TITLE_MAX && alt.toLowerCase().includes(kpLower)) {
+    if (alt.length >= titleMin && alt.length <= titleMax && alt.toLowerCase().includes(kpLower)) {
       return alt;
     }
   }
@@ -240,7 +246,8 @@ export async function regenerateMeta(
   currentMeta: string,
   keyword: string,
 ): Promise<string> {
-  const prompt = `Generate 5 alternative meta descriptions that are ${META_MIN}-${META_MAX} characters and include the keyword "${keyword}".\n\nCurrent (${currentMeta.length} chars): "${currentMeta}"\n\nReturn as JSON: {"alternatives": ["meta 1", "meta 2", "meta 3", "meta 4", "meta 5"]}`;
+  const { min: metaMin, max: metaMax } = englishMetaRange();
+  const prompt = `Generate 5 alternative meta descriptions that are ${metaMin}-${metaMax} characters and include the keyword "${keyword}".\n\nCurrent (${currentMeta.length} chars): "${currentMeta}"\n\nReturn as JSON: {"alternatives": ["meta 1", "meta 2", "meta 3", "meta 4", "meta 5"]}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: "You write SEO meta descriptions. Return only valid JSON." }, { role: "user", content: prompt }],
@@ -251,7 +258,7 @@ export async function regenerateMeta(
   const alternatives: string[] = data.alternatives || [];
 
   for (const alt of alternatives) {
-    if (alt.length >= META_MIN && alt.length <= META_MAX) return alt;
+    if (alt.length >= metaMin && alt.length <= metaMax) return alt;
   }
 
   return alternatives[0] || currentMeta;

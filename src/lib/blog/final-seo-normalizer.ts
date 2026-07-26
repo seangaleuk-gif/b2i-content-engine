@@ -12,7 +12,7 @@ import {
   normalizeHtmlWhitespace,
   getFirstNReadableWords,
 } from "@/lib/seo/seo-text-utils";
-import { keyphraseRangeForWordCount, keyphrasePreferredTarget, computeKeyphraseTargets, computeKeyphraseDensity, KEYPHRASE_DENSITY_MIN, KEYPHRASE_DENSITY_MAX } from "@/lib/services/generation-constants";
+import { computeKeyphraseTargets, computeKeyphraseDensity, englishKeyphraseDensity } from "@/lib/content-standards";
 import { rebalanceWpBlocks } from "@/lib/services/text-utils";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, computeWordCountTolerance, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
@@ -1119,7 +1119,8 @@ export async function normalizeFinalSeo(
   const effectiveTarget = kpTargets.preferred;
   const kpMax = kpTargets.max;
 
-  console.log(`[SEO-NORMALIZER] started preferred=${kpTargets.preferred} max=${kpMax} density=${KEYPHRASE_DENSITY_MIN}%-${KEYPHRASE_DENSITY_MAX}%`);
+  const { warningBelow: kpLow, stuffingAbove: kpHigh } = englishKeyphraseDensity();
+  console.log(`[SEO-NORMALIZER] started preferred=${kpTargets.preferred} max=${kpMax} density=${kpLow}%-${kpHigh}%`);
 
   // Step 1: Tokenize protected blocks — extract and replace with placeholders.
   // This guarantees protected blocks are byte-identical after normalization
@@ -1202,8 +1203,8 @@ export async function normalizeFinalSeo(
 
   // Keyphrase density check — stuffing (>3%) is blocking, below-min is soft
   const kpDensity = computeKeyphraseDensity(after.exactKeyphraseCount, focusKeyphrase, after.readableWordCount);
-  const kpCountOk = kpDensity <= KEYPHRASE_DENSITY_MAX;
-  const kpBelowMin = kpDensity < KEYPHRASE_DENSITY_MIN;
+  const kpCountOk = kpDensity <= kpHigh;
+  const kpBelowMin = kpDensity < kpLow;
 
   const policy = buildPolicy(targetWordCount, undefined, undefined, focusKeyphrase);
   const policyResult = evaluatePolicy(after, policy);
@@ -1220,8 +1221,8 @@ export async function normalizeFinalSeo(
     || after.keyphraseInFirst100Words;
   const internalLinksOk = after.uniqueInternalLinkCount >= policy.internalLinkMin && after.uniqueInternalLinkCount <= policy.internalLinkMax;
 
-  if (after.exactKeyphraseCount > kpMax) warnings.push(`Keyphrase stuffing: ${after.exactKeyphraseCount} occurrences (${kpDensity.toFixed(1)}% density, max ${KEYPHRASE_DENSITY_MAX}%)`);
-  if (kpBelowMin) warnings.push(`Keyphrase density ${kpDensity.toFixed(1)}% below minimum ${KEYPHRASE_DENSITY_MIN}%`);
+  if (after.exactKeyphraseCount > kpMax) warnings.push(`Keyphrase stuffing: ${after.exactKeyphraseCount} occurrences (${kpDensity.toFixed(1)}% density, max ${kpHigh}%)`);
+  if (kpBelowMin) warnings.push(`Keyphrase density ${kpDensity.toFixed(1)}% below minimum ${kpLow}%`);
   if (!wcOk) warnings.push(`Word count ${after.readableWordCount} outside tolerance range ${tolerance.min}-${tolerance.max}`);
   if (!h2Ok) warnings.push("No H2 contains exact keyphrase");
   if (!parasOk) warnings.push(`${after.longParagraphCount} paragraphs still exceed 3 sentences`);

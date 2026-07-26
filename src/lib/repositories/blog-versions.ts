@@ -11,6 +11,20 @@ function toSnakeCase(record: Record<string, unknown>): Record<string, unknown> {
 }
 
 export const blogVersionRepository = {
+  async findById(id: number): Promise<BlogVersion | null> {
+    const db = getDb() as any;
+    const { data, error } = await db
+      .from("blog_versions")
+      .select("*")
+      .eq("id", id)
+      .single();
+    if (error) {
+      if (error.code === "PGRST116") return null;
+      throw error;
+    }
+    return data;
+  },
+
   async findByProject(projectId: number): Promise<BlogVersion[]> {
     const db = getDb() as any;
     const { data, error } = await db

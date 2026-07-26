@@ -20,7 +20,7 @@ import type { FinalArticlePolicy, FinalArticleMetrics } from "@/lib/blog/final-a
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { countReadableWords, containsExactPhrase } from "@/lib/services/text-utils";
 import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
-import { keyphraseRangeForWordCount, MAX_SENTENCES_PER_PARAGRAPH } from "@/lib/services/generation-constants";
+import { MAX_SENTENCES_PER_PARAGRAPH } from "@/lib/services/generation-constants";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, ensureLanguageSwitcher, pairedSlugs } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";

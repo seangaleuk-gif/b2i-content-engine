@@ -5,14 +5,21 @@ import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { blogVersionRepository } from "@/lib/repositories";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getCurrentUserId();
     const { id } = await params;
     await requireProjectAccess(userId, Number(id));
-    const versions = await blogVersionRepository.findByProject(Number(id));
+    const url = new URL(request.url);
+    const language = url.searchParams.get("language");
+    let versions = await blogVersionRepository.findByProject(Number(id));
+    if (language === "en") {
+      versions = versions.filter((v: any) => !v.slug?.endsWith("-zh"));
+    } else if (language === "zh") {
+      versions = versions.filter((v: any) => v.slug?.endsWith("-zh"));
+    }
     return NextResponse.json(versions);
   } catch (error) {
     return toErrorResponse(error);

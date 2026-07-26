@@ -111,7 +111,8 @@ export async function POST(
     const categories = (latest as any).categories || [];
     const tags = (latest as any).tags || [];
 
-    // Run Chinese SEO audit using the AI-translated keyphrase.
+    // Run Chinese SEO audit using the AI-translated keyphrase and paired English version.
+    const pairedEnFaq = (latest as any)?.faq || [];
     const zhAudit = runChineseAudit({
       title: result.title || latest.title || "",
       metaDescription: result.metaDescription || (latest as any).meta_description || "",
@@ -119,6 +120,7 @@ export async function POST(
       blog: zhBlog,
       faq: extractVisibleFaqAsArray(zhBlog),
       englishWordCount: (latest as any).word_count || 2500,
+      pairedEnglishFaqCount: Array.isArray(pairedEnFaq) ? pairedEnFaq.length : 0,
     });
     console.log("[translate] Chinese SEO audit:", JSON.stringify({
       score: zhAudit.overallScore,
@@ -140,7 +142,7 @@ export async function POST(
 
     const nextVersion = await blogVersionRepository.getNextVersionNumber(Number(id));
 
-    const saved = await blogVersionRepository.create({
+    const created = await blogVersionRepository.create({
       projectId: Number(id),
       userId,
       versionNumber: nextVersion,
@@ -157,16 +159,29 @@ export async function POST(
       readingTime: `${result.estimatedReadingMinutes} min`,
       // wordCount stores CJK character count for Chinese content (not English whitespace words)
       wordCount: result.zhCharCount,
-      summary: "",
+      summary: `source-en-version:${latest.id}`,
       model: "deepseek-v4-flash",
       promptVersion: "translation-v3",
       generationTimeMs: 0,
       tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     } as any);
+    const createdId = (created as any).id;
+
+    // Readback: verify the exact created version by ID
+    const readback = await blogVersionRepository.findById(createdId);
+    if (!readback) {
+      throw AppError.internal(`Post-save readback failed: version ${createdId} not found`);
+    }
 
     return NextResponse.json({
-      saved: true,
-      version: { id: (saved as any).id, versionNumber: (saved as any).versionNumber },
+      version: {
+        id: createdId,
+        versionNumber: nextVersion,
+        language: "zh",
+        slug: zhSlug,
+        sourceEnVersionId: latest.id,
+        keyphrase: zhKeyword,
+      },
       chineseSeo: {
         score: zhAudit.overallScore,
         softWarnings: softWarnings.length,

@@ -123,11 +123,10 @@ export default function ChineseSEOPage() {
 
   const auditChecks = liveAuditResult?.checks ?? (savedChecks ?? []) as SeoCheck[];
   const auditedVersionNumber = liveAuditResult?._auditedVersionNumber ?? (savedChecks as any)?._version;
-  const applicableChecks = auditChecks.filter((c) => c.status !== "not_applicable");
-  const overallScore =
-    applicableChecks.length > 0
-      ? Math.round(applicableChecks.reduce((sum, c) => sum + (c.score ?? 0), 0) / applicableChecks.length)
-      : 0;
+  // Use server-provided overall score; fall back to simple average for saved checks only
+  const overallScore = liveAuditResult?.overallScore ?? (auditChecks.length > 0
+    ? Math.round(auditChecks.filter((c) => c.status !== "not_applicable").reduce((sum, c) => sum + (c.score ?? 0), 0) / Math.max(1, auditChecks.filter((c) => c.status !== "not_applicable").length))
+    : 0);
 
   const statusIcon = (status: string) => {
     switch (status) {
@@ -147,9 +146,11 @@ export default function ChineseSEOPage() {
         <div>
           <h1 className="text-[38px] font-bold text-text-primary tracking-tight">Chinese SEO Audit</h1>
           <p className="text-[14px] text-text-secondary mt-1">
-            {latestZh
-              ? `Auditing v${latestZh.versionNumber} — ${latestZh.title}`
-              : "Traditional Chinese content optimization report"}
+            {liveAuditResult
+              ? `Audited v${(liveAuditResult as any)._auditedVersionNumber ?? "?"} (id: ${(liveAuditResult as any)._auditedVersionId ?? "?"})`
+              : latestZh
+                ? `Auditing v${latestZh.versionNumber} — ${latestZh.title}`
+                : "Traditional Chinese content optimization report"}
             {isOutdated && (
               <span className="ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-accent-warning/10 text-accent-warning">
                 outdated
@@ -219,25 +220,28 @@ export default function ChineseSEOPage() {
             </Card>
 
             <Card className="col-span-3">
-              <div className="grid grid-cols-2 gap-6">
-                <div>
-                  <h3 className="text-[13px] font-medium text-text-secondary mb-3 uppercase tracking-wider">Score Breakdown</h3>
-                  <div className="space-y-3">
-                    {categories.map((cat) => {
-                      const catChecks = auditChecks.filter((c) => c.category === cat);
-                      const catScore = Math.round(catChecks.reduce((sum, c) => sum + (c.score ?? 0), 0) / catChecks.length);
-                      return (
-                        <div key={cat}>
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-[13px] text-text-secondary">{cat}</span>
-                            <span className="text-[13px] text-text-primary font-medium">{catScore}%</span>
-                          </div>
-                          <ProgressBar value={catScore} variant={catScore >= 80 ? "success" : catScore >= 60 ? "warning" : "primary"} size="sm" />
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
+                  <div className="grid grid-cols-2 gap-6">
+                    <div>
+                      <h3 className="text-[13px] font-medium text-text-secondary mb-3 uppercase tracking-wider">Score Breakdown</h3>
+                      <div className="space-y-3">
+                        {categories.map((cat) => {
+                          const catChecks = auditChecks.filter((c) => c.category === cat).filter((c) => c.status !== "not_applicable");
+                          const catScore = catChecks.length > 0
+                            ? Math.round(catChecks.reduce((sum, c) => sum + (c.score ?? 0), 0) / catChecks.length)
+                            : null;
+                          if (catScore === null) return null;
+                          return (
+                            <div key={cat}>
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="text-[13px] text-text-secondary">{cat}</span>
+                                <span className="text-[13px] text-text-primary font-medium">{catScore}%</span>
+                              </div>
+                              <ProgressBar value={catScore} variant={catScore >= 80 ? "success" : catScore >= 60 ? "warning" : "primary"} size="sm" />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
 
                 <div>
                   <h3 className="text-[13px] font-medium text-text-secondary mb-3 uppercase tracking-wider">Summary</h3>

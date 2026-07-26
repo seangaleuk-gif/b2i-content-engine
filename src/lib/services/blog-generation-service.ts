@@ -11,7 +11,8 @@ import { getCompiledBundle } from "@/lib/services/prompt-compiler";
 import { AiService, type ChatMessage, type ChatOptions } from "@/lib/services/deepseek";
 import { AppError } from "@/lib/services/errors";
 import { countReadableWords, robustJsonParse, repairMetaDescription, containsExactPhrase } from "@/lib/services/text-utils";
-import { META_MIN, META_MAX, DEFAULT_WORD_COUNT, WORD_ALLOCATION, computeKeyphraseTargets, keyphraseRangeForWordCount, GENERATION_WORD_BUFFER, wordCountRange, getKeyphraseContentWordCount } from "@/lib/services/generation-constants";
+import { WORD_ALLOCATION, GENERATION_WORD_BUFFER } from "@/lib/services/generation-constants";
+import { englishWordTolerance, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount } from "@/lib/content-standards";
 import { runComponentRegeneration, regenerateIntroduction, regenerateSection, regenerateConclusion, type GenContext } from "@/lib/services/component-regenerator";
 import { buildGenerationReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry } from "@/lib/services/generation-telemetry";
@@ -123,9 +124,9 @@ export async function runBlogGeneration(
 
   const { systemPrompt, userMessage } = buildBlogPrompt(context);
   const { bundle } = getCompiledBundle(context);
+  const requestedWordCount = context.project.wordCount || 2500;
 
-  const requestedWordCount = context.project.wordCount || DEFAULT_WORD_COUNT;
-  const { min: wordMin, max: wordMax } = wordCountRange(requestedWordCount);
+  const { min: wordMin, max: wordMax } = englishWordTolerance(requestedWordCount);
   const keyphrase = (context.project.keyword ?? "").toLowerCase();
 
   // Phase A: Outline
@@ -188,7 +189,8 @@ export async function runBlogGeneration(
   // Mark the FAQ section type so ArticleDocument can use structured boundaries
   const faqSectionType = "faq-heading" as const;
 
-  const repairedMeta = repairMetaDescription(outline.metaDescription || "", META_MIN, META_MAX);
+  const { min: metaMin, max: metaMax } = englishMetaRange();
+  const repairedMeta = repairMetaDescription(outline.metaDescription || "", metaMin, metaMax);
 
   const internalTarget = Math.ceil(requestedWordCount * GENERATION_WORD_BUFFER);
   const introTarget = Math.round(internalTarget * WORD_ALLOCATION.INTRO);

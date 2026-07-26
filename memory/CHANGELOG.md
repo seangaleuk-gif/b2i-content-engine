@@ -1,54 +1,50 @@
 # Changelog
 
-## 2026-07-25 — Translation QA Fixes, Source Localisation, Numeric Equivalence, Paragraph Splitting
+## 2026-07-26 — Chinese Translation Pipeline, SEO Audit, Retry Budget, Assembly Fixes
 
-### Translation QA Script Fixes
-- **Brand-preservation false positives**: `checkBrands()` now detects which brands actually appear in English source text, only requires those in output. Case-insensitive.
-- **Malformed-heading false positive**: `editorialHeadings()` strips `wp:html` blocks, scripts, JSON-LD before counting. CTA `<h2>` inside `wp:html` no longer counted as mismatch.
-- **Chinese length reporting**: QA script displays `ZH Chinese characters: N` for `-zh` articles using the saved `word_count` field (CJK chars).
-- **Number comparison**: Replaced raw total-count comparison with component-level exact normalized occurrence matching. Reports every lost/extra value by name.
-- **Secrets removal**: Hardcoded Supabase keys removed from scripts. Now loaded from `.env.local` via `dotenv`. Fails clearly when required variables missing.
-- **API model name fix**: Default model changed from `deepseek-chat` to `deepseek-v4-flash` in `deepseek.ts` and `playground/route.ts`.
+### Traditional Chinese Translation Pipeline
+- **Metadata + keyphrase combined call**: Meta description and English focus keyphrase translated together in a single request (padded with introduction text to avoid DeepSeek `empty_response` on tiny prompts). Structured JSON attempt first; plain-text JSON fallback second; finally a one-shot plain-text keyphrase translation if both JSON attempts fail.
+- **Keyphrase sanitization**: Non-CJK characters (English letters, spaces) stripped from AI output. Clean CJK-only keyphrase stored in `excerpt` field on the saved version.
+- **12-call normal flow**: Metadata+keyphrase, title, introduction, 6× combined H2+body sections, conclusion, FAQ, CTA — 12 normal API calls per translation.
+- **Combined H2 + section body**: Single AI call returns JSON `{heading, body}` replacing prior separate H2 heading call. Section-body validation remains unchanged. Heading fallback call if empty or mostly English.
+- **Retry budget**: `RetryBudget` class scoped per `translateArticle()` call, not module-level. 12 shared retries across the entire translation. Every component gets its first API attempt regardless of budget exhaustion. Caps only retries (attempts 2 and 3).
 
-### Source Localisation
-- **`localiseSources()`** — For non-authoritative URLs, research items are scored by Chinese domain bonus (+3), title/anchor text similarity (×5), number match (+2), snippet quality (+1), same-domain (+1). Replacement threshold: score ≥ 4 AND content similarity ≥ 1.
-- **Authoritative domains preserved**: `gov.hk`, `censtatd.gov.hk`, `facebook.com`, `instagram.com`, `meta.com`, `google.com`, WHO, UN, OECD, Statista, academic publishers.
-- **`applySourceDecisions()`** — Safe regex-based replacement in rendered HTML, preserving all anchor attributes.
-- **`localiseInternalLinks()`** — Checks for existing `-zh` slug versions in DB; localises only when real Chinese version exists.
-- **`SourceDecision` type** — Tracks `originalUrl`, `finalUrl`, `decision`, `reason`, `matchScore`.
+### Chinese SEO Audit
+- **`runChineseAudit()`**: Parallel to `runAudit()` with Chinese-specific rules: character count range 3,800–5,500 (hard fail below 3,200), title 25–35 chars, meta 80–120 chars, keyphrase in first 200 CJK chars, Flesch N/A (excluded from scoring).
+- **FAQ schema**: Audits only the LAST `FAQPage` JSON-LD block. Rejects empty `acceptedAnswer.text`. Enforces exact visible/schema parity. First attempt retries on `finish_reason=length` with `max_tokens: 2048`.
+- **CJK keyphrase guard**: If the stored keyword has no CJK characters, keyphrase checks show as not_applicable — no false failures for English keywords.
+- **Chinese SEO tab**: New `/projects/[id]/chinese-seo` route with saved audit reload, version tracking, and outdated indicator.
 
-### Unit-Aware Numeric Equivalence
-- **`extractScaledNumbers()`** — Replaces `extractVisibleNumbers()` + `normalizeNumber()`. Converts `1.2 million` ↔ `120萬`, `2.5 billion` ↔ `25億`, `500 thousand` ↔ `50萬`, `HK$1.2 million` ↔ `120萬港元`.
-- Supports: `thousand`/`千`, `million`/`萬`, `billion`/`億`, `HK$`/`港元`, `US$`, full-width percent.
-- Currency mismatch (`US$1.2M` ≠ `120萬港元`) correctly rejected.
-- **`checkNumbersPreserved()`** uses count-based occurrence matching (per value, not total).
+### SEO Audit Version & Language Separation
+- **Audit route**: English audits find latest non-`-zh` version; Chinese audits find latest `-zh` version. Previous behaviour used `findLatest()` regardless of language.
+- **Language-prefixed categories**: Chinese checks stored with `zh-` prefix on `category` field (e.g. `zh-SEO Fundamentals`). Added `findByProjectAndLanguage()` and `deleteByProjectAndLanguage()` to seo repository.
+- **GET route**: Accepts `?language=en|zh` query parameter.
 
-### Word Count Hard Failure
-- **`evaluatePolicy()`**: Word count changed from SOFT warning to HARD failure. Articles outside 2,125-2,875 range now blocked.
-- **`scoreArticle()`**: Word count uses `scoreInRange(value, min, max)` with tolerance range, not `scoreMin(≥target)`.
-- Flesch readability skipped for Chinese content (slug ends with `-zh`).
-- Keyphrase scoring uses density-based formula (`KEYPHRASE_DENSITY_MIN`/`MAX`).
+### Hard Validation Gate (Translation Route)
+- **Critical fix**: Route now blocks saving when `failedComponents` is non-empty: `throw AppError.badRequest(...)`. Previously only logged the failure.
+- Failed components: introduction, title, each section, section-heading fallback, conclusion, FAQ, meta-description, faq-count, cta.
+- Number mismatches (`numbersMatch: false`) correctly set `passed: false` in `translateWithRetry`.
 
-### Final-Trim Aggressiveness
-- **`final-trim`**: Increased max passes from 3 to 8. Loops until under `wordMax`. Target per pass: `Math.max(30, ceil(stillExcess / sectionCount))`. Breaks when `passRemoved === 0`.
+### Assembly Defect Fixes
+- **English blocks stripped**: `FAQPage` JSON-LD schemas stripped from section bodies before assembly using regex with optional whitespace (`"@type"\s*:\s*"FAQPage"`).
+- **CTA CJK check**: Translated CTA must contain CJK characters — if not, marked as hard failure.
+- **FAQ count**: Enforced 4–6 entries before building `faqSchema`. Count outside range blocks saving.
+- **Same-array FAQ + schema**: Visible FAQ and `faqSchema` built from the same `zhFaq` array — wording matches exactly.
 
-### Paragraph Splitting Fix
-- **`splitLongParagraphs()`**: Improved sentence boundary detection with Chinese punctuation (。！？), abbreviation handling (Mr., Dr., etc.), character-by-character scanning.
-- **`countLongParagraphs()`**: Shared function used by pipeline, SEO audit, final validation, and post-save readback.
-- **Pipeline order**: `paragraphs-final` moved to last content-changing position (after `faq-recovery`, before `final-validation`) so no later `syncBlogFromDocument()` can rejoin split paragraphs.
-- **Post-save readback**: Route calls `countLongParagraphs()` on final HTML and rejects if any editorial paragraph exceeds 3 sentences.
+### Cost Optimisation
+- `MAX_RETRIES` reduced from 1 to 0 — outer retry loop removed; inner `chatWithRetry` (3 tries) sufficient.
+- `translateText` max_tokens reduced from 4096 to 512; CTA from 4096 to 1024; FAQ from 8192 to 4096.
+- Dead `METADATA_ZH_SYSTEM` constant and `{keyphrase}` placeholder removed from `TRANSLATION_SYSTEM`.
 
-### Bug Fixes
-- **FAQ recovery corrupted links**: Changed insertion point from conclusion-text match to before last `wp:html` block.
-- **Quality scorer tests**: Updated 4 tests expecting soft word-count → hard failure.
-- **Pipeline order tests**: Updated 3 test stage lists to include `paragraphs-final`.
+### SEO Auditor Updates
+- Long paragraphs changed from hard fail (0) to minimum score 60/warning (soft per pipeline policy).
+- External links: 0 acceptable (pass 100, not fail 0).
+- Internal links: 0–4 range (not 3–5).
+- Keyphrase density: weighted formula matching pipeline, stuffing threshold at 3%.
+- Keyphrase in first 100 words: warning (60) not fail (0).
+- Keyphrase in H2: warning (60) not fail (0).
 
-### Known Pipeline Bugs (still open)
-1. **CTA loss**: `cta-preserve` re-injects CTA into `state.blog` but NOT `state.articleDoc.cta`. `syncBlogFromDocument()` rebuilds from document, losing the CTA.
-2. **FAQ parity after paragraph split**: `faq-recovery` runs before `paragraphs-final`. Split FAQ paragraphs change visible structure but schema is already rebuilt.
-3. **Word count validation inconsistency**: Articles >2,875 words still return 201. Suspected: `guardStageOutput` restores pre-validation snapshot after validation passes.
-
-### Tests: 586 passing (7 files)
+### Tests: 620 passing (7 files)
 
 ---
 

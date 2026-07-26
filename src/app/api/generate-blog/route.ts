@@ -63,6 +63,12 @@ export async function POST(request: Request) {
       throw AppError.internal(saveErr);
     }
 
+    // Readback: verify the exact created version by ID exists
+    const readbackVersion = await blogVersionRepository.findById(savedVersionId!);
+    if (!readbackVersion) {
+      throw AppError.internal(`Post-save readback failed: version ${savedVersionId} not found`);
+    }
+
     try {
       await aiLogRepository.create({
         userId, model: "section-by-section", endpoint: "/api/generate-blog",
@@ -73,8 +79,21 @@ export async function POST(request: Request) {
       });
     } catch (e) { console.error("[AI-LOG] Non-fatal:", String(e)); }
 
-    const responsePayload = {
-      success: true, version: nextVersion,
+    // Post-save content validation
+    const wordCountRecheck = countReadableWords(finalBlogHtml);
+    if (wordCountRecheck < result.wordMin || wordCountRecheck > result.wordMax) {
+      console.error(`[generate-blog:POST] Readback FAILED: word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
+      throw AppError.internal(`Post-save word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
+    }
+    const longParaCount = countLongParagraphs(finalBlogHtml, 3);
+    if (longParaCount > 0) {
+      console.error(`[generate-blog:POST] Readback FAILED: ${longParaCount} paragraph(s) exceed 3 sentences`);
+      throw AppError.internal(`Post-save validation failed: ${longParaCount} paragraph(s) exceed 3 sentences`);
+    }
+
+    return NextResponse.json({
+      success: true,
+      version: nextVersion,
       title: finalTitle,
       slug: result.generated.slug,
       metaDescription: result.generated.metaDescription,
@@ -92,21 +111,8 @@ export async function POST(request: Request) {
       generationTimeMs,
       tokenUsage: { totalTokens: 0 },
       qualityScore: result.qualityReport?.qualityScore ?? null,
-    };
-
-    // Post-save readback: verify the saved article passes all hard checks.
-    const wordCountRecheck = countReadableWords(finalBlogHtml);
-    if (wordCountRecheck < result.wordMin || wordCountRecheck > result.wordMax) {
-      console.error(`[generate-blog:POST] Readback FAILED: word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
-      throw AppError.internal(`Post-save word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
-    }
-    const longParaCount = countLongParagraphs(finalBlogHtml, 3);
-    if (longParaCount > 0) {
-      console.error(`[generate-blog:POST] Readback FAILED: ${longParaCount} paragraph(s) exceed 3 sentences`);
-      throw AppError.internal(`Post-save validation failed: ${longParaCount} paragraph(s) exceed 3 sentences`);
-    }
-
-    return NextResponse.json(responsePayload, { status: 201 });
+      _versionId: savedVersionId,
+    }, { status: 201 });
 
   } catch (error) {
     console.error("[generate-blog:POST]", error instanceof Error ? error.message : String(error));

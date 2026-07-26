@@ -46,6 +46,8 @@ export interface ChatResult {
     totalTokens: number;
   };
   model: string;
+  /** Number of retry attempts actually consumed beyond the first. 0 = first attempt succeeded. */
+  attemptsUsed: number;
 }
 
 export interface ChatResponse {
@@ -231,6 +233,7 @@ export async function chat(
       totalTokens: usage.total_tokens,
     },
     model: data.model,
+    attemptsUsed: 0,
   };
 }
 
@@ -243,7 +246,9 @@ export async function chatWithRetry(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await chat(messages, options);
+      const result = await chat(messages, options);
+      result.attemptsUsed = attempt;
+      return result;
     } catch (err) {
       if (err instanceof DeepSeekError) {
         lastError = err;

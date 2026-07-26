@@ -2,50 +2,31 @@
 
 ## Active
 
-### 1. CTA loss after syncBlogFromDocument()
-- **Description**: The `cta-preserve` pipeline stage re-injects the CTA block into `state.blog` (HTML string) when the CTA is missing. However, later stages (`factual-scan`, `final-trim`) call `syncBlogFromDocument()`, which rebuilds HTML from `state.articleDoc`. The re-injected CTA is NOT persisted in `state.articleDoc.cta`, so it gets lost on rebuild. Final validation then fails with `cta headings=0; signup URLs=0`.
-- **Reproduction**: Run `/api/generate-blog` — approximately 60% of runs fail with CTA-related validation errors.
-- **Suspected cause**: `cta-preserve` modifies `state.blog` but not `state.articleDoc.cta`. `syncBlogFromDocument()` only reads from `ArticleDocument`.
-- **Fix**: Move `cta-preserve` to run AFTER all `syncBlogFromDocument()`-calling stages (`factual-scan`, `link-enforce`, `final-trim`, `faq-recovery`), just before `paragraphs-final`.
-- **Status**: Open — targeted fix identified
-- **Date discovered**: Jul 25, 2026
+### 1. DeepSeek v4 `empty_response` on small prompts
+- **Description**: DeepSeek v4 Flash returns `empty_response` for prompts under ~500 input tokens. Affects metadata+keyphrase JSON calls (even with `response_format`), tiny keyphrase-only queries, and short plain-text calls.
+- **Workaround**: Metadata calls padded with introduction text to exceed 500 input tokens. Keyphrase-only fallback uses a single plain-text `translateText` call (which wraps into a larger prompt). Structured JSON attempt retries without `response_format` on failure.
+- **Status**: Working — mitigated by padding and retry logic. Not eliminated.
+- **Date discovered**: Jul 26, 2026
 
-### 2. FAQ parity mismatch after paragraph splitting
-- **Description**: `faq-recovery` extracts visible FAQ from the HTML and rebuilds FAQPage JSON-LD. But `paragraphs-final` (which splits long paragraphs) runs AFTER `faq-recovery`. If FAQ paragraphs are split, the visible FAQ structure changes, but the schema (already rebuilt) doesn't match the new split structure.
-- **Reproduction**: Run `/api/generate-blog` — occasionally fails with `FAQ parity mismatch` in final validation.
-- **Suspected cause**: Pipeline order: `faq-recovery` → `paragraphs-final` → `final-validation`. The FAQ schema is rebuilt before paragraph splitting.
-- **Fix**: Move `faq-recovery` AFTER `paragraphs-final` so schema is rebuilt from the final (split) visible FAQ structure. Or rebuild FAQ schema as part of paragraphs-final.
-- **Status**: Open — targeted fix identified
-- **Date discovered**: Jul 25, 2026
-
-### 3. Word count validation above 2,875 still returns 201
-- **Description**: `evaluatePolicy()` includes `wcHard` which should reject articles with word count outside 2,125-2,875. However, articles with `wordCount > 3,000` still return `201`. The route computes `finalWordCount` from `finalBlogHtml`, but the pipeline's validation may run on a different snapshot.
-- **Reproduction**: Run `/api/generate-blog` consistently — word counts above 2,875 return 201 instead of 500.
-- **Suspected cause**: `guardStageOutput` in `runTrackedHtmlStage` may restore a pre-validation snapshot of `state.blog` after validation passes. The restored HTML has a different (higher) word count, which the route then saves.
-- **Fix**: Consolidate to one shared `countReadableWords()` call used by pipeline policy, route, and post-save readback. Log word count and HTML fingerprint at every critical point.
-- **Status**: Open — root cause identified
-- **Date discovered**: Jul 25, 2026
-
-### 4. Supabase Node.js 20 deprecation warning
+### 2. Supabase Node.js 20 deprecation warning
 - **Description**: `@supabase/supabase-js` warns about Node.js 20 deprecation at startup
 - **Reproduction**: Run `npm run dev` or `npm run build`
 - **Suspected cause**: `@supabase/supabase-js@2.110.6` requires Node.js >= 22
 - **Status**: Open — non-blocking warning
 - **Date discovered**: Jul 16, 2026
 
-### 5. Research page 500 when `BRAVE_API_KEY` not set
+### 3. Research page 500 when `BRAVE_API_KEY` not set
 - **Description**: Clicking "Generate Research" fails if `BRAVE_API_KEY` is not configured with a valid key
 - **Reproduction**: Set placeholder key and click Generate
 - **Suspected cause**: Placeholder value fails API authentication
 - **Status**: Expected behavior — user must set a real Brave Search API key
 - **Date discovered**: Jul 18, 2026
 
-### 6. Translated article `wordCount` must use CJK character count
-- **Description**: The route stores `wordCount` using `countReadableWords()` for translated Chinese articles. For `zh-HK` content, this should store CJK character count, not whitespace words.
-- **Reproduction**: Translate an English article to Chinese.
-- **Suspected cause**: Route uses `countReadableWords()` for all articles.
-- **Fix**: Use `result.zhCharCount` for `-zh` slug. Update already applied in route (uses `result.zhCharCount` from `TranslationResult`).
-- **Status**: Fixed Jul 25, 2026
+### 4. Chinese translation AI output quality varies per run
+- **Description**: The AI (DeepSeek v4) produces output with varying numeric preservation and English content. Section-0 of test article has 5 numbers; AI loses 1 in ~90% of runs. `hasExcessiveEnglish` blocks ~40% of runs. FAQ count varies (4-7). This is an AI output quality limitation, not a pipeline bug.
+- **Workaround**: Retry until AI produces compliant output. Validation gates correctly reject non-compliant content.
+- **Status**: Open — depends on AI model improvement
+- **Date discovered**: Jul 26, 2026
 
 ---
 
@@ -63,9 +44,20 @@
 | 8 | word_count not passed to prompt | Jul 17 | Jul 17 |
 | 9 | Copy button on research page | Jul 17 | Jul 17 |
 | 10 | DeepSeek truncation on long posts | Jul 17 | Jul 18 |
-| 11 | DeepSeek `deepseek-chat` model name outdated | Jul 25 | Jul 25 — changed to `deepseek-v4-flash` |
-| 12 | FAQ recovery corrupted link destinations | Jul 25 | Jul 25 — changed insertion to last `wp:html` block |
-| 13 | Paragraph splitting lost by later `syncBlogFromDocument()` | Jul 25 | Jul 25 — moved `paragraphs-final` to last content-changing position |
-| 14 | Quality scorer used `scoreMin` instead of tolerance range | Jul 25 | Jul 25 — changed to `scoreInRange` |
-| 15 | Quality scorer ran Flesch on Chinese content | Jul 25 | Jul 25 — skipped for `zh` slug |
-| 16 | Keyphrase used fixed occurrence range instead of density formula | Jul 25 | Jul 25 — changed to density-based |
+| 11 | DeepSeek `deepseek-chat` model name outdated | Jul 25 | Jul 25 |
+| 12 | FAQ recovery corrupted link destinations | Jul 25 | Jul 25 |
+| 13 | Paragraph splitting lost by later `syncBlogFromDocument()` | Jul 25 | Jul 25 |
+| 14 | Quality scorer used `scoreMin` instead of tolerance range | Jul 25 | Jul 25 |
+| 15 | Quality scorer ran Flesch on Chinese content | Jul 25 | Jul 25 |
+| 16 | Keyphrase used fixed occurrence range instead of density formula | Jul 25 | Jul 25 |
+| 17 | **CTA loss after syncBlogFromDocument()** — `cta-preserve` injected into HTML string but not `articleDoc.cta` | Jul 25 | Jul 26 |
+| 18 | **FAQ parity mismatch after paragraph split** — `faq-recovery`/`paragraphs-final` order | Jul 25 | Jul 26 |
+| 19 | **Word count validation >2,875 returns 201** — inconsistent `countReadableWords` | Jul 25 | Jul 26 |
+| 20 | **chinese_keyword column missing** — DB insert failed on unsupported column | Jul 26 | Jul 26 |
+| 21 | **Translation saved despite hard failures** — route logged `failedComponents` but didn't block save | Jul 26 | Jul 26 |
+| 22 | **English blocks in Chinese output** — English FAQPage schema, introduction, CTA rendered alongside Chinese | Jul 26 | Jul 26 |
+| 23 | **Chinese keyphrase checks N/A** — English project keyword used instead of saved `zhKeyphrase` from `excerpt` | Jul 26 | Jul 26 |
+| 24 | **Nested retry multiplication** — outer loop `MAX_RETRIES=1` × inner `chatWithRetry` 3 tries = 6 | Jul 26 | Jul 26 |
+| 25 | **Oversized max_tokens** — title 4096, heading 4096, keyphrase 4096, CTA 4096, FAQ 8192 | Jul 26 | Jul 26 |
+| 26 | **Dead METADATA_ZH_SYSTEM constant** — unused code from earlier metadata approach | Jul 26 | Jul 26 |
+| 27 | **Module-level retry budget shared across concurrent translations** | Jul 26 | Jul 26 |

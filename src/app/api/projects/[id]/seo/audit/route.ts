@@ -21,19 +21,56 @@ export async function POST(
 
     console.log(`[SEO-AUDIT:${auditRunId}:api-input] keywordLen=${(body.keyword || "").length} blogLen=${(body.blog || "").length} lang=${language}`);
 
-    // Find the latest version matching the requested language
+    // Find the latest version matching the requested language.
     const versions = await blogVersionRepository.findByProject(Number(id));
     const targetedVersion = isChinese
       ? versions?.find((v: any) => v.slug?.endsWith("-zh"))
       : versions?.find((v: any) => !v.slug?.endsWith("-zh"));
 
+    let pairedEnglishVersion: any = undefined;
+    if (isChinese) {
+      // Read the source English version ID from the Chinese version's summary field.
+      // Format: "source-en-version:<ID>" (set during translation).
+      const summary: string = (targetedVersion as any)?.summary || "";
+      const sourceMatch = summary.match(/^source-en-version:(\d+)$/);
+      if (sourceMatch) {
+        const sourceId = Number(sourceMatch[1]);
+        pairedEnglishVersion = versions?.find((v: any) => v.id === sourceId);
+      }
+      // Fallback for legacy versions without summary marker: find by slug matching
+      if (!pairedEnglishVersion) {
+        const enSlug = ((targetedVersion as any)?.slug || "").replace(/-zh$/, "");
+        pairedEnglishVersion = versions?.find((v: any) => v.slug === enSlug);
+      }
+      if (!pairedEnglishVersion) {
+        throw AppError.badRequest(
+          `Cannot identify the English source version for Chinese version ${(targetedVersion as any)?.id}. ` +
+          `Re-translate the article to create a proper paired version.`
+        );
+      }
+    }
+
     const title = (targetedVersion as any)?.title || body.title || project.name || "";
     const metaDescription = (targetedVersion as any)?.meta_description || body.metaDescription || "";
+
+    // For Chinese: use the saved Chinese keyphrase from the version's excerpt only.
+    // Never fall back to the English project keyword.
+    if (isChinese) {
+      const zhKeyword = ((targetedVersion as any)?.excerpt || "").trim();
+      if (!zhKeyword || !/[\u4e00-\u9fff]/.test(zhKeyword)) {
+        throw AppError.badRequest(
+          `Chinese SEO audit requires a valid Chinese keyphrase. ` +
+          `The Chinese version's excerpt field is empty or lacks CJK characters. ` +
+          `Re-translate the article to generate the Chinese keyphrase.`
+        );
+      }
+      body.keyword = zhKeyword;
+    }
     const clientKeyword = typeof body.keyword === "string" ? body.keyword.trim() : "";
     const projectKeyword = typeof project.keyword === "string" ? project.keyword.trim() : "";
-    const keyword = clientKeyword || projectKeyword;
+    const keyword = isChinese ? clientKeyword : (clientKeyword || projectKeyword);
 
-    console.log(`[KEYPHRASE-RESOLVE] client="${clientKeyword}" project="${projectKeyword}" resolved="${keyword}" len=${keyword.length}`);
+    console.log(`[KEYPHRASE-RESOLVE] zh="${(targetedVersion as any)?.excerpt}" client="${clientKeyword}" project="${projectKeyword}" resolved="${keyword}" len=${keyword.length}`);
 
     if (!keyword) {
       console.warn("[seo:audit] No focus keyphrase available — marking keyphrase checks as not_applicable");
@@ -43,7 +80,15 @@ export async function POST(
     const targetWordCount = (project as any).wordCount || (project as any).word_count || 2500;
     const targetKeyphraseCount = 5;
 
-    console.log(`[seo:audit] versionId=${(targetedVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language}`);
+    // Use the paired English version's word count for chineseCharRange, and its FAQ count for parity
+    const englishWordCount = isChinese
+      ? ((pairedEnglishVersion as any)?.word_count || targetWordCount)
+      : targetWordCount;
+    const pairedEnglishFaqCount = isChinese
+      ? ((pairedEnglishVersion as any)?.faq?.length || 0)
+      : 0;
+
+    console.log(`[seo:audit] versionId=${(targetedVersion as any)?.id} sourceEnVersionId=${(pairedEnglishVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language} enWordCount=${englishWordCount} enFaqCount=${pairedEnglishFaqCount}`);
 
     if (!blog) {
       throw AppError.badRequest("No blog content to audit");
@@ -52,7 +97,8 @@ export async function POST(
     const result = isChinese
       ? runChineseAudit({
           title, metaDescription, keyword, blog, faq,
-          englishWordCount: targetWordCount,
+          englishWordCount,
+          pairedEnglishFaqCount,
         })
       : runAudit({
           title, metaDescription, keyword, blog, faq,

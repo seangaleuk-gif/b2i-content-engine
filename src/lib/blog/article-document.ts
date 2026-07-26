@@ -363,8 +363,8 @@ export function extractVisibleFaqFromArticle(
     while ((sm = strongRe.exec(faqSection)) !== null) {
       const rawQuestion = sm[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
       // Skip if not a question — guards against keyphrase <strong> inside answers
-      if (!rawQuestion.endsWith("?")) continue;
-      const question = rawQuestion.replace(/\?$/, "").trim();
+      if (!rawQuestion.endsWith("?") && !rawQuestion.endsWith("？")) continue;
+      const question = rawQuestion.replace(/[?？]$/, "").trim();
       if (!question) continue;
 
       const afterStrong = sm.index + sm[0].length;
@@ -442,8 +442,8 @@ function extractFaqPairsFromSectionBody(sectionHtml: string): Array<{ question: 
   let sm: RegExpExecArray | null;
   while ((sm = strongRe.exec(sectionHtml)) !== null) {
     const rawQuestion = sm[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-    if (!rawQuestion.endsWith("?")) continue;
-    const question = rawQuestion.replace(/\?$/, "").trim();
+    if (!rawQuestion.endsWith("?") && !rawQuestion.endsWith("？")) continue;
+    const question = rawQuestion.replace(/[?？]$/, "").trim();
     if (!question) continue;
 
     const afterStrong = sm.index + sm[0].length;

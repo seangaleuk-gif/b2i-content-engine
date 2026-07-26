@@ -21,7 +21,7 @@ import {
   guardStageOutput,
   validatePipelineOrder,
 } from "@/lib/pipeline/blog-generation-pipeline";
-import { enforceInternalLinkLimit, analyzeFinalArticle, evaluatePolicy, buildPolicy } from "@/lib/blog/final-article-policy";
+import { enforceInternalLinkLimit, analyzeFinalArticle, evaluatePolicy, buildPolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
 
 // ── Test helpers ──
@@ -997,8 +997,10 @@ describe("Word count validation", () => {
   it("evaluatePolicy accepts word count at 2875 (exact max)", () => {
     const policy = buildPolicy(2500, 2125, 2875, "test keyphrase");
 
-    const metricsAtMax = {
+    const metricsAtMax: FinalArticleMetrics = {
       readableWordCount: 2875,
+      h2Count: 6,
+      faqEntryCount: 5,
       exactKeyphraseCount: 25,
       keyphraseDensity: 1.2,
       exactKeyphraseInH2: true,
@@ -1010,10 +1012,14 @@ describe("Word count validation", () => {
       signupUrlCount: 1,
       faqBlockCount: 1,
       faqJsonLdCount: 1,
+      hasLanguageSwitcher: true,
       nestedParagraphCount: 0,
       malformedHeadingCount: 0,
       wpBlockCountMismatch: false,
       faqParityValid: true,
+      titleLength: 60,
+      metaDescriptionLength: 170,
+      fleschReadingEase: 65,
     };
     const resultAtMax = evaluatePolicy(metricsAtMax, policy);
     expect(resultAtMax.passed).toBe(true);
@@ -1022,8 +1028,10 @@ describe("Word count validation", () => {
   it("evaluatePolicy rejects word count below 2125", () => {
     const policy = buildPolicy(2500, 2125, 2875, "test keyphrase");
 
-    const metricsBelow = {
+    const metricsBelow: FinalArticleMetrics = {
       readableWordCount: 2124,
+      h2Count: 6,
+      faqEntryCount: 5,
       exactKeyphraseCount: 18,
       keyphraseDensity: 1.1,
       exactKeyphraseInH2: true,
@@ -1035,10 +1043,14 @@ describe("Word count validation", () => {
       signupUrlCount: 1,
       faqBlockCount: 1,
       faqJsonLdCount: 1,
+      hasLanguageSwitcher: true,
       nestedParagraphCount: 0,
       malformedHeadingCount: 0,
       wpBlockCountMismatch: false,
       faqParityValid: true,
+      titleLength: 60,
+      metaDescriptionLength: 170,
+      fleschReadingEase: 65,
     };
     const resultBelow = evaluatePolicy(metricsBelow, policy);
     expect(resultBelow.passed).toBe(false);

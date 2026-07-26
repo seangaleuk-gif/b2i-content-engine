@@ -90,16 +90,21 @@ export default function SEOAuditPage() {
   const { data: project, loading: projectLoading } = useData<{ keyword?: string; name?: string }>(() =>
     api.get(`/api/projects/${projectId}`)
   );
-  const latestEn = (blogVersions ?? []).find((v) => !v.slug?.endsWith("-zh"));
+  const enVersions = (blogVersions ?? []).filter((v) => !v.slug?.endsWith("-zh"));
+  const latestEn = enVersions[0];
 
   const resolvedKeyword = (project?.keyword ?? "").trim();
 
   const targetBlog = targetVersion
-    ? (blogVersions ?? []).find((v) => v.versionNumber === targetVersion)?.blog ?? ""
+    ? enVersions.find((v) => v.versionNumber === targetVersion)?.blog ?? ""
     : "";
   const targetMeta = targetVersion
-    ? (blogVersions ?? []).find((v) => v.versionNumber === targetVersion)?.metaDescription ?? ""
+    ? enVersions.find((v) => v.versionNumber === targetVersion)?.metaDescription ?? ""
     : "";
+
+  // Outdated detection: compare audited version ID with latest English version ID
+  const auditedVersionId = (liveAuditResult as any)?._auditedVersionId;
+  const isOutdated = latestEn && auditedVersionId && latestEn.id !== auditedVersionId;
 
   const handleRunAudit = useCallback(async () => {
     if (!resolvedKeyword) {
@@ -113,7 +118,7 @@ export default function SEOAuditPage() {
       const auditRunId = crypto.randomUUID();
       console.log(`[SEO-AUDIT:${auditRunId}:client-request] keywordLen=${resolvedKeyword.length}`);
 
-      const result = await api.post<AuditResult>(`/api/projects/${projectId}/seo/audit`, {
+      const result = await api.post<any>(`/api/projects/${projectId}/seo/audit`, {
         keyword: resolvedKeyword,
         metaDescription: targetMeta || latestEn?.metaDescription || "",
         blog: targetBlog || undefined,
@@ -140,14 +145,10 @@ export default function SEOAuditPage() {
   if (loading && !liveAuditResult) return <SeoSkeleton />;
 
   const auditChecks = liveAuditResult?.checks ?? (checks ?? []) as SeoCheck[];
-  const applicableChecks = auditChecks.filter((c) => c.status !== "not_applicable");
-  const overallScore =
-    applicableChecks.length > 0
-      ? Math.round(
-          applicableChecks.reduce((sum, c) => sum + (c.score ?? 0), 0) /
-            applicableChecks.length
-        )
-      : 0;
+  // Use server-provided overall score; fall back to simple average for saved checks only
+  const overallScore = liveAuditResult?.overallScore ?? (auditChecks.length > 0
+    ? Math.round(auditChecks.filter((c) => c.status !== "not_applicable").reduce((sum, c) => sum + (c.score ?? 0), 0) / Math.max(1, auditChecks.filter((c) => c.status !== "not_applicable").length))
+    : 0);
 
   const statusIcon = (status: string) => {
     switch (status) {
@@ -179,7 +180,16 @@ export default function SEOAuditPage() {
             SEO Audit
           </h1>
           <p className="text-[14px] text-text-secondary mt-1">
-            {targetVersion ? `Auditing v${targetVersion} content` : "Content optimization report"}
+            {liveAuditResult
+              ? `Audited v${(liveAuditResult as any)._auditedVersionNumber ?? "?"} (id: ${(liveAuditResult as any)._auditedVersionId ?? "?"})`
+              : targetVersion
+                ? `Auditing v${targetVersion} content`
+                : "Content optimization report"}
+            {isOutdated && (
+              <span className="ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-accent-warning/10 text-accent-warning">
+                outdated
+              </span>
+            )}
           </p>
         </div>
         <Button

@@ -37,10 +37,6 @@ export const WORD_ALLOCATION = {
 // This replaces the old clamped keyphraseTarget() behavior with ranges
 // that scale naturally with article length.
 
-/** Legacy exports — kept for compatibility. Consumers should prefer computeKeyphraseTargets */
-export const KEYPHRASE_MIN = 3;
-export const KEYPHRASE_MAX = 5;
-
 export interface KeyphraseRange {
   min: number;
   max: number;
@@ -285,12 +281,6 @@ export const CONTENT_MIN_BODY_PARAGRAPHS = 2;
 // ── Paragraph limits ──
 export const MAX_SENTENCES_PER_PARAGRAPH = 3;
 
-// ── Article density targets ──
-export const ARTICLE_DENSITY_MIN_PERCENT = 0.5;
-export const ARTICLE_DENSITY_MAX_PERCENT = 2.0;
-export const SECTION_OVERUSE_THRESHOLD = 3;
-export const SECTION_OVERUSE_WORD_LIMIT = 500;
-
 // ── Factuality instruction (shared across all generation stages) ──
 // Single source of truth for AI behavioral guardrails against fabricated claims.
 export const FACTUALITY_INSTRUCTION = `## Factuality Rules (CRITICAL)
@@ -305,10 +295,6 @@ You MUST follow these factuality rules:
   * "A business might..."
 - NEVER use quotation marks for a fictional testimonial.
 - When uncertain, omit the number or generalize the claim entirely.`;
-
-// ── External link counts ──
-export const EXTERNAL_LINKS_MIN = 2;
-export const EXTERNAL_LINKS_MAX = 3;
 
 // ── B2I-owned domains (not counted as external authoritative sources) ──
 export const B2I_DOMAINS = ["b2ihub.com", "app.b2ihub.com"];

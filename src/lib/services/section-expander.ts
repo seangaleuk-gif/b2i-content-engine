@@ -1,6 +1,7 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
 import { countReadableWords, robustJsonParse, splitLongParagraphs, rebalanceWpBlocks } from "@/lib/services/text-utils";
-import { MAX_SECTION_EXPANSIONS, MAX_SECTION_TRIMS, MAX_SENTENCES_PER_PARAGRAPH } from "@/lib/services/generation-constants";
+import { MAX_SECTION_EXPANSIONS, MAX_SECTION_TRIMS } from "@/lib/services/generation-constants";
+import { paragraphSentenceLimit } from "@/lib/content-standards";
 
 const stripMainH2Blocks = (html: string): string =>
   html
@@ -184,6 +185,6 @@ export async function trimToMaximum(
   return { sections: workingSections, finalWordCount: wordCount, trims };
 }
 
-export function normalizeParagraphs(html: string, maxSentences: number = MAX_SENTENCES_PER_PARAGRAPH): { html: string; splitCount: number } {
+export function normalizeParagraphs(html: string, maxSentences: number = paragraphSentenceLimit()): { html: string; splitCount: number } {
   return splitLongParagraphs(html, maxSentences);
 }

@@ -1,5 +1,6 @@
 import { cleanBodyText, countWords } from "@/lib/services/text-utils";
-import { SEO_TITLE_MIN, SEO_TITLE_MAX, META_MIN, META_MAX, keyphraseRangeForWordCount, FLESCH_MIN, FLESCH_MAX, DEFAULT_WORD_COUNT, wordCountRange, KEYPHRASE_DENSITY_MIN, KEYPHRASE_DENSITY_MAX } from "@/lib/services/generation-constants";
+import { FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
+import { englishTitleRange, englishMetaRange, englishWordTolerance, englishKeyphraseDensity, computeKeyphraseTargets } from "@/lib/content-standards";
 
 // ── Types ──
 
@@ -134,14 +135,18 @@ export function scoreArticle(
   const avgSentLen = avgSentenceLength(blog);
   const longParagraphs = countParagraphsWithExcessiveSentences(blog);
 
+  const { min: titleMin, max: titleMax } = englishTitleRange();
+  const { min: metaMin, max: metaMax } = englishMetaRange();
+  const { warningBelow: kpLow, stuffingAbove: kpHigh } = englishKeyphraseDensity();
+
   // ── SEO (30 points) ──
   const seoDetails: ScoreDetail[] = [];
 
   // Title length: 10 pts
-  seoDetails.push(scoreInRange(title.length, SEO_TITLE_MIN, SEO_TITLE_MAX, 10, "Title length"));
+  seoDetails.push(scoreInRange(title.length, titleMin, titleMax, 10, "Title length"));
 
   // Meta length: 10 pts
-  seoDetails.push(scoreInRange(metaDescription.length, META_MIN, META_MAX, 10, "Meta description length"));
+  seoDetails.push(scoreInRange(metaDescription.length, metaMin, metaMax, 10, "Meta description length"));
 
   // Keyphrase in H1/title: 5 pts — check the SEO title field, not blog body's <h1>
   const kpInTitle = keywordLower ? title.toLowerCase().includes(keywordLower) : false;
@@ -234,22 +239,22 @@ export function scoreArticle(
   const contentDetails: ScoreDetail[] = [];
 
   // Word count within tolerance range (±15% for ≥2000, ±10% for <2000): 5 pts
-  const wcRange = wordCountRange(targetWordCount);
+  const wcRange = englishWordTolerance(targetWordCount);
   contentDetails.push(scoreInRange(actualWordCount, wcRange.min, wcRange.max, 5, "Word count"));
 
   // Keyphrase density — use weighted density formula
   const kpCount = keywordLower ? blogCleaned.toLowerCase().split(keywordLower).length - 1 : 0;
   const kpWords = keywordLower ? keywordLower.split(/\s+/).length : 1;
   const density = actualWordCount > 0 ? (kpCount * kpWords / actualWordCount) * 100 : 0;
-  const densityOk = density >= KEYPHRASE_DENSITY_MIN && density <= KEYPHRASE_DENSITY_MAX;
+  const densityOk = density >= kpLow && density <= kpHigh;
   contentDetails.push({
     label: "Keyphrase density",
-    score: densityOk ? 5 : density > KEYPHRASE_DENSITY_MAX ? 1 : Math.max(1, Math.round(5 * density / KEYPHRASE_DENSITY_MIN)),
+    score: densityOk ? 5 : density > kpHigh ? 1 : Math.max(1, Math.round(5 * density / kpLow)),
     max: 5,
-    status: densityOk ? "pass" : density > KEYPHRASE_DENSITY_MAX ? "fail" : "warning",
+    status: densityOk ? "pass" : density > kpHigh ? "fail" : "warning",
     message: densityOk
-      ? `✓ Keyphrase density: ${density.toFixed(2)}% (target: ${KEYPHRASE_DENSITY_MIN}%-${KEYPHRASE_DENSITY_MAX}%)`
-      : `⚠ Keyphrase density: ${density.toFixed(2)}% — ${density > KEYPHRASE_DENSITY_MAX ? "too high" : "below minimum ${KEYPHRASE_DENSITY_MIN}%"}`,
+      ? `✓ Keyphrase density: ${density.toFixed(2)}% (target: ${kpLow}%-${kpHigh}%)`
+      : `⚠ Keyphrase density: ${density.toFixed(2)}% — ${density > kpHigh ? "too high" : `below minimum ${kpLow}%`}`,
   });
 
   // External links 2-3: 5 pts — excludes B2I Hub signup and language switcher links
