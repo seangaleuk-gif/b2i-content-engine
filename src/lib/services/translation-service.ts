@@ -51,7 +51,72 @@ export interface TranslationResult {
 // ── Constants ──
 
 const COMPLETENESS_RATIO = 0.25;
-const MAX_RETRIES = 1;
+const MAX_RETRIES = 0; // Outer retries removed — inner chatWithRetry (3 tries) is sufficient
+const MAX_RETRY_BUDGET = 12; // Shared retry budget for the entire translation operation
+
+// ── Request-scoped retry budget ──
+
+class RetryBudget {
+  remaining: number;
+  total: number;
+  exhausted: boolean;
+  apiCallCount: number;
+  componentLog: string[];
+
+  constructor(budget: number) {
+    this.remaining = budget;
+    this.total = budget;
+    this.exhausted = false;
+    this.apiCallCount = 0;
+    this.componentLog = [];
+  }
+
+  /** Always allow the first attempt. Cap retries (attempts 2 and 3) to remaining budget.
+   *  Returns the effective maxRetries for chatWithRetry. */
+  capRetries(requestedRetries: number): number {
+    this.apiCallCount++;
+    if (this.exhausted || this.remaining <= 0) {
+      return 0; // first attempt only, no retries
+    }
+    const allowed = Math.min(requestedRetries, this.remaining);
+    return allowed;
+  }
+
+  /** After the AI call, record how many retries were actually consumed. */
+  record(component: string, usedRetries: number, budgetExhausted: boolean): void {
+    this.remaining = Math.max(0, this.remaining - usedRetries);
+    if (budgetExhausted || this.remaining <= 0) {
+      this.exhausted = true;
+    }
+    if (usedRetries > 0 || budgetExhausted) {
+      this.componentLog.push(`${component}(retries=${usedRetries}/${this.total})`);
+    }
+  }
+}
+
+/** Always make the first API attempt; cap only retries against the shared budget. */
+async function chatWithBudget(
+  messages: ChatMessage[],
+  options: Record<string, unknown>,
+  component: string,
+  budget?: RetryBudget,
+): Promise<{ content: string; finishReason?: string }> {
+  const requestedRetries = (options as any).maxRetries ?? 2;
+  const maxRetries = budget ? budget.capRetries(requestedRetries) : requestedRetries;
+  (options as any).maxRetries = maxRetries;
+
+  try {
+    const result = await ai.chatWithRetry(messages, options as any);
+    const usedRetries = requestedRetries - maxRetries;
+    if (budget) budget.record(component, usedRetries, maxRetries < requestedRetries);
+    return { content: result.content, finishReason: result.finishReason };
+  } catch (error) {
+    if (budget) budget.record(component, requestedRetries, true);
+    throw error;
+  }
+}
+
+/** Module-level currentKeyphrase has been removed — keyphrase is passed explicitly through function arguments. */
 
 const CTA_TRANSLATION_SYSTEM = `You are a professional translator. Translate ONLY the visible display text of this CTA button/section to Hong Kong Traditional Chinese.
 
@@ -271,23 +336,25 @@ export function checkNumbersPreserved(source: string, translated: string): { los
 
 const ai = new AiService();
 
-async function translateText(text: string, instruction: string, systemPrompt: string): Promise<string> {
+async function translateText(text: string, instruction: string, systemPrompt: string, keyphrase?: string, component?: string, budget?: RetryBudget): Promise<string> {
   if (!text || text.trim().length === 0) return text;
+  const kpMsg = keyphrase ? ` The SEO focus keyphrase is "${keyphrase}". You MUST include this exact keyphrase in the translation.` : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt },
+    { role: "system", content: systemPrompt + kpMsg },
     { role: "user", content: `${instruction}\n\n${text}` },
   ];
-  const result = await ai.chatWithRetry(messages, { maxTokens: 4096, temperature: 0.3 });
+    const result = await chatWithBudget(messages, { maxTokens: 1024, temperature: 0.3 }, component || "translate-text", budget);
   return result.content.trim();
 }
 
-async function translateHtml(html: string, context: string): Promise<string> {
+async function translateHtml(html: string, context: string, keyphrase?: string, component?: string, budget?: RetryBudget): Promise<string> {
   if (!html || html.trim().length === 0) return html;
+  const kpMsg = keyphrase ? `\n\nThe SEO focus keyphrase for this article is "${keyphrase}". Use this exact keyphrase naturally in headings and body where it fits organically.` : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: TRANSLATION_SYSTEM },
+    { role: "system", content: TRANSLATION_SYSTEM + kpMsg },
     { role: "user", content: `Translate this section to Traditional Chinese (Hong Kong):\n\nSection context: ${context}\n\n${html}` },
   ];
-  const result = await ai.chatWithRetry(messages, { maxTokens: 8192, temperature: 0.3 });
+  const result = await chatWithBudget(messages, { maxTokens: 8192, temperature: 0.3 }, component || "translate-html", budget);
   try {
     const parsed = JSON.parse(result.content);
     if (parsed.translatedHtml) return parsed.translatedHtml;
@@ -295,8 +362,8 @@ async function translateHtml(html: string, context: string): Promise<string> {
   return result.content.trim();
 }
 
-async function translateSection(html: string, heading: string, prevHeading: string, nextHeading: string): Promise<string> {
-  return translateHtml(html, `Heading: "${heading}". Previous: "${prevHeading}". Next: "${nextHeading}"`);
+async function translateSection(html: string, heading: string, prevHeading: string, nextHeading: string, keyphrase?: string, component?: string, budget?: RetryBudget): Promise<string> {
+  return translateHtml(html, `Heading: "${heading}". Previous: "${prevHeading}". Next: "${nextHeading}"`, keyphrase, component, budget);
 }
 
 async function translateWithRetry(
@@ -360,17 +427,18 @@ export interface ResearchItem {
 
 export async function translateArticle(
   enHtml: string,
-  existingDoc?: ArticleDocument,
-  research?: ResearchItem[],
-  zhSlugs?: Set<string>,
+  sourceDoc: ArticleDocument,
+  research: any[],
+  zhSlugs: Set<string>,
 ): Promise<TranslationResult> {
+  const budget = new RetryBudget(MAX_RETRY_BUDGET);
   const warnings: string[] = [];
   const metrics: TranslationMetrics[] = [];
   const failedComponents: string[] = [];
 
   let enDoc: ArticleDocument;
-  if (existingDoc) {
-    const parsed = parseArticleDocumentFromHtml(enHtml, existingDoc);
+  if (sourceDoc) {
+    const parsed = parseArticleDocumentFromHtml(enHtml, sourceDoc);
     if (!parsed.doc) throw new Error(`Failed to parse English article: ${parsed.errors.join("; ")}`);
     enDoc = parsed.doc;
   } else {
@@ -403,31 +471,119 @@ export async function translateArticle(
   };
 
   // ── Metadata ──
+  // Order: 1) combined meta+keyphrase translation (with intro padding), 2) title with known keyphrase
+
+  // Step 1: Translate meta description AND keyphrase together (padded with introduction to avoid empty_response)
+  let zhKeyphrase = "";
+  if (enDoc.metadata.metaDescription) {
+    const sourceKeyword = enDoc.metadata.focusKeyphrase || "";
+    const introPadding = enDoc.introduction.html || "";
+    const combinedUserMsg = introPadding
+      ? `Meta description: ${enDoc.metadata.metaDescription}\nFocus keyphrase: ${sourceKeyword}\n\n(Additional content to translate for context — do NOT include in returned JSON):\n\n${introPadding}`
+      : `Meta description: ${enDoc.metadata.metaDescription}\nFocus keyphrase: ${sourceKeyword}`;
+
+    let combinedResult: { metaDescription: string; zhKeyphrase: string } | null = null;
+    const messages: ChatMessage[] = [
+      { role: "system", content: `You are a professional translator specializing in Hong Kong Traditional Chinese (zh-HK). Translate the provided text and focus keyphrase to Traditional Chinese. Return ONLY a JSON object with these exact keys: { "metaDescription": "translated meta description (80-120 Chinese characters, includes CTA)", "zhKeyphrase": "the English focus keyphrase translated into Hong Kong Traditional Chinese (2-12 Chinese characters only — NO English words, NO Latin characters)" }. Rules: Hong Kong Traditional Chinese only, full-width punctuation, natural phrasing. zhKeyphrase must contain ONLY Chinese characters. Return ONLY valid JSON, no explanation, no markdown.` },
+      { role: "user", content: combinedUserMsg },
+    ];
+
+    // Attempt 1: structured mode with response_format
+    try {
+      const res = await chatWithBudget(messages, { maxTokens: 2048, temperature: 0.3, responseFormat: { type: "json_object" } }, "metadata-json", budget);
+      const parsed = JSON.parse(res.content);
+      const zhKp = (parsed.zhKeyphrase || "").trim();
+      const cjkKp = zhKp.replace(/[a-zA-Z\s]+/g, "").trim();
+      if (parsed.metaDescription && cjkKp && /[\u4e00-\u9fff]/.test(cjkKp)) {
+        combinedResult = { metaDescription: parsed.metaDescription, zhKeyphrase: cjkKp };
+      }
+    } catch { /* fall through */ }
+
+    // Attempt 2: if structured mode returned empty, retry once without response_format
+    if (!combinedResult) {
+      console.log("[metadata] Structured JSON mode failed — retrying without response_format");
+      try {
+        const res = await chatWithBudget(
+          [...messages, { role: "user", content: "Return ONLY valid JSON. No markdown, no code fences, no explanation." }],
+          { maxTokens: 2048, temperature: 0.3 },
+          "metadata-plain",
+          budget
+        );
+        // Try to extract JSON from plain-text response
+        const jsonStr = res.content.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+        const parsed = JSON.parse(jsonStr);
+        const zhKp = (parsed.zhKeyphrase || "").trim();
+        const cjkKp = zhKp.replace(/[a-zA-Z\s]+/g, "").trim();
+        if (parsed.metaDescription && cjkKp && /[\u4e00-\u9fff]/.test(cjkKp)) {
+          combinedResult = { metaDescription: parsed.metaDescription, zhKeyphrase: cjkKp };
+        }
+      } catch { /* fall through to fallback */ }
+    }
+
+    if (combinedResult) {
+      zhDoc.metadata.metaDescription = combinedResult.metaDescription;
+      zhKeyphrase = combinedResult.zhKeyphrase;
+    } else {
+      const metaTr = await translateWithRetry(
+        () => translateText(enDoc.metadata.metaDescription, "Translate this meta description to Traditional Chinese:", TITLE_META_SYSTEM, undefined, "meta-fallback", budget),
+        enDoc.metadata.metaDescription, "meta-description",
+      );
+      zhDoc.metadata.metaDescription = metaTr.passed ? metaTr.translated : enDoc.metadata.metaDescription;
+      metrics.push(metaTr.metrics);
+      if (!metaTr.passed) failedComponents.push("meta-description");
+
+      // Fallback keyphrase translation: one plain-text call, no separate retry cycle
+      if (sourceKeyword && !/[\u4e00-\u9fff]/.test(sourceKeyword)) {
+        try {
+          const kpResult = await translateText(
+            sourceKeyword,
+            "Translate this English SEO keyphrase into natural Hong Kong Traditional Chinese (繁體中文):",
+            TITLE_META_SYSTEM, undefined, "keyphrase-fallback", budget,
+          );
+          const cleaned = (kpResult || "").replace(/[a-zA-Z\s]+/g, "").trim();
+          if (cleaned.length >= 2 && /[\u4e00-\u9fff]/.test(cleaned)) {
+            zhKeyphrase = cleaned;
+            console.log(`[metadata] Fallback keyphrase: "${sourceKeyword}" → "${zhKeyphrase}"`);
+          }
+        } catch {
+          console.warn(`[metadata] Fallback keyphrase translation failed for "${sourceKeyword}"`);
+        }
+      } else if (sourceKeyword) {
+        zhKeyphrase = sourceKeyword;
+      }
+    }
+  } else {
+    zhDoc.metadata.metaDescription = enDoc.metadata.metaDescription;
+  }
+
+  // Step 2: Translate title once, then insert keyphrase deterministically if missing
   if (enDoc.metadata.title) {
     const tr = await translateWithRetry(
-      () => translateText(enDoc.metadata.title, "Translate this blog title to Traditional Chinese:", TITLE_META_SYSTEM),
+      () => translateText(enDoc.metadata.title, "Translate this blog title to Traditional Chinese:", TITLE_META_SYSTEM, zhKeyphrase, "title", budget),
       enDoc.metadata.title, "title",
     );
-    zhDoc.metadata.title = tr.passed ? tr.translated : enDoc.metadata.title;
+    let zhTitle = tr.passed ? tr.translated : enDoc.metadata.title;
     metrics.push(tr.metrics);
     if (!tr.passed) failedComponents.push("title");
-  } else zhDoc.metadata.title = enDoc.metadata.title;
 
-  if (enDoc.metadata.metaDescription) {
-    const tr = await translateWithRetry(
-      () => translateText(enDoc.metadata.metaDescription, "Translate this meta description to Traditional Chinese:", TITLE_META_SYSTEM),
-      enDoc.metadata.metaDescription, "meta-description",
-    );
-    zhDoc.metadata.metaDescription = tr.passed ? tr.translated : enDoc.metadata.metaDescription;
-    metrics.push(tr.metrics);
-    if (!tr.passed) failedComponents.push("meta-description");
-  } else zhDoc.metadata.metaDescription = enDoc.metadata.metaDescription;
+    // Deterministic keyphrase insertion: if keyphrase is CJK and missing from title, prepend it
+    if (zhKeyphrase && /[\u4e00-\u9fff]/.test(zhKeyphrase) && !zhTitle.includes(zhKeyphrase)) {
+      const { ensureKeyphraseInTitle } = await import("@/lib/services/text-utils");
+      zhTitle = ensureKeyphraseInTitle(zhTitle, zhKeyphrase);
+      console.log(`[metadata] Keyphrase "${zhKeyphrase}" inserted into title: "${zhTitle}"`);
+    }
+
+    zhDoc.metadata.title = zhTitle;
+    zhDoc.metadata.focusKeyphrase = zhKeyphrase || enDoc.metadata.focusKeyphrase || "";
+  } else {
+  }
+  zhKeyphrase = zhDoc.metadata.focusKeyphrase;
 
   // ── Introduction ──
   if (enDoc.introduction.html) {
     const tr = await translateWithRetry(
-      () => translateSection(enDoc.introduction.html, "Introduction", "(start)", enDoc.sections[0]?.heading || "first section"),
-      enDoc.introduction.html, "introduction",
+      () => translateSection(enDoc.introduction.html, "Introduction", "(start)", enDoc.sections[0]?.heading || "first section", zhKeyphrase, "introduction", budget),
+      enDoc.introduction.html, "introduction", enDoc.introduction.html,
     );
     zhDoc.introduction.html = tr.passed ? tr.translated : enDoc.introduction.html;
     zhDoc.introduction.wordCount = countReadableWords(zhDoc.introduction.html);
@@ -442,26 +598,57 @@ export async function translateArticle(
     const next = i < enDoc.sections.length - 1 ? enDoc.sections[i + 1].heading : "Conclusion";
 
     let translatedHeading = section.heading;
-    if (section.heading) {
-      const hTr = await translateText(
-        section.heading,
-        `Translate this H2 heading to Traditional Chinese. Return ONLY the translated heading text:`,
-        TITLE_META_SYSTEM,
-      );
-      translatedHeading = hTr || section.heading;
-    }
-
     let translatedBody = "";
     let bodyPassed = false;
     if (section.html) {
-      const tr = await translateWithRetry(
-        () => translateSection(section.html, section.heading, prev, next),
-        section.html, `section-${i}`, section.html,
-      );
+      // Combine heading + body in one AI call: prompt asks for JSON {heading, body}.
+      // The body is validated through translateWithRetry for links/numbers/completeness.
+      const combinedFn = async (): Promise<string> => {
+        const context = `Heading: "${section.heading}". Previous: "${prev}". Next: "${next}"`;
+        const kpMsg = zhKeyphrase ? `\n\nThe SEO focus keyphrase for this article is "${zhKeyphrase}". Use this exact keyphrase naturally in headings and body where it fits organically.` : "";
+        const messages: ChatMessage[] = [
+          { role: "system", content: `${TRANSLATION_SYSTEM}${kpMsg}
+
+Return a JSON object with two keys:
+{
+  "heading": "translated H2 heading",
+  "body": "full translated section HTML with WordPress blocks preserved"
+}
+Rules: Translate both heading and body completely. Preserve ALL WordPress block comments, HTML structure, links, and URLs. Traditional Chinese only.` },
+          { role: "user", content: `Translate this section to Traditional Chinese (Hong Kong):\n\nSection context: ${context}\n\n## Heading ##\n${section.heading}\n\n## Body ##\n${section.html}` },
+        ];
+        const result = await chatWithBudget(messages, { maxTokens: 8192, temperature: 0.3 }, `section-${i}`, budget);
+        try {
+          const parsed = JSON.parse(result.content);
+          if (parsed.heading) translatedHeading = parsed.heading;
+          return parsed.body || result.content;
+        } catch {
+          return result.content;
+        }
+      };
+      const tr = await translateWithRetry(combinedFn, section.html, `section-${i}`, section.html);
       translatedBody = tr.translated;
       bodyPassed = tr.passed;
       metrics.push(tr.metrics);
       if (!tr.passed) failedComponents.push(`section-${i}`);
+
+      // Check heading quality: if empty or mostly English, make one heading-only fallback call
+      const headingEngRatio = translatedHeading ? (translatedHeading.replace(/[\u4e00-\u9fff]+/g, "").length / translatedHeading.length) : 1;
+      if (!translatedHeading || headingEngRatio > 0.5) {
+        console.log(`[translate] Section ${i} heading "${translatedHeading}" has ratio ${headingEngRatio.toFixed(2)} — fallback call`);
+        const hFallback = await translateText(
+          section.heading,
+          "Translate this H2 heading to Traditional Chinese:",
+          TITLE_META_SYSTEM, zhKeyphrase, `heading-${i}-fallback`, budget,
+        );
+        if (hFallback && hFallback.replace(/[a-zA-Z\s]+/g, "").length >= 2) {
+          translatedHeading = hFallback;
+          console.log(`[translate] Section ${i} heading fallback succeeded: "${translatedHeading}"`);
+        } else {
+          console.warn(`[translate] Section ${i} heading fallback also failed — marking hard failure`);
+          failedComponents.push(`section-${i}-heading`);
+        }
+      }
     }
 
     zhDoc.sections.push({
@@ -480,7 +667,7 @@ export async function translateArticle(
   const zhFaq: FaqEntry[] = [];
   if (enFaq.length > 0) {
     try {
-      const faqResult = await translateFaqEntries(enFaq);
+      const faqResult = await translateFaqEntries(enFaq, budget);
       const check = checkCompleteness(
         enFaq.map((f) => f.question + f.answerText).join(" "),
         faqResult.map((f) => f.question + f.answerText).join(" "),
@@ -505,7 +692,7 @@ export async function translateArticle(
   if (enDoc.conclusion.html) {
     const prevHeading = enDoc.sections.length > 0 ? enDoc.sections[enDoc.sections.length - 1].heading : "FAQ";
     const tr = await translateWithRetry(
-      () => translateSection(enDoc.conclusion.html, "Conclusion", prevHeading, "(end)"),
+      () => translateSection(enDoc.conclusion.html, "Conclusion", prevHeading, "(end)", undefined, "conclusion", budget),
       enDoc.conclusion.html, "conclusion", enDoc.conclusion.html,
     );
     zhDoc.conclusion.html = tr.passed ? tr.translated : enDoc.conclusion.html;
@@ -517,11 +704,18 @@ export async function translateArticle(
   // ── Translate CTA display text ──
   zhDoc.languageSwitcher = enDoc.languageSwitcher;
   if (enDoc.cta) {
-    zhDoc.cta = await translateCtaBlock(enDoc.cta);
+    zhDoc.cta = await translateCtaBlock(enDoc.cta, budget);
+    // Check CTA is actually translated — signup URL alone is not enough
+    const ctaText = zhDoc.cta?.html?.replace(/<[^>]+>/g, "").trim() || "";
+    if (!ctaText || !/[\u4e00-\u9fff]/.test(ctaText)) {
+      console.warn("[translate] CTA remained substantially English — marking hard failure");
+      failedComponents.push("cta");
+    }
   }
 
   // ── Rebuild FAQPage JSON-LD ──
-  if (zhFaq.length > 0) {
+  if (zhFaq.length >= 4 && zhFaq.length <= 6) {
+    // Build schema from the same zhFaq array used for visible FAQ — exact match guaranteed
     const schemaJson = buildFaqSchemaJson(zhFaq);
     const schemaHtml = `<!-- wp:html -->\n<script type="application/ld+json">\n${schemaJson}\n</script>\n<!-- /wp:html -->`;
     zhDoc.faqSchema = {
@@ -530,6 +724,16 @@ export async function translateArticle(
       html: schemaHtml,
       fingerprint: fingerprintHtml(schemaHtml),
     };
+    zhDoc.visibleFaq = zhFaq;
+  } else {
+    console.warn(`[translate] FAQ count ${zhFaq.length} outside required 4-6 — marking hard failure`);
+    failedComponents.push("faq-count");
+  }
+
+  // ── Strip any English FAQPage schemas from section bodies before assembly ──
+  for (const section of zhDoc.sections) {
+    section.html = section.html.replace(/<!--\s*wp:html\s*-->[\s\S]*?"@type"\s*:\s*"FAQPage"[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "");
+    section.html = section.html.replace(/<script[\s\S]*?"@type"\s*:\s*"FAQPage"[\s\S]*?<\/script>/gi, "");
   }
 
   // ── Render ──
@@ -544,6 +748,8 @@ export async function translateArticle(
 
   // ── Chinese length metrics ──
   const lengthMetrics = chineseLengthMetrics(balanced);
+
+  console.log(`[translate] API calls=${budget.apiCallCount} retries=${MAX_RETRY_BUDGET - budget.remaining}/${MAX_RETRY_BUDGET} budgetExhausted=${budget.exhausted} components="${budget.componentLog.join("; ")}"`);
 
   return {
     doc: zhDoc,
@@ -826,13 +1032,13 @@ function applyLocalisations(
 
 // ── CTA translation ──
 
-async function translateCtaBlock(cta: ProtectedArticleBlock): Promise<ProtectedArticleBlock> {
+async function translateCtaBlock(cta: ProtectedArticleBlock, budget?: RetryBudget): Promise<ProtectedArticleBlock> {
   const messages: ChatMessage[] = [
     { role: "system", content: CTA_TRANSLATION_SYSTEM },
     { role: "user", content: cta.html },
   ];
   try {
-    const result = await ai.chatWithRetry(messages, { maxTokens: 4096, temperature: 0.3 });
+  const result = await chatWithBudget(messages, { maxTokens: 512, temperature: 0.3 }, "cta", budget);
     let translated = result.content.trim();
     // Remove JSON wrapping if present
     try {
@@ -880,16 +1086,39 @@ function extractFaqFromHtml(html: string): FaqEntry[] {
   return entries;
 }
 
-async function translateFaqEntries(entries: FaqEntry[]): Promise<FaqEntry[]> {
+async function translateFaqEntries(entries: FaqEntry[], budget?: RetryBudget): Promise<FaqEntry[]> {
   if (entries.length === 0) return [];
   const input = entries.map((e) => ({ question: e.question, answer: e.answerText }));
-  const result = await ai.chatWithRetry(
+  let result = await chatWithBudget(
     [
       { role: "system", content: FAQ_QA_SYSTEM },
       { role: "user", content: JSON.stringify(input, null, 2) },
     ],
-    { responseFormat: { type: "json_object" }, maxTokens: 8192, temperature: 0.3 },
+    { responseFormat: { type: "json_object" }, maxTokens: 4096, temperature: 0.3 },
+    "faq",
+    budget,
   );
+
+  // Retry once with higher max_tokens if truncated
+  if (result.finishReason === "length") {
+    console.log("[faq] Response truncated (finish_reason=length) — retrying with max_tokens 2048");
+    result = await chatWithBudget(
+      [
+        { role: "system", content: FAQ_QA_SYSTEM },
+        { role: "user", content: JSON.stringify(input, null, 2) },
+      ],
+      { responseFormat: { type: "json_object" }, maxTokens: 2048, temperature: 0.3 },
+      "faq-retry",
+      budget,
+    );
+  }
+
+  // Hard failure if still truncated — do not save partial FAQ
+  if (result.finishReason === "length") {
+    console.error("[faq] FAQ still truncated after retry — marking hard failure");
+    throw new Error("FAQ truncated after retry");
+  }
+
   const parsed = JSON.parse(result.content);
   const translated = Array.isArray(parsed) ? parsed : parsed.entries || parsed.faq || [];
   return translated.map((t: any, i: number) => ({

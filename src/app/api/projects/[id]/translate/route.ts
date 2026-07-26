@@ -4,7 +4,8 @@ import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { projectRepository, blogVersionRepository, researchRepository } from "@/lib/repositories";
 import { translateArticle } from "@/lib/services/translation-service";
-import { countReadableWords } from "@/lib/services/text-utils";
+import { countReadableWords, countChineseCharacters } from "@/lib/services/text-utils";
+import { runChineseAudit } from "@/lib/services/seo-auditor";
 
 export async function POST(
   _request: Request,
@@ -16,12 +17,18 @@ export async function POST(
     const project = await requireProjectAccess(userId, Number(id));
 
     const versions = await blogVersionRepository.findByProject(Number(id));
-    const latest = versions?.[0];
+    // Find the latest ENGLISH version (slug doesn't end with -zh)
+    const latest = versions?.find((v: any) => !v.slug?.endsWith("-zh")) || versions?.[0];
     if (!latest || !latest.blog) {
       throw AppError.badRequest("No blog content to translate");
     }
 
     const targetSlug = (latest.slug ?? project.name.replace(/\s+/g, "-").toLowerCase()) + "-zh";
+
+    // The English keyphrase is passed as focusKeyphrase in existingDoc.
+    // The translation service's metadata section will translate it to HK Traditional Chinese
+    // alongside the title and meta description. The translated keyphrase is read from the result.
+    const englishKeyword = project.keyword || "";
 
     // Build a minimal ArticleDocument from the existing version metadata
     const existingDoc = {
@@ -53,9 +60,19 @@ export async function POST(
     );
     const result = await translateArticle(latest.blog, existingDoc, research, zhSlugs);
 
+    // Read the translated Chinese keyphrase from the translation result's metadata
+    let zhKeyword = result.doc?.metadata?.focusKeyphrase || "";
+    if (zhKeyword && /[\u4e00-\u9fff]/.test(zhKeyword)) {
+      console.log(`[translate] Chinese keyphrase from metadata: "${zhKeyword}"`);
+    } else {
+      zhKeyword = englishKeyword && /[\u4e00-\u9fff]/.test(englishKeyword) ? englishKeyword : "";
+    }
+
     if (result.failedComponents.length > 0) {
+      const failedList = result.failedComponents.join(", ");
       console.log("[translate] Components below threshold:", result.failedComponents);
       console.log("[translate] Translation metrics:", JSON.stringify(result.metrics, null, 2));
+      throw AppError.badRequest(`Translation failed for components: ${failedList}`);
     }
 
     // Update language switcher in the translated HTML
@@ -94,6 +111,33 @@ export async function POST(
     const categories = (latest as any).categories || [];
     const tags = (latest as any).tags || [];
 
+    // Run Chinese SEO audit using the AI-translated keyphrase.
+    const zhAudit = runChineseAudit({
+      title: result.title || latest.title || "",
+      metaDescription: result.metaDescription || (latest as any).meta_description || "",
+      keyword: zhKeyword,
+      blog: zhBlog,
+      faq: extractVisibleFaqAsArray(zhBlog),
+      englishWordCount: (latest as any).word_count || 2500,
+    });
+    console.log("[translate] Chinese SEO audit:", JSON.stringify({
+      score: zhAudit.overallScore,
+      passed: zhAudit.summary.passed,
+      failed: zhAudit.summary.failed,
+      keyword: zhKeyword,
+      keywordLen: zhKeyword.length,
+    }));
+
+    // Gate: block translation only on hard failures. Soft SEO warnings do not block.
+    if (zhAudit.summary.failed > 0) {
+      const failedLabels = zhAudit.checks.filter((c) => c.status === "fail").map((c) => `${c.label}(${c.measuredValue})`).join(", ");
+      const failedDetails = zhAudit.checks.filter((c) => c.status === "fail").map((c) => `${c.label}: ${c.measuredValue} vs ${c.targetValue}`).join("; ");
+      console.error(`[translate] Chinese SEO hard failures: ${failedDetails}`);
+      throw AppError.badRequest(`Chinese SEO audit failed: ${failedLabels}`);
+    }
+    const softWarnings = zhAudit.checks.filter((c) => c.status === "warning").map((c) => ({ id: c.id, label: c.label, score: c.score }));
+    console.log(`[translate] Chinese SEO soft warnings: ${softWarnings.length}, score=${zhAudit.overallScore}`);
+
     const nextVersion = await blogVersionRepository.getNextVersionNumber(Number(id));
 
     const saved = await blogVersionRepository.create({
@@ -103,7 +147,7 @@ export async function POST(
       title: result.title || latest.title,
       slug: zhSlug,
       metaDescription: result.metaDescription || (latest as any).meta_description || "",
-      excerpt: "",
+      excerpt: zhKeyword || "",
       blog: zhBlog,
       faq: extractVisibleFaqAsArray(zhBlog),
       internalLinks,
@@ -120,7 +164,15 @@ export async function POST(
       tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     } as any);
 
-    return NextResponse.json({ success: true, version: saved }, { status: 201 });
+    return NextResponse.json({
+      saved: true,
+      version: { id: (saved as any).id, versionNumber: (saved as any).versionNumber },
+      chineseSeo: {
+        score: zhAudit.overallScore,
+        softWarnings: softWarnings.length,
+        warningDetails: softWarnings,
+      },
+    }, { status: 201 });
   } catch (error) {
     console.error("[translate]", error);
     return toErrorResponse(error);
