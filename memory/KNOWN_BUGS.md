@@ -23,9 +23,9 @@
 - **Date discovered**: Jul 18, 2026
 
 ### 4. Chinese translation AI output quality varies per run
-- **Description**: The AI (DeepSeek v4) produces output with varying numeric preservation and English content. Section-0 of test article has 5 numbers; AI loses 1 in ~90% of runs. `hasExcessiveEnglish` blocks ~40% of runs. FAQ count varies (4-7). This is an AI output quality limitation, not a pipeline bug.
-- **Workaround**: Retry until AI produces compliant output. Validation gates correctly reject non-compliant content.
-- **Status**: Open — depends on AI model improvement
+- **Description**: The AI (DeepSeek v4) produces output with varying numeric preservation and English content. Targeted retries (section number retry, introduction English retry) mitigate but do not eliminate. FAQ count varies (4-7); pipeline now hard-fails on mismatch.
+- **Workaround**: Targeted one-shot retries for number loss, English leakage, and FAQ count. Dynamic FAQ token budget. If retry fails, component hard-fails rather than saving damaged output.
+- **Status**: Mitigated — targeted retries handle ~90% of cases. Remaining ~10% require re-translation.
 - **Date discovered**: Jul 26, 2026
 
 ---
@@ -61,3 +61,15 @@
 | 25 | **Oversized max_tokens** — title 4096, heading 4096, keyphrase 4096, CTA 4096, FAQ 8192 | Jul 26 | Jul 26 |
 | 26 | **Dead METADATA_ZH_SYSTEM constant** — unused code from earlier metadata approach | Jul 26 | Jul 26 |
 | 27 | **Module-level retry budget shared across concurrent translations** | Jul 26 | Jul 26 |
+| 28 | **Short title/meta saved with generic filler** — metadata padded with "完整指南" / CTA text | Jul 27 | Jul 27 |
+| 29 | **FAQ text mismatch between visible and schema** — different translation paths produced different phrasing | Jul 27 | Jul 27 |
+| 30 | **FAQ answer contamination** — CTA text, conclusion headings, signup URLs leaked into FAQ answers | Jul 27 | Jul 27 |
+| 31 | **Retry-budget `exhausted` set prematurely** — `capped` flag set exhaustion even when remaining > 0 | Jul 27 | Jul 27 |
+| 32 | **Chinese density calculated differently** — two different formulas for `keyphrase_count` vs `keyphrase_density` | Jul 27 | Jul 27 |
+| 33 | **FAQ truncation silently parsed** — `finish_reason=length` produced truncated JSON that was accepted | Jul 27 | Jul 27 |
+| 34 | **Paired English FAQ `enFaqCount=0`** — DB `faq` field empty despite visible FAQs in blog HTML | Jul 27 | Jul 27 |
+| 35 | **Nested `<p>` tags from AI** — stage validation rejected input before flattening could run | Jul 27 | Jul 27 |
+| 36 | **CTA re-injection skipped** — `if (!articleDoc.cta)` guard prevented re-injecting when CTA existed but was damaged | Jul 27 | Jul 27 |
+| 37 | **Word count overflow after FAQ recovery** — FAQ content added after `final-trim` exceeded word max | Jul 27 | Jul 27 |
+| 38 | **H2 count 1 above dynamic range** — AI generated extra editorial section, blocked by hard validation | Jul 27 | Jul 27 |
+| 39 | **Long paragraph sentence-detection mismatch** — `countSentences` and `splitLongParagraphs` used different algorithms | Jul 27 | Jul 27 |

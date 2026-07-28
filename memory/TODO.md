@@ -3,19 +3,38 @@
 ## Previous Sprints — Phases 1–7, Pipeline Bug Fixes, Chinese Translation Pipeline (Completed)
 (see CHANGELOG.md for full history)
 
-## Current Sprint — 3 Consecutive Clean Translations & Hardening
+## Completed — Stage 7 (Jul 27, 2026)
 
-### Translation Pipeline
-- [ ] Achieve 3 consecutive Chinese translations passing all hard checks (numbers, completeness, English checks, FAQ 4-6 count, CTA CJK, keyphrase density)
-- [ ] Reduce AI output variability: investigate prompt engineering for numeric preservation
-- [ ] Investigate `hasExcessiveEnglish` false positives — brand names and technical terms inflate English ratio
-- [ ] Consider per-component retry budget allocation (critical sections get higher priority)
+### Content Standards Module
+- `src/lib/content-standards.ts`: canonical thresholds for all structural and quality rules.
+- 6 word-count bands with dynamic H2/FAQ ranges.
+- Integrated into English and Chinese pipelines.
+- All hardcoded thresholds replaced by canonical functions.
+
+### Translation Pipeline Refactor
+- Five-module split: `types` / `ai` / `validator` / `assembler` / `orchestration`.
+- Deterministic number protection with placeholders + targeted retries.
+- Introduction English retry.
+- FAQ boundary validation (dynamic budget, truncation failure, content scanning).
+- Metadata range compliance (retry + hard-fail, no filler padding).
+- Retry budget fixed (`capped` does not trigger exhaustion).
+- Unified Chinese density calculation.
+- Paired English version stored in `summary` field; SEO audit reads exact source.
+- Paired English FAQ fallback parsing.
+
+### Pipeline Fixes
+- Nested `<p>` flattening before stage validation.
+- CTA always re-injected (not just when null).
+- Post-CTA FAQ schema rebuild.
+- Word count trim after FAQ recovery + CTA.
+- Unified sentence detection (all functions use `splitSentences`).
 
 ### Verification
-- [ ] Run real `/api/projects/[id]/translate` until 3 consecutive versions save successfully with score ≥ 90
-- [ ] Run `npx vitest run` (expect 620 passing)
-- [ ] Run `npx next build` (expect clean compilation)
-- [ ] Update all memory .md files with results
+- ✅ 842 tests passing (10 files)
+- ✅ Build clean
+- ✅ 3 consecutive production translations passed (versions 24-26)
+- ✅ All 6 word-count tiers verified
+- ✅ `.md` files updated
 
 ## Next Sprint — Phase 8: WordPress Integration (Actual Publishing)
 - (unchanged — see previous sprint notes)

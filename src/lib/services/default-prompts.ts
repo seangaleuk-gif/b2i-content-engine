@@ -85,7 +85,7 @@ Bad (complex): "The rapid evolution of Hong Kong's marketing landscape necessita
 
   formatting_rules: `All output must use WordPress block format. Never output Markdown.
 
-## Block syntax
+## Recommended block format for generated non-editorial content
 Use the following WordPress block format for every content element:
 
 - Paragraphs: <!-- wp:paragraph --><p>text</p><!-- /wp:paragraph -->
@@ -95,6 +95,34 @@ Use the following WordPress block format for every content element:
 - Tables: <!-- wp:table --><figure class="wp-block-table"><table><thead><tr><th>col</th></tr></thead><tbody><tr><td>val</td></tr></tbody></table></figure><!-- /wp:table -->
 - Blockquotes: <!-- wp:quote --><blockquote class="wp-block-quote"><p>quote text</p></blockquote><!-- /wp:quote -->
 - Custom HTML (language switcher, CTA, FAQ schema): <!-- wp:html -->raw HTML here<!-- /wp:html -->
+
+## Structured JSON block format for generated editorial content (introduction, sections, conclusion)
+When generating the introduction, editorial sections or conclusion as individual components, use this structured JSON format:
+
+\`\`\`json
+{
+  "blocks": [
+    {
+      "type": "paragraph",
+      "text": "Your paragraph text here."
+    }
+  ]
+}
+\`\`\`
+
+Supported block types:
+- \`paragraph\` — A text paragraph. Provide the text in a "text" field.
+- \`subheading\` — An H3-level subsection heading. Provide the heading text in a "text" field.
+- \`list\` — A bullet (unordered) or numbered (ordered) list. Provide "ordered": true/false and an "items" array of strings.
+- \`quote\` — A blockquote. Provide the quoted text in a "text" field.
+- \`table\` — A data table. Provide a "headers" array and a "rows" array of arrays.
+
+Rules:
+- Return valid JSON only. No Markdown fences. No HTML. No WordPress comments.
+- Do not create H2 headings. The section H2 is already provided by the application.
+- Use "subheading" only for H3-level subsections within a section.
+- Do not include empty blocks.
+- Introduction and conclusion should normally contain paragraphs only.
 
 ## Forbidden
 - Never output Markdown syntax (##, **, __, backticks, [], etc.) in the final blog content.
@@ -176,7 +204,7 @@ The reader is typically: a shop owner in Mong Kok, a bakery in Sai Kung, a freel
 
 8. **FAQ Schema JSON-LD Block** — Custom HTML block containing \`<script type="application/ld+json">\` with FAQPage schema. Include the same 4–6 question/answer pairs from the FAQ section.
 
-9. **Conclusion** — 2 paragraphs. Summarise key takeaways. End with a call to action to create a B2I Hub profile.
+9. **Conclusion** — 2 paragraphs. Summarise key takeaways. No CTA content — the CTA block is separate and handled automatically by the application.
 
 10. **Internal Links Section** — Inline links distributed across body sections (not a separate block). Links should appear naturally within relevant paragraphs, never in a dedicated "Related Links" section.`,
 

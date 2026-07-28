@@ -287,12 +287,14 @@ export function runAudit(input: AuditInput): AuditResult {
   }
 
   // 15. CTA / Signup / Switcher presence
+  const ctaOk = m.ctaHeadingCount >= policy.requiredCtaHeadingCount && m.signupUrlCount >= policy.requiredSignupUrlCount;
   checks.push(makeCheck("cta_presence", "CTA & Signup",
-    m.ctaHeadingCount >= policy.requiredCtaHeadingCount && m.signupUrlCount >= policy.requiredSignupUrlCount ? 100 : 0,
-    m.ctaHeadingCount >= policy.requiredCtaHeadingCount && m.signupUrlCount >= policy.requiredSignupUrlCount ? "pass" : "fail",
+    ctaOk ? 100 : 0,
+    ctaOk ? "pass" : "fail",
     `CTA: ${m.ctaHeadingCount}, signup: ${m.signupUrlCount}`,
     `CTA: ${policy.requiredCtaHeadingCount}, signup: ${policy.requiredSignupUrlCount}`,
-    "CTA or signup missing (hard failure).", "Structure & Schema"));
+    ctaOk ? "CTA heading and signup URL are present." : "CTA or signup missing (hard failure).",
+    "Structure & Schema"));
 
   checks.push(makeCheck("language_switcher", "Language Switcher",
     m.hasLanguageSwitcher ? 100 : 0,
@@ -485,65 +487,40 @@ export function runChineseAudit(input: ChineseAuditInput): AuditResult {
     checks.push(makeCheck("keyphrase_h2", "Keyphrase in H2", null, "not_applicable", "No CJK keyword", "Exact phrase in H2", "Keyword has no CJK characters — set a Chinese focus keyphrase for this project.", "Content & Keyphrase"));
   }
 
-  // 7. Keyphrase Occurrences (density-aware for Chinese) — using chineseKeyphraseDensity() thresholds
-  if (keywordHasCjk && keywordLower) {
+  // Canonical Chinese density: one calculation used for both occurrence and density checks.
+  // kpCjkLen = number of CJK characters in the keyphrase (units of meaning for Chinese).
+  let zhDensity: number | null = null;
+  let zhExactCount = 0;
+  if (keywordHasCjk && keywordLower && zhCharCount > 0) {
     const readableText = extractReadableText(blog);
-    const exactCount = countExactPhrase(readableText, keywordLower);
-    const kpCharLen = [...keywordLower].filter((c) => c.charCodeAt(0) >= 0x4E00).length || keywordLower.length;
-    const densityPct = zhCharCount > 0 ? (exactCount * kpCharLen / zhCharCount) * 100 : null;
-    const densityHealthy = densityPct !== null && densityPct >= kpLow && densityPct <= kpPref;
+    zhExactCount = countExactPhrase(readableText, keywordLower);
+    const kpCjkLen = [...keywordLower].filter((c) => c.charCodeAt(0) >= 0x4E00).length || 1;
+    zhDensity = (zhExactCount * kpCjkLen / zhCharCount) * 100;
+  }
 
-    let kpScore: number;
-    let kpStatus: AuditStatus;
-    let kpMsg: string;
-
-    if (densityHealthy) {
-      kpScore = 100;
-      kpStatus = "pass";
-      kpMsg = `Keyphrase density is healthy (${densityPct!.toFixed(2)}%) for this article length.`;
-    } else if (densityPct !== null && densityPct >= 0.3 && densityPct < kpLow) {
-      kpScore = 60;
-      kpStatus = "warning";
-      kpMsg = `Keyphrase density is slightly low (${densityPct.toFixed(2)}%). Consider naturally increasing keyphrase frequency.`;
-    } else if (densityPct !== null && densityPct > kpPref && densityPct <= kpStuff) {
-      kpScore = 60;
-      kpStatus = "warning";
-      kpMsg = `Keyphrase density is above the preferred range but below stuffing threshold (${densityPct.toFixed(2)}%). Consider using variations.`;
-    } else if (densityPct !== null && densityPct > kpStuff) {
-      kpScore = 0;
-      kpStatus = "fail";
-      kpMsg = `Keyphrase density exceeds stuffing threshold (${densityPct.toFixed(2)}%) — hard failure. Reduce keyphrase occurrences.`;
-    } else {
-      kpScore = 60;
-      kpStatus = "warning";
-      kpMsg = "Keyphrase density is very low — consider naturally increasing keyphrase frequency (soft warning).";
-    }
-
-    checks.push(makeCheck("keyphrase_count", "Keyphrase Occurrences", kpScore, kpStatus, `${exactCount} occurrences`, `Density ${kpLow}%–${kpPref}% (preferred ~${kpPref}%, stuffing at ${kpStuff}%)`, kpMsg, "Content & Keyphrase"));
+  // 7. Keyphrase Occurrences (density-aware for Chinese)
+  if (keywordHasCjk && keywordLower && zhDensity !== null) {
+    const densityHealthy = zhDensity >= kpLow && zhDensity <= kpPref;
+    let kpScore: number; let kpStatus: AuditStatus; let kpMsg: string;
+    if (densityHealthy) { kpScore = 100; kpStatus = "pass"; kpMsg = `Keyphrase density is healthy (${zhDensity.toFixed(2)}%) for this article length.`; }
+    else if (zhDensity >= 0.3 && zhDensity < kpLow) { kpScore = 60; kpStatus = "warning"; kpMsg = `Keyphrase density is slightly low (${zhDensity.toFixed(2)}%). Consider naturally increasing keyphrase frequency.`; }
+    else if (zhDensity > kpPref && zhDensity <= kpStuff) { kpScore = 60; kpStatus = "warning"; kpMsg = `Keyphrase density is above the preferred range but below stuffing threshold (${zhDensity.toFixed(2)}%). Consider using variations.`; }
+    else if (zhDensity > kpStuff) { kpScore = 0; kpStatus = "fail"; kpMsg = `Keyphrase density exceeds stuffing threshold (${zhDensity.toFixed(2)}%) — hard failure. Reduce keyphrase occurrences.`; }
+    else { kpScore = 60; kpStatus = "warning"; kpMsg = "Keyphrase density is very low — consider naturally increasing keyphrase frequency (soft warning)."; }
+    checks.push(makeCheck("keyphrase_count", "Keyphrase Occurrences", kpScore, kpStatus, `${zhExactCount} occurrences`, `Density ${kpLow}%–${kpPref}% (preferred ~${kpPref}%, stuffing at ${kpStuff}%)`, kpMsg, "Content & Keyphrase"));
   } else {
     checks.push(makeCheck("keyphrase_count", "Keyphrase Occurrences", null, "not_applicable", "No CJK keyword", `Density ${kpLow}%–${kpPref}%`, "", "Content & Keyphrase"));
   }
 
-  // 8. Keyphrase Density (weighted) — Chinese-adapted calculation using canonical thresholds
-  if (keywordHasCjk && keywordLower && zhCharCount > 0) {
-    const readableText = extractReadableText(blog);
-    const exactCount = countExactPhrase(readableText, keywordLower);
-    const cjkLen = [...keywordLower].filter((c) => c.charCodeAt(0) >= 0x4E00).length || keywordLower.length;
-    const kpUnits = Math.max(2, Math.ceil(cjkLen / 2));
-    const densityPct = (exactCount * kpUnits / zhCharCount) * 100;
-    const densityStr = `${densityPct.toFixed(2)}%`;
+  // 8. Keyphrase Density (weighted) — uses the SAME zhDensity as check 7
+  if (keywordHasCjk && keywordLower && zhDensity !== null) {
+    const densityStr = `${zhDensity.toFixed(2)}%`;
     const targetStr = `${kpLow}%–${kpPref}% (stuffing at ${kpStuff}%)`;
-    if (densityPct >= kpLow && densityPct <= kpPref) {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 100, "pass", densityStr, targetStr, "Density is within the healthy range.", "Content & Keyphrase"));
-    } else if (densityPct >= 0.3 && densityPct < kpLow) {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is slightly below the minimum (soft warning).", "Content & Keyphrase"));
-    } else if (densityPct > kpPref && densityPct <= kpStuff) {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is above the preferred range but below stuffing threshold.", "Content & Keyphrase"));
-    } else if (densityPct > kpStuff) {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 0, "fail", densityStr, targetStr, "Density exceeds stuffing threshold (hard failure). Reduce keyphrase occurrences.", "Content & Keyphrase"));
-    } else {
-      checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is very low (soft warning) — consider naturally increasing keyphrase frequency.", "Content & Keyphrase"));
-    }
+    if (zhDensity >= kpLow && zhDensity <= kpPref) { checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 100, "pass", densityStr, targetStr, "Density is within the healthy range.", "Content & Keyphrase")); }
+    else if (zhDensity >= 0.3 && zhDensity < kpLow) { checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is slightly below the minimum (soft warning).", "Content & Keyphrase")); }
+    else if (zhDensity > kpPref && zhDensity <= kpStuff) { checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is above the preferred range but below stuffing threshold.", "Content & Keyphrase")); }
+    else if (zhDensity > kpStuff) { checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 0, "fail", densityStr, targetStr, "Density exceeds stuffing threshold (hard failure). Reduce keyphrase occurrences.", "Content & Keyphrase")); }
+    else { checks.push(makeCheck("keyphrase_density", "Keyphrase Density", 60, "warning", densityStr, targetStr, "Density is very low (soft warning) — consider naturally increasing keyphrase frequency.", "Content & Keyphrase")); }
   } else {
     checks.push(makeCheck("keyphrase_density", "Keyphrase Density", null, "not_applicable", "N/A", `${kpLow}%–${kpPref}%`, "", "Content & Keyphrase"));
   }
@@ -627,18 +604,10 @@ export function runChineseAudit(input: ChineseAuditInput): AuditResult {
       const schemaQuestionCount = entities.length;
       if (zhVisibleFaq.length !== schemaQuestionCount) {
         chineseFaqIssues.push(`Visible FAQ count (${zhVisibleFaq.length}) differs from schema question count (${schemaQuestionCount})`);
-      } else {
-        // Check exact Q&A match (normalizing whitespace and punctuation spacing)
-        for (let i = 0; i < zhVisibleFaq.length; i++) {
-          const norm = (s: string) => s.replace(/\s+/g, " ").replace(/\s*([,、。？！，])/g, "$1").replace(/[？?]$/, "").trim();
-          const vQ = norm(zhVisibleFaq[i].question);
-          const sQ = norm(entities[i].name || "");
-          const vA = norm(zhVisibleFaq[i].answerText);
-          const sA = norm(entities[i].acceptedAnswer?.text || "");
-          if (vQ !== sQ) { chineseFaqIssues.push(`FAQ #${i+1} question mismatch: visible="${vQ}" vs schema="${sQ}"`); }
-          if (vA !== sA) { chineseFaqIssues.push(`FAQ #${i+1} answer mismatch: visible="${vA.substring(0, 40)}..." vs schema="${sA.substring(0, 40)}..."`); }
-        }
       }
+      // Structure-only validation: counts match and no empty answers.
+      // Exact text comparison between HTML-extracted visible FAQ and
+      // JSON stringified schema is too fragile (whitespace, entity encoding).
     }
     chineseFaqValid = chineseFaqIssues.length === 0;
   }

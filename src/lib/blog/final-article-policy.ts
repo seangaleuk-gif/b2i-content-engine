@@ -15,7 +15,7 @@ import {
   countCtaHeadingTags,
   hasLanguageSwitcher,
 } from "@/lib/seo/seo-text-utils";
-import { detectNestedParagraphs, extractVisibleFaqFromArticle } from "@/lib/blog/article-document";
+import { detectNestedParagraphs, extractVisibleFaqFromArticle, validateFaqParity, CONCLUSION_START_MARKER, CONCLUSION_END_MARKER, FAQ_HEADING_MARKER } from "@/lib/blog/article-document";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import {
   paragraphSentenceLimit,
@@ -118,6 +118,11 @@ export interface FinalArticleMetrics {
   titleLength: number;
   metaDescriptionLength: number;
   fleschReadingEase: number;
+  hasPlaceholderContent: boolean;
+  hasRawProseOutsideBlocks: boolean;
+  duplicateFaqSchemaCount: number;
+  duplicateCtaBlockCount: number;
+  hasConclusionContent: boolean;
 }
 
 // ── Helpers ──
@@ -268,7 +273,6 @@ export function analyzeFinalArticle(
   targetWordCount?: number,
 ): FinalArticleMetrics {
   const readableText = extractReadableText(html);
-  const h2Texts = extractH2Texts(html);
   const paraTexts = extractParagraphTexts(html);
   const kpLower = keyphrase.toLowerCase().trim();
   const structHtml = html
@@ -278,8 +282,6 @@ export function analyzeFinalArticle(
 
   const ctaHeadings = countCtaHeadingTags(html);
   const signupUrls = (html.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
-  const faqBlocks = (html.match(/FAQPage/gi) ?? []).length;
-  const faqJsonLd = (html.match(/application\/ld\+json/i) ?? []).length;
   const wpOpen = (html.match(/<!--\s*wp:\w+/gi) ?? []).length;
   const wpClose = (html.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
   const nestedParagraphs = detectNestedParagraphs(html);
@@ -287,21 +289,44 @@ export function analyzeFinalArticle(
   const headingOpeners = (html.match(/<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->/gi) ?? []).length;
   const malformedHeadings = Math.abs(bareH2 - headingOpeners);
 
-  // Editorial H2 count (exclude FAQ H2, conclusion H2, etc.)
-  const faqHeadingPattern = /faq|frequently|常見|問題|問答|常見問題集/i;
-  const editorialH2s = h2Texts.filter((h) => !faqHeadingPattern.test(h));
+  // Editorial H2 count: exclude headings inside wp:html blocks (CTA, language
+  // switcher) and the FAQ heading. Identify the FAQ H2 by FAQ_HEADING_MARKER
+  // or strict known heading text.
+  const allHarH2s = extractH2Texts(html);
+  const wpHtmlH2Patterns: string[] = [];
+  {
+    const wpHtmlRe = /<!--\s*wp:html\s*-->([\s\S]*?)<!--\s*\/wp:html\s*-->/gi;
+    let whm: RegExpExecArray | null;
+    while ((whm = wpHtmlRe.exec(html)) !== null) {
+      const innerH2s = [...whm[1].matchAll(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi)];
+      for (const m of innerH2s) {
+        wpHtmlH2Patterns.push(m[1].replace(/<[^>]+>/g, "").trim().toLowerCase());
+      }
+    }
+  }
+  // Find the FAQ heading: prefer FAQ_HEADING_MARKER; fallback to strict known
+  // heading text (complete match only, no substring).
+  const faqHeadingText = findFaqHeadingText(html, allHarH2s);
+  const editorialH2s = allHarH2s.filter((h) => {
+    const hl = h.toLowerCase().trim();
+    // Exclude the FAQ heading (identified by marker or strict text match)
+    if (faqHeadingText && hl === faqHeadingText.toLowerCase().trim()) return false;
+    // Exclude headings inside wp:html blocks
+    if (wpHtmlH2Patterns.some((inner) => inner === hl)) return false;
+    return true;
+  });
   const h2Count = editorialH2s.length;
 
   // FAQ entry count from visible FAQ
   const visibleFaq = extractVisibleFaqFromArticle(html);
   const faqEntryCount = visibleFaq.length;
 
-  // FAQ parity
+  // FAQ parity using JSON-parsed schema (not regex)
   let faqParityValid = false;
   const faqSchemaBlock = extractFaqBlock(html);
-  if (faqBlocks === 1 && faqSchemaBlock) {
-    const schemaQuestionCount = (faqSchemaBlock.match(/"name"\s*:\s*"/gi) ?? []).length;
-    faqParityValid = schemaQuestionCount > 0 && (faqEntryCount > 0 ? faqEntryCount === schemaQuestionCount : true);
+  if (faqSchemaBlock && visibleFaq.length > 0) {
+    const parityResult = validateFaqParity(visibleFaq.map((v) => ({ question: v.question, answerHtml: "", answerText: v.answerText })), faqSchemaBlock);
+    faqParityValid = parityResult.valid;
   }
 
   // Flesch
@@ -320,21 +345,86 @@ export function analyzeFinalArticle(
     fleschReadingEase = 206.835 - 1.015 * (fleschWords.length / fleschSentences.length) - 84.6 * (syllables / fleschWords.length);
   }
 
+  // Placeholder content detection (English + Chinese variants)
+  const placeholderPattern = /Content unavailable|No content available|This section is empty|此部分暫無內容/i;
+  const hasPlaceholderContent = placeholderPattern.test(readableText);
+
+  // Raw prose outside supported WordPress blocks: hard-fail any non-whitespace prose
+  const strippedOfAllWp = html
+    .replace(/<!--\s*wp:\w+(?:\s[^>]*)?\s*-->[\s\S]*?<!--\s*\/wp:\w+\s*-->/gi, "")
+    .replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const hasRawProseOutsideBlocks = strippedOfAllWp.length > 0 && /\S/.test(strippedOfAllWp);
+
+  // Count valid FAQ schema blocks by parsed JSON-LD (enumerate individual blocks)
+  const validFaqSchemaBlocks: string[] = [];
+  {
+    const schemaRe = /<!--\s*wp:html\s*-->([\s\S]*?)<!--\s*\/wp:html\s*-->/gi;
+    let sm: RegExpExecArray | null;
+    while ((sm = schemaRe.exec(html)) !== null) {
+      const inner = sm[1];
+      const scriptMatch = inner.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
+      if (scriptMatch) {
+        try {
+          const parsed = JSON.parse(scriptMatch[1]);
+          if (parsed?.["@type"] === "FAQPage" && Array.isArray(parsed.mainEntity)) {
+            validFaqSchemaBlocks.push(sm[0]);
+          }
+        } catch {
+          // Not valid JSON — not an FAQ schema block
+        }
+      }
+    }
+  }
+  const faqBlockCount = validFaqSchemaBlocks.length;
+  const duplicateFaqSchemaCount = Math.max(0, validFaqSchemaBlocks.length - 1);
+
+  // CTA duplication: extract canonical CTA, remove it, then check for
+  // signup URLs, canonical CTA button text, or heading phrases elsewhere.
+  const canonicalCtaHtml = extractCanonicalCtaBlock(html);
+  const htmlWithoutCta = canonicalCtaHtml ? html.replace(canonicalCtaHtml, "") : html;
+  const signupOutsideCta = (htmlWithoutCta.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
+  const ctaButtonTextOutside = (htmlWithoutCta.match(/Create Your Free Profile/i) ?? []).length;
+  const ctaHeadingOutside = (htmlWithoutCta.match(/Ready to grow your brand/i) ?? []).length;
+  const duplicateCtaBlockCount = signupOutsideCta + ctaButtonTextOutside + ctaHeadingOutside + (canonicalCtaHtml ? 0 : 1);
+
+  // Conclusion detection: exactly one start and one end marker in order.
+  // Extract readable content between them; empty or HTML-only content fails.
+  const concStartCount = countOccurrences(html, CONCLUSION_START_MARKER);
+  const concEndCount = countOccurrences(html, CONCLUSION_END_MARKER);
+  const concStartIdx = html.indexOf(CONCLUSION_START_MARKER);
+  const concEndIdx = html.indexOf(CONCLUSION_END_MARKER);
+  let conclusionContent = "";
+  let hasConclusionContent = false;
+  if (concStartCount === 1 && concEndCount === 1 && concEndIdx > concStartIdx) {
+    conclusionContent = html.substring(concStartIdx + CONCLUSION_START_MARKER.length, concEndIdx)
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    hasConclusionContent = conclusionContent.length >= 3; // at least a short readable word
+  }
+
   return {
     readableWordCount: countReadableWords(html),
     h2Count,
     faqEntryCount,
     exactKeyphraseCount: countExactPhrase(readableText, keyphrase),
     keyphraseDensity: computeKeyphraseDensity(countExactPhrase(readableText, keyphrase), keyphrase, countReadableWords(html)),
-    exactKeyphraseInH2: h2Texts.some((h) => h.toLowerCase().includes(kpLower)),
+    exactKeyphraseInH2: editorialH2s.some((h) => h.toLowerCase().includes(kpLower)),
     longParagraphCount: paraTexts.filter((t) => countSentences(t) > paragraphSentenceLimit()).length,
     keyphraseInFirst100Words: first100.includes(kpLower),
     uniqueInternalLinkCount: countUniqueInternalLinks(html),
     externalSourceLinkCount: countExternalSourceLinks(html),
     ctaHeadingCount: ctaHeadings,
     signupUrlCount: signupUrls,
-    faqBlockCount: faqBlocks,
-    faqJsonLdCount: faqJsonLd,
+    faqBlockCount,
+    faqJsonLdCount: faqBlockCount,
     hasLanguageSwitcher: hasLanguageSwitcher(html),
     nestedParagraphCount: nestedParagraphs,
     malformedHeadingCount: malformedHeadings,
@@ -343,7 +433,53 @@ export function analyzeFinalArticle(
     titleLength: (title || "").length,
     metaDescriptionLength: (metaDescription || "").length,
     fleschReadingEase,
+    hasPlaceholderContent,
+    hasRawProseOutsideBlocks,
+    duplicateFaqSchemaCount,
+    duplicateCtaBlockCount,
+    hasConclusionContent,
   };
+}
+
+function countOccurrences(text: string, substr: string): number {
+  let count = 0, pos = 0;
+  while ((pos = text.indexOf(substr, pos)) >= 0) { count++; pos += substr.length; }
+  return count;
+}
+
+/**
+ * Identify the FAQ H2 heading text. Prefers the FAQ_HEADING_MARKER (the first
+ * WordPress H2 block immediately following the marker). Falls back to strict
+ * complete heading text matching.
+ */
+function findFaqHeadingText(html: string, allH2Texts: string[]): string | null {
+  const markerIdx = html.indexOf(FAQ_HEADING_MARKER);
+  if (markerIdx >= 0) {
+    const afterMarker = html.substring(markerIdx + FAQ_HEADING_MARKER.length);
+    const headingRe = /<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*\n?<h2\b[^>]*>([\s\S]*?)<\/h2>/i;
+    const headingMatch = afterMarker.match(headingRe);
+    if (headingMatch) {
+      return headingMatch[1].replace(/<[^>]+>/g, "").trim();
+    }
+  }
+  const strictFaqHeadings = ["frequently asked questions", "faq", "faqs", "常見問題"];
+  for (const h of allH2Texts) {
+    const hTrimmed = h.toLowerCase().trim();
+    if (strictFaqHeadings.includes(hTrimmed)) return h;
+  }
+  return null;
+}
+
+/** Enumerate individual wp:html blocks and select the one containing app.b2ihub.com/signup. */
+function extractCanonicalCtaBlock(html: string): string | null {
+  const wpHtmlRe = /<!--\s*wp:html\s*-->([\s\S]*?)<!--\s*\/wp:html\s*-->/gi;
+  let whm: RegExpExecArray | null;
+  while ((whm = wpHtmlRe.exec(html)) !== null) {
+    if (/app\.b2ihub\.com\/signup/.test(whm[1])) {
+      return whm[0];
+    }
+  }
+  return null;
 }
 
 // ── Single pass/fail gate ──
@@ -372,6 +508,11 @@ export function evaluatePolicy(
   const nestedHard = metrics.nestedParagraphCount === 0;
   const headingsHard = metrics.malformedHeadingCount === 0;
   const faqParityHard = !policy.requiredFaqParity || metrics.faqParityValid;
+  const placeholderHard = !metrics.hasPlaceholderContent;
+  const rawProseHard = !metrics.hasRawProseOutsideBlocks;
+  const dupFaqSchemaHard = metrics.duplicateFaqSchemaCount === 0;
+  const dupCtaHard = metrics.duplicateCtaBlockCount === 0;
+  const conclusionHard = metrics.hasConclusionContent;
 
   // ── Soft warnings (never block) ──
   const kpSoft = metrics.keyphraseDensity >= kpWarning;
@@ -396,6 +537,11 @@ export function evaluatePolicy(
   if (!nestedHard) reasons.push(`nested paragraphs=${metrics.nestedParagraphCount}`);
   if (!headingsHard) reasons.push(`malformed headings=${metrics.malformedHeadingCount}`);
   if (!faqParityHard) reasons.push("FAQ parity mismatch");
+  if (!placeholderHard) reasons.push("placeholder content found");
+  if (!rawProseHard) reasons.push("raw prose outside WordPress blocks");
+  if (!dupFaqSchemaHard) reasons.push(`duplicate FAQ schemas=${metrics.duplicateFaqSchemaCount}`);
+  if (!dupCtaHard) reasons.push(`duplicate CTA blocks=${metrics.duplicateCtaBlockCount}`);
+  if (!conclusionHard) reasons.push("conclusion content missing");
 
   // Soft warning reasons
   if (!kpSoft) reasons.push(`[SOFT] kp density=${metrics.keyphraseDensity.toFixed(2)}% < ${kpWarning}%`);
@@ -405,7 +551,8 @@ export function evaluatePolicy(
 
   const passed = wcHard && h2Hard && faqEntryHard && paraHard && kpStuffHard
     && linksHard && ctaHard && signupHard && switcherHard
-    && faqBlockHard && faqJsonHard && wpHard && nestedHard && headingsHard && faqParityHard;
+    && faqBlockHard && faqJsonHard && wpHard && nestedHard && headingsHard && faqParityHard
+    && placeholderHard && rawProseHard && dupFaqSchemaHard && dupCtaHard && conclusionHard;
 
   return { passed, reasons };
 }

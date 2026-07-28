@@ -1,15 +1,20 @@
 import { AiService, type ChatMessage } from "@/lib/services/deepseek";
-import { countReadableWords, rebalanceWpBlocks, ensureKeyphraseInTitle } from "@/lib/services/text-utils";
+import { rebalanceWpBlocks, ensureKeyphraseInTitle } from "@/lib/services/text-utils";
 import { translationFaqCount } from "@/lib/content-standards";
 import {
   type ArticleDocument, type ArticleSection, type FaqEntry,
   type ProtectedArticleBlock, type ArticleComponent,
   renderArticleDocument, parseArticleDocumentFromHtml, fingerprintHtml,
+  renderComponentHtml,
 } from "@/lib/blog/article-document";
+import { translateEditorialBlocks, type StructuredTranslationShadowOptions, type StructuredTranslationShadowResult, runConclusionStructuredShadow } from "./editorial-block-translation";
 import type { TranslationMetrics, TranslationResult, ResearchItem } from "./translation-types";
 import { RetryBudget } from "./translation-types";
-import { TITLE_META_SYSTEM, TRANSLATION_SYSTEM, INTRO_RETRY_STRICT, chatWithBudget, translateText, translateSection, translateCtaBlock, translateFaqEntries } from "./translation-ai";
+import { TITLE_META_SYSTEM, TRANSLATION_SYSTEM, INTRO_RETRY_STRICT, STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM, chatWithBudget, translateText, translateSection, translateCtaBlock, translateFaqEntries, buildStructuredConclusionTranslationPrompt, buildStructuredConclusionRepairPrompt, createProductionConclusionStructuredShadowOptions } from "./translation-ai";
 import { protectNumbersInHtml, tryRestoreNumbersInHtml, checkCompleteness, checkLinksPreserved, checkNumbersPreserved, extractVisibleNumbers, hasExcessiveEnglish, chineseLengthMetrics } from "./translation-validator";
+import { protectNumbersInEditorialBlocks } from "./editorial-block-protection";
+import { renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
+import { isConclusionShadowEvidenceEnabled, recordConclusionShadowEvidence } from "./conclusion-shadow-evidence";
 import { buildFaqSchemaJson, extractFaqFromDoc, localiseSources, localiseInternalLinks, applyLocalisations } from "./translation-assembler";
 
 export type { TranslationMetrics, TranslationResult, SourceDecision, InternalLinkDecision, ResearchItem } from "./translation-types";
@@ -74,11 +79,21 @@ export async function translateArticle(
   sourceDoc: ArticleDocument,
   research: any[],
   zhSlugs: Set<string>,
+  deps?: {
+    translateEditorialBlocks?: typeof translateEditorialBlocks;
+    structuredTranslationShadow?: StructuredTranslationShadowOptions;
+  },
 ): Promise<TranslationResult> {
+  const translateEditorialBlocksFn = deps?.translateEditorialBlocks ?? translateEditorialBlocks;
+  const shadowEnabled = deps?.structuredTranslationShadow?.enabled ?? (process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION === "true");
   const budget = new RetryBudget(MAX_RETRY_BUDGET);
+  const shadowOptions: StructuredTranslationShadowOptions = shadowEnabled
+    ? deps?.structuredTranslationShadow ?? createProductionConclusionStructuredShadowOptions(budget)
+    : { enabled: false, translatePayload: async () => "" };
   const warnings: string[] = [];
   const metrics: TranslationMetrics[] = [];
   const failedComponents: string[] = [];
+  const shadowResults: StructuredTranslationShadowResult[] = [];
 
   let enDoc: ArticleDocument;
   if (sourceDoc) {
@@ -88,9 +103,9 @@ export async function translateArticle(
   } else {
     const fallbackDoc: ArticleDocument = {
       metadata: { title: "", slug: "", metaDescription: "", excerpt: "", targetWordCount: 0, focusKeyphrase: "" },
-      languageSwitcher: null, introduction: { id: "intro", html: "", wordCount: 0, status: "generated" },
+      languageSwitcher: null, introduction: { id: "intro", blocks: [], status: "generated" },
       sections: [], visibleFaq: [],
-      conclusion: { id: "conc", html: "", wordCount: 0, status: "generated" },
+      conclusion: { id: "conc", blocks: [], status: "generated" },
       cta: null, faqSchema: null, insertedLinks: [],
     };
     const parsed = parseArticleDocumentFromHtml(enHtml, fallbackDoc);
@@ -101,9 +116,9 @@ export async function translateArticle(
   const zhDoc: ArticleDocument = {
     metadata: { ...enDoc.metadata, title: "", metaDescription: "" },
     languageSwitcher: null,
-    introduction: { id: "zh-intro", html: "", wordCount: 0, status: "generated" },
+    introduction: { id: "zh-intro", blocks: [], status: "generated" },
     sections: [], visibleFaq: [],
-    conclusion: { id: "zh-conc", html: "", wordCount: 0, status: "generated" },
+    conclusion: { id: "zh-conc", blocks: [], status: "generated" },
     cta: null, faqSchema: null, insertedLinks: enDoc.insertedLinks,
   };
 
@@ -111,7 +126,7 @@ export async function translateArticle(
   let zhKeyphrase = "";
   if (enDoc.metadata.metaDescription) {
     const sourceKeyword = enDoc.metadata.focusKeyphrase || "";
-    const introPadding = enDoc.introduction.html || "";
+      const introPadding = renderComponentHtml(enDoc.introduction) || "";
     const combinedUserMsg = introPadding
       ? `Meta description: ${enDoc.metadata.metaDescription}\nFocus keyphrase: ${sourceKeyword}\n\n(Additional content to translate for context — do NOT include in returned JSON):\n\n${introPadding}`
       : `Meta description: ${enDoc.metadata.metaDescription}\nFocus keyphrase: ${sourceKeyword}`;
@@ -168,6 +183,34 @@ export async function translateArticle(
       zhDoc.metadata.metaDescription = metaPassed ? metaTranslated : enDoc.metadata.metaDescription;
       metrics.push({ ...metaTr.metrics, passed: metaPassed, numbersMatch: metaPassed });
       if (!metaPassed) failedComponents.push("meta-description");
+      // Metadata range compliance: do NOT pad with filler. Retry once with exact range, then hard-fail.
+      const { chineseMetaRange, chineseTitleRange } = await import("@/lib/content-standards");
+      const { min: metaMin, max: metaMax } = chineseMetaRange();
+      let m = zhDoc.metadata.metaDescription;
+      const cjkMetaCount = (m.match(/[\u4e00-\u9fff]/g) || []).length;
+      if (metaPassed && (cjkMetaCount < metaMin || cjkMetaCount > metaMax)) {
+        console.log(`[metadata] Meta ${cjkMetaCount} CJK chars outside ${metaMin}-${metaMax} — retry with range`);
+        const rangeMeta = await translateText(
+          enDoc.metadata.metaDescription,
+          `Translate this meta description to Traditional Chinese. Length must be ${metaMin}-${metaMax} CJK characters (characters in the Chinese CJK range, not total length). Return ONLY the translated text.`,
+          TITLE_META_SYSTEM, undefined, "meta-range-retry", budget,
+        );
+        const rangeCjk = (rangeMeta || "").match(/[\u4e00-\u9fff]/g) || [];
+        if (rangeCjk.length >= metaMin && rangeCjk.length <= metaMax) {
+          zhDoc.metadata.metaDescription = rangeMeta!.trim();
+          console.log(`[metadata] Meta range retry succeeded: ${rangeCjk.length} CJK chars`);
+        } else {
+          // Allow one cleanup pass: trim trailing whitespace/punctuation only
+          const cleaned = zhDoc.metadata.metaDescription.replace(/[。，、！？\s]+$/g, "");
+          const cleanedCjk = (cleaned.match(/[\u4e00-\u9fff]/g) || []).length;
+          if (cleanedCjk >= metaMin && cleanedCjk <= metaMax) {
+            zhDoc.metadata.metaDescription = cleaned;
+          } else {
+            console.error(`[metadata] Meta still ${cleanedCjk} CJK chars after retry — hard failure`);
+            failedComponents.push("meta-description");
+          }
+        }
+      }
 
       if (sourceKeyword && !/[\u4e00-\u9fff]/.test(sourceKeyword)) {
         try {
@@ -193,35 +236,83 @@ export async function translateArticle(
       zhTitle = ensureKeyphraseInTitle(zhTitle, zhKeyphrase);
       console.log(`[metadata] Keyphrase "${zhKeyphrase}" inserted into title: "${zhTitle}"`);
     }
+    // Title range compliance: retry once with exact range, then hard-fail. No filler padding.
+    const { chineseTitleRange } = await import("@/lib/content-standards");
+    const { min: tMin, max: tMax } = chineseTitleRange();
+    const zhTitleCjk = (zhTitle.match(/[\u4e00-\u9fff]/g) || []).length;
+    if (tr.passed && (zhTitleCjk < tMin || zhTitleCjk > tMax)) {
+      console.log(`[metadata] Title ${zhTitleCjk} CJK chars outside ${tMin}-${tMax} — retry with range`);
+      const rangeTitle = await translateText(
+        enDoc.metadata.title,
+        `Translate this blog title to Traditional Chinese. Length must be ${tMin}-${tMax} CJK characters. The SEO focus keyphrase is "${zhKeyphrase}". Include it naturally. Return ONLY the translated title.`,
+        TITLE_META_SYSTEM, zhKeyphrase, "title-range-retry", budget,
+      );
+      const rangeCjk = (rangeTitle || "").match(/[\u4e00-\u9fff]/g) || [];
+      if (rangeCjk.length >= tMin && rangeCjk.length <= tMax) {
+        zhTitle = rangeTitle!.trim();
+        console.log(`[metadata] Title range retry succeeded: ${rangeCjk.length} CJK chars`);
+      } else {
+        // Cleanup pass: trim only trailing whitespace/punctuation
+        const cleaned = zhTitle.replace(/[。，、！？\s]+$/g, "");
+        const cleanedCjk = (cleaned.match(/[\u4e00-\u9fff]/g) || []).length;
+        if (cleanedCjk >= tMin && cleanedCjk <= tMax) {
+          zhTitle = cleaned;
+        } else {
+          console.error(`[metadata] Title still ${cleanedCjk} CJK chars after retry — hard failure`);
+          failedComponents.push("title");
+        }
+      }
+    }
+    if (!failedComponents.includes("title")) {
+      // Truncate if overlength (cleanup only, no padding)
+      const finalTitleCjk = (zhTitle.match(/[\u4e00-\u9fff]/g) || []).length;
+      if (finalTitleCjk > tMax) zhTitle = [...zhTitle].slice(0, tMax).join("");
+    }
     zhDoc.metadata.title = zhTitle;
     zhDoc.metadata.focusKeyphrase = zhKeyphrase || enDoc.metadata.focusKeyphrase || "";
   }
   zhKeyphrase = zhDoc.metadata.focusKeyphrase;
 
   // ── Introduction ──
-  if (enDoc.introduction.html) {
-    const { protectedHtml: protectedIntro, placeholders: introPhs, originalValues: introVals } = protectNumbersInHtml(enDoc.introduction.html);
-    const tr = await translateWithRetry(
-      () => translateSection(protectedIntro, "Introduction", "(start)", enDoc.sections[0]?.heading || "first section", zhKeyphrase, "introduction", budget),
-      protectedIntro, "introduction", protectedIntro,
-    );
-    metrics.push(tr.metrics);
-    let finalIntro = tr.translated;
-    let introPassed = tr.passed;
-    if (hasExcessiveEnglish(finalIntro)) {
-      console.log("[translate] Introduction excessive English — targeted retry");
-      const retryText = await translateText(protectedIntro, INTRO_RETRY_STRICT, TITLE_META_SYSTEM, zhKeyphrase, "introduction-retry", budget);
-      if (retryText && !hasExcessiveEnglish(retryText)) { finalIntro = retryText; introPassed = true; console.log("[translate] Introduction retry succeeded"); }
-      else { console.warn("[translate] Introduction retry still has excessive English"); introPassed = false; }
-    }
-    if (introPassed && introPhs.length > 0) {
-      const restored = tryRestoreNumbersInHtml(finalIntro, introPhs, introVals);
-      if (!restored.ok) { console.warn(`[translate] Introduction number loss: lost=${restored.lost.join(",")}`); introPassed = false; }
-      else { finalIntro = restored.html; }
-    }
-    zhDoc.introduction.html = introPassed ? finalIntro : enDoc.introduction.html;
-    zhDoc.introduction.wordCount = countReadableWords(zhDoc.introduction.html);
-    if (!introPassed) failedComponents.push("introduction");
+  const enIntroHtml = renderComponentHtml(enDoc.introduction);
+  if (enIntroHtml) {
+    const introResult = await translateEditorialBlocksFn({
+      blocks: enDoc.introduction.blocks,
+      componentId: "zh-intro",
+      componentKind: "introduction",
+      context: { keyphrase: zhKeyphrase },
+      translateProtectedHtml: async (protectedHtml) => {
+        let html = await translateSection(
+          protectedHtml, "Introduction", "(start)",
+          enDoc.sections[0]?.heading || "first section", zhKeyphrase, "introduction", budget,
+        );
+        if (hasExcessiveEnglish(html)) {
+          console.log("[translate] Introduction excessive English — targeted retry");
+          const retryHtml = await translateText(protectedHtml, INTRO_RETRY_STRICT, TITLE_META_SYSTEM, zhKeyphrase, "introduction-retry", budget);
+          if (retryHtml && !hasExcessiveEnglish(retryHtml)) { html = retryHtml; }
+        }
+        return html;
+      },
+      repairProtectedHtml: async (protectedHtml, error) => {
+        if (error.includes("number")) {
+          return await translateText(
+            protectedHtml,
+            `RETRY: ${error}. Preserve EXACTLY every number, percentage, date, and __NUM_0__ token. Every original value must appear verbatim.`,
+            TITLE_META_SYSTEM, zhKeyphrase, "intro-numbers-retry", budget,
+          );
+        }
+        return null;
+      },
+      onStatus: (status) => {
+        if (!status.passed) failedComponents.push("introduction");
+        metrics.push({ component: "introduction", ...status.metrics, passed: status.passed ? 1 : 0 } as any);
+      },
+    });
+    zhDoc.introduction = {
+      id: "zh-intro",
+      blocks: introResult.blocks,
+      status: introResult.passed ? "generated" : "regenerated",
+    };
   }
 
   // ── Sections ──
@@ -230,31 +321,43 @@ export async function translateArticle(
     const prev = i > 0 ? enDoc.sections[i - 1].heading : "Introduction";
     const next = i < enDoc.sections.length - 1 ? enDoc.sections[i + 1].heading : "Conclusion";
     let translatedHeading = section.heading;
-    let translatedBody = "";
-    let bodyPassed = false;
-    if (section.html) {
-      const { protectedHtml: protectedBody, placeholders: secPhs, originalValues: secVals } = protectNumbersInHtml(section.html);
-      const combinedFn = async (): Promise<string> => {
-        const context = `Heading: "${section.heading}". Previous: "${prev}". Next: "${next}"`;
-        const kpMsg = zhKeyphrase ? `\n\nThe SEO focus keyphrase for this article is "${zhKeyphrase}". Use this exact keyphrase naturally.` : "";
-        const messages: ChatMessage[] = [
-          { role: "system", content: `${TRANSLATION_SYSTEM}${kpMsg}\n\nReturn a JSON object with two keys:\n{\n  "heading": "translated H2 heading",\n  "body": "full translated section HTML"\n}\nRules: Translate both heading and body completely. Preserve ALL WordPress block comments, HTML structure, links, URLs.` },
-          { role: "user", content: `Translate this section to Traditional Chinese (Hong Kong):\n\nSection context: ${context}\n\n## Heading ##\n${section.heading}\n\n## Body ##\n${protectedBody}` },
-        ];
-        const result = await chatWithBudget(messages, { maxTokens: 8192, temperature: 0.3 }, `section-${i}`, budget);
-        try { const parsed = JSON.parse(result.content); if (parsed.heading) translatedHeading = parsed.heading; return parsed.body || result.content; }
-        catch { return result.content; }
-      };
-      const tr = await translateWithRetry(combinedFn, protectedBody, `section-${i}`, protectedBody);
-      translatedBody = tr.translated;
-      bodyPassed = tr.passed;
-      metrics.push(tr.metrics);
-      if (bodyPassed && secPhs.length > 0) {
-        const restored = tryRestoreNumbersInHtml(translatedBody, secPhs, secVals);
-        if (!restored.ok) { console.warn(`[translate] Section ${i} number loss: lost=${restored.lost.join(",")}`); bodyPassed = false; }
-        else { translatedBody = restored.html; }
+    let secResult: Awaited<ReturnType<typeof translateEditorialBlocks>> | null = null;
+    const sectionHtml = renderComponentHtml(section);
+    if (sectionHtml) {
+      secResult = await translateEditorialBlocksFn({
+        blocks: section.blocks,
+        componentId: `zh-section-${i}`,
+        componentKind: "section",
+        context: { keyphrase: zhKeyphrase, heading: section.heading, prev, next },
+        translateProtectedHtml: async (protectedHtml) => {
+          const context = `Heading: "${section.heading}". Previous: "${prev}". Next: "${next}"`;
+          const kpMsg = zhKeyphrase ? `\n\nThe SEO focus keyphrase for this article is "${zhKeyphrase}". Use this exact keyphrase naturally.` : "";
+          const messages: ChatMessage[] = [
+            { role: "system", content: `${TRANSLATION_SYSTEM}${kpMsg}\n\nReturn a JSON object with two keys:\n{\n  "heading": "translated H2 heading",\n  "body": "full translated section HTML"\n}\nRules: Translate both heading and body completely. Preserve ALL WordPress block comments, HTML structure, links, URLs.` },
+            { role: "user", content: `Translate this section to Traditional Chinese (Hong Kong):\n\nSection context: ${context}\n\n## Heading ##\n${section.heading}\n\n## Body ##\n${protectedHtml}` },
+          ];
+          const result = await chatWithBudget(messages, { maxTokens: 8192, temperature: 0.3 }, `section-${i}`, budget);
+          try { const parsed = JSON.parse(result.content); if (parsed.heading) translatedHeading = parsed.heading; return parsed.body || result.content; }
+          catch { return result.content; }
+        },
+        repairProtectedHtml: async (protectedHtml, error) => {
+          if (error.includes("number")) {
+            return await translateText(
+              protectedHtml,
+              `RETRY: ${error}. Preserve EXACTLY every number, percentage, date, and token like __NUM_0__. Every original value must appear verbatim.`,
+              TRANSLATION_SYSTEM, zhKeyphrase, `section-${i}-numbers`, budget,
+            );
+          }
+          return null;
+        },
+        onStatus: (status) => {
+          if (!status.passed) failedComponents.push(`section-${i}`);
+          metrics.push({ component: `section-${i}`, ...status.metrics, passed: status.passed ? 1 : 0 } as any);
+        },
+      });
+      if (!secResult.passed && section.blocks.length > 0) {
+        secResult.blocks = section.blocks;
       }
-      if (!bodyPassed) failedComponents.push(`section-${i}`);
       const headingEngRatio = translatedHeading ? (translatedHeading.replace(/[\u4e00-\u9fff]+/g, "").length / translatedHeading.length) : 1;
       if (!translatedHeading || headingEngRatio > 0.5) {
         console.log(`[translate] Section ${i} heading "${translatedHeading}" has ratio ${headingEngRatio.toFixed(2)} — fallback call`);
@@ -265,8 +368,8 @@ export async function translateArticle(
     }
     zhDoc.sections.push({
       id: `zh-section-${i}`, heading: translatedHeading, headingLevel: 2, sectionType: section.sectionType,
-      html: translatedBody, wordCount: countReadableWords(translatedBody),
-      status: bodyPassed ? "generated" : section.html ? "regenerated" : "missing",
+      blocks: secResult?.passed ? secResult.blocks : section.blocks,
+      status: secResult?.passed ? "generated" : section.blocks.length > 0 ? "regenerated" : "missing",
     });
   }
 
@@ -284,22 +387,62 @@ export async function translateArticle(
   zhDoc.visibleFaq = zhFaq;
 
   // ── Conclusion ──
-  if (enDoc.conclusion.html) {
-    const { protectedHtml: protectedConc, placeholders: concPhs, originalValues: concVals } = protectNumbersInHtml(enDoc.conclusion.html);
+  const enConcHtml = renderComponentHtml(enDoc.conclusion);
+  if (enConcHtml) {
     const prevHeading = enDoc.sections.length > 0 ? enDoc.sections[enDoc.sections.length - 1].heading : "FAQ";
-    const tr = await translateWithRetry(() => translateSection(protectedConc, "Conclusion", prevHeading, "(end)", undefined, "conclusion", budget), protectedConc, "conclusion", protectedConc);
-    metrics.push(tr.metrics);
-    let finalConc = tr.translated;
-    let concPassed = tr.passed;
-    if (concPassed && concPhs.length > 0) {
-      const restored = tryRestoreNumbersInHtml(finalConc, concPhs, concVals);
-      if (!restored.ok) { console.warn(`[translate] Conclusion number loss: lost=${restored.lost.join(",")}`); concPassed = false; }
-      else { finalConc = restored.html; }
+    // Protect conclusion blocks once — shared between HTML and shadow paths
+    const { blocks: concProtectedBlocks, state: concProtectionState } = protectNumbersInEditorialBlocks(enDoc.conclusion.blocks);
+    const concProtectedHtml = renderEditorialBlocksToWordPress(concProtectedBlocks);
+
+    const concResult = await translateEditorialBlocksFn({
+      blocks: enDoc.conclusion.blocks,
+      componentId: "zh-conc",
+      componentKind: "conclusion",
+      translateProtectedHtml: async (protectedHtml) => {
+        return await translateSection(protectedHtml, "Conclusion", prevHeading, "(end)", undefined, "conclusion", budget);
+      },
+      repairProtectedHtml: async (protectedHtml, error) => {
+        if (error.includes("number")) {
+          return await translateText(
+            protectedHtml,
+            `RETRY: ${error}. Preserve EXACTLY every number, percentage, date, and __NUM_0__ token. This is a number-preservation retry — do not change ANY number.`,
+            TITLE_META_SYSTEM, undefined, "conc-numbers-retry", budget,
+          );
+        }
+        return null;
+      },
+      onStatus: (status) => {
+        if (!status.passed) failedComponents.push("conclusion");
+        metrics.push({ component: "conclusion", ...status.metrics, passed: status.passed ? 1 : 0 } as any);
+      },
+    });
+    zhDoc.conclusion = {
+      id: "zh-conc",
+      blocks: concResult.blocks,
+      status: concResult.passed ? "generated" : "regenerated",
+    };
+
+    // Structured translation shadow (conclusion only, diagnostic)
+    const shadowResult: StructuredTranslationShadowResult = await runConclusionStructuredShadow(
+      concProtectedBlocks,
+      concProtectionState,
+      "zh-conc",
+      shadowOptions,
+    );
+    shadowResults.push(shadowResult);
+
+    // Evidence recording (privacy-safe, local only)
+    if (shadowResult.attempted && isConclusionShadowEvidenceEnabled()) {
+      recordConclusionShadowEvidence(shadowResult, concProtectedBlocks, concProtectionState).catch(() => {
+        // Evidence-recording failure must never fail article translation
+      });
     }
-    zhDoc.conclusion.html = concPassed ? finalConc : enDoc.conclusion.html;
-    zhDoc.conclusion.wordCount = countReadableWords(zhDoc.conclusion.html);
-    if (!concPassed) failedComponents.push("conclusion");
   }
+
+  // ── zhDoc.visibleFaq is the sole canonical FAQ representation.
+  // FAQ section heading and section-type were already assigned during section translation.
+  // FAQ section body blocks must not duplicate visibleFaq — renderArticleDocument
+  // renders FAQ content exclusively from visibleFaq, not from section blocks. ──
 
   // ── CTA ──
   zhDoc.languageSwitcher = enDoc.languageSwitcher;
@@ -319,10 +462,12 @@ export async function translateArticle(
     zhDoc.visibleFaq = zhFaq;
   }
 
-  // ── Strip English FAQPage from sections ──
+  // ── Strip English FAQPage from sections (legacy compat) ──
   for (const section of zhDoc.sections) {
-    section.html = section.html.replace(/<!--\s*wp:html\s*-->[\s\S]*?"@type"\s*:\s*"FAQPage"[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "");
-    section.html = section.html.replace(/<script[\s\S]*?"@type"\s*:\s*"FAQPage"[\s\S]*?<\/script>/gi, "");
+    if (section.blocks.length > 0 && section.blocks.some((b) => b.type === "quote" || b.type === "paragraph")) {
+      // New structured format: FAQPage is never in blocks, no action needed
+      break;
+    }
   }
 
   // ── Render and localise ──
@@ -345,6 +490,7 @@ export async function translateArticle(
       decision: d.hasChineseVersion ? "localised" as const : "preserved" as const,
       reason: d.reason, matchScore: d.hasChineseVersion ? 10 : 0,
     })),
+    structuredShadowResult: shadowResults.length > 0 ? shadowResults[shadowResults.length - 1] : undefined,
     ...lengthMetrics,
   };
 }

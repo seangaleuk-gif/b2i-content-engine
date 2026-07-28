@@ -1,0 +1,32 @@
+﻿
+ RUN  v4.1.10 C:/Users/sean_/b2i-content-engine
+
+ ❯ src/lib/pipeline/verify-word-count-tiers.test.ts (161 tests | 12 failed) 333ms
+     × passes for well-formed article (only soft warnings) 61ms
+     × soft warnings (low kp density) produce warning not fail 6ms
+     × passes for well-formed article (only soft warnings) 6ms
+     × soft warnings (low kp density) produce warning not fail 6ms
+     × passes for well-formed article (only soft warnings) 13ms
+     × soft warnings (low kp density) produce warning not fail 10ms
+     × passes for well-formed article (only soft warnings) 22ms
+     × soft warnings (low kp density) produce warning not fail 12ms
+     × passes for well-formed article (only soft warnings) 14ms
+     × soft warnings (low kp density) produce warning not fail 12ms
+     × passes for well-formed article (only soft warnings) 15ms
+     × soft warnings (low kp density) produce warning not fail 14ms
+stdout | src/lib/pipeline/blog-generation-pipeline.test.ts
+[INTEGRITY] extractLinkHrefs completed, count=2
+
+ ❯ src/lib/pipeline/blog-generation-pipeline.test.ts (54 tests | 6 failed) 123ms
+     × visible FAQ using canonical format is extracted correctly 18ms
+     × FAQ schema generated from visible FAQ matches questions 2ms
+     × full article with FAQ passes final validation (structural + FAQ) 1ms
+     × extractVisibleFaqFromArticle <strong> fallback ignores inline keyphrase <strong> in answers 2ms
+     × FAQ schema from extracted visible FAQ has correct entry count 2ms
+     × CTA survives after syncBlogFromDocument in factual-scan or trim stages 1ms
+
+ Test Files  2 failed | 8 passed (10)
+      Tests  18 failed | 824 passed (842)
+   Start at  13:58:38
+   Duration  2.37s (transform 3.79s, setup 0ms, import 6.88s, tests 1.27s, environment 2ms)
+

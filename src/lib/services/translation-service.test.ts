@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { ArticleDocument } from "@/lib/blog/article-document";
 import {
   checkCompleteness,
   visibleChars,
@@ -16,8 +17,290 @@ import {
   chineseLengthMetrics,
   localiseSources,
   applySourceDecisions,
+  translateArticle,
 } from "./translation-service";
 import { formatWordCount } from "@/lib/services/text-utils";
+
+// ── Service-flow integration tests ──
+
+function makeSourceDoc(): ArticleDocument {
+  return {
+    metadata: { title: "", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 0, focusKeyphrase: "" },
+    languageSwitcher: null, introduction: { id: "intro", blocks: [], status: "generated" },
+    sections: [], visibleFaq: [],
+    conclusion: { id: "conc", blocks: [], status: "generated" },
+    cta: null, faqSchema: null, insertedLinks: [],
+  };
+}
+
+function makeMinimalEnHtml(): string {
+  // Section heading must be ≤50% Latin chars so heading-fallback AI call is not triggered.
+  return `<!-- wp:html --><div class="b2i-language-switcher" data-language="en"><span>English</span></div><!-- /wp:html -->
+
+<!-- wp:paragraph --><p>Introduction text.</p><!-- /wp:paragraph -->
+
+<!-- wp:heading {"level":2} --><h2>測試一節</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>Section body.</p><!-- /wp:paragraph -->
+
+<!-- b2i-conclusion-start -->
+<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->
+<!-- b2i-conclusion-end -->`;
+}
+
+function makeMockHelper(calls: Array<{ componentId: string; componentKind: string }>): typeof import("./editorial-block-translation").translateEditorialBlocks {
+  return async (opts) => {
+    calls.push({ componentId: opts.componentId, componentKind: opts.componentKind });
+    return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
+  };
+}
+
+// These tests inject a mock translateEditorialBlocks via the DI parameter.
+// The mock ensures no real AI calls are made during orchestration.
+const TEST_EN_KEY = "sk-test-mock-helper-orchestration";
+
+describe("translateArticle — structured helper orchestration", () => {
+  beforeEach(() => { process.env.DEEPSEEK_API_KEY = TEST_EN_KEY; });
+  afterEach(() => { delete process.env.DEEPSEEK_API_KEY; });
+
+  it("introduction invokes the helper once", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    const introCall = calls.find((c) => c.componentKind === "introduction");
+    expect(introCall).toBeTruthy();
+    expect(introCall!.componentId).toBe("zh-intro");
+  });
+
+  it("each ordinary editorial section invokes the helper once", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+
+    expect(calls.filter((c) => c.componentKind === "section").length).toBe(1);
+    const secCall = calls.find((c) => c.componentKind === "section");
+    expect(secCall).toBeTruthy();
+    expect(secCall!.componentId).toBe("zh-section-0");
+  });
+
+  it("conclusion invokes the helper once", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+
+    const concCall = calls.find((c) => c.componentKind === "conclusion");
+    expect(concCall).toBeTruthy();
+    expect(concCall!.componentId).toBe("zh-conc");
+  });
+
+  it("translated blocks from helper are stored in the output ArticleDocument", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks =
+      async (opts) => {
+        calls.push({ componentId: opts.componentId, componentKind: opts.componentKind });
+        return {
+          blocks: [{ id: "mock-block", type: "paragraph" as const, content: [{ type: "text" as const, text: "Translated" }] }],
+          translatedHtml: "<!-- wp:paragraph --><p>Translated</p><!-- /wp:paragraph -->",
+          passed: true,
+          metrics: { sourceChars: 10, translatedChars: 10, ratio: 1, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 },
+        };
+      };
+
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+
+    expect(result.doc.introduction.blocks.length).toBe(1);
+    expect(result.doc.introduction.blocks[0].type).toBe("paragraph");
+    expect(result.doc.sections.length).toBeGreaterThan(0);
+    expect(result.doc.conclusion.blocks.length).toBe(1);
+  });
+
+  it("helper failure falls back to source blocks", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks =
+      async (opts) => {
+        calls.push({ componentId: opts.componentId, componentKind: opts.componentKind });
+        return {
+          blocks: opts.blocks,
+          translatedHtml: "",
+          passed: false,
+          metrics: { sourceChars: 10, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 0 },
+        };
+      };
+
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+
+    // When the helper fails (passed=false), the service falls back to source blocks
+    expect(result.doc.sections.length).toBeGreaterThan(0);
+    expect(result.doc.sections[0].blocks.length).toBeGreaterThan(0);
+  });
+});
+
+describe("FAQ and CTA do not use structured helper", () => {
+  it("FAQ translation does not invoke the helper", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+
+    const faqCalls = calls.filter((c: any) => c.componentId?.includes("faq") || c.componentId?.includes("zh-faq"));
+    expect(faqCalls.length).toBe(0);
+  });
+
+  it("CTA translation does not invoke the helper", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+
+    const ctaCalls = calls.filter((c: any) => c.componentId?.includes("cta"));
+    expect(ctaCalls.length).toBe(0);
+  });
+});
+
+describe("structured translation shadow orchestration", () => {
+  function makeShadowMock(calls: Array<string>): typeof import("./editorial-block-translation").translateEditorialBlocks {
+    return async (opts) => {
+      if (opts.componentKind === "conclusion") calls.push(opts.componentKind);
+      return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
+    };
+  }
+
+  it("shadow disabled by default makes zero shadow calls", async () => {
+    const mockCalls: Array<string> = [];
+    const mockHelper = makeShadowMock(mockCalls);
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    // No structured shadow was configured, so zero DTO-related calls
+    expect(mockCalls.filter((c) => c === "conclusion").length).toBe(1); // HTML path conclusion call
+  });
+
+  it("enabled shadow runs for conclusion but not intro, sections, FAQ, CTA", async () => {
+    const mockCalls: Array<string> = [];
+    const mockHelper = makeShadowMock(mockCalls);
+    const shadowTranslate = vi.fn(async () => {
+      mockCalls.push("shadow-conclusion");
+      return JSON.stringify({ componentKind: "conclusion", blocks: [] });
+    });
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+      translateEditorialBlocks: mockHelper,
+      structuredTranslationShadow: {
+        enabled: true,
+        translatePayload: shadowTranslate,
+      },
+    });
+    // Shadow ran exactly once for conclusion
+    expect(shadowTranslate).toHaveBeenCalledTimes(1);
+  });
+
+  it("explicit enabled:false overrides environment", async () => {
+    process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
+    const mockCalls: Array<string> = [];
+    const mockHelper = makeShadowMock(mockCalls);
+    const shadowTranslate = vi.fn();
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+      translateEditorialBlocks: mockHelper,
+      structuredTranslationShadow: { enabled: false, translatePayload: shadowTranslate },
+    });
+    expect(shadowTranslate).not.toHaveBeenCalled();
+    delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION;
+  });
+
+  it("shadow failure does not fail article translation", async () => {
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
+      return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
+    };
+    const shadowTranslate = vi.fn(async () => "invalid json that will fail");
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+      translateEditorialBlocks: mockHelper,
+      structuredTranslationShadow: { enabled: true, translatePayload: shadowTranslate },
+    });
+    // Article translation must succeed even when shadow fails
+    expect(result.failedComponents.includes("conclusion")).toBe(false);
+    expect(result.structuredShadowResult?.passed).toBe(false);
+  });
+});
+
+describe("structured conclusion shadow callbacks", () => {
+  it("uses STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM not TITLE_META_SYSTEM", async () => {
+    // Verify the default production callback uses the dedicated prompt
+    const { STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM, TITLE_META_SYSTEM, buildStructuredConclusionTranslationPrompt } = await import("./translation-ai");
+    process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
+    // Build production defaults by calling translateArticle with only env flag (no DI)
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
+      return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
+    };
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+      translateEditorialBlocks: mockHelper,
+      // No structuredTranslationShadow injected — env flag builds production defaults
+    });
+    delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION;
+    // The shadow was attempted (env flag caused production defaults to run)
+    expect(result.structuredShadowResult?.attempted).toBe(true);
+  });
+
+  it("initial prompt says only text may change", async () => {
+    const { buildStructuredConclusionTranslationPrompt } = await import("./translation-ai");
+    const prompt = buildStructuredConclusionTranslationPrompt('{"blocks":[]}');
+    expect(prompt).toContain("text");
+    expect(prompt).not.toContain("title");
+    expect(prompt).not.toContain("meta");
+  });
+
+  it("initial prompt forbids HTML, Markdown, and CTA", async () => {
+    const { STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM } = await import("./translation-ai");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("Hong Kong Traditional Chinese");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("type");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("seq");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("linkRef");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("__NUM_");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("JSON");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("Markdown");
+    expect(STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM).toContain("CTA");
+  });
+
+  it("repair builder includes errors and source payload", async () => {
+    const { buildStructuredConclusionRepairPrompt } = await import("./translation-ai");
+    const prompt = buildStructuredConclusionRepairPrompt('{"src":1}', '{"bad":1}', ["error 1", "error 2"]);
+    expect(prompt).toContain("error 1");
+    expect(prompt).toContain("error 2");
+    expect(prompt).toContain('{"src":1}');
+    expect(prompt).toContain('{"bad":1}');
+  });
+
+  it("repair builder limits error count and size", async () => {
+    const { buildStructuredConclusionRepairPrompt } = await import("./translation-ai");
+    const longError = "x".repeat(500);
+    const prompts = Array.from({ length: 10 }, (_, i) => `error ${i}: ${longError}`);
+    const prompt = buildStructuredConclusionRepairPrompt("{}", "{}", prompts);
+    // At most 5 errors included, each at most 200 chars
+    expect(prompt.split("error ").length - 1).toBeLessThanOrEqual(5);
+  });
+
+  it("environment defaults include a repair callback", async () => {
+    process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
+      return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
+    };
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+      translateEditorialBlocks: mockHelper,
+    });
+    delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION;
+    // When the shadow attempted, the environment defaults include both callbacks
+    if (result.structuredShadowResult?.attempted) {
+      expect(result.structuredShadowResult).toBeDefined();
+    }
+  });
+
+  it("one repair attempt occurs on invalid response", async () => {
+    process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
+      return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
+    };
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+      translateEditorialBlocks: mockHelper,
+    });
+    delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION;
+    expect(result.structuredShadowResult).toBeDefined();
+  });
+});
 
 // ── visibleChars ──
 

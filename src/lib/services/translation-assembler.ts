@@ -1,4 +1,4 @@
-import type { ArticleDocument, FaqEntry } from "@/lib/blog/article-document";
+import { type ArticleDocument, type FaqEntry, renderComponentHtml } from "@/lib/blog/article-document";
 import type { SourceDecision, InternalLinkDecision, ResearchItem } from "./translation-types";
 
 // ── FAQ schema builder ──
@@ -19,8 +19,8 @@ export function extractFaqFromDoc(doc: ArticleDocument): FaqEntry[] {
   const faqSection = doc.sections.find((s) =>
     s.sectionType === "faq-heading" || /faq|frequently|常見|問題|問答|常見問題集/i.test(s.heading)
   );
-  if (!faqSection || !faqSection.html) return [];
-  return extractFaqFromHtml(faqSection.html);
+  if (!faqSection || !faqSection.blocks || faqSection.blocks.length === 0) return [];
+  return extractFaqFromHtml(renderComponentHtml(faqSection));
 }
 
 function extractFaqFromHtml(html: string): FaqEntry[] {

@@ -1,0 +1,43 @@
+﻿
+ RUN  v4.1.10 C:/Users/sean_/b2i-content-engine
+
+ ❯ src/lib/pipeline/verify-word-count-tiers.test.ts (161 tests | 12 failed) 367ms
+     × passes for well-formed article (only soft warnings) 74ms
+     × soft warnings (low kp density) produce warning not fail 6ms
+     × passes for well-formed article (only soft warnings) 7ms
+     × soft warnings (low kp density) produce warning not fail 9ms
+     × passes for well-formed article (only soft warnings) 8ms
+     × soft warnings (low kp density) produce warning not fail 6ms
+     × passes for well-formed article (only soft warnings) 11ms
+     × soft warnings (low kp density) produce warning not fail 13ms
+     × passes for well-formed article (only soft warnings) 14ms
+     × soft warnings (low kp density) produce warning not fail 10ms
+     × passes for well-formed article (only soft warnings) 16ms
+     × soft warnings (low kp density) produce warning not fail 20ms
+stdout | src/lib/pipeline/blog-generation-pipeline.test.ts
+[INTEGRITY] extractLinkHrefs completed, count=2
+
+ ❯ src/lib/pipeline/blog-generation-pipeline.test.ts (54 tests | 8 failed) 114ms
+     × E. round-trip parse→render preserves structural validity 21ms
+     × E. round-trip parse→render preserves introduction content 1ms
+     × E. round-trip parse→render preserves conclusion content 1ms
+     × E. round-trip parse→render preserves all sections 1ms
+     × round-trip parse→render preserves valid block pairs 1ms
+     × conclusion split preserves block balance when H3+paragraph in last section 10ms
+     × FAQ parity after parse→render round-trip 1ms
+     × CTA survives after syncBlogFromDocument in factual-scan or trim stages 1ms
+ ❯ src/lib/blog/final-seo-normalizer.test.ts (396 tests | 8 failed) 766ms
+     × rendered HTML parses back to identical sections 20ms
+     × heading change in HTML survives parsing 2ms
+     × CTA changes survive parsing 1ms
+     × language switcher survives parsing 1ms
+     × introduction change survives parsing 1ms
+     × conclusion change survives parsing 1ms
+     × no accepted HTML change is silently lost 1ms
+     × only centralized renderer assigns state.blog — parser returns doc, not raw blog 1ms
+
+ Test Files  3 failed | 7 passed (10)
+      Tests  28 failed | 814 passed (842)
+   Start at  13:44:49
+   Duration  2.96s (transform 4.58s, setup 0ms, import 8.76s, tests 1.55s, environment 3ms)
+

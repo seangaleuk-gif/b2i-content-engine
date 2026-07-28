@@ -41,10 +41,10 @@ export async function POST(
         focusKeyphrase: (latest as any).keyword || project.keyword || "",
       },
       languageSwitcher: null as any,
-      introduction: { id: "intro", html: "", wordCount: 0, status: "generated" as const },
+      introduction: { id: "intro", blocks: [], status: "generated" as const },
       sections: [],
       visibleFaq: (latest as any).faq || [],
-      conclusion: { id: "conc", html: "", wordCount: 0, status: "generated" as const },
+      conclusion: { id: "conc", blocks: [], status: "generated" as const },
       cta: null as any,
       faqSchema: null as any,
       insertedLinks: [],
@@ -112,7 +112,19 @@ export async function POST(
     const tags = (latest as any).tags || [];
 
     // Run Chinese SEO audit using the AI-translated keyphrase and paired English version.
-    const pairedEnFaq = (latest as any)?.faq || [];
+    // Derive source FAQ count from the English article's saved faq field, falling back to
+    // canonical HTML parsing when that field is empty but the article has visible FAQs.
+    let pairedEnFaqCount = 0;
+    const pairedSavedFaq = (latest as any)?.faq;
+    if (Array.isArray(pairedSavedFaq) && pairedSavedFaq.length > 0) {
+      pairedEnFaqCount = pairedSavedFaq.length;
+    } else if ((latest as any)?.blog) {
+      const { extractVisibleFaqFromArticle } = await import("@/lib/blog/article-document");
+      const parsedEnFaq = extractVisibleFaqFromArticle((latest as any).blog);
+      pairedEnFaqCount = parsedEnFaq.length;
+    }
+    console.log(`[translate] Paired EN FAQ count: saved=${(pairedSavedFaq as any)?.length ?? "none"} parsed=${pairedEnFaqCount}`);
+
     const zhAudit = runChineseAudit({
       title: result.title || latest.title || "",
       metaDescription: result.metaDescription || (latest as any).meta_description || "",
@@ -120,7 +132,7 @@ export async function POST(
       blog: zhBlog,
       faq: extractVisibleFaqAsArray(zhBlog),
       englishWordCount: (latest as any).word_count || 2500,
-      pairedEnglishFaqCount: Array.isArray(pairedEnFaq) ? pairedEnFaq.length : 0,
+      pairedEnglishFaqCount: pairedEnFaqCount,
     });
     console.log("[translate] Chinese SEO audit:", JSON.stringify({
       score: zhAudit.overallScore,

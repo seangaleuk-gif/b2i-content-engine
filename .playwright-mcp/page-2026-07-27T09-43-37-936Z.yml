@@ -1,0 +1,26 @@
+- generic [active] [ref=f4e1]:
+  - complementary [ref=f4e2]:
+    - generic [ref=f4e3]: B2I Content Engine
+    - navigation [ref=f4e5]:
+      - link "Dashboard" [ref=f4e6] [cursor=pointer]:
+        - /url: /
+      - link "Projects" [ref=f4e13] [cursor=pointer]:
+        - /url: /projects
+      - link "Knowledge" [ref=f4e17] [cursor=pointer]:
+        - /url: /knowledge
+      - link "Prompt Library" [ref=f4e21] [cursor=pointer]:
+        - /url: /prompts
+      - link "Settings" [ref=f4e26] [cursor=pointer]:
+        - /url: /settings
+      - generic [ref=f4e31]:
+        - generic [ref=f4e32]: System Status
+        - generic [ref=f4e33]: API Usage
+        - generic [ref=f4e41]: Storage
+        - generic [ref=f4e49]: CPU Load
+    - generic [ref=f4e66]:
+      - generic [ref=f4e67]: v1.2.4
+      - generic [ref=f4e68]:
+        - button "Sign out" [ref=f4e69]
+        - button [ref=f4e73]
+  - main [ref=f4e76]
+  - alert [ref=f4e110]

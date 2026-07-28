@@ -146,7 +146,7 @@ export const STAGE_SYSTEM_PROMPTS: Record<string, string[]> = {
   introduction: ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context"],
   section:      ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context", "blog_structure"],
   faq:          ["brand_voice", "seo_rules", "formatting_rules"],
-  conclusion:   ["brand_voice", "formatting_rules", "cta"],
+  conclusion:   ["brand_voice", "formatting_rules"],
 };
 
 export function buildSystemPrompt(context: BlogContext, modules?: string[]): string {
@@ -159,7 +159,7 @@ export function buildSystemPrompt(context: BlogContext, modules?: string[]): str
   parts.push(FACTUALITY_INSTRUCTION);
 
   // CRITICAL FORMAT — always included for every stage
-  parts.push(`CRITICAL FORMAT REQUIREMENT: The blog content in your JSON response MUST use WordPress block format. Every heading must be <!-- wp:heading {"level":2} --> or <!-- wp:heading {"level":3} -->, every paragraph <!-- wp:paragraph -->, every list <!-- wp:list -->, every quote <!-- wp:quote -->, every table <!-- wp:table -->. Custom HTML (language switcher, CTA, FAQ schema) uses <!-- wp:html -->. NEVER use Markdown (##, **, backtick, [], etc.) or bare HTML tags. This is NON-NEGOTIABLE. If you output Markdown, the response is invalid.`);
+  parts.push(`CRITICAL FORMAT REQUIREMENT: The blog content in your JSON response MUST use WordPress block format when generating full-article content or non-editorial components. Every heading must be <!-- wp:heading ... -->, every paragraph <!-- wp:paragraph -->, every list <!-- wp:list -->, every quote <!-- wp:quote -->, every table <!-- wp:table -->. Custom HTML (language switcher, CTA, FAQ schema) uses <!-- wp:html -->. NEVER use Markdown (##, **, backtick, [], etc.) or bare HTML tags. This is NON-NEGOTIABLE.`);
 
   // Brand Voice
   if (isFull || include?.has("brand_voice")) {

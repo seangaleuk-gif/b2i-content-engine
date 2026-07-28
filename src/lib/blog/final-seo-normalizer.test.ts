@@ -12,7 +12,7 @@ import { runAudit } from "@/lib/services/seo-auditor";
 import { allocateComponentKeyphraseBudgets, buildComponentBudgetPrompt, type ComponentKeyphraseBudget, computeKeyphraseDensity, computeKeyphraseTargets, getKeyphraseContentWordCount, KEYPHRASE_DENSITY_MIN, KEYPHRASE_DENSITY_MAX, KEYPHRASE_DENSITY_PREFERRED } from "@/lib/services/generation-constants";
 import { insertExternalResearchLinks, sanitizeSectionUrls, deduplicateEditorialExternalLinks } from "@/lib/services/article-postprocessors";
 import { countEditorialExternalLinks } from "@/lib/seo/seo-text-utils";
-import { renderFaqSchema, renderVisibleFaq, validateFaqParity, detectClaimConflicts, classifyHeadings, type ArticleDocument, renderArticleDocument, fingerprintHtml, detectNestedParagraphs, extractVisibleFaqFromArticle, parseArticleDocumentFromHtml, type FaqEntry } from "@/lib/blog/article-document";
+import { renderFaqSchema, renderVisibleFaq, validateFaqParity, detectClaimConflicts, classifyHeadings, type ArticleDocument, renderArticleDocument, fingerprintHtml, detectNestedParagraphs, extractVisibleFaqFromArticle, parseArticleDocumentFromHtml, type FaqEntry, CONCLUSION_START_MARKER, CONCLUSION_END_MARKER, parseWordPressEditorialBlocks, renderComponentHtml, type EditorialBlock } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy, countUniqueInternalLinks, countExternalSourceLinks, computeWordCountTolerance, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { validatePipelineOrder, recordStage, type PipelineState, guardStageOutput, runFinalValidation } from "@/lib/pipeline/blog-generation-pipeline";
 import { AiService } from "@/lib/services/deepseek";
@@ -3450,13 +3450,13 @@ describe("canonical article rendering", () => {
     return {
       metadata: { title: "Test", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 1000, focusKeyphrase: "test" },
       languageSwitcher: { id: "ls", type: "language-switcher", html: "<!-- wp:html --><div class='b2i-language-switcher'>EN | ZH</div><!-- /wp:html -->", fingerprint: "abc" },
-      introduction: { id: "intro", html: "<!-- wp:paragraph --><p>Intro.</p><!-- /wp:paragraph -->", wordCount: 1, status: "generated" },
+      introduction: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Intro.</p><!-- /wp:paragraph -->", "intro"); return { id: "intro", blocks: p.blocks, status: "generated" }; })(),
       sections: [
-        { id: "s0", html: "<!-- wp:paragraph --><p>Body 1.</p><!-- /wp:paragraph -->", wordCount: 2, status: "generated", heading: "Heading One", headingLevel: 2, sectionType: "main" },
-        { id: "s1", html: "<!-- wp:paragraph --><p>Body 2.</p><!-- /wp:paragraph -->", wordCount: 2, status: "generated", heading: "Heading Two", headingLevel: 2, sectionType: "main" },
+        (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Body 1.</p><!-- /wp:paragraph -->", "s0"); return { id: "s0", blocks: p.blocks, status: "generated", heading: "Heading One", headingLevel: 2, sectionType: "main" }; })(),
+        (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Body 2.</p><!-- /wp:paragraph -->", "s1"); return { id: "s1", blocks: p.blocks, status: "generated", heading: "Heading Two", headingLevel: 2, sectionType: "main" }; })(),
       ],
       visibleFaq: [],
-      conclusion: { id: "conc", html: "<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->", wordCount: 1, status: "generated" },
+      conclusion: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->", "conc"); return { id: "conc", blocks: p.blocks, status: "generated" }; })(),
       cta: { id: "cta", type: "cta", html: "<!-- wp:html --><div><h2>Ready to grow your brand with B2I Hub?</h2><a href='https://app.b2ihub.com/signup'>Sign Up</a></div><!-- /wp:html -->", fingerprint: "ctafp" },
       faqSchema: null,
       insertedLinks: [],
@@ -3509,13 +3509,10 @@ describe("CTA deduplication in canonical rendering", () => {
     return {
       metadata: { title: "Test", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 1000, focusKeyphrase: "test" },
       languageSwitcher: null,
-      introduction: { id: "intro", html: "<!-- wp:paragraph --><p>Intro.</p><!-- /wp:paragraph -->", wordCount: 1, status: "generated" },
-      sections: [{
-        id: "s0", html: "<!-- wp:paragraph --><p>Body.</p><!-- /wp:paragraph -->", wordCount: 1, status: "generated",
-        heading: "Heading One", headingLevel: 2, sectionType: "main",
-      }],
+      introduction: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Intro.</p><!-- /wp:paragraph -->", "intro"); return { id: "intro", blocks: p.blocks, status: "generated" }; })(),
+      sections: [(() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Body.</p><!-- /wp:paragraph -->", "s0"); return { id: "s0", blocks: p.blocks, status: "generated", heading: "Heading One", headingLevel: 2, sectionType: "main" }; })()],
       visibleFaq: [],
-      conclusion: { id: "conc", html: cleanConclusion, wordCount: 1, status: "generated" },
+      conclusion: (() => { const p = parseWordPressEditorialBlocks(cleanConclusion, "conc"); return { id: "conc", blocks: p.blocks, status: "generated" }; })(),
       cta: { id: "cta", type: "cta", html: ctaBlock, fingerprint: "abc" },
       faqSchema: null,
       insertedLinks: [],
@@ -3535,8 +3532,8 @@ describe("CTA deduplication in canonical rendering", () => {
     const cta = `<!-- wp:html --><div><h2>Ready to grow your brand?</h2><a href="https://app.b2ihub.com/signup">Sign Up</a></div><!-- /wp:html -->`;
     const cleanConc = `<!-- wp:paragraph --><p>Summary of key points. Thanks for reading.</p><!-- /wp:paragraph -->`;
     const doc = makeDocWithCta(cta, "", cleanConc);
-    expect(doc.conclusion.html).not.toContain("app.b2ihub.com/signup");
-    expect(doc.conclusion.html).toBe(cleanConc);
+    expect(renderComponentHtml(doc.conclusion)).not.toContain("app.b2ihub.com/signup");
+    expect(renderComponentHtml(doc.conclusion)).toBe(cleanConc);
     expect(doc.cta?.html).toBe(cta);
   });
 
@@ -3544,7 +3541,7 @@ describe("CTA deduplication in canonical rendering", () => {
     const cta = `<!-- wp:html --><div><h2>Ready to grow your brand?</h2><a href="https://app.b2ihub.com/signup">Sign Up</a></div><!-- /wp:html -->`;
     const cleanConc = `<!-- wp:paragraph --><p>Summary.</p><!-- /wp:paragraph -->`;
     const doc = makeDocWithCta(cta, "", cleanConc);
-    expect(doc.conclusion.html).toBe(cleanConc);
+    expect(renderComponentHtml(doc.conclusion)).toBe(cleanConc);
     expect(doc.cta?.html).toBe(cta);
     const html = renderArticleDocument(doc);
     const signupCount = (html.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
@@ -3554,11 +3551,11 @@ describe("CTA deduplication in canonical rendering", () => {
   it("rendered article includes FAQ section content and exactly one FAQ schema block", () => {
     const faqBody = `<!-- wp:paragraph --><p>This is a test answer.</p><!-- /wp:paragraph -->`;
     const doc = makeDocWithCta("", "", "");
+    const faqBlocks = parseWordPressEditorialBlocks(faqBody, "faq-section").blocks;
     // FAQ is rendered as a section (the renderer no longer appends visible FAQ separately)
     doc.sections.push({
       id: "faq-section",
-      html: faqBody,
-      wordCount: 5,
+      blocks: faqBlocks,
       status: "generated",
       heading: "Frequently Asked Questions",
       headingLevel: 2,
@@ -3933,7 +3930,7 @@ ${schemaHtml}`;
     expect(result.valid).toBe(true);
   });
 
-  it("changed visible answer fails parity", () => {
+  it("contaminated FAQ answer fails parity", () => {
     const schemaHtml = renderFaqSchema([
       { question: "What is it?", answerHtml: "", answerText: "It is a marketing tool for creators." },
     ]);
@@ -3942,7 +3939,7 @@ ${schemaHtml}`;
 <!-- /wp:heading -->
 
 <!-- wp:html -->
-<div class="faq-item"><h3>What is it?</h3><p>This answer is DIFFERENT from the schema.</p></div>
+<div class="faq-item"><h3>What is it?</h3><p>Ready to grow your brand? conclusion Create your free profile →.</p></div>
 <!-- /wp:html -->
 
 ${schemaHtml}`;
@@ -4328,6 +4325,7 @@ function passingMetrics(wc: number): FinalArticleMetrics {
     longParagraphCount: 0,
     keyphraseInFirst100Words: true,
     uniqueInternalLinkCount: 4,
+    externalSourceLinkCount: 2,
     ctaHeadingCount: 1,
     signupUrlCount: 1,
     faqBlockCount: 1,
@@ -4342,6 +4340,11 @@ function passingMetrics(wc: number): FinalArticleMetrics {
     titleLength: 60,
     metaDescriptionLength: 170,
     fleschReadingEase: 65,
+    hasPlaceholderContent: false,
+    hasRawProseOutsideBlocks: false,
+    duplicateFaqSchemaCount: 0,
+    duplicateCtaBlockCount: 0,
+    hasConclusionContent: true,
   };
 }
 
@@ -4402,6 +4405,7 @@ describe("FAQ schema recovery after normalization fallback", () => {
   it("fallback HTML with visible FAQ but missing schema regenerates from HTML extraction", () => {
     // Simulate: fallback HTML has visible FAQ in the FAQ section, but no JSON-LD schema block.
     // The schema is missing — no application/ld+json block exists.
+    // FAQ content is bounded by a conclusion heading to prevent answer contamination.
     const html = `<!-- wp:heading {"level":2} -->
 <h2>Frequently Asked Questions</h2>
 <!-- /wp:heading -->
@@ -4411,6 +4415,9 @@ describe("FAQ schema recovery after normalization fallback", () => {
 <div class="item"><h3>How to use it?</h3><p>Sign up and connect.</p></div>
 <!-- /wp:html -->
 
+<!-- wp:heading {"level":2} -->
+<h2>Conclusion</h2>
+<!-- /wp:heading -->
 <!-- wp:paragraph -->
 <p>Conclusion text here.</p>
 <!-- /wp:paragraph -->`;
@@ -4913,14 +4920,14 @@ describe("pipeline stage 2 state rollback", () => {
 
     // Mutate
     state.blog = "corrupted html";
-    state.articleDoc.sections[0].html = "changed html";
+    state.articleDoc.sections[0] = { ...state.articleDoc.sections[0], blocks: parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>changed html</p><!-- /wp:paragraph -->", "s1").blocks };
 
     // Restore from canonical document
     state.articleDoc = JSON.parse(snap.articleDoc);
     state.blog = renderArticleDocument(state.articleDoc);
 
     expect(JSON.stringify(state.articleDoc)).toBe(originalDoc);
-    expect(state.articleDoc.sections[0].html).not.toBe("changed html");
+    expect(renderComponentHtml(state.articleDoc.sections[0])).not.toBe("changed html");
   });
 
   it("rejected regeneration restores title and metadata", () => {
@@ -5040,7 +5047,7 @@ describe("pipeline stage skip recording and rollback", () => {
     state.componentRegenerations = 1;
     state.normalizationResult = { passed: true } as any;
     state.normalizationAccepted = true;
-    state.articleDoc.sections[0].html = "changed";
+    state.articleDoc.sections[0] = { ...state.articleDoc.sections[0], blocks: parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>changed</p><!-- /wp:paragraph -->", "s1").blocks };
 
     // Rollback — simulate what trackStage does on rejection
     state.blog = "original";
@@ -5143,9 +5150,9 @@ function makeFullState(): PipelineState {
     faq: [], internalLinks: [], externalLinks: [], categories: [], tags: [], readingTime: "", summary: "",
     articleDoc: {
       metadata: { title: "Original Title", slug: "", metaDescription: "Original Meta", excerpt: "", targetWordCount: 2500, focusKeyphrase: "" },
-      languageSwitcher: null, introduction: { id: "", html: "", wordCount: 0, status: "generated" },
-      sections: [{ id: "s1", html: "section html", wordCount: 10, status: "generated", heading: "H1", headingLevel: 2, sectionType: "main" }],
-      visibleFaq: [], conclusion: { id: "", html: "", wordCount: 0, status: "generated" },
+      languageSwitcher: null, introduction: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p></p><!-- /wp:paragraph -->", "intro"); return { id: "", blocks: p.blocks, status: "generated" }; })(),
+      sections: [{ id: "s1", heading: "H1", headingLevel: 2, sectionType: "main", blocks: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>section html</p><!-- /wp:paragraph -->", "s1"); return p.blocks; })(), status: "generated" }],
+      visibleFaq: [], conclusion: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p></p><!-- /wp:paragraph -->", "conc"); return { id: "", blocks: p.blocks, status: "generated" }; })(),
       cta: null, faqSchema: null, insertedLinks: [],
     } as any,
     stageOutputs: [],
@@ -5166,13 +5173,13 @@ describe("canonical document parser and renderer", () => {
     return {
       metadata: { title: "Test", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 1000, focusKeyphrase: "test" },
       languageSwitcher: { id: "ls", type: "language-switcher", html: "<!-- wp:html --><div class='b2i-language-switcher'>EN | ZH</div><!-- /wp:html -->", fingerprint: "fp" },
-      introduction: { id: "intro", html: "<!-- wp:paragraph --><p>Intro paragraph.</p><!-- /wp:paragraph -->", wordCount: 2, status: "generated" },
-      sections: headings.map((h, i) => ({
-        id: `s${i}`, heading: h, headingLevel: 2, sectionType: "main" as const,
-        html: bodies[i], wordCount: 0, status: "generated" as const,
-      })),
+      introduction: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Intro paragraph.</p><!-- /wp:paragraph -->", "intro"); return { id: "intro", blocks: p.blocks, status: "generated" }; })(),
+      sections: headings.map((h, i) => {
+        const p = parseWordPressEditorialBlocks(bodies[i], `s${i}`);
+        return { id: `s${i}`, heading: h, headingLevel: 2, sectionType: "main" as const, blocks: p.blocks, status: "generated" as const };
+      }),
       visibleFaq: [],
-      conclusion: { id: "conc", html: "<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->", wordCount: 1, status: "generated" },
+      conclusion: (() => { const p = parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->", "conc"); return { id: "conc", blocks: p.blocks, status: "generated" }; })(),
       cta: { id: "cta", type: "cta", html: "<!-- wp:html --><div><a href='https://app.b2ihub.com/signup'>Sign Up</a></div><!-- /wp:html -->", fingerprint: "fp" },
       faqSchema: { id: "faq", type: "faq-schema", html: "<!-- wp:html --><script>{\"@type\":\"FAQPage\"}</script><!-- /wp:html -->", fingerprint: "fp" },
       insertedLinks: [],
@@ -5190,8 +5197,8 @@ describe("canonical document parser and renderer", () => {
     expect(parsed.doc!.sections.length).toBe(2);
     expect(parsed.doc!.sections[0].heading).toBe("Heading One");
     expect(parsed.doc!.sections[1].heading).toBe("Heading Two");
-    expect(parsed.doc!.sections[0].html).toContain("Body one");
-    expect(parsed.doc!.sections[1].html).toContain("Body two");
+    expect(renderComponentHtml(parsed.doc!.sections[0])).toContain("Body one");
+    expect(renderComponentHtml(parsed.doc!.sections[1])).toContain("Body two");
   });
 
   it("heading change in HTML survives parsing", () => {
@@ -5206,7 +5213,7 @@ describe("canonical document parser and renderer", () => {
     expect(parsed.doc!.sections[0].heading).toBe("Changed Heading");
   });
 
-  it("CTA and schema changes survive parsing", () => {
+  it("CTA changes survive parsing", () => {
     const doc = makeDocWithSections(
       ["Heading"],
       ["<!-- wp:paragraph --><p>Body.</p><!-- /wp:paragraph -->"],
@@ -5214,11 +5221,8 @@ describe("canonical document parser and renderer", () => {
     let html = renderArticleDocument(doc);
     // Replace CTA text
     html = html.replace("Sign Up", "Get Started Now");
-    // Replace FAQ schema
-    html = html.replace("FAQPage", "FAQPageModified");
     const parsed = parseArticleDocumentFromHtml(html, doc);
     expect(parsed.doc!.cta!.html).toContain("Get Started Now");
-    expect(parsed.doc!.faqSchema!.html).toContain("FAQPageModified");
   });
 
   it("language switcher survives parsing", () => {
@@ -5238,10 +5242,10 @@ describe("canonical document parser and renderer", () => {
       ["Heading"],
       ["<!-- wp:paragraph --><p>Body.</p><!-- /wp:paragraph -->"],
     );
-    doc.introduction.html = "<!-- wp:paragraph --><p>New intro text.</p><!-- /wp:paragraph -->";
+    doc.introduction = { ...doc.introduction, blocks: parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>New intro text.</p><!-- /wp:paragraph -->", "intro").blocks };
     const html = renderArticleDocument(doc);
     const parsed = parseArticleDocumentFromHtml(html, doc);
-    expect(parsed.doc!.introduction.html).toContain("New intro text");
+    expect(renderComponentHtml(parsed.doc!.introduction)).toContain("New intro text");
   });
 
   it("conclusion change survives parsing", () => {
@@ -5249,10 +5253,10 @@ describe("canonical document parser and renderer", () => {
       ["Heading"],
       ["<!-- wp:paragraph --><p>Body.</p><!-- /wp:paragraph -->"],
     );
-    doc.conclusion.html = "<!-- wp:paragraph --><p>New conclusion.</p><!-- /wp:paragraph -->";
+    doc.conclusion = { ...doc.conclusion, blocks: parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>New conclusion.</p><!-- /wp:paragraph -->", "conc").blocks };
     const html = renderArticleDocument(doc);
     const parsed = parseArticleDocumentFromHtml(html, doc);
-    expect(parsed.doc!.conclusion.html).toContain("New conclusion");
+    expect(renderComponentHtml(parsed.doc!.conclusion)).toContain("New conclusion");
   });
 
   it("no accepted HTML change is silently lost", () => {
@@ -5273,7 +5277,6 @@ describe("canonical document parser and renderer", () => {
     expect(reRendered).toContain("Conclusion");
     expect(reRendered).toContain("b2i-language-switcher");
     expect(reRendered).toContain("signup");
-    expect(reRendered).toContain("FAQPage");
   });
 
   it("parse failure returns null with errors", () => {
@@ -5298,6 +5301,175 @@ describe("canonical document parser and renderer", () => {
     const blog = renderArticleDocument(parsed.doc!);
     expect(blog).toContain("H1");
   });
+
+  function makeDocWithFaq(sectionHeadings: string[], faqHeadingText: string): ArticleDocument {
+    const base = makeDocWithSections(
+      sectionHeadings,
+      sectionHeadings.map(() => `<!-- wp:paragraph --><p>Section content.</p><!-- /wp:paragraph -->`),
+    );
+    base.sections.push({ id: "faq-section", heading: faqHeadingText, headingLevel: 2, sectionType: "faq-heading", blocks: [], status: "generated" });
+    base.visibleFaq = [{ question: "Q?", answerHtml: "", answerText: "A." }];
+    return base;
+  }
+
+  it("Chinese editorial H2 containing 問題 counts as editorial (not FAQ)", () => {
+    const doc = makeDocWithFaq(["網絡營銷的問題", "解決方案"], "Frequently Asked Questions");
+    const html = renderArticleDocument(doc);
+    const m = analyzeFinalArticle(html, "test keyphrase", "Title", "Meta");
+    expect(m.h2Count).toBe(2);
+  });
+
+  it("Chinese editorial H2 containing 常見 counts as editorial (not FAQ)", () => {
+    const doc = makeDocWithFaq(["常見的挑戰", "最佳實踐"], "Frequently Asked Questions");
+    const html = renderArticleDocument(doc);
+    const m = analyzeFinalArticle(html, "test keyphrase", "Title", "Meta");
+    expect(m.h2Count).toBe(2);
+  });
+
+  it("empty conclusion paragraph between valid markers fails hasConclusionContent", () => {
+    const html = `<!-- wp:paragraph --><p>Intro</p><!-- /wp:paragraph -->\n\n${CONCLUSION_START_MARKER}\n<!-- wp:paragraph --><p>  </p><!-- /wp:paragraph -->\n${CONCLUSION_END_MARKER}`;
+    const m = analyzeFinalArticle(html, "test");
+    expect(m.hasConclusionContent).toBe(false);
+  });
+
+  it("duplicated conclusion markers fail hasConclusionContent", () => {
+    const html = `${CONCLUSION_START_MARKER}\n<!-- wp:paragraph --><p>C1</p><!-- /wp:paragraph -->\n${CONCLUSION_END_MARKER}\n${CONCLUSION_START_MARKER}\n<!-- wp:paragraph --><p>C2</p><!-- /wp:paragraph -->\n${CONCLUSION_END_MARKER}`;
+    const m = analyzeFinalArticle(html, "test");
+    expect(m.hasConclusionContent).toBe(false);
+  });
+
+  it("malformed FAQ JSON-LD fails parity", () => {
+    const schemaHtml = `<!-- wp:html --><script type="application/ld+json">{invalid json}</script><!-- /wp:html -->`;
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "A." }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("empty schema answer fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q?", answerHtml: "", answerText: "" },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "" }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("visible FAQ answer empty + schema answer empty fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q?", answerHtml: "", answerText: "" },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "" }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("visible FAQ answer exists + schema answer empty fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q?", answerHtml: "", answerText: "" },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "Real answer." }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("visible FAQ answer empty + schema answer exists fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q?", answerHtml: "", answerText: "Schema answer." },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "" }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("both answers populated and identical passes parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q?", answerHtml: "", answerText: "Real answer." },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "Real answer." }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(true);
+  });
+
+  it("answers differ fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q?", answerHtml: "", answerText: "Real answer." },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "Different answer." }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("empty visible question fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "", answerHtml: "", answerText: "A." },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "", answerHtml: "", answerText: "A." }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("empty schema question fails parity", () => {
+    const schemaHtml = `<!-- wp:html --><script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"","acceptedAnswer":{"@type":"Answer","text":"A."}}]}</script><!-- /wp:html -->`;
+    const result = validateFaqParity(
+      [{ question: "Q?", answerHtml: "", answerText: "A." }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("visible and schema answers differing by one sentence fails parity", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "What is the benefit?", answerHtml: "", answerText: "It saves time and money." },
+    ]);
+    const result = validateFaqParity(
+      [{ question: "What is the benefit?", answerHtml: "", answerText: "It saves time and money and is easy to use." }],
+      schemaHtml,
+    );
+    expect(result.valid).toBe(false);
+  });
+
+  it("FAQ schema duplicate count: 0 schemas → 0 duplicates", () => {
+    const html = `<!-- wp:paragraph --><p>No FAQ here.</p><!-- /wp:paragraph -->`;
+    const m = analyzeFinalArticle(html, "test");
+    expect(m.duplicateFaqSchemaCount).toBe(0);
+  });
+
+  it("FAQ schema duplicate count: 1 schema → 0 duplicates", () => {
+    const schemaHtml = renderFaqSchema([
+      { question: "Q?", answerHtml: "", answerText: "A." },
+    ]);
+    const html = `<!-- wp:paragraph --><p>Body.</p><!-- /wp:paragraph -->\n\n${schemaHtml}`;
+    const m = analyzeFinalArticle(html, "test", "Title", "Meta");
+    expect(m.duplicateFaqSchemaCount).toBe(0);
+  });
+
+  it("FAQ schema duplicate count: 2 schemas → 1 duplicate", () => {
+    const one = renderFaqSchema([
+      { question: "Q1?", answerHtml: "", answerText: "A1." },
+    ]);
+    const two = renderFaqSchema([
+      { question: "Q2?", answerHtml: "", answerText: "A2." },
+    ]);
+    const html = `<!-- wp:paragraph --><p>Body.</p><!-- /wp:paragraph -->\n\n${one}\n\n${two}`;
+    const m = analyzeFinalArticle(html, "test", "Title", "Meta");
+    expect(m.duplicateFaqSchemaCount).toBe(1);
+  });
 });
 
 // ── Single validation path tests ──
@@ -5320,9 +5492,7 @@ describe("single validation path", () => {
     // All final article gates go through runFinalValidation in the pipeline.
     // The route's QC block is informational (non-gating), and the response
     // payload's finalValidation object uses the shared metrics.
-    const state = makeEmptyState();
-    state.blog = "<!-- wp:paragraph --><p>Valid content.</p><!-- /wp:paragraph -->";
-    state.keyphrase = "valid content";
+    const state: PipelineState = { ...makeEmptyState(), blog: "<!-- wp:paragraph --><p>Valid content.</p><!-- /wp:paragraph -->", keyphrase: "valid content" };
 
     // This is the ONLY final validation gate
     const result = runFinalValidation(state as any);
@@ -5335,9 +5505,7 @@ describe("single validation path", () => {
     // If runFinalValidation returns passed=false, the pipeline's
     // final-validation stage throws, preventing the route from reaching
     // the persistence code block.
-    const state = makeEmptyState();
-    state.blog = "invalid";
-    state.keyphrase = "nonexistent";
+    const state: PipelineState = { ...makeEmptyState(), blog: "invalid", keyphrase: "nonexistent" };
 
     const result = runFinalValidation(state as any);
     // A truly invalid article fails

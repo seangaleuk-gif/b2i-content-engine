@@ -80,13 +80,22 @@ export async function POST(
     const targetWordCount = (project as any).wordCount || (project as any).word_count || 2500;
     const targetKeyphraseCount = 5;
 
-    // Use the paired English version's word count for chineseCharRange, and its FAQ count for parity
+    // Use the paired English version's word count for chineseCharRange, and its FAQ count for parity.
+    // Fall back to canonical HTML parsing when the saved faq field is empty.
+    let pairedEnglishFaqCount = 0;
+    if (isChinese && pairedEnglishVersion) {
+      const savedFaq = (pairedEnglishVersion as any)?.faq;
+      if (Array.isArray(savedFaq) && savedFaq.length > 0) {
+        pairedEnglishFaqCount = savedFaq.length;
+      } else if ((pairedEnglishVersion as any)?.blog) {
+        const { extractVisibleFaqFromArticle } = await import("@/lib/blog/article-document");
+        const parsedFaq = extractVisibleFaqFromArticle((pairedEnglishVersion as any).blog);
+        pairedEnglishFaqCount = parsedFaq.length;
+      }
+    }
     const englishWordCount = isChinese
       ? ((pairedEnglishVersion as any)?.word_count || targetWordCount)
       : targetWordCount;
-    const pairedEnglishFaqCount = isChinese
-      ? ((pairedEnglishVersion as any)?.faq?.length || 0)
-      : 0;
 
     console.log(`[seo:audit] versionId=${(targetedVersion as any)?.id} sourceEnVersionId=${(pairedEnglishVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language} enWordCount=${englishWordCount} enFaqCount=${pairedEnglishFaqCount}`);
 

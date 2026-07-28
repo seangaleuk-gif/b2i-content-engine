@@ -5,12 +5,26 @@
 
 /**
  * Extract the FAQ JSON-LD block from the full assembled article.
- * Searches for the `<!-- wp:html -->` block containing FAQPage schema.
+ * Enumerates individual wp:html blocks and selects the one whose
+ * JSON-LD @type is "FAQPage". Never spans multiple unrelated blocks.
  */
 export function extractFaqBlock(article: string): string {
   if (!article) return "";
-  const match = article.match(/<!--\s*wp:html\s*-->[\s\S]*?FAQPage[\s\S]*?<!--\s*\/wp:html\s*-->/i);
-  return match ? match[0] : "";
+  const wpHtmlRe = /<!--\s*wp:html\s*-->([\s\S]*?)<!--\s*\/wp:html\s*-->/gi;
+  let whm: RegExpExecArray | null;
+  while ((whm = wpHtmlRe.exec(article)) !== null) {
+    const inner = whm[1];
+    const scriptMatch = inner.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
+    if (scriptMatch) {
+      try {
+        const parsed = JSON.parse(scriptMatch[1]);
+        if (parsed?.["@type"] === "FAQPage" && Array.isArray(parsed.mainEntity)) return whm[0];
+      } catch {
+        // Not valid JSON — continue searching
+      }
+    }
+  }
+  return "";
 }
 
 /**

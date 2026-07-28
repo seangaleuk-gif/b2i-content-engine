@@ -93,9 +93,49 @@ export function calculateFleschReadingEase(text: string): number {
   return 206.835 - 1.015 * (words.length / sentences.length) - 84.6 * (syllables / words.length);
 }
 
-/** Count sentences in a paragraph text */
+/** Character-by-character sentence detector — strips inline HTML and checks if
+ *  the next content character starts with an uppercase letter (true sentence end).
+ *  Avoids false positives from abbreviations, decimals, URLs, file extensions. */
+const NO_SPLIT_BEFORE = /\b(?:Mr|Ms|Mrs|Dr|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|inc|ltd|co|corp|ave|blvd|rd|st|sq|dept|univ|inst|assn|tel|ext|no|vol|pg|pp|ed|par|chap|sec|fig|ref|e\.g|i\.e|viz|al)\.$/i;
+
+export function splitSentences(text: string): string[] {
+  const sentences: string[] = [];
+  let current = "";
+  const chars = [...text];
+  for (let i = 0; i < chars.length; i++) {
+    current += chars[i];
+    if (/[.!?！？。]/.test(chars[i])) {
+      if (chars[i] === "." && NO_SPLIT_BEFORE.test(current)) continue;
+      const rest = text.substring(i + 1);
+      const restContent = rest.replace(/<[^>]+>/g, "").trimStart();
+      if (restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent)) {
+        sentences.push(current.trim());
+        current = "";
+      }
+    }
+  }
+  if (current.trim()) sentences.push(current.trim());
+  return sentences;
+}
+
+/** Count sentences in a paragraph text. Uses the same character-by-character
+ *  detector as splitLongParagraphs for pipeline consistency. */
 export function countSentences(paragraphText: string): number {
-  return paragraphText.split(/[.!?]+/).filter((s) => s.trim().length > 0).length;
+  return splitSentences(paragraphText).length;
+}
+
+/** Analyse which paragraphs exceed a sentence limit and return their excerpts with counts.
+ *  Useful for debugging paragraph-length SEO issues. */
+export function analyseLongParagraphs(html: string, maxSentences: number): Array<{ index: number; excerpt: string; sentences: number }> {
+  const texts = extractParagraphTexts(html);
+  const result: Array<{ index: number; excerpt: string; sentences: number }> = [];
+  for (let i = 0; i < texts.length; i++) {
+    const s = countSentences(texts[i]);
+    if (s > maxSentences) {
+      result.push({ index: i, excerpt: texts[i].substring(0, 120), sentences: s });
+    }
+  }
+  return result;
 }
 
 /** Check if text contains the exact focus keyphrase as a contiguous substring (case-insensitive) */

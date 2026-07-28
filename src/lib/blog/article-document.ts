@@ -1,13 +1,17 @@
 // ── Canonical Article Document Model ──
 // The single source of truth for article structure, protected blocks, and rendering.
-// All pipeline stages mutate ArticleDocument fields, then call the canonical renderer.
+// Editorial content stores structured blocks; WordPress HTML is generated only at render time.
+
+import { type EditorialBlock, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, extractPlainTextFromEditorialBlocks } from "@/lib/blog/article-content";
+
+export type { EditorialBlock };
+export { renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, extractPlainTextFromEditorialBlocks };
 
 export type ComponentStatus = "generated" | "regenerated" | "expanded" | "normalized" | "trimmed" | "missing";
 
 export interface ArticleComponent {
   id: string;
-  html: string;
-  wordCount: number;
+  blocks: EditorialBlock[];
   status: ComponentStatus;
 }
 
@@ -44,6 +48,20 @@ export interface InsertedLink {
   href: string;
   anchorText: string;
   sourceType: "editorial-external" | "internal" | "cta" | "language";
+}
+
+// ── Compatibility helpers for legacy consumers ──
+// Render a single component to HTML without going through the full document renderer.
+export function renderComponentHtml(component: ArticleComponent): string {
+  return renderEditorialBlocksToWordPress(component.blocks);
+}
+export function countComponentWords(component: ArticleComponent): number {
+  return extractPlainTextFromEditorialBlocks(component.blocks).split(/\s+/).filter(Boolean).length;
+}
+
+/** Get the section body as HTML string, rendering from blocks. */
+export function sectionHtmlFromBlocksOrString(section: ArticleSection): string {
+  return renderComponentHtml(section);
 }
 
 export interface ArticleDocument {
@@ -92,39 +110,63 @@ export function renderArticleDocument(doc: ArticleDocument): string {
   }
 
   // 2. Introduction
-  if (doc.introduction.html) {
-    parts.push(doc.introduction.html);
+  const introHtml = renderEditorialBlocksToWordPress(doc.introduction.blocks);
+  if (introHtml) {
+    parts.push(introHtml);
   }
 
-  // 3. Main H2 sections (each with heading block + body)
-  //    The visible FAQ section part of doc.sections.
+  // 3. Editorial H2 sections only (exclude faq-heading and conclusion-heading)
   for (const section of doc.sections) {
+    if (section.sectionType === "faq-heading") continue;
+    if (section.sectionType === "conclusion-heading") continue;
     parts.push(
       `<!-- wp:heading {"level":2} -->\n<h2>${section.heading}</h2>\n<!-- /wp:heading -->`
     );
-    if (section.html) {
-      parts.push(section.html);
+    const sectionHtml = renderEditorialBlocksToWordPress(section.blocks);
+    if (sectionHtml) {
+      parts.push(sectionHtml);
     }
   }
 
-  // 4. Conclusion (before CTA and FAQ schema so extraction never
-  //    captures CTA or schema text as conclusion content).
-  if (doc.conclusion.html) {
-    parts.push(doc.conclusion.html);
+  // 4. Conclusion with stable boundary markers
+  const concHtml = renderEditorialBlocksToWordPress(doc.conclusion.blocks);
+  if (concHtml) {
+    parts.push("<!-- b2i-conclusion-start -->");
+    parts.push(concHtml);
+    parts.push("<!-- b2i-conclusion-end -->");
   }
 
-  // 5. CTA block (after conclusion, before FAQ schema)
+  // 5. Visible FAQ heading + Q&A generated from doc.visibleFaq (single source of truth)
+  if (doc.visibleFaq && doc.visibleFaq.length > 0) {
+    const faqSection = doc.sections.find((s) => s.sectionType === "faq-heading");
+    if (faqSection) {
+      parts.push("<!-- b2i-faq-heading -->");
+      parts.push(
+        `<!-- wp:heading {"level":2} -->\n<h2>${faqSection.heading}</h2>\n<!-- /wp:heading -->`
+      );
+    }
+    const visibleFaqHtml = renderVisibleFaq(doc.visibleFaq);
+    if (visibleFaqHtml) {
+      parts.push(visibleFaqHtml);
+    }
+  }
+
+  // 6. FAQ JSON-LD schema generated from the same doc.visibleFaq (must match exactly)
+  if (doc.visibleFaq && doc.visibleFaq.length > 0) {
+    parts.push(renderFaqSchema(doc.visibleFaq));
+  }
+
+  // 7. CTA block (always last)
   if (doc.cta) {
     parts.push(doc.cta.html);
   }
 
-  // 6. FAQ JSON-LD schema (always last)
-  if (doc.faqSchema) {
-    parts.push(doc.faqSchema.html);
-  }
-
   return parts.join("\n\n");
 }
+
+export const CONCLUSION_START_MARKER = "<!-- b2i-conclusion-start -->";
+export const CONCLUSION_END_MARKER = "<!-- b2i-conclusion-end -->";
+export const FAQ_HEADING_MARKER = "<!-- b2i-faq-heading -->";
 
 // ── Structured nesting validator ──
 
@@ -198,7 +240,7 @@ export function classifyHeadings(doc: ArticleDocument, renderedHtml: string): He
 // ── FAQ parity validation ──
 
 export interface FaqParityIssue {
-  type: "missing-question" | "extra-question" | "wording-mismatch" | "answer-mismatch" | "reordered";
+  type: "missing-question" | "extra-question" | "wording-mismatch" | "answer-mismatch" | "reordered" | "empty-question" | "empty-answer";
   index?: number;
   detail: string;
 }
@@ -240,7 +282,14 @@ export function validateFaqParity(
   for (let i = 0; i < maxQuestions; i++) {
     const entryText = entries[i].question.toLowerCase().trim();
     const schemaText = schemaQuestions[i].toLowerCase().trim();
-    if (entryText !== schemaText) {
+
+    if (!entryText || !schemaText) {
+      issues.push({
+        type: "empty-question",
+        index: i,
+        detail: `Question ${i + 1}: visible="${entryText}" schema="${schemaText}"`,
+      });
+    } else if (entryText !== schemaText) {
       issues.push({
         type: "wording-mismatch",
         index: i,
@@ -250,10 +299,24 @@ export function validateFaqParity(
   }
 
   // Compare answers (visible answerText vs schema answerText)
+  // Both must be non-empty and identical for the entry to be valid.
   for (let i = 0; i < maxQuestions; i++) {
     const entryAnswer = (entries[i].answerText || "").toLowerCase().trim();
     const schemaAnswer = (schemaAnswers[i] || "").toLowerCase().trim();
-    if (entryAnswer && schemaAnswer && entryAnswer !== schemaAnswer) {
+
+    if (!entryAnswer) {
+      issues.push({
+        type: "empty-answer",
+        index: i,
+        detail: `Answer ${i + 1}: visible answer is empty`,
+      });
+    } else if (!schemaAnswer) {
+      issues.push({
+        type: "empty-answer",
+        index: i,
+        detail: `Answer ${i + 1}: schema answer is empty`,
+      });
+    } else if (entryAnswer !== schemaAnswer) {
       issues.push({
         type: "answer-mismatch",
         index: i,
@@ -289,8 +352,9 @@ export function extractVisibleFaqFromArticle(
     const faqSection = doc.sections.find((s) =>
       /faq|frequently.asked|common.question/i.test(s.heading),
     );
-    if (faqSection && faqSection.html) {
-      const extracted = extractFaqPairsFromSectionBody(faqSection.html);
+    if (faqSection) {
+      const faqHtml = sectionHtmlFromBlocksOrString(faqSection);
+      const extracted = extractFaqPairsFromSectionBody(faqHtml);
       result.push(...extracted);
       return result; // Structured boundary — never scans beyond the section body.
     }
@@ -415,7 +479,7 @@ export function extractVisibleFaqFromArticle(
  */
 const CTA_BOUNDARY_RE = /\b(?:Ready to|Create your|Start your|Create a free)[^.!?]*[.!?]/i;
 
-function extractFaqPairsFromSectionBody(sectionHtml: string): Array<{ question: string; answerText: string }> {
+export function extractFaqPairsFromSectionBody(sectionHtml: string): Array<{ question: string; answerText: string }> {
   const result: Array<{ question: string; answerText: string }> = [];
 
   // First: try <h3>Question</h3> style
@@ -733,7 +797,7 @@ export function parseArticleDocumentFromHtml(
   const ctaSearchStart = languageSwitcher
     ? html.indexOf(switcherMatch![0]) + switcherMatch![0].length
     : 0;
-  const ctaMatch = html.substring(ctaSearchStart).match(/<!--\s*wp:html\s*-->[\s\S]*?app\.b2ihub\.com\/signup[\s\S]*?<!--\s*\/wp:html\s*-->/i);
+  const ctaMatch = html.substring(ctaSearchStart).match(/<!--\s*wp:html\s*-->(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?app\.b2ihub\.com\/signup(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?<!--\s*\/wp:html\s*-->/i);
   const cta: ProtectedArticleBlock | null = ctaMatch ? {
     id: "cta",
     type: "cta",
@@ -746,7 +810,7 @@ export function parseArticleDocumentFromHtml(
   const faqSearchStart = ctaMatch
     ? ctaSearchStart + ctaMatch.index! + ctaMatch[0].length
     : ctaSearchStart;
-  const faqSchemaMatch = html.substring(faqSearchStart).match(/<!--\s*wp:html\s*-->[\s\S]*?FAQPage[\s\S]*?<!--\s*\/wp:html\s*-->/i);
+  const faqSchemaMatch = html.substring(faqSearchStart).match(/<!--\s*wp:html\s*-->(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?FAQPage(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?<!--\s*\/wp:html\s*-->/i);
   const faqSchema: ProtectedArticleBlock | null = faqSchemaMatch ? {
     id: "faq-schema",
     type: "faq-schema",
@@ -771,16 +835,18 @@ export function parseArticleDocumentFromHtml(
   const ctaStartIdx = ctaMatch ? html.indexOf(ctaMatch[0]) : -1;
   const faqSchemaStartIdx = faqSchemaMatch ? html.indexOf(faqSchemaMatch[0]) : -1;
 
-  // Extract introduction: everything from after language switcher to first heading
+  // Extract introduction and parse it into blocks
   const introStart = languageSwitcher
     ? html.indexOf(switcherMatch![0]) + switcherMatch![0].length
     : 0;
   const introEnd = headingMatches[0].index;
   const introductionHtml = html.substring(introStart, introEnd).trim();
-  if (introductionHtml.length === 0) {
-    errors.push("Introduction section is empty");
-    return { doc: null, errors };
-  }
+  const introParse = parseWordPressEditorialBlocks(introductionHtml, "intro");
+  const introduction: ArticleComponent = {
+    id: existingDoc.introduction?.id ?? "intro",
+    blocks: introParse.blocks.length > 0 ? introParse.blocks : [],
+    status: existingDoc.introduction?.status ?? "generated",
+  };
 
   // Extract section bodies from between heading blocks.
   // Sections stop at the NEXT heading, the CTA block, or the FAQ schema
@@ -811,15 +877,15 @@ export function parseArticleDocumentFromHtml(
     }
     rawBodyEnds.push(sectionEnd);
 
-    // Use heading from HTML, section type from existing if available
+    const sectionParse = parseWordPressEditorialBlocks(bodyHtml, `section-${i}`);
+
     const existing = existingDoc.sections[i];
     newSections.push({
       id: existing?.id ?? `section-${i}`,
-      heading: headingMatches[i].heading, // from HTML, not old doc
+      heading: headingMatches[i].heading,
       headingLevel: 2,
       sectionType: existing?.sectionType ?? "main",
-      html: bodyHtml,
-      wordCount: 0,
+      blocks: sectionParse.blocks,
       status: existing?.status ?? "generated",
     });
   }
@@ -836,37 +902,18 @@ export function parseArticleDocumentFromHtml(
     const ctaPos = html.indexOf(ctaMatch[0]);
     if (ctaPos > conclusionStart) {
       conclusionToCta = html.substring(conclusionStart, ctaPos).trim();
-      // Trim conclusion content from the last section body (it was
-      // included because sections stop at CTA, not at the conclusion).
-      if (newSections.length > 0 && conclusionToCta.length > 0) {
-        const lastSection = newSections[newSections.length - 1];
-        const sectionHtml = lastSection.html;
-        // Find the conclusion text in the section body and remove it
-        const concIndex = sectionHtml.indexOf(conclusionToCta.substring(0, 60));
-        if (concIndex >= 0) {
-          lastSection.html = sectionHtml.substring(0, concIndex).trim();
-        }
-      }
     }
   } else if (faqSchemaMatch) {
     const faqPos = html.indexOf(faqSchemaMatch[0]);
     if (faqPos > conclusionStart) {
       conclusionToCta = html.substring(conclusionStart, faqPos).trim();
-      if (newSections.length > 0 && conclusionToCta.length > 0) {
-        const lastSection = newSections[newSections.length - 1];
-        const sectionHtml = lastSection.html;
-        const concIndex = sectionHtml.indexOf(conclusionToCta.substring(0, 60));
-        if (concIndex >= 0) {
-          lastSection.html = sectionHtml.substring(0, concIndex).trim();
-        }
-      }
     }
   }
-  // Use the extracted conclusion content from between the last section and CTA
   let conclusionHtml = conclusionToCta;
+
   // Fallback: if no CTA/schema found, try splitting the last section body
   if (conclusionHtml.length === 0 && newSections.length > 0) {
-    const lastBody = newSections[newSections.length - 1].html;
+    const lastBody = renderComponentHtml(newSections[newSections.length - 1]);
     const blockRe = /(<!--\s*wp:\w+(?:\s[^>]*)?\s*-->)/gi;
     const separators: number[] = [];
     let bm: RegExpExecArray | null;
@@ -879,26 +926,33 @@ export function parseArticleDocumentFromHtml(
       : separators.length === 1 ? separators[0]
       : -1;
     if (threshold >= 0) {
-      newSections[newSections.length - 1].html = lastBody.substring(0, threshold).trim();
-      conclusionHtml = lastBody.substring(threshold).trim();
+      const splitHtml = lastBody.substring(threshold).trim();
+      if (splitHtml) conclusionHtml = splitHtml;
     }
   }
 
   if (conclusionHtml.length === 0) {
-    conclusionHtml = existingDoc.conclusion?.html ?? "";
+    conclusionHtml = existingDoc.conclusion?.blocks ? renderComponentHtml(existingDoc.conclusion) : "";
   }
+
+  // Parse conclusion HTML into blocks
+  const conclusionParse = parseWordPressEditorialBlocks(conclusionHtml, "conc");
 
   const doc: ArticleDocument = {
     metadata: { ...existingDoc.metadata },
     languageSwitcher: languageSwitcher ?? existingDoc.languageSwitcher,
     introduction: {
-      ...existingDoc.introduction,
-      html: introductionHtml,
-      wordCount: 0,
+      id: existingDoc.introduction?.id ?? "intro",
+      blocks: introduction.blocks,
+      status: existingDoc.introduction?.status ?? "generated",
     },
     sections: newSections,
     visibleFaq: existingDoc.visibleFaq,
-    conclusion: { ...existingDoc.conclusion, html: conclusionHtml },
+    conclusion: {
+      id: existingDoc.conclusion?.id ?? "conc",
+      blocks: conclusionParse.blocks,
+      status: existingDoc.conclusion?.status ?? "generated",
+    },
     cta: cta ?? existingDoc.cta,
     faqSchema: faqSchema ?? existingDoc.faqSchema,
     insertedLinks: existingDoc.insertedLinks,

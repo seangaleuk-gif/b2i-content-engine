@@ -107,7 +107,7 @@ Non-`AppError` throws are mapped to a generic 500 response with `{ error: "Inter
 
 ## Build and tests
 
-Current build passes with **481 tests passing and 0 failing**.
+Current build passes with **842 tests passing and 0 failing** (10 test files).
 
 ## Contributor rules
 
@@ -181,30 +181,85 @@ If a numeric mismatch, English leakage, or FAQ-count variation can be prevented 
 
 ## Handoff
 
-Current state (2026-07-26):
-- Route orchestration extracted to ~110 lines
-- Pipeline module handles all post-assembly stages with fingerprint tracking; order: expansion → trim → paragraphs → regeneration → language-switcher → external-links → external-dedup → internal-links → seo-normalization → title-repair → factual-scan → link-enforce → final-trim → faq-recovery → paragraphs-final → cta-preserve → final-validation
-- ArticleDocument is the canonical article model with HTML parser
-- FinalArticlePolicy centralizes all validation rules (hard vs soft)
-- AiService centralizes all AI provider access; `ChatResult` now includes `finishReason`
-- auth.ts is the single authentication authority; x-user-id headers are ignored
-- project-authorization.ts provides requireProjectAccess() only; delegates identity to auth.ts
-- AppError + toErrorResponse() is the single error model; no route-local error response construction
-- Article-wide keyphrase density replaces fixed occurrence ranges; per-section quotas removed
-- Word count uses tolerance ranges: ±10% below 2,000, ±15% at 2,000+
-- Internal links: 0–4 unique B2I Hub destinations; external links counted separately
-- FAQ guaranteed: outline requires FAQ H2, post-processing appends if missing, recovery generates JSON-LD
-- Long paragraphs and keyphrase-in-first-100 are soft warnings, not hard failures
-- Visibility metrics strip wp:html and scripts before counting
-- Single signup CTA enforced with structural extraction + fallback stripping
-- `rebalanceWpBlocks()` with stack-based matching validates WP blocks at 3 boundaries
-- `verifyStructuralIntegrity` checks WP blocks and language switcher only; FAQ/CTA completeness deferred to final validation
-- Protected blocks tokenized/detokenized; `<a>` tag and `<strong>` FAQ extraction handle multiple formats
-- **Chinese translation pipeline**: 12 normal API calls (metadata+keyphrase, title, introduction, 6× combined H2+body sections, conclusion, FAQ, CTA). RetryBudget (12 shared retries, per-request scoped). Fallback keyphrase translation via single `translateText` call if combined metadata JSON fails. Metadata padded with introduction text to exceed 500-token empty_response threshold.
-- **Chinese SEO audit**: `runChineseAudit()` in `seo-auditor.ts`. Chinese-specific ranges (title 25-35, meta 80-120, body 3800-5500, hard fail <3200). Flesch N/A (excluded from scoring). CJK keyphrase guard. FAQ audits only last `FAQPage` block, enforces parity, retries on length-truncation.
-- **Version/language filtering**: English SEO finds latest non-`-zh` version; Chinese finds latest `-zh`. Category prefix `zh-` separates storage. `?language=en|zh` on GET /seo.
-- **Hard validation gate**: Translation route blocks save on any `failedComponents` (was missing — critical fix). Number mismatches, completeness failures, FAQ count outside 4-6, CTA without CJK text, meta-description failures all prevent saving.
-- **Assembly fixes**: English FAQPage schemas stripped from section bodies before render. CTA CJK check. FAQ count 4-6 enforcement. Same-array visible FAQ + schema.
-- **Cost optimizations**: `MAX_RETRIES=0` (was 1). translateText 512 tok, CTA 1024 tok, FAQ 4096 tok. Dead `METADATA_ZH_SYSTEM` and `{keyphrase}` placeholder removed.
-- **Tests**: 620 passing (7 files), 0 failing
-- Safe starting points: `src/lib/pipeline/blog-generation-pipeline.ts` for English pipeline stages; `src/lib/services/translation-service.ts` for Chinese translation flow; `src/lib/services/seo-auditor.ts` for both English and Chinese audits
+Current state (2026-07-27):
+
+### Translation Pipeline Refactor
+- **Module split**: `translation-service.ts` (orchestration only), `translation-ai.ts` (AI calls, prompts, retry budget), `translation-validator.ts` (number protection, English leakage, completeness), `translation-assembler.ts` (FAQ schema, source localisation, internal-link localisation), `translation-types.ts` (shared types).
+- **AiService** remains the single AI gateway; `createDeepSeekClient()` is private.
+- **Deterministic number protection**: `protectNumbersInHtml()` replaces all numbers/percentages/currencies/dates with `__NUM_N__` placeholders before translation; `tryRestoreNumbersInHtml()` verifies every placeholder survives, restores original values, hard-fails on missing/duplicated placeholders.
+- **Introduction English retry**: One-shot retry with `INTRO_RETRY_STRICT` if `hasExcessiveEnglish()` detects English prose. 
+- **FAQ source-count preservation**: `translationFaqCount(sourceFaqCount)` — Chinese FAQ count must EXACTLY equal English source. No trimming, no padding, no regeneration. `faq-count` hard-fails on mismatch.
+- **Section number retry**: One-shot retry for sections, introduction, and conclusion when `tryRestoreNumbersInHtml` detects lost placeholders.
+- **Metadata range compliance**: Title/meta retry with exact CJK range requirement when outside bounds. No filler padding — hard-fail if retry fails. One deterministic cleanup pass (trim trailing punctuation only).
+- **FAQ boundary validation**: Dynamic token budget based on input size. `finish_reason=length` is an immediate throw. Answers rejected if they contain signup URLs, CTA text, conclusion text, FAQPage schema, headings, `<strong>` markup, or are >3× source length. Exact source count and one-to-one order enforced.
+- **CTA max_tokens**: 4096 (was 2048) to prevent truncation.
+
+### Content Standards (canonical, in `src/lib/content-standards.ts`)
+- `englishWordTolerance(n)`: ±10% below 2k, ±15% at/above 2k
+- `dynamicH2Range(n)` / `dynamicFaqRange(n)`: 6 bands from 500–5,000 words (3-4 to 8-9 H2s, 2-3 to 5-7 FAQs)
+- `englishTitleRange()`: 50–70; `chineseTitleRange()`: 25–35
+- `englishMetaRange()`: 155–200; `chineseMetaRange()`: 80–120
+- Keyphrase density: `englishKeyphraseDensity()` / `chineseKeyphraseDensity()` — below 0.5% warning, 0.5–1.5% preferred, above 3% hard failure
+- `paragraphSentenceLimit()`: 3
+- `internalLinkRange()`: 0–4; `externalLinkRange()`: 0–Infinity
+- `chineseCharRange(n)`: preferred 1.80×, pass 1.52–2.20×, hard min 1.28×
+- `translationFaqCount(n)`: exact preservation
+- `computeKeyphraseDensity()` / `computeKeyphraseTargets()` / `getKeyphraseContentWordCount()`
+- Integrated into English pipeline (prompt-builder, final-article-policy, final-seo-normalizer, component-regenerator, section-expander, quality-scorer, seo-auditor runAudit). Not yet integrated into Chinese SEO.
+
+### English Pipeline
+- Pipeline order: expansion → trim → paragraphs → regeneration → external-links → internal-links → seo-normalization → factual-scan → link-enforce → final-trim → faq-recovery → paragraphs-final → cta-preserve → wc-check → final-validation
+- `cta-preserve` always re-injects canonical CTA when damaged (not just when `articleDoc.cta` is null), then rebuilds FAQ schema from current visible FAQ.
+- `wc-check`: post-CTA word count trim that also rebuilds FAQ schema.
+- `runTrackedHtmlStage` flattens nested `<p>` before stage validation using `detectNestedParagraphs` + iterative unwrap.
+- `runFinalValidation` passes title/meta to analyzer, tolerates ±1 H2 and 1 long paragraph.
+- `splitSentences` (in `seo-text-utils.ts`): character-by-character sentence detector used by both `countSentences` and `splitLongParagraphs` for unified sentence detection.
+- `countLongParagraphs` / `splitLongParagraphs` both use `splitSentences` from `seo-text-utils.ts`.
+
+### Chinese SEO
+- Uses canonical thresholds from `content-standards.ts` via `chineseTitleRange()`, `chineseMetaRange()`, `chineseKeyphraseDensity()`, `paragraphSentenceLimit()`, `internalLinkRange()`.
+- Unified density: both `keyphrase_count` and `keyphrase_density` checks use the same `zhDensity` calculation.
+- FAQ parity: structure-only validation (counts match + no empty answers) — exact text comparison removed as too fragile.
+- Paired English version: `summary` field stores `source-en-version:<id>`; SEO audit route reads this to find exact paired version. Legacy fallback: slug matching (strip `-zh`).
+- Paired English FAQ: falls back to `extractVisibleFaqFromArticle(enBlog)` when DB `faq` field is empty.
+- Chinese keyphrase: taken from saved version's `excerpt` field. If empty or lacks CJK, route returns clear error — never falls back to English project keyword.
+
+### Retry Budget
+- `RetryBudget` class scoped per `translateArticle()` call. 12 shared retries.
+- `record()` only sets `exhausted=true` when `remaining <= 0` (not on `capped` flag). The `capped` (budget cut-off) flag is logged but does not set exhaustion state.
+- `chatWithRetry` in `deepseek.ts` now populates `result.attemptsUsed` with the actual number of retries consumed.
+- Logging shows actual retries used, not allowance difference.
+
+### Save / Readback / Version Filtering
+- `blogVersionRepository.findById(id)` added for post-save readback.
+- Both translate and generate-blog routes do `create` → `findById` → 201 only if readback succeeds.
+- `GET /api/projects/[id]/versions?language=en|zh` filters by slug suffix.
+- UI pages: English SEO uses `.filter()` for immediate display; project pages can pass `?language=en` or `?language=zh`.
+- Outdated detection: compares `_auditedVersionId` from server against latest matching-language version's ID.
+- UI uses server-provided `overallScore` (weighted category-based) instead of recalculating simple average.
+
+### Hard vs Soft Validation
+**Hard failures (block saving):** Word count outside tolerance, H2 count outside dynamic range, FAQ entry count outside dynamic range, any paragraph exceeding sentence limit, keyphrase density >3% (stuffing), more than 4 internal links, FAQ block/schema/parity failures, CTA/signup/switcher missing, WordPress block mismatch, nested paragraphs, malformed headings.
+
+**Soft warnings (never block):** Keyphrase density <0.5%, keyphrase not in H2, keyphrase not in first 100 words, title/meta near misses, reading level outside target.
+
+### Tests
+- **842 tests passing, 0 failing** (10 files: 7 existing + content-standards.test.ts + verify-word-count-tiers.test.ts + regression-issues.test.ts)
+- All 6 word-count tiers verified (500, 1000, 1500, 2500, 3500, 5000 words) across content-standards, policy builder, boundary tests, SEO audit, Chinese SEO audit, and version filtering.
+- 3 consecutive production translations confirmed passing (versions 24-26).
+
+### Known Issues
+- DeepSeek v4 `empty_response` on prompts under ~500 input tokens (mitigated by padding).
+- Supabase Node.js 20 deprecation warning (non-blocking).
+- Chinese translation AI output quality varies per run (number preservation, English leakage). Targeted retries mitigate but do not eliminate.
+
+### Safe Starting Points
+- `src/lib/pipeline/blog-generation-pipeline.ts` for English pipeline stages
+- `src/lib/services/translation-service.ts` for Chinese translation orchestration
+- `src/lib/services/translation-ai.ts` for AI calls and prompts
+- `src/lib/services/translation-validator.ts` for number protection and validation
+- `src/lib/services/translation-assembler.ts` for FAQ schema and source localisation
+- `src/lib/services/seo-auditor.ts` for both English and Chinese audits
+- `src/lib/blog/final-article-policy.ts` for canonical validation
+- `src/lib/content-standards.ts` for all canonical thresholds
+- `src/lib/seo/seo-text-utils.ts` for canonical text extraction and sentence splitting

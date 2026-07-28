@@ -1,4 +1,5 @@
 import type { ArticleDocument, FaqEntry, ProtectedArticleBlock } from "@/lib/blog/article-document";
+import type { StructuredTranslationShadowResult } from "./editorial-block-translation";
 
 export interface TranslationMetrics {
   component: string;
@@ -33,6 +34,7 @@ export interface TranslationResult {
   estimatedReadingMinutes: number;
   sourceDecisions: SourceDecision[];
   internalLinkDecisions: SourceDecision[];
+  structuredShadowResult?: StructuredTranslationShadowResult;
 }
 
 export interface ResearchItem {
@@ -73,11 +75,12 @@ export class RetryBudget {
     return Math.min(requestedRetries, this.remaining);
   }
 
-  record(component: string, usedRetries: number, budgetExhausted: boolean): void {
+  record(component: string, usedRetries: number, capped: boolean): void {
     this.remaining = Math.max(0, this.remaining - usedRetries);
-    if (budgetExhausted || this.remaining <= 0) this.exhausted = true;
-    if (usedRetries > 0 || budgetExhausted) {
-      this.componentLog.push(`${component}(retries=${usedRetries}/${this.total})`);
+    if (this.remaining <= 0) this.exhausted = true;
+    const note = capped ? "(capped)" : "";
+    if (usedRetries > 0 || capped) {
+      this.componentLog.push(`${component}(retries=${usedRetries}/${this.total}${note})`);
     }
   }
 }

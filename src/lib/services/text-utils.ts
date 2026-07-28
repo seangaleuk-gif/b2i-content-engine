@@ -1,4 +1,5 @@
 import { AppError } from "./errors";
+import { splitSentences } from "@/lib/seo/seo-text-utils";
 
 export function countReadableWords(html: string): number {
   // Strip non-readable content first
@@ -60,13 +61,6 @@ export function cleanBodyText(text: string): string {
     .replace(/```[\s\S]*?```/g, "")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-export function splitSentences(text: string): string[] {
-  return cleanBodyText(text)
-    .split(/[.!?]+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 10);
 }
 
 export function robustJsonParse(raw: string, stage?: string): unknown {
@@ -225,40 +219,36 @@ export function repairMetaDescription(meta: string, min: number, max: number): s
 
 /** Split WordPress paragraph blocks that exceed MAX_SENTENCES per paragraph.
  *  Preserves inline HTML (<strong>, <em>, <a>, <br>). Never splits lists/headings/tables/quotes/html blocks. */
+/** Unwrap nested <p> tags — outer <p> that contains child <p> tags is removed,
+ *  leaving the inner content intact. Prevents paragraph splitting from breaking
+ *  on AI-generated content that wraps already-paragraphed text in a new <p>. */
+function flattenNestedParagraphs(html: string): string {
+  // Repeatedly find outermost <p>...</p> that contains another <p> and remove the outer wrapper
+  let prev = "";
+  let result = html;
+  while (result !== prev) {
+    prev = result;
+    result = result.replace(/<p\b[^>]*>([\s\S]*?)<\/p>/g, (match, inner) => {
+      if (/<p\b[^>]*>/i.test(inner)) {
+        return inner;
+      }
+      return match;
+    });
+  }
+  return result;
+}
+
 export function splitLongParagraphs(html: string, maxSentences: number = 3): { html: string; splitCount: number } {
   let splitCount = 0;
-  const noSplitBefore = /\b(?:Mr|Ms|Mrs|Dr|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|inc|ltd|co|corp|ave|blvd|rd|st|sq|dept|univ|inst|assn|tel|ext|no|vol|pg|pp|ed|par|chap|sec|fig|ref|e\.g|i\.e|viz|al)\.$/i;
+  const flatHtml = flattenNestedParagraphs(html);
 
-  const result = html.replace(
+  const result = flatHtml.replace(
     /<!--\s*wp:paragraph\s*-->\s*<p>([\s\S]*?)<\/p>\s*<!--\s*\/wp:paragraph\s*-->/gi,
     (match: string, content: string) => {
       const trimmed = content.trim();
       if (!trimmed) return match;
 
-      // Build sentence list by scanning character by character
-      const sentences: string[] = [];
-      let current = "";
-      const chars = [...trimmed];
-      for (let i = 0; i < chars.length; i++) {
-        current += chars[i];
-        const ch = chars[i];
-        // Check for sentence-ending punctuation
-        if (/[.!?！？。]/.test(ch)) {
-          // Don't split on known abbreviations
-          if (ch === "." && noSplitBefore.test(current)) continue;
-          // Check if this is truly the end of a sentence:
-          // Strip inline HTML tags (e.g. </strong>, </em>, </a>) and whitespace
-          // before checking the next content character.
-          const rest = trimmed.substring(i + 1);
-          const restContent = rest.replace(/<[^>]+>/g, "").trimStart();
-          const isBoundary = restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent);
-          if (isBoundary) {
-            sentences.push(current.trim());
-            current = "";
-          }
-        }
-      }
-      if (current.trim()) sentences.push(current.trim());
+      const sentences = splitSentences(trimmed);
 
       if (sentences.length <= maxSentences) return match;
 
@@ -364,27 +354,10 @@ export function countLongParagraphs(html: string, maxSentences: number = 3): num
   const paraRe = /<!--\s*wp:paragraph\s*-->\s*<p>([\s\S]*?)<\/p>\s*<!--\s*\/wp:paragraph\s*-->/gi;
   let count = 0;
   let m: RegExpExecArray | null;
-  const noSplitBefore = /\b(?:Mr|Ms|Mrs|Dr|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|inc|ltd|co|corp|ave|blvd|rd|sq|dept|univ|inst|assn|tel|ext|no|vol|pg|pp|ed|par|chap|sec|fig|ref|e\.g|i\.e|viz|al)\.$/i;
   while ((m = paraRe.exec(html)) !== null) {
     const content = m[1].trim();
     if (!content) continue;
-    const sentences: string[] = [];
-    let current = "";
-    const chars = [...content];
-    for (let i = 0; i < chars.length; i++) {
-      current += chars[i];
-      if (/[.!?！？。]/.test(chars[i])) {
-        if (chars[i] === "." && noSplitBefore.test(current)) continue;
-        const rest = content.substring(i + 1);
-        const restContent = rest.replace(/<[^>]+>/g, "").trimStart();
-        if (restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent)) {
-          sentences.push(current.trim());
-          current = "";
-        }
-      }
-    }
-    if (current.trim()) sentences.push(current.trim());
-    if (sentences.length > maxSentences) count++;
+    if (splitSentences(content).length > maxSentences) count++;
   }
   return count;
 }

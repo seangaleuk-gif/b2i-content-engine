@@ -4,7 +4,7 @@
 AI-powered content creation workflow for B2I Digital. Automates blog writing from research through publishing, with AI-driven SEO analysis, image generation, and social media content creation.
 
 ## Current Development Phase
-**Phase 7 — Eliminate Remaining AI Weaknesses** (Jul 25, 2026)
+**Phase 7 — Eliminate Remaining AI Weaknesses** (Jul 27, 2026) — Completed
 
 | Phase | Status | Completed |
 |-------|--------|-----------|
@@ -18,6 +18,7 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 | Keyphrase Budgets & Dynamic SEO Ranges | Complete | Jul 22, 2026 |
 | Translation Pipeline (Component-based) | Complete | Jul 24, 2026 |
 | Source Localisation & Number Equivalence | Complete | Jul 24, 2026 |
+| Stage 7 — Canonical Standards, Pipeline Hardening, Chinese Translation Refactor | Complete | Jul 27, 2026 |
 
 ## Features Completed
 
@@ -68,26 +69,29 @@ AI-powered content creation workflow for B2I Digital. Automates blog writing fro
 ## Overall Workflow
 (unchanged — see previous versions)
 
-## Current State (2026-07-25)
+## Current State (2026-07-27)
 
 ### Build & Tests
 - **Build**: Pass
-- **Tests**: 586/586 (7 test files)
+- **Tests**: 842/842 (10 test files)
 
-### Known Pipeline Bugs (requires fix)
+### Key Achievements (Stage 7)
+- **Canonical content standards** — single `content-standards.ts` for all thresholds
+- **Translation pipeline refactor** — 5-module split with clean responsibilities
+- **Deterministic number protection** — placeholder-based with targeted retries
+- **FAQ boundary validation** — dynamic token budget, content scanning, exact source count
+- **Metadata range compliance** — retry with exact range, hard-fail on failure, no filler
+- **Unified sentence detection** — `splitSentences` shared across pipeline and validation
+- **Paired English version tracking** — `summary` field stores source version ID
+- **Retry budget fixed** — `capped` flag no longer sets exhaustion
+- **CTA always re-injected** — not gated on null check
+- **3 consecutive production translations** — versions 24-26 passed all checks
+- **842 tests** — 10 files, all passing
 
-1. **CTA loss after `syncBlogFromDocument()`** — `cta-preserve` stage re-injects the CTA into `state.blog` (HTML string) but NOT into `state.articleDoc.cta`. When `factual-scan` or `final-trim` calls `syncBlogFromDocument()`, the HTML is rebuilt from `ArticleDocument` and the re-injected CTA is lost. Final validation then fails with `cta headings=0; signup URLs=0`.
-
-2. **FAQ parity mismatch** — FAQPage JSON-LD is rebuilt from visible FAQ during `faq-recovery`, but `paragraphs-final` (which splits long paragraphs) runs AFTER it. Splitting FAQ paragraphs can change the visible FAQ paragraph structure, causing the schema to no longer match the visible Q&A.
-
-3. **Word count validation inconsistency** — `evaluatePolicy` includes `wcHard` (rejects outside 2,125-2,875), but articles above 2,875 still return `201`. Suspected root cause: `guardStageOutput` in `runTrackedHtmlStage` may restore a pre-validation snapshot after validation passes, replacing `state.blog` with an earlier unsplit version. The route's `finalWordCount` is computed from the restored HTML, bypassing the validated word count.
-
-4. **DeepSeek `deepseek-chat` model name** — API now requires `deepseek-v4-flash` or `deepseek-v4-pro`. Default was changed in `deepseek.ts:132` and `playground/route.ts:23`.
-
-5. **Paragraph splitting lost by later stages** — Fixed by moving `paragraphs-final` to last content-changing position, but `cta-preserve` and `faq-recovery` still run after `final-trim` and can modify content post-split.
+### Known Active Issues
+1. DeepSeek v4 `empty_response` on small prompts — mitigated with padding
+2. Supabase Node.js 20 deprecation warning — non-blocking
+3. Chinese translation AI output quality varies — targeted retries mitigate
 
 ### Next Priority
-1. Fix CTA loss — move `cta-preserve` after all `syncBlogFromDocument()` stages
-2. Fix FAQ parity — run `paragraphs-final` BEFORE `faq-recovery`, or ensure FAQ schema is rebuilt after paragraph splitting
-3. Fix word count validation — use one shared counting function everywhere; ensure `state.blog` is the validated HTML at save time
-4. Run 3 consecutive production generations with all checks passing
+Phase 8: WordPress Integration (Actual Publishing) — see TODO.md

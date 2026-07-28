@@ -1,16 +1,8 @@
 // ── Number protection ──
 
-const NUMBER_PROTECT_RE = new RegExp([
-  '(?:HK?\\$|US?\\$|USD|HKD|EUR|GBP|JPY|CNY)\\s*\\d{1,3}(?:,\\d{3})*(?:\\.\\d+)?',
-  '\\d{1,3}(?:,\\d{3})*(?:\\.\\d+)?\\s*(?:港元|港幣|美元|歐元|英鎊|日圓|人民幣)',
-  '\\d{1,3}(?:,\\d{3})*(?:\\.\\d+)?[%％]',
-  '\\d+(?:\\.\\d+)?\\s*(?:thousand|million|billion|trillion)',
-  '(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},?\\s+\\d{4}',
-  '\\d{1,2}\\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}',
-  '\\b\\d{4}-\\d{1,2}-\\d{1,2}\\b',
-  '\\b\\d{1,2}/\\d{1,2}/\\d{4}\\b',
-  '\\b\\d{1,3}(?:,\\d{3})*(?:\\.\\d+)?\\b',
-].join('|'), 'gi');
+import { createNumberExpressionRegex } from "./translation-number-grammar";
+
+const NUMBER_PROTECT_RE = createNumberExpressionRegex();
 
 export function protectNumbersInHtml(html: string): {
   protectedHtml: string;

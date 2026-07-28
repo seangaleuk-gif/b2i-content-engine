@@ -17,13 +17,12 @@ import { runComponentRegeneration, regenerateIntroduction, regenerateSection, re
 import { buildGenerationReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry } from "@/lib/services/generation-telemetry";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
-import { extractCtaFromConclusion, stripProtectedBlocksFromConclusion } from "@/lib/blog/protected-block-extractor";
-import { countExactPhrase, extractReadableText } from "@/lib/seo/seo-text-utils";
-import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle } from "@/lib/blog/article-document";
+import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
 import { sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
 import { rebalanceWpBlocks } from "@/lib/services/text-utils";
+import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks } from "@/lib/blog/article-content";
 
 /** Strip ALL heading blocks (H2, H3, bare <h2>, bare <h3>) from section body content.
  *  Handles complete blocks, orphaned openers/closers, and malformed heading markup
@@ -91,9 +90,16 @@ export interface GenerationResult {
   userMessage: string;
 }
 
+/** Optional overrides for test dependency injection. */
+export interface GenerationOverrides {
+  /** When provided, replaces the internal DeepSeek request function. */
+  requestDeepSeek?: (stage: string, messages: ChatMessage[], options?: ChatOptions) => Promise<{ content: string }>;
+}
+
 export async function runBlogGeneration(
   userId: string,
   projectId: number,
+  overrides?: GenerationOverrides,
 ): Promise<GenerationResult> {
   const telemetry = new GenerationTelemetry();
   telemetry.startTimer("total");
@@ -102,7 +108,9 @@ export async function runBlogGeneration(
   if (!project) throw AppError.internal();
 
   const ai = new AiService(telemetry);
-  const trackedChat = (stage: string, messages: ChatMessage[], options?: ChatOptions) => ai.call(stage, messages, options);
+  const trackedChat = overrides?.requestDeepSeek
+    ? overrides.requestDeepSeek
+    : (stage: string, messages: ChatMessage[], options?: ChatOptions) => ai.call(stage, messages, options);
   const makeTrackedChatForStage = (stage: string) => ai.makeCallerForStage(stage);
 
   const research = await researchRepository.findByProject(Number(projectId));
@@ -236,76 +244,167 @@ export async function runBlogGeneration(
   type TaskResult = { type: string; index?: number; heading?: string; content: string };
   const tasks: Promise<TaskResult>[] = [];
 
-  const introUserMsg = `Write the introduction (${introTarget} words). Return as JSON: {"intro": "..."}.\n\nTitle: ${outline.title}${kpNote}`;
+  const introUserMsg = `Write the introduction (${introTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another supported type is clearly useful.\n\nTitle: ${outline.title}${kpNote}`;
   tasks.push(trackedChat("intro", [{ role: "system", content: bundle.introSystem }, { role: "user", content: introUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 4096 })
-    .then((res: any) => ({ type: "intro", content: (robustJsonParse(res.content, "intro") as any).intro || "" })));
+    .then(async (res: any) => {
+      let parsed: any;
+      try { parsed = robustJsonParse(res.content, "intro"); } catch {
+        // Retry once
+        const retryMsg = introUserMsg + `\n\nYour previous response was not valid JSON. Return ONLY valid JSON with the format: {"blocks": [{"type": "paragraph", "text": "..."}]}. No HTML, no WordPress comments, no Markdown fences.`;
+        const retryRes = await trackedChat("intro_retry", [{ role: "system", content: bundle.introSystem }, { role: "user", content: retryMsg }], { responseFormat: { type: "json_object" }, maxTokens: 4096 });
+        parsed = robustJsonParse(retryRes.content, "intro-retry");
+      }
+      const normalized = normalizeAiEditorialPayload(parsed, "intro");
+      if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
+        // Retry with repair prompt
+        const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}.\n\nReturn ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences.`;
+        const repairRes = await trackedChat("intro_repair", [{ role: "system", content: bundle.introSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 4096 });
+        const repaired = robustJsonParse(repairRes.content, "intro-repair");
+        const repairedNorm = normalizeAiEditorialPayload(repaired, "intro");
+        if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+          throw AppError.internal(new Error(`Introduction generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
+        }
+        return { type: "intro", content: renderEditorialBlocksToWordPress(repairedNorm.blocks) };
+      }
+      return { type: "intro", content: renderEditorialBlocksToWordPress(normalized.blocks) };
+    }));
 
   for (let i = 0; i < h2Headings.length; i++) {
     const h2Text = h2Headings[i];
+    const isFaq = faqPattern.test(h2Text);
     const prev = i > 0 ? h2Headings[i - 1] : "none";
     const next = i < h2Headings.length - 1 ? h2Headings[i + 1] : "none";
-    const msg = `Return section BODY only. Do NOT return H2 heading. Start directly with a paragraph. Section heading: "${h2Text}". Target ${wordsPerSection} words. Previous: ${prev}. Next: ${next}. Title: ${outline.title}. Return as JSON: {"body": "..."}.${sectionResearchPrompt}`;
-    
+    const msg = isFaq
+      ? `Write the FAQ section for heading: "${h2Text}". Target ${wordsPerSection} words. Return FAQ content in WordPress block format as the body of a section. Return as JSON: {"body": "..."}.\n\nTitle: ${outline.title}${kpNote}${sectionResearchPrompt}`
+      : `Return section BODY as structured JSON blocks. Do NOT return H2 heading. Section heading: "${h2Text}". Target ${wordsPerSection} words. Previous heading: ${prev}. Next heading: ${next}. Title: ${outline.title}. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Use paragraph, subheading (H3 only), list, quote or table types as needed.${kpNote}${sectionResearchPrompt}`;
+
     tasks.push(trackedChat(`section_${i}`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: msg }], { responseFormat: { type: "json_object" }, maxTokens: 8192 })
-      .then((res: any) => {
-        const raw = (robustJsonParse(res.content, `section_${i}`) as any).body || "";
-        let clean = stripHeadingBlocks(raw);
-        if (researchUrls.length > 0) clean = sanitizeSectionUrls(clean, researchUrls);
-        if (clean.trim().length < 50) {
-          // AI returned empty/whitespace content — mark as missing so expander regenerates it.
-          return { type: "section", index: i, heading: h2Text, content: "", missing: true };
+      .then(async (res: any) => {
+        const raw = robustJsonParse(res.content, `section_${i}`);
+        if (isFaq) {
+          // FAQ still uses the old WordPress HTML format
+          const body = (raw as any).body || "";
+          let clean = stripHeadingBlocks(body);
+          if (researchUrls.length > 0) clean = sanitizeSectionUrls(clean, researchUrls);
+          if (clean.trim().length < 50) {
+            throw AppError.internal(new Error(`Section ${i} ("${h2Text}"): FAQ body too short`));
+          }
+          return { type: "section", index: i, heading: h2Text, content: clean, isFaq: true };
         }
-        return { type: "section", index: i, heading: h2Text, content: clean };
+        // Editorial section: structured JSON blocks
+        const normalized = normalizeAiEditorialPayload(raw, `section-${i}`);
+        if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
+          // Retry once with repair prompt
+          const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}. Return ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences. Do NOT include H2 headings.`;
+          const repairRes = await trackedChat(`section_${i}_repair`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192 });
+          const repaired = robustJsonParse(repairRes.content, `section-${i}-repair`);
+          const repairedNorm = normalizeAiEditorialPayload(repaired, `section-${i}`);
+          if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+            throw AppError.internal(new Error(`Section ${i} ("${h2Text}"): generation failed after retry — ${repairedNorm.errors.join("; ") || "empty blocks"}`));
+          }
+          let html = renderEditorialBlocksToWordPress(repairedNorm.blocks);
+          if (researchUrls.length > 0) html = sanitizeSectionUrls(html, researchUrls);
+          return { type: "section", index: i, heading: h2Text, content: html };
+        }
+        let html = renderEditorialBlocksToWordPress(normalized.blocks);
+        if (researchUrls.length > 0) html = sanitizeSectionUrls(html, researchUrls);
+        return { type: "section", index: i, heading: h2Text, content: html };
       }));
   }
 
-  const concUserMsg = `Write the conclusion (${conclusionTarget} words). Include a CTA. Return as JSON: {"conclusion": "..."}.\n\nTitle: ${outline.title}${kpNote}`;
+  const concUserMsg = `Write the conclusion (${conclusionTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another type is clearly useful. Do NOT include any CTA content, signup buttons, or CTA headings — the application handles the CTA separately.\n\nTitle: ${outline.title}${kpNote}`;
   tasks.push(trackedChat("conclusion", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: concUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 4096 })
-    .then((res: any) => ({ type: "conclusion", content: (robustJsonParse(res.content, "conclusion") as any).conclusion || "" })));
+    .then(async (res: any) => {
+      let parsed: any;
+      try { parsed = robustJsonParse(res.content, "conclusion"); } catch {
+        const retryMsg = concUserMsg + `\n\nYour previous response was not valid JSON. Return ONLY valid JSON with the format: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA, no signup content, no HTML, no WordPress comments.`;
+        const retryRes = await trackedChat("conclusion_retry", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: retryMsg }], { responseFormat: { type: "json_object" }, maxTokens: 4096 });
+        parsed = robustJsonParse(retryRes.content, "conclusion-retry");
+      }
+      const normalized = normalizeAiEditorialPayload(parsed, "conclusion", { disallowCtaContent: true });
+      if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
+        const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ") || "empty blocks"}. Return ONLY valid conclusion JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA content. No signup buttons. No HTML.`;
+        const repairRes = await trackedChat("conclusion_repair", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 4096 });
+        const repaired = robustJsonParse(repairRes.content, "conclusion-repair");
+        const repairedNorm = normalizeAiEditorialPayload(repaired, "conclusion", { disallowCtaContent: true });
+        if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+          throw AppError.internal(new Error(`Conclusion generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
+        }
+        return { type: "conclusion", content: renderEditorialBlocksToWordPress(repairedNorm.blocks) };
+      }
+      return { type: "conclusion", content: renderEditorialBlocksToWordPress(normalized.blocks) };
+    }));
 
   const settled = await Promise.allSettled(tasks);
   const results = settled.filter((s) => s.status === "fulfilled").map((s: any) => s.value);
   
-  // Write section results back
-  for (const r of results) {
-    if (r.type === "section" && r.index !== undefined && r.index < sectionBodies.length) {
-      if ((r as any).missing) {
-        sectionBodies[r.index].body = "";
-        sectionBodies[r.index].status = "missing";
-      } else {
-        sectionBodies[r.index].body = r.content;
-        sectionBodies[r.index].status = "generated";
+  // Propagate section failures to the caller
+  for (let i = 0; i < settled.length; i++) {
+    const s = settled[i];
+    if (s.status === "rejected" && s.reason) {
+      // Check if this is a section rejection (has index and heading in message)
+      const reason = s.reason as Error;
+      // The task index maps: 0=intro, 1..N-2=sections, N-1=conclusion
+      const taskIndex = i;
+      if (taskIndex >= 1 && taskIndex <= h2Headings.length) {
+        const sectionIdx = taskIndex - 1;
+        const heading = h2Headings[sectionIdx] || `section-${sectionIdx}`;
+        throw AppError.internal(new Error(`Section ${sectionIdx} ("${heading}"): ${reason.message}`));
       }
     }
   }
-  for (let i = 0; i < sectionBodies.length; i++) {
-    if (!sectionBodies[i].body) { sectionBodies[i].status = "missing"; sectionBodies[i].body = "<!-- wp:paragraph --><p>Content unavailable for this section.</p><!-- /wp:paragraph -->"; }
+  
+  // Write section results back
+  for (const r of results) {
+    if (r.type === "section" && r.index !== undefined && r.index < sectionBodies.length) {
+      sectionBodies[r.index].body = r.content;
+      sectionBodies[r.index].status = "generated";
+    }
   }
+  // FAQ section body may need the old-style format wrapping if AI returned structured blocks
+  // (handled above in the section generation promise)
 
   const intro = results.find((r: any) => r.type === "intro")?.content || "";
   const conclusion = results.find((r: any) => r.type === "conclusion")?.content || "";
 
-  // Assembly
-  const ctaHtml = extractCtaFromConclusion(conclusion);
-  const cleanConclusion = stripProtectedBlocksFromConclusion(conclusion, ctaHtml, "");
+  // Early abort: intro must have content
+  if (!intro) {
+    throw AppError.internal(new Error("Introduction generation returned empty content — aborting before section generation"));
+  }
+
+  // Conclusion must have content — no CTA extraction since the pipeline handles CTA
+  if (!conclusion) {
+    throw AppError.internal(new Error("Conclusion generation returned empty content"));
+  }
+
+  // Assembly — no CTA extraction from conclusion; CTA is handled by the pipeline
   const slugs = pairedSlugs(outline.slug || "blog-post");
 
   const articleDoc: ArticleDocument = {
     metadata: { title: outline.title || "Untitled", slug: outline.slug || "", metaDescription: repairedMeta, excerpt: outline.excerpt || "", targetWordCount: requestedWordCount, focusKeyphrase: keyphrase },
     languageSwitcher: { id: "ls", type: "language-switcher", html: `<!-- wp:html --><div class="b2i-language-switcher"><span>English</span> | <a href="/blog/${slugs.chineseSlug}">繁體中文</a></div><!-- /wp:html -->`, fingerprint: fingerprintHtml("switcher") },
-    introduction: { id: "intro", html: intro, wordCount: countReadableWords(intro), status: "generated" },
+    introduction: { id: "intro", blocks: parseWordPressEditorialBlocks(intro, "intro").blocks, status: "generated" },
     sections: sectionBodies.map((s) => ({
       id: `section-${s.index}`,
       heading: s.heading,
       headingLevel: 2 as const,
       sectionType: (faqPattern.test(s.heading) ? "faq-heading" : "main") as "main" | "faq-heading",
-      html: s.body,
-      wordCount: countReadableWords(s.body),
+      blocks: parseWordPressEditorialBlocks(s.body, `section-${s.index}`).blocks,
       status: s.status as any,
     })),
-    visibleFaq: [],
-    conclusion: { id: "conc", html: cleanConclusion, wordCount: countReadableWords(cleanConclusion), status: "generated" },
-    cta: ctaHtml ? { id: "cta", type: "cta", html: ctaHtml, fingerprint: fingerprintHtml(ctaHtml) } : null,
+    visibleFaq: (() => {
+      const faqSection = sectionBodies.find((s) => faqPattern.test(s.heading));
+      if (faqSection && faqSection.body) {
+        return extractFaqPairsFromSectionBody(faqSection.body).map((e) => ({
+          question: e.question,
+          answerHtml: "",
+          answerText: e.answerText,
+        }));
+      }
+      return [];
+    })(),
+    conclusion: { id: "conc", blocks: parseWordPressEditorialBlocks(conclusion, "conc").blocks, status: "generated" },
+    cta: null,
     faqSchema: null,
     insertedLinks: [],
   };
@@ -315,7 +414,7 @@ export async function runBlogGeneration(
   // Pipeline
   const pipelineState = createPipelineState({
     userId, projectId: String(projectId), keyphrase, requestedWordCount,
-    articleDoc, h2Headings, intro, conclusion: cleanConclusion,
+    articleDoc, h2Headings, intro, conclusion,
     wordsPerSection, exactKeyphraseTarget,
     policy: buildPolicy(requestedWordCount, wordMin, wordMax, keyphrase),
     ctx: context, wordMin, wordMax, systemPrompt, userMessage: "",
@@ -335,7 +434,7 @@ export async function runBlogGeneration(
 
   const generated = {
     title: finalTitle, slug: outline.slug || "", metaDescription: finalMeta,
-    excerpt: outline.excerpt || "", blog: finalBlog, faq: [],
+    excerpt: outline.excerpt || "", blog: finalBlog, faq: pipelineState.faq || [],
     internalLinks: [], externalLinks: [], categories: [], tags: [], readingTime: "", summary: "",
   };
 

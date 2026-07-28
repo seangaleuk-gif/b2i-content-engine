@@ -17,6 +17,7 @@
     "drizzle-orm": "^0.45.2",
     "lucide-react": "^1.24.0",
     "next": "16.2.10",
+    "parse5": "^8.0.1",
     "postgres": "^3.4.9",
     "react": "19.2.4",
     "react-dom": "19.2.4"
@@ -24,6 +25,7 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
+    "@types/parse5": "^6.0.3",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^6.0.3",
