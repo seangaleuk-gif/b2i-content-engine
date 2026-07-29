@@ -309,9 +309,9 @@ export function analyzeFinalArticle(
   const faqHeadingText = findFaqHeadingText(html, allHarH2s);
   const editorialH2s = allHarH2s.filter((h) => {
     const hl = h.toLowerCase().trim();
-    // Exclude the FAQ heading (identified by marker or strict text match)
+    // dynamicH2Range() applies to editorial H2s. FAQ and protected CTA/switcher
+    // headings are additional structural headings and are excluded here.
     if (faqHeadingText && hl === faqHeadingText.toLowerCase().trim()) return false;
-    // Exclude headings inside wp:html blocks
     if (wpHtmlH2Patterns.some((inner) => inner === hl)) return false;
     return true;
   });

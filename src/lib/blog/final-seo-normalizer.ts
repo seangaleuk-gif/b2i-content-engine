@@ -12,7 +12,7 @@ import {
   normalizeHtmlWhitespace,
   getFirstNReadableWords,
 } from "@/lib/seo/seo-text-utils";
-import { computeKeyphraseTargets, computeKeyphraseDensity, englishKeyphraseDensity } from "@/lib/content-standards";
+import { computeKeyphraseTargets, computeKeyphraseDensity, englishKeyphraseDensity, getKeyphraseContentWordCount } from "@/lib/content-standards";
 import { rebalanceWpBlocks } from "@/lib/services/text-utils";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, computeWordCountTolerance, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
@@ -1156,7 +1156,7 @@ export async function normalizeFinalSeo(
   }
 
   // Step 7: Recheck exact keyphrase count (expansion may have changed it)
-  // Retry reduction up to 3 times until count is within range
+  // Retry reduction up to 3 times until count is within numeric max.
   let kpRetries = 0;
   const MAX_KP_RETRIES = 3;
   while (kpRetries < MAX_KP_RETRIES) {
@@ -1202,7 +1202,21 @@ export async function normalizeFinalSeo(
   const blocksUnchanged = true;
 
   // Keyphrase density check — stuffing (>3%) is blocking, below-min is soft
-  const kpDensity = computeKeyphraseDensity(after.exactKeyphraseCount, focusKeyphrase, after.readableWordCount);
+  let kpDensity = computeKeyphraseDensity(after.exactKeyphraseCount, focusKeyphrase, after.readableWordCount);
+  // Reduce deterministically if density exceeds hard limit AND count is high
+  // enough that reduction won't remove the only editorial occurrence.
+  // This catches cases where later stages removed words but not keyphrase,
+  // or where expansion + H2 insertion pushed density past 3%.
+  if (kpDensity > kpHigh && after.exactKeyphraseCount > Math.max(effectiveTarget, 2)) {
+    const kpWordCount = getKeyphraseContentWordCount(focusKeyphrase) || 1;
+    const targetByDensity = Math.max(1, Math.floor((kpHigh / 100 * after.readableWordCount) / kpWordCount) - 1);
+    if (targetByDensity > 0 && targetByDensity < after.exactKeyphraseCount) {
+      currentHtml = fixExcessiveKeyphrase(currentHtml, focusKeyphrase, targetByDensity, changes);
+      console.log(`[SEO-NORMALIZER] density reduction: ${after.exactKeyphraseCount}→${targetByDensity} (kpDensity=${kpDensity.toFixed(1)}% > ${kpHigh}%)`);
+      const afterAfter = computeMetrics(currentHtml, focusKeyphrase);
+      kpDensity = computeKeyphraseDensity(afterAfter.exactKeyphraseCount, focusKeyphrase, afterAfter.readableWordCount);
+    }
+  }
   const kpCountOk = kpDensity <= kpHigh;
   const kpBelowMin = kpDensity < kpLow;
 

@@ -1,5 +1,14 @@
 const DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions";
-const TIMEOUT_MS = 60_000;
+
+/** Default timeout per request. Individual stages may override via ChatOptions.timeoutMs. */
+const DEFAULT_TIMEOUT_MS = 60_000;
+
+/** Generate a short unique request ID for tracing. */
+let requestIdCounter = 0;
+function nextRequestId(): string {
+  requestIdCounter++;
+  return "req_" + Date.now().toString(36) + "_" + requestIdCounter.toString(36);
+}
 
 export type DeepSeekErrorType =
   | "timeout"
@@ -30,6 +39,7 @@ export interface ChatOptions {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  timeoutMs?: number;
   topP?: number;
   frequencyPenalty?: number;
   presencePenalty?: number;
@@ -83,10 +93,16 @@ function getApiKey(): string {
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
-  timeoutMs: number
+  timeoutMs: number,
+  stage: string,
+  requestId: string,
+  attempt: number,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => {
+    controller.abort();
+    console.log(`[deepseek:${stage}:${requestId}] attempt ${attempt} timed out after ${timeoutMs}ms`);
+  }, timeoutMs);
 
   try {
     const response = await fetch(url, {
@@ -129,10 +145,14 @@ function classifyHttpError(status: number): DeepSeekErrorType {
 
 export async function chat(
   messages: ChatMessage[],
-  options: ChatOptions = {}
+  options: ChatOptions = {},
+  stage = "unknown",
+  requestId = nextRequestId(),
+  attempt = 1,
 ): Promise<ChatResult> {
   const apiKey = getApiKey();
   const model = options.model ?? "deepseek-v4-flash";
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const body: Record<string, unknown> = {
     model,
@@ -148,14 +168,7 @@ export async function chat(
   if (options.stop) body.stop = options.stop;
   if (options.responseFormat) body.response_format = options.responseFormat;
 
-  const promptSizes = messages.map((m) => `${m.role}:${m.content.length}`).join(", ");
-  const totalPromptChars = messages.reduce((sum, m) => sum + m.content.length, 0);
-  console.log(`[deepseek:REQ] model=${model} | max_tokens=${body.max_tokens} | temperature=${body.temperature}`);
-  console.log(`[deepseek:REQ] messages=[${promptSizes}] | total_chars=${totalPromptChars} | ~${Math.round(totalPromptChars / 4)} tokens`);
-  console.log(`[deepseek:REQ] body keys: ${Object.keys(body).join(", ")}`);
-  if (body.stop) console.log(`[deepseek:REQ] stop sequences: ${JSON.stringify(body.stop)}`);
-  if (body.frequency_penalty !== undefined) console.log(`[deepseek:REQ] frequency_penalty: ${body.frequency_penalty}`);
-  if (body.presence_penalty !== undefined) console.log(`[deepseek:REQ] presence_penalty: ${body.presence_penalty}`);
+  console.log(`[deepseek:${stage}:${requestId}] model=${model} | max_tokens=${body.max_tokens} | timeout=${timeoutMs}ms | attempt=${attempt} | input_tokens≈${Math.round(messages.reduce((s, m) => s + m.content.length, 0) / 4)}`);
 
   const response = await fetchWithTimeout(
     DEEPSEEK_API_URL,
@@ -167,7 +180,10 @@ export async function chat(
       },
       body: JSON.stringify(body),
     },
-    TIMEOUT_MS
+    timeoutMs,
+    stage,
+    requestId,
+    attempt,
   );
 
   if (!response.ok) {
@@ -201,27 +217,13 @@ export async function chat(
   };
 
   // ── Response path verification ──
-  console.log(`[deepseek:PATH] HTTP body → parseResponseBody() → ChatResponse`);
-  console.log(`[deepseek:PATH] ChatResponse.choices[0].message.content → typeof=${typeof content} length=${content.length}`);
-  console.log(`[deepseek:PATH] finish_reason=${finishReason}`);
-  if (typeof content !== "string") {
-    console.warn(`[deepseek:PATH] ⚠️ content is NOT a string — type is ${typeof content}`);
-  }
-
-  console.log(
-    `[deepseek:RES] model=${data.model} | finish_reason=${finishReason}`
-  );
-  console.log(
-    `[deepseek:RES] tokens_in=${usage.prompt_tokens} tokens_out=${usage.completion_tokens} total=${usage.total_tokens}`
-  );
-  console.log(
-    `[deepseek:RES] content_chars=${content.length} | ~${content.split(/\s+/).filter(Boolean).length} words`
-  );
+  console.log(`[deepseek:${stage}:${requestId}] finish_reason=${finishReason} | tokens_in=${usage.prompt_tokens} tokens_out=${usage.completion_tokens} total=${usage.total_tokens}`);
+  console.log(`[deepseek:${stage}:${requestId}] content_chars=${content.length} | ~${content.split(/\s+/).filter(Boolean).length} words`);
   if (finishReason === "length") {
-    console.warn(`[deepseek:RES] ⚠️ FINISH_REASON=LENGTH — generation was truncated! Increase max_tokens.`);
+    console.warn(`[deepseek:${stage}:${requestId}] ⚠️ finish_reason=length — generation truncated`);
   }
   if (finishReason === "stop") {
-    console.log(`[deepseek:RES] ✓ finish_reason=stop — generation completed naturally.`);
+    console.log(`[deepseek:${stage}:${requestId}] ✓ completed naturally`);
   }
 
   return {
@@ -240,27 +242,33 @@ export async function chat(
 export async function chatWithRetry(
   messages: ChatMessage[],
   options: ChatOptions = {},
-  maxRetries = 2
+  stage = "unknown",
+  maxRetries = 2,
 ): Promise<ChatResult> {
+  const requestId = nextRequestId();
   let lastError: DeepSeekError | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const result = await chat(messages, options);
+      const result = await chat(messages, options, stage, requestId, attempt + 1);
       result.attemptsUsed = attempt;
       return result;
     } catch (err) {
       if (err instanceof DeepSeekError) {
         lastError = err;
-        console.error(`[deepseek] Attempt ${attempt + 1}/${maxRetries + 1} failed (${err.type}): ${err.message}`);
+        console.error(`[deepseek:${stage}:${requestId}] attempt ${attempt + 1}/${maxRetries + 1} failed (${err.type}): ${err.message}`);
+        // Permanent 4xx errors other than 429 should not be retried
+        if (err.type === "api_failure" && err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {
+          break;
+        }
       } else {
         lastError = new DeepSeekError("api_failure", err instanceof Error ? err.message : String(err));
-        console.error(`[deepseek] Attempt ${attempt + 1}/${maxRetries + 1} failed (unexpected): ${lastError.message}`);
+        console.error(`[deepseek:${stage}:${requestId}] attempt ${attempt + 1}/${maxRetries + 1} failed (unexpected): ${lastError.message}`);
       }
 
       if (attempt < maxRetries) {
         const delayMs = 1000 * Math.pow(2, attempt);
-        console.log(`[deepseek] Retrying in ${delayMs}ms...`);
+        console.log(`[deepseek:${stage}:${requestId}] retrying attempt ${attempt + 2}/${maxRetries + 1} in ${delayMs}ms`);
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
@@ -301,7 +309,7 @@ export class AiService {
   async call(stage: string, messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult> {
     const promptChars = messages.reduce((s, m) => s + m.content.length, 0);
     try {
-      const result = await this.chatWithRetryFn(messages, options);
+      const result = await this.chatWithRetryFn(messages, options, stage);
       this.tracer?.recordAiCall({ stage, durationMs: 0, promptChars, completionChars: result.content.length, completed: true, jsonRepaired: false });
       return result;
     } catch (e) {
@@ -320,8 +328,12 @@ export class AiService {
     return this.chatFn;
   }
 
-  /** Retry-wrapped chat. Used by services that need retry. */
+  /** Retry-wrapped chat. Used by services that need retry.
+   *  Wraps the inner function to provide a default stage name for callers
+   *  (like component-regenerator and fixers) that do not pass one. */
   get chatWithRetry(): typeof chatWithRetry {
-    return this.chatWithRetryFn;
+    return (messages: ChatMessage[], options?: ChatOptions, stage = "pipeline", maxRetries?: number) => {
+      return this.chatWithRetryFn(messages, options, stage, maxRetries);
+    };
   }
 }

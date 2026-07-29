@@ -2773,9 +2773,14 @@ describe("JSON repair for malformed AI responses", () => {
     expect(result.body).toContain('level'); // Escapes decoded by JSON.parse
   });
 
-  it("unrecognized properties fall through to normal error", () => {
+  it("unescaped quotes inside string values are repaired", () => {
+    // `robustJsonParse` now repairs unescaped `"` inside JSON string values
+    // by replacing them with Unicode curly quotes. This previously threw.
     const raw = '{"unknown": "value with "bad" quotes"}';
-    expect(() => robustJsonParse(raw, "test_unknown")).toThrow();
+    const result = robustJsonParse(raw, "test_unknown");
+    expect(result).toBeDefined();
+    const parsed = result as Record<string, string>;
+    expect(parsed.unknown).toBe('value with \u201Cbad\u201D quotes');
   });
 
   it("does not truncate quoted prose followed by a comma", () => {
@@ -4728,7 +4733,8 @@ describe("pipeline stage order and fallback", () => {
       { stage: "seo-normalization", inputFingerprint: "f3", outputFingerprint: "g", accepted: true },
       { stage: "faq-recovery", inputFingerprint: "g", outputFingerprint: "g1", accepted: true },
       { stage: "paragraphs-final", inputFingerprint: "g1", outputFingerprint: "h", accepted: true },
-      { stage: "final-validation", inputFingerprint: "h", outputFingerprint: "i", accepted: true },
+      { stage: "wc-check", inputFingerprint: "h", outputFingerprint: "h1", accepted: true },
+      { stage: "final-validation", inputFingerprint: "h1", outputFingerprint: "i", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
     expect(issues.length).toBe(0);
@@ -4787,7 +4793,7 @@ describe("pipeline stage order and fallback", () => {
 describe("pipeline stage 2 integration", () => {
   it("every post-assembly stage executes once in the required order", () => {
     const state = makeEmptyState();
-    const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "cta-preserve", "factual-scan", "link-enforce", "seo-normalization", "faq-recovery", "paragraphs-final", "final-validation"];
+    const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "cta-preserve", "factual-scan", "link-enforce", "seo-normalization", "faq-recovery", "paragraphs-final", "wc-check", "final-validation"];
     // All required stages present
     state.stageOutputs = required.map((s, i) => ({
       stage: s, inputFingerprint: `in${i}`, outputFingerprint: `out${i}`, accepted: true,
@@ -5120,6 +5126,7 @@ describe("pipeline stage skip recording and rollback", () => {
       { stage: "title-repair", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "faq-recovery", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "paragraphs-final", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "wc-check", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "final-validation", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
@@ -5316,6 +5323,7 @@ describe("canonical document parser and renderer", () => {
     const doc = makeDocWithFaq(["網絡營銷的問題", "解決方案"], "Frequently Asked Questions");
     const html = renderArticleDocument(doc);
     const m = analyzeFinalArticle(html, "test keyphrase", "Title", "Meta");
+    // 3 total H2s: 2 editorial + 1 FAQ (excluded) = 2 editorial
     expect(m.h2Count).toBe(2);
   });
 
@@ -5323,6 +5331,7 @@ describe("canonical document parser and renderer", () => {
     const doc = makeDocWithFaq(["常見的挑戰", "最佳實踐"], "Frequently Asked Questions");
     const html = renderArticleDocument(doc);
     const m = analyzeFinalArticle(html, "test keyphrase", "Title", "Meta");
+    // 3 total H2s: 2 editorial + 1 FAQ (excluded) = 2 editorial
     expect(m.h2Count).toBe(2);
   });
 

@@ -1,12 +1,17 @@
 import { describe, it, expect } from "vitest";
 import {
   type ArticleDocument,
+  type ArticleSection,
+  type ComponentStatus,
   renderArticleDocument,
+  renderComponentHtml,
   fingerprintHtml,
   parseArticleDocumentFromHtml,
+  parseWordPressEditorialBlocks,
   detectNestedParagraphs,
   renderFaqSchema,
   extractVisibleFaqFromArticle,
+  extractFaqPairsFromSectionBody,
 } from "@/lib/blog/article-document";
 import {
   createArticleIntegrityBaseline,
@@ -18,13 +23,46 @@ import { normalizeParagraphs } from "@/lib/services/section-expander";
 import { countReadableWords, rebalanceWpBlocks, countLongParagraphs } from "@/lib/services/text-utils";
 import { wordCountRange } from "@/lib/services/generation-constants";
 import {
+  assertFinalWordCountParity,
+  assertRenderedCacheMatchesDocument,
+  createPipelineState,
   guardStageOutput,
+  shouldAcceptSeoNormalization,
   validatePipelineOrder,
 } from "@/lib/pipeline/blog-generation-pipeline";
 import { enforceInternalLinkLimit, analyzeFinalArticle, evaluatePolicy, buildPolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
 
 // ── Test helpers ──
+
+function componentFromHtml(
+  id: string,
+  html: string,
+  status: ComponentStatus = "generated",
+): ArticleDocument["introduction"] {
+  return {
+    id,
+    blocks: parseWordPressEditorialBlocks(html, id).blocks,
+    status,
+  };
+}
+
+function sectionFromHtml(
+  id: string,
+  heading: string,
+  html: string,
+  sectionType: ArticleSection["sectionType"] = "main",
+  status: ComponentStatus = "generated",
+): ArticleSection {
+  return {
+    id,
+    heading,
+    headingLevel: 2,
+    sectionType,
+    blocks: parseWordPressEditorialBlocks(html, id).blocks,
+    status,
+  };
+}
 
 function makeArticleDoc(overrides?: Partial<ArticleDocument>): ArticleDocument {
   const languageSwitcher = {
@@ -41,44 +79,45 @@ function makeArticleDoc(overrides?: Partial<ArticleDocument>): ArticleDocument {
     fingerprint: "def",
   };
 
+  const visibleFaq = [
+    { question: "What is the main benefit?", answerHtml: "", answerText: "It helps you save time and money." },
+    { question: "How do I get started?", answerHtml: "", answerText: "Simply sign up and follow the setup." },
+  ];
+
   const faqSchema = {
     id: "faq-schema",
     type: "faq-schema" as const,
-    html: `<!-- wp:html --><script type="application/ld+json">{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is it?","acceptedAnswer":{"@type":"Answer","text":"It works."}}]}</script><!-- /wp:html -->`,
+    html: renderFaqSchema(visibleFaq),
     fingerprint: "ghi",
   };
 
-  const intro: ArticleDocument["introduction"] = {
-    id: "intro",
-    html: `<!-- wp:paragraph --><p>This is the introduction paragraph that explains the topic in detail. It has multiple sentences to provide context. This is the third sentence for good measure.</p><!-- /wp:paragraph -->`,
-    wordCount: 40,
-    status: "generated",
-  };
+  const introduction = componentFromHtml(
+    "intro",
+    `<!-- wp:paragraph --><p>This is the introduction paragraph that explains the topic in detail. It has multiple sentences to provide context. This is the third sentence for good measure.</p><!-- /wp:paragraph -->`,
+  );
 
-  const sections: ArticleDocument["sections"] = [
-    {
-      id: "section-0", heading: "First Main Heading", headingLevel: 2 as const, sectionType: "main" as const,
-      html: `<!-- wp:paragraph --><p>First section content with several sentences. This covers the first main topic in detail. It has enough content to be useful for readers.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Additional paragraph in the first section. This provides more depth on the first topic. Readers will find this informative and well-structured.</p><!-- /wp:paragraph -->`,
-      wordCount: 60, status: "generated",
-    },
-    {
-      id: "section-1", heading: "Second Topic Explored", headingLevel: 2 as const, sectionType: "main" as const,
-      html: `<!-- wp:paragraph --><p>Second section body text with quality content. This section explores a different angle of the main topic. Readers benefit from the varied perspective provided here.</p><!-- /wp:paragraph -->`,
-      wordCount: 35, status: "generated",
-    },
+  const sections: ArticleSection[] = [
+    sectionFromHtml(
+      "section-0",
+      "First Main Heading",
+      `<!-- wp:paragraph --><p>First section content with several sentences. This covers the first main topic in detail. It has enough content to be useful for readers.</p><!-- /wp:paragraph -->
+
+<!-- wp:paragraph --><p>Additional paragraph in the first section. This provides more depth on the first topic. Readers will find this informative and well-structured.</p><!-- /wp:paragraph -->`,
+    ),
+    sectionFromHtml(
+      "section-1",
+      "Second Topic Explored",
+      `<!-- wp:paragraph --><p>Second section body text with quality content. This section explores a different angle of the main topic. Readers benefit from the varied perspective provided here.</p><!-- /wp:paragraph -->`,
+    ),
+    sectionFromHtml(
+      "section-2",
+      "Frequently Asked Questions",
+      `<!-- wp:paragraph --><p><strong>What is the main benefit?</strong><br>It helps you save time and money.</p><!-- /wp:paragraph -->
+
+<!-- wp:paragraph --><p><strong>How do I get started?</strong><br>Simply sign up and follow the setup.</p><!-- /wp:paragraph -->`,
+      "faq-heading",
+    ),
   ];
-
-  const faqSection: ArticleSection = {
-    id: "section-2", heading: "Frequently Asked Questions", headingLevel: 2 as const, sectionType: "faq-heading" as const,
-    html: `<!-- wp:paragraph --><p><strong>What is the main benefit?</strong><br>It helps you save time and money. The solution is proven to work effectively in real-world scenarios.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p><strong>How do I get started?</strong><br>Simply sign up and follow the guided setup. The onboarding process takes less than five minutes to complete.</p><!-- /wp:paragraph -->`,
-    wordCount: 50, status: "generated",
-  };
-
-  const conclusion: ArticleDocument["conclusion"] = {
-    id: "conclusion",
-    html: `<!-- wp:paragraph --><p>In conclusion, this approach provides significant value. Readers should take action on the key points discussed above. The benefits are clear and well-documented.</p><!-- /wp:paragraph -->`,
-    wordCount: 30, status: "generated",
-  };
 
   return {
     metadata: {
@@ -90,13 +129,13 @@ function makeArticleDoc(overrides?: Partial<ArticleDocument>): ArticleDocument {
       focusKeyphrase: "test keyphrase",
     },
     languageSwitcher,
-    introduction: intro,
-    sections: [...sections, faqSection],
-    visibleFaq: [
-      { question: "What is the main benefit?", answerHtml: "", answerText: "It helps you save time and money." },
-      { question: "How do I get started?", answerHtml: "", answerText: "Simply sign up and follow the setup." },
-    ],
-    conclusion,
+    introduction,
+    sections,
+    visibleFaq,
+    conclusion: componentFromHtml(
+      "conclusion",
+      `<!-- wp:paragraph --><p>In conclusion, this approach provides significant value. Readers should take action on the key points discussed above. The benefits are clear and well-documented.</p><!-- /wp:paragraph -->`,
+    ),
     cta,
     faqSchema,
     insertedLinks: [],
@@ -110,6 +149,85 @@ function createBaseline(doc: ArticleDocument): ArticleIntegrityBaseline {
 }
 
 // ── Tests ──
+
+describe("pipeline: canonical state invariants", () => {
+  it("detects rendered cache divergence immediately", () => {
+    const doc = makeArticleDoc();
+    const blog = renderArticleDocument(doc);
+    expect(() => assertRenderedCacheMatchesDocument({ articleDoc: doc, blog })).not.toThrow();
+    expect(() => assertRenderedCacheMatchesDocument({ articleDoc: doc, blog: blog + " stale" })).toThrow(/diverged/);
+  });
+
+  it("accepts safe SEO normalization before the canonical CTA is restored", () => {
+    const accepted = shouldAcceptSeoNormalization({
+      passed: true,
+      safety: {
+        protectedBlocksUnchanged: true,
+        linkDestinationsUnchanged: true,
+        wordpressBlocksValid: true,
+        faqSchemaPreserved: true,
+        languageSwitcherPreserved: true,
+        ctaPreserved: false,
+      },
+    } as any);
+    expect(accepted).toBe(true);
+  });
+
+  it("allows a damaged CTA to be replaced by the canonical signup CTA", () => {
+    const damagedDoc = makeArticleDoc({
+      cta: {
+        id: "cta",
+        type: "cta",
+        html: `<!-- wp:html --><div class="cta-broken"><a href="https://app.b2ihub.com/signup">Broken CTA</a></div><!-- /wp:html -->`,
+        fingerprint: "broken",
+      },
+    });
+    const repairedDoc = makeArticleDoc({
+      cta: {
+        id: "cta",
+        type: "cta",
+        html: `<!-- wp:html --><div><h2>Ready to grow your brand with Hong Kong creators?</h2><a href="https://app.b2ihub.com/signup">Create Your Free Profile</a></div><!-- /wp:html -->`,
+        fingerprint: "repaired",
+      },
+    });
+    const baseline = createArticleIntegrityBaseline(renderArticleDocument(damagedDoc));
+    const result = validateFinalArticleIntegrity(renderArticleDocument(repairedDoc), baseline);
+    expect(result.valid).toBe(true);
+    expect(result.metrics.ctaPresent).toBe(true);
+  });
+
+  it("uses the same readable word count as final validation after CTA and FAQ rendering", () => {
+    const doc = makeArticleDoc();
+    const state = createPipelineState({
+      userId: "test",
+      projectId: "1",
+      keyphrase: "test keyphrase",
+      requestedWordCount: 500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((section) => section.heading),
+      intro: renderComponentHtml(doc.introduction),
+      conclusion: renderComponentHtml(doc.conclusion),
+      wordsPerSection: 100,
+      exactKeyphraseTarget: 2,
+      policy: buildPolicy(500, 450, 550, "test keyphrase"),
+      ctx: {},
+      wordMin: 450,
+      wordMax: 550,
+      systemPrompt: "",
+      userMessage: "",
+    });
+
+    const pipelineCount = assertFinalWordCountParity(state);
+    const metrics = analyzeFinalArticle(
+      state.blog,
+      state.keyphrase,
+      state.title,
+      state.metaDescription,
+      state.requestedWordCount,
+    );
+    expect(pipelineCount).toBe(metrics.readableWordCount);
+  });
+});
 
 describe("pipeline: guardStageOutput", () => {
   const validDoc = makeArticleDoc();
@@ -236,8 +354,8 @@ describe("pipeline: rendered article integrity", () => {
   it("E. FAQ section with <strong> and <br> tags passes validation", () => {
     const doc = makeArticleDoc();
     const html = renderArticleDocument(doc);
-    expect(html).toContain("<strong>What is");
-    expect(html).toContain("<br>");
+    expect(html).toContain("<div class=\"faq-item\">");
+    expect(html).toContain("<h3>What is the main benefit?</h3>");
     const wpResult = validateWordpressBlockPairs(html);
     expect(wpResult.valid).toBe(true);
   });
@@ -259,7 +377,7 @@ describe("pipeline: rendered article integrity", () => {
     const parseResult = parseArticleDocumentFromHtml(html1, doc);
     expect(parseResult.doc).not.toBeNull();
     if (!parseResult.doc) return;
-    expect(parseResult.doc.introduction.html).toContain("This is the introduction");
+    expect(renderComponentHtml(parseResult.doc.introduction)).toContain("This is the introduction");
   });
 
   it("E. round-trip parse→render preserves conclusion content", () => {
@@ -268,7 +386,7 @@ describe("pipeline: rendered article integrity", () => {
     const parseResult = parseArticleDocumentFromHtml(html1, doc);
     expect(parseResult.doc).not.toBeNull();
     if (!parseResult.doc) return;
-    expect(parseResult.doc.conclusion.html).toContain("In conclusion");
+    expect(renderComponentHtml(parseResult.doc.conclusion)).toContain("In conclusion");
   });
 
   it("E. round-trip parse→render preserves all sections", () => {
@@ -302,15 +420,9 @@ describe("E2: regression — 6-section article with H3 subheadings", () => {
       `<!-- wp:paragraph --><p>Data privacy regulations in Hong Kong are aligned with international standards. The Personal Data (Privacy) Ordinance provides a framework that businesses must follow when collecting and processing consumer data.</p><!-- /wp:paragraph -->\n\n<!-- wp:heading {"level":3} -->\n<h3>Compliance Requirements</h3>\n<!-- /wp:heading -->\n\n<!-- wp:paragraph --><p>Marketers must ensure their data collection practices comply with both local regulations and international standards like GDPR when targeting cross-border audiences.</p><!-- /wp:paragraph -->`,
     ];
 
-    const sections = bodies.map((body, i) => ({
-      id: `section-${i}`,
-      heading: `Section ${i + 1}: Topic ${i + 1}`,
-      headingLevel: 2 as const,
-      sectionType: "main" as const,
-      html: body,
-      wordCount: countReadableWords(body),
-      status: "generated" as const,
-    }));
+    const sections = bodies.map((body, i) =>
+      sectionFromHtml(`section-${i}`, `Section ${i + 1}: Topic ${i + 1}`, body),
+    );
 
     const cta = `<!-- wp:html --><div class="cta-block"><h2>Ready to Grow Your Brand?</h2><p>Join B2I Hub today at <a href="https://app.b2ihub.com/signup">app.b2ihub.com/signup</a> and start creating content that converts.</p></div><!-- /wp:html -->`;
 
@@ -324,10 +436,10 @@ describe("E2: regression — 6-section article with H3 subheadings", () => {
     return {
       metadata: { title: "Hong Kong Digital Marketing 2026", slug: "hk-digital-2026", metaDescription: "HK digital marketing", excerpt: "", targetWordCount: 2500, focusKeyphrase: "hong kong digital marketing" },
       languageSwitcher: { id: "ls", type: "language-switcher", html: ls, fingerprint: "ls-fp" },
-      introduction: { id: "intro", html: intro, wordCount: 50, status: "generated" },
+      introduction: componentFromHtml("intro", intro),
       sections,
       visibleFaq: [],
-      conclusion: { id: "conc", html: conclusion, wordCount: 50, status: "generated" },
+      conclusion: componentFromHtml("conc", conclusion),
       cta: { id: "cta", type: "cta", html: cta, fingerprint: "cta-fp" },
       faqSchema: { id: "faq", type: "faq-schema", html: faqSchema, fingerprint: "faq-fp" },
       insertedLinks: [],
@@ -380,21 +492,21 @@ describe("E3: regression — section cleanup strips H2 but keeps H3", () => {
     const cleaned = cleanupH2(aiRaw);
 
     const sections = [
-      { id: "s0", heading: "Topic A", headingLevel: 2 as const, sectionType: "main" as const, html: cleaned, wordCount: 0, status: "generated" as const },
-      { id: "s1", heading: "Topic B", headingLevel: 2 as const, sectionType: "main" as const, html: cleaned, wordCount: 0, status: "generated" as const },
-      { id: "s2", heading: "Topic C", headingLevel: 2 as const, sectionType: "main" as const, html: cleaned, wordCount: 0, status: "generated" as const },
-      { id: "s3", heading: "Topic D", headingLevel: 2 as const, sectionType: "main" as const, html: cleaned, wordCount: 0, status: "generated" as const },
-      { id: "s4", heading: "Topic E", headingLevel: 2 as const, sectionType: "main" as const, html: cleaned, wordCount: 0, status: "generated" as const },
-      { id: "s5", heading: "Topic F", headingLevel: 2 as const, sectionType: "main" as const, html: cleaned, wordCount: 0, status: "generated" as const },
+      sectionFromHtml("s0", "Topic A", cleaned),
+      sectionFromHtml("s1", "Topic B", cleaned),
+      sectionFromHtml("s2", "Topic C", cleaned),
+      sectionFromHtml("s3", "Topic D", cleaned),
+      sectionFromHtml("s4", "Topic E", cleaned),
+      sectionFromHtml("s5", "Topic F", cleaned),
     ];
 
     const doc: ArticleDocument = {
       metadata: { title: "Test", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 2000, focusKeyphrase: "test" },
       languageSwitcher: { id: "ls", type: "language-switcher", html: `<!-- wp:html --><div class="b2i-language-switcher"><span>EN</span></div><!-- /wp:html -->`, fingerprint: "x" },
-      introduction: { id: "intro", html: `<!-- wp:paragraph --><p>Intro text.</p><!-- /wp:paragraph -->`, wordCount: 3, status: "generated" },
+      introduction: componentFromHtml("intro", `<!-- wp:paragraph --><p>Intro text.</p><!-- /wp:paragraph -->`),
       sections,
       visibleFaq: [],
-      conclusion: { id: "conc", html: `<!-- wp:paragraph --><p>Conclusion text.</p><!-- /wp:paragraph -->`, wordCount: 3, status: "generated" },
+      conclusion: componentFromHtml("conc", `<!-- wp:paragraph --><p>Conclusion text.</p><!-- /wp:paragraph -->`),
       cta: { id: "cta", type: "cta", html: `<!-- wp:html --><div class="cta"><h2>Join</h2><a href="https://app.b2ihub.com/signup">Sign up</a></div><!-- /wp:html -->`, fingerprint: "c" },
       faqSchema: null,
       insertedLinks: [],
@@ -410,17 +522,17 @@ describe("E3: regression — section cleanup strips H2 but keeps H3", () => {
     const lastBody = `<!-- wp:heading {"level":3} -->\n<h3>Key Takeaway</h3>\n<!-- /wp:heading -->\n\n<!-- wp:paragraph --><p>This is the concluding thought that wraps up the section content effectively.</p><!-- /wp:paragraph -->`;
 
     const sections = [
-      { id: "s0", heading: "Topic A", headingLevel: 2 as const, sectionType: "main" as const, html: `<!-- wp:paragraph --><p>Body 1.</p><!-- /wp:paragraph -->`, wordCount: 3, status: "generated" as const },
-      { id: "s1", heading: "Topic B", headingLevel: 2 as const, sectionType: "main" as const, html: lastBody, wordCount: 30, status: "generated" as const },
+      sectionFromHtml("s0", "Topic A", `<!-- wp:paragraph --><p>Body 1.</p><!-- /wp:paragraph -->`),
+      sectionFromHtml("s1", "Topic B", lastBody),
     ];
 
     const doc: ArticleDocument = {
       metadata: { title: "Test", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 500, focusKeyphrase: "test" },
       languageSwitcher: { id: "ls", type: "language-switcher", html: `<!-- wp:html --><div class="b2i-language-switcher"><span>EN</span></div><!-- /wp:html -->`, fingerprint: "x" },
-      introduction: { id: "intro", html: `<!-- wp:paragraph --><p>Intro.</p><!-- /wp:paragraph -->`, wordCount: 2, status: "generated" },
+      introduction: componentFromHtml("intro", `<!-- wp:paragraph --><p>Intro.</p><!-- /wp:paragraph -->`),
       sections,
       visibleFaq: [],
-      conclusion: { id: "conc", html: `<!-- wp:paragraph --><p>Conclusion text.</p><!-- /wp:paragraph -->`, wordCount: 3, status: "generated" },
+      conclusion: componentFromHtml("conc", `<!-- wp:paragraph --><p>Conclusion text.</p><!-- /wp:paragraph -->`),
       cta: null,
       faqSchema: null,
       insertedLinks: [],
@@ -484,20 +596,25 @@ describe("pipeline error hardening", () => {
 describe("FAQ generation guarantees", () => {
   const faqHeadingPattern = /faq|frequently.asked|common.question/i;
 
-  function articleWithFaqSection(faqBody: string) {
+  function articleWithFaqSection(faqBody: string): ArticleDocument {
     const ls = `<!-- wp:html --><div class="b2i-language-switcher"><span>EN</span></div><!-- /wp:html -->`;
     const intro = `<!-- wp:paragraph --><p>Introduction text with keyphrase.</p><!-- /wp:paragraph -->`;
     const sections: ArticleDocument["sections"] = [
-      { id: "s0", heading: "Topic Overview", headingLevel: 2, sectionType: "main", html: `<!-- wp:paragraph --><p>Body content.</p><!-- /wp:paragraph -->`, wordCount: 3, status: "generated" },
-      { id: "s1", heading: "Frequently Asked Questions", headingLevel: 2, sectionType: "faq-heading", html: faqBody, wordCount: faqBody.split(/\s+/).length, status: "generated" },
+      sectionFromHtml("s0", "Topic Overview", `<!-- wp:paragraph --><p>Body content.</p><!-- /wp:paragraph -->`),
+      sectionFromHtml("s1", "Frequently Asked Questions", faqBody, "faq-heading"),
     ];
+    const visibleFaq = extractFaqPairsFromSectionBody(faqBody).map((entry) => ({
+      question: entry.question,
+      answerHtml: "",
+      answerText: entry.answerText,
+    }));
     return {
       metadata: { title: "Test", slug: "test", metaDescription: "", excerpt: "", targetWordCount: 500, focusKeyphrase: "test keyphrase" },
       languageSwitcher: { id: "ls", type: "language-switcher", html: ls, fingerprint: "ls" },
-      introduction: { id: "intro", html: intro, wordCount: 3, status: "generated" },
+      introduction: componentFromHtml("intro", intro),
       sections,
-      visibleFaq: [],
-      conclusion: { id: "conc", html: `<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->`, wordCount: 2, status: "generated" },
+      visibleFaq,
+      conclusion: componentFromHtml("conc", `<!-- wp:paragraph --><p>Conclusion.</p><!-- /wp:paragraph -->`),
       cta: null, faqSchema: null,
       insertedLinks: [],
     };
@@ -818,7 +935,7 @@ describe("FAQ generation guarantees", () => {
 
   it("renderArticleDocument places conclusion before CTA and FAQ schema", () => {
     const doc = makeArticleDoc({
-      conclusion: { id: "conc", html: "<!-- wp:paragraph --><p>Conclusion text here.</p><!-- /wp:paragraph -->", wordCount: 5, status: "generated" },
+      conclusion: componentFromHtml("conc", "<!-- wp:paragraph --><p>Conclusion text here.</p><!-- /wp:paragraph -->"),
       cta: { id: "cta", type: "cta", html: "<!-- wp:html --><div><a href='https://app.b2ihub.com/signup'>Sign up</a></div><!-- /wp:html -->", fingerprint: "x" },
       faqSchema: { id: "faq", type: "faq-schema", html: "<!-- wp:html --><script type='application/ld+json'>{\"@type\":\"FAQPage\"}</script><!-- /wp:html -->", fingerprint: "y" },
     });
@@ -831,8 +948,8 @@ describe("FAQ generation guarantees", () => {
     expect(schemaPos).toBeGreaterThan(0);
     // Conclusion must appear before CTA
     expect(concPos).toBeLessThan(ctaPos);
-    // CTA must appear before FAQ schema
-    expect(ctaPos).toBeLessThan(schemaPos);
+    // FAQ schema must appear before the final CTA block
+    expect(schemaPos).toBeLessThan(ctaPos);
   });
 });
 
@@ -887,6 +1004,54 @@ ${ctaHtml}
     expect(parseResult2.doc!.cta!.html).toContain("app.b2ihub.com/signup");
   });
 
+
+  it("round-trips FAQ, CTA and schema without duplicating conclusion content", () => {
+    const doc = makeArticleDoc({
+      sections: [
+        ...makeArticleDoc().sections.slice(0, 5),
+        {
+          id: "faq-section",
+          heading: "Frequently Asked Questions",
+          headingLevel: 2 as const,
+          sectionType: "faq-heading" as const,
+          blocks: [],
+          status: "generated" as const,
+        },
+      ],
+      visibleFaq: [
+        { question: "What is Threads marketing?", answerHtml: "", answerText: "It is conversational marketing on Threads." },
+        { question: "Is it useful for SMEs?", answerHtml: "", answerText: "Yes, it can support organic engagement." },
+        { question: "How often should brands post?", answerHtml: "", answerText: "Post consistently and focus on useful conversations." },
+        { question: "Do follower counts matter most?", answerHtml: "", answerText: "No, relevant interaction matters more than raw reach." },
+      ],
+      conclusion: {
+        id: "conc",
+        blocks: parseWordPressEditorialBlocks("<!-- wp:paragraph --><p>Use Threads consistently and focus on genuine customer conversations.</p><!-- /wp:paragraph -->", "conc").blocks,
+        status: "generated",
+      },
+      cta: {
+        id: "cta", type: "cta", fingerprint: "cta",
+        html: "<!-- wp:html --><div><h2>Ready to grow your brand?</h2><a href=\"https://app.b2ihub.com/signup\">Create Your Free Profile</a></div><!-- /wp:html -->",
+      },
+    });
+
+    const first = renderArticleDocument(doc);
+    const firstWords = countReadableWords(first);
+    const parsed1 = parseArticleDocumentFromHtml(first, doc);
+    expect(parsed1.doc).not.toBeNull();
+    const second = renderArticleDocument(parsed1.doc!);
+    const parsed2 = parseArticleDocumentFromHtml(second, parsed1.doc!);
+    expect(parsed2.doc).not.toBeNull();
+    const third = renderArticleDocument(parsed2.doc!);
+
+    expect(countReadableWords(second)).toBe(firstWords);
+    expect(countReadableWords(third)).toBe(firstWords);
+    expect((third.match(/app\.b2ihub\.com\/signup/gi) ?? []).length).toBe(1);
+    expect((third.match(/\"@type\": \"FAQPage\"/g) ?? []).length).toBe(1);
+    expect((third.match(/b2i-conclusion-start/g) ?? []).length).toBe(1);
+    expect(third.indexOf("FAQPage")).toBeLessThan(third.indexOf("Create Your Free Profile"));
+  });
+
   it("CTA is detected by countCtaHeadingTags", () => {
     const ctaHtml = `<!-- wp:html --><div class="cta-block"><h2>Ready to grow your brand with B2I Hub?</h2><p><a href="https://app.b2ihub.com/signup">Sign Up</a></p></div><!-- /wp:html -->`;
     const headings = countCtaHeadingTags(ctaHtml);
@@ -909,11 +1074,12 @@ describe("FAQ parity", () => {
 <!-- wp:paragraph --><p><strong>What support is available?</strong><br>24/7 email and chat support. Phone support during business hours.</p><!-- /wp:paragraph -->`;
 
     const doc = makeArticleDoc({
-      sections: [{
-        id: "section-0", heading: "Frequently Asked Questions", headingLevel: 2 as const,
-        sectionType: "faq-heading" as const,
-        html: faqHtml, wordCount: countReadableWords(faqHtml), status: "generated",
-      }],
+      sections: [sectionFromHtml(
+        "section-0",
+        "Frequently Asked Questions",
+        faqHtml,
+        "faq-heading",
+      )],
     });
 
     const visibleFaq = extractVisibleFaqFromArticle("", doc);
@@ -941,20 +1107,19 @@ describe("FAQ parity", () => {
     // Simulate doc with FAQ section
     const doc = makeArticleDoc({
       sections: [
-        {
-          id: "section-main", heading: "Main Section", headingLevel: 2 as const,
-          sectionType: "main" as const,
-          html: "<!-- wp:paragraph --><p>Main content here with details about the topic.</p><!-- /wp:paragraph -->",
-          wordCount: 12, status: "generated",
-        },
-        {
-          id: "section-faq", heading: "Frequently Asked Questions", headingLevel: 2 as const,
-          sectionType: "faq-heading" as const,
-          html: faqBody + `<!-- wp:paragraph --><p>Ready to grow your brand? Sign up at B2I Hub today. Create your free account now.</p><!-- /wp:paragraph -->`,
-          wordCount: countReadableWords(faqBody), status: "generated",
-        },
+        sectionFromHtml(
+          "section-main",
+          "Main Section",
+          "<!-- wp:paragraph --><p>Main content here with details about the topic.</p><!-- /wp:paragraph -->",
+        ),
+        sectionFromHtml(
+          "section-faq",
+          "Frequently Asked Questions",
+          faqBody + `<!-- wp:paragraph --><p>Ready to grow your brand? Sign up at B2I Hub today. Create your free account now.</p><!-- /wp:paragraph -->`,
+          "faq-heading",
+        ),
       ],
-      conclusion: { id: "conc", html: "<!-- wp:paragraph --><p>This is the conclusion. Sign up now for access.</p><!-- /wp:paragraph -->", wordCount: 12, status: "generated" },
+      conclusion: componentFromHtml("conc", "<!-- wp:paragraph --><p>This is the conclusion. Sign up now for access.</p><!-- /wp:paragraph -->"),
     });
 
     const visibleFaq = extractVisibleFaqFromArticle("", doc);
@@ -971,8 +1136,10 @@ describe("Word count validation", () => {
     const policy = buildPolicy(2500, 2125, 2875, "test keyphrase");
 
     // Metrics above the max
-    const metricsAbove = {
+    const metricsAbove: FinalArticleMetrics = {
       readableWordCount: 2876,
+      h2Count: 6,
+      faqEntryCount: 5,
       exactKeyphraseCount: 25,
       keyphraseDensity: 1.2,
       exactKeyphraseInH2: true,
@@ -984,10 +1151,19 @@ describe("Word count validation", () => {
       signupUrlCount: 1,
       faqBlockCount: 1,
       faqJsonLdCount: 1,
+      hasLanguageSwitcher: true,
       nestedParagraphCount: 0,
       malformedHeadingCount: 0,
       wpBlockCountMismatch: false,
       faqParityValid: true,
+      titleLength: 60,
+      metaDescriptionLength: 170,
+      fleschReadingEase: 65,
+      hasPlaceholderContent: false,
+      hasRawProseOutsideBlocks: false,
+      duplicateFaqSchemaCount: 0,
+      duplicateCtaBlockCount: 0,
+      hasConclusionContent: true,
     };
     const resultAbove = evaluatePolicy(metricsAbove, policy);
     expect(resultAbove.passed).toBe(false);
@@ -1020,6 +1196,11 @@ describe("Word count validation", () => {
       titleLength: 60,
       metaDescriptionLength: 170,
       fleschReadingEase: 65,
+      hasPlaceholderContent: false,
+      hasRawProseOutsideBlocks: false,
+      duplicateFaqSchemaCount: 0,
+      duplicateCtaBlockCount: 0,
+      hasConclusionContent: true,
     };
     const resultAtMax = evaluatePolicy(metricsAtMax, policy);
     expect(resultAtMax.passed).toBe(true);
@@ -1051,6 +1232,11 @@ describe("Word count validation", () => {
       titleLength: 60,
       metaDescriptionLength: 170,
       fleschReadingEase: 65,
+      hasPlaceholderContent: false,
+      hasRawProseOutsideBlocks: false,
+      duplicateFaqSchemaCount: 0,
+      duplicateCtaBlockCount: 0,
+      hasConclusionContent: true,
     };
     const resultBelow = evaluatePolicy(metricsBelow, policy);
     expect(resultBelow.passed).toBe(false);

@@ -7,7 +7,7 @@
 // No stage treats raw HTML as independently canonical.
 
 import type { ArticleDocument } from "@/lib/blog/article-document";
-import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, extractVisibleFaqFromArticle } from "@/lib/blog/article-document";
+import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, extractVisibleFaqFromArticle, renderComponentHtml, parseWordPressEditorialBlocks } from "@/lib/blog/article-document";
 import { type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { normalizeFinalSeo } from "@/lib/blog/final-seo-normalizer";
 import {
@@ -18,12 +18,12 @@ import {
 } from "@/lib/blog/article-integrity";
 import type { FinalArticlePolicy, FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
-import { countReadableWords, containsExactPhrase } from "@/lib/services/text-utils";
-import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
+import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags, countReadableWords, containsExactPhrase } from "@/lib/seo/seo-text-utils";
 import { MAX_SENTENCES_PER_PARAGRAPH } from "@/lib/services/generation-constants";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, ensureLanguageSwitcher, pairedSlugs } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
+import { runEditorialPolish, isEditorialPolishEnabled } from "@/lib/pipeline/editorial-polish";
 import { runComponentRegeneration, regenerateSection } from "@/lib/services/component-regenerator";
 import { scanFactualRisks, removeUnsupportedSentences, formatClaimLog } from "@/lib/blog/factual-risk-scanner";
 import { enforceInternalLinkLimit } from "@/lib/blog/final-article-policy";
@@ -107,12 +107,87 @@ function fp(html: string): string { return fingerprintHtml(html); }
 /** THE ONLY place state.blog is assigned. No other code may assign state.blog directly. */
 function syncBlogFromDocument(state: PipelineState): void {
   state.blog = renderArticleDocument(state.articleDoc);
+  state.faq = state.articleDoc.visibleFaq.map((entry) => ({
+    question: entry.question,
+    answer: entry.answerText,
+  }));
+}
+
+/** Fail immediately if the rendered cache diverges from the canonical document. */
+export function assertRenderedCacheMatchesDocument(state: Pick<PipelineState, "articleDoc" | "blog">): void {
+  const canonicalHtml = renderArticleDocument(state.articleDoc);
+  if (state.blog !== canonicalHtml) {
+    throw new Error(
+      `Pipeline rendered cache diverged from ArticleDocument: cached=${fingerprintHtml(state.blog)} canonical=${fingerprintHtml(canonicalHtml)}`,
+    );
+  }
+}
+
+/** SEO normalization runs before canonical CTA restoration, so a missing CTA at
+ * this stage must not discard an otherwise valid normalized article. */
+export function shouldAcceptSeoNormalization(result: FinalSeoNormalizerResult): boolean {
+  const safety = result.safety;
+  return result.passed === true
+    && safety.protectedBlocksUnchanged
+    && safety.linkDestinationsUnchanged
+    && safety.wordpressBlocksValid
+    && safety.faqSchemaPreserved
+    && safety.languageSwitcherPreserved;
+}
+
+/** Compute the exact readable word count used by final validation. */
+export function finalReadableWordCount(
+  state: Pick<PipelineState, "blog" | "keyphrase" | "title" | "metaDescription" | "requestedWordCount">,
+): number {
+  return analyzeFinalArticle(
+    state.blog,
+    state.keyphrase,
+    state.title,
+    state.metaDescription,
+    state.requestedWordCount,
+  ).readableWordCount;
+}
+
+/** Prevent different word-count helpers from silently disagreeing at the final gate. */
+export function assertFinalWordCountParity(
+  state: Pick<PipelineState, "blog" | "keyphrase" | "title" | "metaDescription" | "requestedWordCount">,
+): number {
+  const policyWordCount = finalReadableWordCount(state);
+  const pipelineWordCount = countReadableWords(state.blog);
+  const delta = Math.abs(policyWordCount - pipelineWordCount);
+  // The legacy helper may differ by one or two words around punctuation or
+  // underscores. Material divergence indicates stale/duplicated HTML and fails.
+  const allowedDelta = Math.max(2, Math.ceil(policyWordCount * 0.002));
+  if (delta > allowedDelta) {
+    throw new Error(
+      `Final word-count divergence: pipeline=${pipelineWordCount} policy=${policyWordCount} delta=${delta}`,
+    );
+  }
+  return policyWordCount;
+}
+
+/** Render a canonical structured component to WordPress HTML. */
+function componentHtml(component: ArticleDocument["introduction"]): string {
+  return renderComponentHtml(component);
+}
+
+/** Replace a component's structured blocks from validated WordPress HTML. */
+function replaceComponentHtml(
+  component: ArticleDocument["introduction"],
+  html: string,
+  status?: ArticleDocument["introduction"]["status"],
+): void {
+  const parsed = parseWordPressEditorialBlocks(html, component.id);
+  component.blocks = parsed.blocks;
+  if (status) component.status = status;
 }
 
 /** Derive section input from the canonical ArticleDocument. */
 function deriveSectionInput(state: PipelineState): Array<{ index: number; heading: string; body: string }> {
-  return state.articleDoc.sections.map((s, i) => ({
-    index: i, heading: s.heading, body: s.html,
+  return state.articleDoc.sections.map((section, index) => ({
+    index,
+    heading: section.heading,
+    body: componentHtml(section),
   }));
 }
 
@@ -265,6 +340,7 @@ function applyHtmlToDocument(state: PipelineState, html: string, existingDoc: Ar
   }
   state.articleDoc = parseResult.doc;
   syncBlogFromDocument(state);
+  assertRenderedCacheMatchesDocument(state);
   return true;
 }
 
@@ -289,9 +365,8 @@ function runTrackedHtmlStage(state: PipelineState, stageName: string, fn: (html:
   const guard = guardStageOutput(state.blog, preHtml, stageBaseline, stageName);
   if (!guard.accepted) {
     restoreSnapshot(state, snap);
-  } else {
-    state.blog = guard.html;
   }
+  assertRenderedCacheMatchesDocument(state);
   const outputFp = fp(state.blog);
   recordStage(state, stageName, inputFp, outputFp, guard.accepted, guard.accepted ? undefined : "pre-stage-restore");
   return state;
@@ -313,7 +388,8 @@ export function createPipelineState(params: {
     requestedWordCount: params.requestedWordCount, blog,
     title: params.articleDoc.metadata.title, slug: params.articleDoc.metadata.slug,
     metaDescription: params.articleDoc.metadata.metaDescription, excerpt: params.articleDoc.metadata.excerpt,
-    faq: [], internalLinks: [], externalLinks: [], categories: [], tags: [], readingTime: "", summary: "",
+    faq: params.articleDoc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
+    internalLinks: [], externalLinks: [], categories: [], tags: [], readingTime: "", summary: "",
     articleDoc: params.articleDoc, stageOutputs: [],
     h2Headings: params.h2Headings,
     intro: params.intro, conclusion: params.conclusion,
@@ -331,7 +407,7 @@ export function createPipelineState(params: {
 export function validatePipelineOrder(state: PipelineState): Array<{ code: string; message: string; stage: string }> {
   const issues: Array<{ code: string; message: string; stage: string }> = [];
   const stages = state.stageOutputs.map((s) => s.stage);
-  const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "cta-preserve", "factual-scan", "link-enforce", "seo-normalization", "faq-recovery", "paragraphs-final", "final-validation"];
+  const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "seo-normalization", "factual-scan", "link-enforce", "faq-recovery", "paragraphs-final", "cta-preserve", "wc-check", "final-validation"];
   for (const req of required) {
     if (!stages.includes(req)) issues.push({ code: "MISSING_STAGE", message: `Required stage "${req}" not found`, stage: req });
   }
@@ -349,6 +425,7 @@ export async function runPostAssemblyPipeline(
   state: PipelineState,
   deps: PipelineDependencies,
 ): Promise<PipelineState> {
+  assertRenderedCacheMatchesDocument(state);
   state.baseline = createArticleIntegrityBaseline(state.blog);
   state.stageOutputs.push({ stage: "assembly", inputFingerprint: fp(state.blog), outputFingerprint: fp(state.blog), accepted: true });
 
@@ -444,12 +521,10 @@ export async function runPostAssemblyPipeline(
         if (!section || section.status === "missing") continue;
         
         // Remove unsupported sentences from the section
-        const { html: cleanedHtml, sentencesRemoved } = removeUnsupportedSentences(section.html, sectionClaims);
+        const { html: cleanedHtml, sentencesRemoved } = removeUnsupportedSentences(componentHtml(section), sectionClaims);
         if (sentencesRemoved > 0 && cleanedHtml.length > 50) {
           console.log(`[factual-scan] section=${sectionIdx} removed ${sentencesRemoved} unsupported sentence(s)`);
-          state.articleDoc.sections[sectionIdx].html = cleanedHtml;
-          state.articleDoc.sections[sectionIdx].wordCount = countReadableWords(cleanedHtml);
-          state.articleDoc.sections[sectionIdx].status = "normalized";
+          replaceComponentHtml(state.articleDoc.sections[sectionIdx], cleanedHtml, "normalized");
         }
       }
       syncBlogFromDocument(state);
@@ -469,58 +544,77 @@ export async function runPostAssemblyPipeline(
   // while preserving headings, FAQ, conclusion, CTA, sourced claims, links, and protected blocks.
   // Runs after all editorial link enforcement but BEFORE FAQ recovery (which adds schema).
   state = runTrackedHtmlStage(state, "final-trim", (html) => {
-    const currentWc = countReadableWords(html);
-    if (currentWc <= state.wordMax) {
-      console.log(`[final-trim] skipped (wc=${currentWc} <= ${state.wordMax})`);
+    const initialWordCount = countReadableWords(html);
+    if (initialWordCount <= state.wordMax) {
+      console.log(`[final-trim] skipped (wc=${initialWordCount} <= ${state.wordMax})`);
       return html;
     }
-    
-    // Process sections in rounds until under limit
-    const excess = currentWc - state.wordMax;
+
+    const excess = initialWordCount - state.wordMax;
     let totalRemoved = 0;
+    let workingHtml = html;
     const maxPasses = Math.min(8, Math.ceil(excess / 100) + 1);
+
     for (let pass = 0; pass < maxPasses; pass++) {
-      const currentWcNow = countReadableWords(state.blog);
-      if (currentWcNow <= state.wordMax) break;
-      const stillExcess = currentWcNow - state.wordMax;
-      const targetPerPass = Math.max(30, Math.ceil(stillExcess / Math.max(1, state.articleDoc.sections.length)));
+      const currentWordCount = countReadableWords(workingHtml);
+      if (currentWordCount <= state.wordMax) break;
+
+      const stillExcess = currentWordCount - state.wordMax;
+      const editableSections = state.articleDoc.sections.filter((section) => section.sectionType !== "faq-heading");
+      const targetPerPass = Math.max(30, Math.ceil(stillExcess / Math.max(1, editableSections.length)));
       let passRemoved = 0;
-      for (let i = 0; i < state.articleDoc.sections.length; i++) {
+
+      for (let index = 0; index < state.articleDoc.sections.length; index++) {
         if (passRemoved >= targetPerPass * 1.5) break;
-        const section = state.articleDoc.sections[i];
-        if (!section.html || section.html.length < 100) continue;
-        if (/faq|frequently.asked/i.test(section.heading)) continue;
-        const sectionWc = countReadableWords(section.html);
-        if (sectionWc < 80) continue;
-        const paraBlocks = section.html.match(
+
+        const section = state.articleDoc.sections[index];
+        if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
+
+        const sectionHtml = componentHtml(section);
+        if (sectionHtml.length < 100) continue;
+
+        const sectionWordCount = countReadableWords(sectionHtml);
+        if (sectionWordCount < 80) continue;
+
+        const paragraphBlocks = sectionHtml.match(
           /<!--\s*wp:paragraph\s*-->\s*\n?<p>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi,
         );
-        if (!paraBlocks || paraBlocks.length <= 1) continue;
-        const lastPara = paraBlocks[paraBlocks.length - 1];
-        const lastParaWc = countReadableWords(lastPara);
-        if (lastParaWc < 10) continue;
-        if (/<a\b/i.test(lastPara) || /\d+\s*(?:%|percent|times)/i.test(lastPara)) continue;
-        const lastIdx = section.html.lastIndexOf(lastPara);
-        if (lastIdx < 0) continue;
-        const trimmed = section.html.substring(0, lastIdx).trim() + section.html.substring(lastIdx + lastPara.length);
-        state.articleDoc.sections[i].html = trimmed;
-        state.articleDoc.sections[i].wordCount = countReadableWords(trimmed);
-        state.articleDoc.sections[i].status = "trimmed";
-        totalRemoved += lastParaWc;
-        passRemoved += lastParaWc;
-        console.log(`[final-trim] pass=${pass} section=${i} removed ${lastParaWc} words`);
+        if (!paragraphBlocks || paragraphBlocks.length <= 1) continue;
+
+        const lastParagraph = paragraphBlocks[paragraphBlocks.length - 1];
+        const lastParagraphWordCount = countReadableWords(lastParagraph);
+        if (lastParagraphWordCount < 10) continue;
+        if (/<a\b/i.test(lastParagraph) || /\d+\s*(?:%|percent|times)/i.test(lastParagraph)) continue;
+
+        const lastIndex = sectionHtml.lastIndexOf(lastParagraph);
+        if (lastIndex < 0) continue;
+
+        const trimmedHtml = (
+          sectionHtml.substring(0, lastIndex).trim()
+          + sectionHtml.substring(lastIndex + lastParagraph.length)
+        ).trim();
+        replaceComponentHtml(section, trimmedHtml, "trimmed");
+        totalRemoved += lastParagraphWordCount;
+        passRemoved += lastParagraphWordCount;
+        console.log(`[final-trim] pass=${pass} section=${index} removed ${lastParagraphWordCount} words`);
       }
+
       if (passRemoved === 0) break;
-    }
-    
-    if (totalRemoved > 0) {
+
+      // Commit each pass before measuring the next one. Measuring stale state.blog
+      // caused every pass to believe the original excess still existed and over-trim.
       syncBlogFromDocument(state);
-      const finalWc = countReadableWords(state.blog);
-      console.log(`[final-trim] total removed=${totalRemoved} final wc=${finalWc} target=${state.wordMax}`);
+      workingHtml = state.blog;
+    }
+
+    if (totalRemoved > 0) {
+      const finalWordCount = countReadableWords(workingHtml);
+      console.log(`[final-trim] total removed=${totalRemoved} final wc=${finalWordCount} target=${state.wordMax}`);
     } else {
       console.log(`[final-trim] no paragraphs removed — excess=${excess}`);
     }
-    return state.blog;
+
+    return workingHtml;
   });
 
   // FAQ recovery: HTML-returning.
@@ -596,6 +690,30 @@ export async function runPostAssemblyPipeline(
     return result.html;
   });
 
+  // Editorial polish: improves coherence, flow and natural language without
+  // damaging structure, links, SEO, FAQ, CTA or schema. Runs after links are
+  // inserted and paragraphs are normalized but BEFORE CTA preservation so
+  // canonical CTA can be restored if the editor accidentally damages it.
+  if (isEditorialPolishEnabled()) {
+    const editorCtx = { chatWithRetry: deps.chatWithRetry };
+    const epResult = await runEditorialPolish(
+      state.articleDoc,
+      state.keyphrase,
+      async (messages, options) => editorCtx.chatWithRetry(messages, options, "editorial-polish"),
+    );
+    if (epResult.result.accepted) {
+      console.log(
+        `[editorial-polish] accepted: wc ${epResult.result.inputWordCount}→${epResult.result.candidateWordCount}` +
+        ` kp ${epResult.result.keyphraseBefore}→${epResult.result.keyphraseAfter}` +
+        ` edits=${epResult.result.proposedEdits} applied=${epResult.result.appliedEdits}`
+      );
+      state.articleDoc = epResult.doc;
+      syncBlogFromDocument(state);
+    } else {
+      console.log(`[editorial-polish] rejected: ${epResult.result.reason}`);
+    }
+  }
+
   // CTA preservation: runs after ALL content-changing stages and FAQ recovery.
   // Ensures exactly one CTA block with one CTA heading and one signup URL.
   // If the CTA is missing or damaged, sets it on the canonical ArticleDocument
@@ -610,12 +728,24 @@ export async function runPostAssemblyPipeline(
 
     // Set CTA on the canonical ArticleDocument and re-render.
     // renderArticleDocument() places CTA at the correct position
-    // (after conclusion, before FAQ schema). No HTML surgery needed.
-    if (!state.articleDoc.cta) {
-      state.articleDoc.cta = { id: "cta", type: "cta", html: CANONICAL_CTA_HTML, fingerprint: fingerprintHtml(CANONICAL_CTA_HTML) };
-    }
+    // (after FAQ schema, as the final visible block). No HTML surgery needed.
+    state.articleDoc.cta = {
+      id: "cta",
+      type: "cta",
+      html: CANONICAL_CTA_HTML,
+      fingerprint: fingerprintHtml(CANONICAL_CTA_HTML),
+    };
     syncBlogFromDocument(state);
     return state.blog;
+  });
+
+  // Post-CTA word-count parity check. CTA, visible FAQ cards and JSON-LD are
+  // application-owned wp:html blocks and therefore do not count as editorial
+  // body words. Use the exact final-policy metric and fail on helper divergence.
+  state = runTrackedHtmlStage(state, "wc-check", (html) => {
+    const finalWordCount = assertFinalWordCountParity(state);
+    console.log(`[wc-check] canonical word count=${finalWordCount} range=${state.wordMin}-${state.wordMax}`);
+    return html;
   });
 
   // Final validation
@@ -635,7 +765,7 @@ export async function runPostAssemblyPipeline(
 
 async function runClaimCheck(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
   const sections = state.articleDoc.sections;
-  const bodies = sections.map((s, i) => ({ index: i, body: s.html }));
+  const bodies = sections.map((section, index) => ({ index, body: componentHtml(section) }));
   const conflicts = detectClaimConflicts(bodies, { claims: [] });
   if (conflicts.length === 0) {
     const fpSnap = fp(state.blog);
@@ -656,9 +786,7 @@ async function runClaimCheck(state: PipelineState, deps: PipelineDependencies): 
         state.title, section.heading, prevHeading, nextHeading, state.wordsPerSection, state.exactKeyphraseTarget, state.keyphrase,
       );
       if (regeneratedBody && countReadableWords(regeneratedBody) > 0) {
-        state.articleDoc.sections[c.sectionIndexB].html = regeneratedBody;
-        state.articleDoc.sections[c.sectionIndexB].wordCount = countReadableWords(regeneratedBody);
-        state.articleDoc.sections[c.sectionIndexB].status = "regenerated";
+        replaceComponentHtml(state.articleDoc.sections[c.sectionIndexB], regeneratedBody, "regenerated");
         syncBlogFromDocument(state);
       }
     } catch (err) { /* continue */ }
@@ -676,18 +804,25 @@ async function runExpansion(state: PipelineState, deps: PipelineDependencies): P
 
   const snap = snapshotState(state);
   const sectionsInput = deriveSectionInput(state);
-  const result = await expandToMinimum({ chatWithRetry: deps.chatWithRetry }, sectionsInput.map((s) => ({ ...s })), sectionsInput, state.intro, state.conclusion, state.currentWordCount, state.wordMin, state.wordsPerSection);
+  const result = await expandToMinimum(
+    { chatWithRetry: deps.chatWithRetry },
+    sectionsInput.map((section) => ({ ...section })),
+    sectionsInput,
+    componentHtml(state.articleDoc.introduction),
+    componentHtml(state.articleDoc.conclusion),
+    state.currentWordCount,
+    state.wordMin,
+    state.wordsPerSection,
+  );
 
   for (const s of result.sections) {
     if (s.index >= 0 && s.index < state.articleDoc.sections.length) {
-      state.articleDoc.sections[s.index].html = s.body;
-      state.articleDoc.sections[s.index].wordCount = countReadableWords(s.body);
-      state.articleDoc.sections[s.index].status = "expanded";
+      replaceComponentHtml(state.articleDoc.sections[s.index], s.body, "expanded");
     }
   }
-  state.currentWordCount = result.finalWordCount;
   state.expansionAttempts = result.expansions;
   syncBlogFromDocument(state);
+  state.currentWordCount = countReadableWords(state.blog);
 
   return runTrackedHtmlStage(state, "expansion", (html) => html, snap);
 }
@@ -701,17 +836,23 @@ async function runTrim(state: PipelineState, deps: PipelineDependencies): Promis
 
   const snap = snapshotState(state);
   const sectionsInput = deriveSectionInput(state);
-  const result = await trimToMaximum({ chatWithRetry: deps.chatWithRetry }, sectionsInput.map((s) => ({ ...s })), state.intro, state.conclusion, state.currentWordCount, state.wordMax);
+  const result = await trimToMaximum(
+    { chatWithRetry: deps.chatWithRetry },
+    sectionsInput.map((section) => ({ ...section })),
+    componentHtml(state.articleDoc.introduction),
+    componentHtml(state.articleDoc.conclusion),
+    state.currentWordCount,
+    state.wordMax,
+  );
 
   for (const s of result.sections) {
     if (s.index >= 0 && s.index < state.articleDoc.sections.length) {
-      state.articleDoc.sections[s.index].html = s.body;
-      state.articleDoc.sections[s.index].wordCount = countReadableWords(s.body);
+      replaceComponentHtml(state.articleDoc.sections[s.index], s.body);
     }
   }
-  state.currentWordCount = result.finalWordCount;
   state.trimAttempts = result.trims;
   syncBlogFromDocument(state);
+  state.currentWordCount = countReadableWords(state.blog);
 
   return runTrackedHtmlStage(state, "trim", (html) => html, snap);
 }
@@ -756,9 +897,7 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
       { html: state.blog, focusKeyphrase: state.keyphrase, targetWordCount: state.requestedWordCount, targetKeyphraseCount: state.exactKeyphraseTarget, minReadingEase: 60, maxReadingEase: 80 },
       deps.chatWithRetry as any,
     );
-    const safety = result.safety;
-    const ctaOk = state.articleDoc.cta !== null;
-    const accepted = result.passed === true && safety.protectedBlocksUnchanged && safety.linkDestinationsUnchanged && safety.wordpressBlocksValid && safety.faqSchemaPreserved && safety.languageSwitcherPreserved && ctaOk;
+    const accepted = shouldAcceptSeoNormalization(result);
     state.normalizationResult = result;
     state.normalizationAccepted = accepted;
 
@@ -776,7 +915,7 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
 }
 
 export function runFinalValidation(state: PipelineState): { passed: boolean; reasons: string[] } {
-  const metrics = analyzeFinalArticle(state.blog, state.keyphrase);
+  const metrics = analyzeFinalArticle(state.blog, state.keyphrase, state.title, state.metaDescription, state.requestedWordCount);
   const policy = buildPolicy(state.requestedWordCount, state.wordMin, state.wordMax, state.keyphrase);
   return evaluatePolicy(metrics, policy);
 }

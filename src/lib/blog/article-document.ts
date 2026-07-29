@@ -151,12 +151,12 @@ export function renderArticleDocument(doc: ArticleDocument): string {
     }
   }
 
-  // 6. FAQ JSON-LD schema generated from the same doc.visibleFaq (must match exactly)
+  // 6. FAQ JSON-LD schema generated from the same visible FAQ source.
   if (doc.visibleFaq && doc.visibleFaq.length > 0) {
     parts.push(renderFaqSchema(doc.visibleFaq));
   }
 
-  // 7. CTA block (always last)
+  // 7. CTA block (canonical final visible block)
   if (doc.cta) {
     parts.push(doc.cta.html);
   }
@@ -249,6 +249,17 @@ export interface FaqParityIssue {
  * Validate that visible FAQ entries match the FAQ schema JSON-LD.
  * Both must derive from the same FaqEntry[] source.
  */
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, "/");
+}
+
 export function validateFaqParity(
   entries: FaqEntry[],
   schemaHtml: string,
@@ -280,7 +291,7 @@ export function validateFaqParity(
 
   const maxQuestions = Math.min(schemaQuestions.length, entries.length);
   for (let i = 0; i < maxQuestions; i++) {
-    const entryText = entries[i].question.toLowerCase().trim();
+    const entryText = decodeHtmlEntities(entries[i].question.toLowerCase().trim());
     const schemaText = schemaQuestions[i].toLowerCase().trim();
 
     if (!entryText || !schemaText) {
@@ -301,7 +312,7 @@ export function validateFaqParity(
   // Compare answers (visible answerText vs schema answerText)
   // Both must be non-empty and identical for the entry to be valid.
   for (let i = 0; i < maxQuestions; i++) {
-    const entryAnswer = (entries[i].answerText || "").toLowerCase().trim();
+    const entryAnswer = decodeHtmlEntities((entries[i].answerText || "").toLowerCase().trim());
     const schemaAnswer = (schemaAnswers[i] || "").toLowerCase().trim();
 
     if (!entryAnswer) {
@@ -389,6 +400,15 @@ export function extractVisibleFaqFromArticle(
     }
   }
 
+  // CTA is rendered after the FAQ schema as the final visible block. Exclude it
+  // from the FAQ boundary so CTA copy cannot be absorbed into an answer.
+  const signupIdx = html.indexOf("app.b2ihub.com/signup", faqStart);
+  if (signupIdx > 0) {
+    const beforeSignup = html.substring(faqStart, signupIdx);
+    const openerIdx = beforeSignup.lastIndexOf("<!-- wp:html -->");
+    if (openerIdx >= 0) effectiveEnd = Math.min(effectiveEnd, faqStart + openerIdx);
+  }
+
   const faqSection = html.substring(faqStart, effectiveEnd);
 
   // Extract Q&A pairs: each question is an <h3>, answers follow until next <h3> or end
@@ -449,13 +469,6 @@ export function extractVisibleFaqFromArticle(
       }
     }
 
-    // Trim trailing CTA/conclusion content from last answer.
-    // The FAQ section may contain non-FAQ text after the last Q&A pair
-    // (e.g., a CTA teaser or signup prompt). This text must not leak
-    // into the FAQ schema answer.
-    if (result.length > 0) {
-      const last = result[result.length - 1];
-    }
   }
 
   return result;
@@ -805,12 +818,9 @@ export function parseArticleDocumentFromHtml(
     fingerprint: fingerprintHtml(ctaMatch[0]),
   } : null;
 
-  // Extract FAQ schema block (wp:html containing FAQPage JSON-LD)
-  // Search from after the CTA to avoid matching the CTA's wp:html block.
-  const faqSearchStart = ctaMatch
-    ? ctaSearchStart + ctaMatch.index! + ctaMatch[0].length
-    : ctaSearchStart;
-  const faqSchemaMatch = html.substring(faqSearchStart).match(/<!--\s*wp:html\s*-->(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?FAQPage(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?<!--\s*\/wp:html\s*-->/i);
+  // Extract FAQ schema block anywhere in the document. Its canonical position is
+  // before the final CTA, but the parser accepts either ordering during migration.
+  const faqSchemaMatch = html.match(/<!--\s*wp:html\s*-->(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?FAQPage(?:(?!<!--\s*\/wp:html\s*-->)[\s\S])*?<!--\s*\/wp:html\s*-->/i);
   const faqSchema: ProtectedArticleBlock | null = faqSchemaMatch ? {
     id: "faq-schema",
     type: "faq-schema",
@@ -834,6 +844,8 @@ export function parseArticleDocumentFromHtml(
   // Find CTA and FAQ schema positions for section boundary calculation
   const ctaStartIdx = ctaMatch ? html.indexOf(ctaMatch[0]) : -1;
   const faqSchemaStartIdx = faqSchemaMatch ? html.indexOf(faqSchemaMatch[0]) : -1;
+  const conclusionMarkerStart = html.indexOf(CONCLUSION_START_MARKER);
+  const conclusionMarkerEnd = html.indexOf(CONCLUSION_END_MARKER);
 
   // Extract introduction and parse it into blocks
   const introStart = languageSwitcher
@@ -848,89 +860,60 @@ export function parseArticleDocumentFromHtml(
     status: existingDoc.introduction?.status ?? "generated",
   };
 
-  // Extract section bodies from between heading blocks.
-  // Sections stop at the NEXT heading, the CTA block, or the FAQ schema
-  // (whichever comes first). The conclusion is BETWEEN the last section
-  // and the CTA, so sections stop at CTA as before — but we separate
-  // the conclusion from the last section body below.
+  // Extract section bodies from between heading blocks. Each section stops at
+  // the next H2 or the first protected boundary (conclusion, schema or CTA).
   const newSections: ArticleSection[] = [];
-  const rawBodyEnds: number[] = []; // track raw body end positions in HTML
   for (let i = 0; i < headingMatches.length; i++) {
     const sectionStart = headingMatches[i].endIndex;
     let sectionEnd = html.length;
     if (i + 1 < headingMatches.length) {
       sectionEnd = headingMatches[i + 1].index;
     }
-    // Stop before CTA (which comes after sections and conclusion)
-    if (ctaStartIdx > sectionStart && ctaStartIdx < sectionEnd) {
-      sectionEnd = ctaStartIdx;
+    // The conclusion has explicit stable markers and must never be absorbed into
+    // the last editorial/FAQ section during HTML round-trips.
+    if (conclusionMarkerStart > sectionStart && conclusionMarkerStart < sectionEnd) {
+      sectionEnd = conclusionMarkerStart;
     }
-    // Stop before FAQ schema
-    if (faqSchemaStartIdx > sectionStart && faqSchemaStartIdx < sectionEnd) {
-      sectionEnd = faqSchemaStartIdx;
-    }
+    if (ctaStartIdx > sectionStart && ctaStartIdx < sectionEnd) sectionEnd = ctaStartIdx;
+    if (faqSchemaStartIdx > sectionStart && faqSchemaStartIdx < sectionEnd) sectionEnd = faqSchemaStartIdx;
 
     const bodyHtml = html.substring(sectionStart, sectionEnd).trim();
-    if (bodyHtml.length === 0) {
+    const existing = existingDoc.sections.find((s) => s.heading === headingMatches[i].heading) ?? existingDoc.sections[i];
+    const isFaqHeading = html.substring(Math.max(0, headingMatches[i].index - FAQ_HEADING_MARKER.length - 10), headingMatches[i].index).includes(FAQ_HEADING_MARKER)
+      || /^(frequently asked questions|faq|常見問題)/i.test(headingMatches[i].heading.trim())
+      || existing?.sectionType === "faq-heading";
+    if (bodyHtml.length === 0 && !isFaqHeading) {
       errors.push(`Section ${i} has empty body`);
       return { doc: null, errors };
     }
-    rawBodyEnds.push(sectionEnd);
 
     const sectionParse = parseWordPressEditorialBlocks(bodyHtml, `section-${i}`);
 
-    const existing = existingDoc.sections[i];
+    const markerWindow = html.substring(Math.max(0, headingMatches[i].index - FAQ_HEADING_MARKER.length - 20), headingMatches[i].index);
+    const sectionType: ArticleSection["sectionType"] = markerWindow.includes(FAQ_HEADING_MARKER)
+      || /^(frequently asked questions|faq|常見問題)/i.test(headingMatches[i].heading.trim())
+      || existing?.sectionType === "faq-heading"
+      ? "faq-heading"
+      : (existing?.sectionType ?? "main");
     newSections.push({
       id: existing?.id ?? `section-${i}`,
       heading: headingMatches[i].heading,
       headingLevel: 2,
-      sectionType: existing?.sectionType ?? "main",
-      blocks: sectionParse.blocks,
+      sectionType,
+      blocks: sectionType === "faq-heading" ? [] : sectionParse.blocks,
       status: existing?.status ?? "generated",
     });
   }
 
-  // Extract conclusion: content BETWEEN the last section body and the CTA block.
-  // With the corrected component order, conclusion appears before CTA/FAQ schema,
-  // so we extract from after the last section body to the CTA start.
-  const lastSectionEnd = rawBodyEnds.length > 0
-    ? rawBodyEnds[rawBodyEnds.length - 1]
-    : headingMatches[headingMatches.length - 1].endIndex;
-  let conclusionStart = lastSectionEnd;
-  let conclusionToCta = "";
-  if (ctaMatch) {
-    const ctaPos = html.indexOf(ctaMatch[0]);
-    if (ctaPos > conclusionStart) {
-      conclusionToCta = html.substring(conclusionStart, ctaPos).trim();
-    }
-  } else if (faqSchemaMatch) {
-    const faqPos = html.indexOf(faqSchemaMatch[0]);
-    if (faqPos > conclusionStart) {
-      conclusionToCta = html.substring(conclusionStart, faqPos).trim();
-    }
+  // Extract conclusion only from the explicit stable boundary markers.
+  // This prevents FAQ/schema/CTA content from being misclassified as conclusion.
+  let conclusionHtml = "";
+  if (conclusionMarkerStart >= 0 && conclusionMarkerEnd > conclusionMarkerStart) {
+    conclusionHtml = html.substring(
+      conclusionMarkerStart + CONCLUSION_START_MARKER.length,
+      conclusionMarkerEnd,
+    ).trim();
   }
-  let conclusionHtml = conclusionToCta;
-
-  // Fallback: if no CTA/schema found, try splitting the last section body
-  if (conclusionHtml.length === 0 && newSections.length > 0) {
-    const lastBody = renderComponentHtml(newSections[newSections.length - 1]);
-    const blockRe = /(<!--\s*wp:\w+(?:\s[^>]*)?\s*-->)/gi;
-    const separators: number[] = [];
-    let bm: RegExpExecArray | null;
-    while ((bm = blockRe.exec(lastBody)) !== null) {
-      if (!/wp:heading/i.test(bm[1])) {
-        separators.push(bm.index);
-      }
-    }
-    const threshold = separators.length >= 2 ? separators[separators.length - 1]
-      : separators.length === 1 ? separators[0]
-      : -1;
-    if (threshold >= 0) {
-      const splitHtml = lastBody.substring(threshold).trim();
-      if (splitHtml) conclusionHtml = splitHtml;
-    }
-  }
-
   if (conclusionHtml.length === 0) {
     conclusionHtml = existingDoc.conclusion?.blocks ? renderComponentHtml(existingDoc.conclusion) : "";
   }
@@ -947,7 +930,12 @@ export function parseArticleDocumentFromHtml(
       status: existingDoc.introduction?.status ?? "generated",
     },
     sections: newSections,
-    visibleFaq: existingDoc.visibleFaq,
+    visibleFaq: (() => {
+      const parsedFaq = extractVisibleFaqFromArticle(html);
+      return parsedFaq.length > 0
+        ? parsedFaq.map((entry) => ({ question: entry.question, answerHtml: "", answerText: entry.answerText }))
+        : existingDoc.visibleFaq;
+    })(),
     conclusion: {
       id: existingDoc.conclusion?.id ?? "conc",
       blocks: conclusionParse.blocks,

@@ -172,17 +172,34 @@ export function getFirstNReadableWords(html: string, n: number): string {
 export function countCtaHeadingTags(html: string): number {
   const headingHtml = html.replace(/<script[\s\S]*?<\/script>/gi, "");
 
-  const h2s =
-    headingHtml.match(/<h2\b[^>]*>[\s\S]*?<\/h2>/gi) ?? [];
+  // Primary: count CTA headings inside wp:html blocks (the canonical CTA location).
+  // Headings in regular editorial sections may accidentally match the text pattern
+  // and produce false positives.
+  const wpHtmlBlocks = headingHtml.match(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi) ?? [];
+  let ctaCount = 0;
+  for (const block of wpHtmlBlocks) {
+    const h2s = block.match(/<h2\b[^>]*>[\s\S]*?<\/h2>/gi) ?? [];
+    const h3s = block.match(/<h3\b[^>]*>[\s\S]*?<\/h3>/gi) ?? [];
+    ctaCount += [...h2s, ...h3s].filter((heading) =>
+      /B2I Hub|Ready to grow|grow your brand|Create Your|Sign Up/i.test(
+        heading.replace(/<[^>]+>/g, " ")
+      )
+    ).length;
+  }
 
-  const h3s =
-    headingHtml.match(/<h3\b[^>]*>[\s\S]*?<\/h3>/gi) ?? [];
+  // Fallback: if no wp:html blocks contain CTA headings, scan all headings.
+  // This handles simplified test fixtures and non-standard CTA rendering.
+  if (ctaCount === 0) {
+    const allH2s = headingHtml.match(/<h2\b[^>]*>[\s\S]*?<\/h2>/gi) ?? [];
+    const allH3s = headingHtml.match(/<h3\b[^>]*>[\s\S]*?<\/h3>/gi) ?? [];
+    ctaCount = [...allH2s, ...allH3s].filter((heading) =>
+      /B2I Hub|Ready to grow|grow your brand|Create Your|Sign Up/i.test(
+        heading.replace(/<[^>]+>/g, " ")
+      )
+    ).length;
+  }
 
-  return [...h2s, ...h3s].filter((heading) =>
-    /B2I Hub|Ready to grow|grow your brand|Create Your|Sign Up/i.test(
-      heading.replace(/<[^>]+>/g, " ")
-    )
-  ).length;
+  return ctaCount;
 }
 
 /** Detect the language switcher block by its stable class or data attribute. */

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { runBlogGeneration } from "@/lib/services/blog-generation-service";
+import { normalizeOutlineHeadings, runBlogGeneration } from "@/lib/services/blog-generation-service";
 import { projectRepository } from "@/lib/repositories";
 
 vi.mock("@/lib/repositories", () => ({
@@ -52,7 +52,7 @@ function outlineValid(): StageResponse {
     stage: "outline",
     content: JSON.stringify({
       title: "Test", slug: "test", metaDescription: "Meta desc with enough chars for validation testing purposes.",
-      h2Headings: ["S1", "S2", "S3", "S4", "S5", "Frequently Asked Questions About Test"],
+      h2Headings: ["S1", "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions About Test"],
       excerpt: "Excerpt.",
     }),
   };
@@ -79,13 +79,39 @@ function buildRequestMock(overrides: StageResponse[]) {
     const q = queue.get(stage);
     if (q && q.length > 0) return Promise.resolve({ content: q.shift()! });
     if (stage === "outline") return Promise.resolve({ content: outlineValid().content });
-    if (stage.startsWith("section_5")) return Promise.resolve({ content: JSON.stringify({ body: "<!-- wp:paragraph --><p><strong>Q?</strong> A.</p><!-- /wp:paragraph -->" }) });
+    if (stage === "faq") return Promise.resolve({ content: JSON.stringify({ heading: "Frequently Asked Questions", entries: [{ question: "What is this?", answer: "This is the first FAQ entry." }, { question: "How does it work?", answer: "It works through a simple process." }, { question: "Who should use this?", answer: "Anyone can use this effectively." }, { question: "When should I start?", answer: "Starting now is recommended for best results." }] }) });
     if (stage.startsWith("section_")) return Promise.resolve({ content: para("Valid section content.") });
     if (stage === "intro" || stage === "intro_retry" || stage === "intro_repair") return Promise.resolve({ content: para("Default intro.") });
     if (stage === "conclusion" || stage === "conclusion_retry" || stage === "conclusion_repair") return Promise.resolve({ content: para("Default conclusion.") });
     return Promise.resolve({ content: JSON.stringify({}) });
   };
 }
+
+describe("normalizeOutlineHeadings", () => {
+  it("adds the missing editorial H2 before the final FAQ heading for a 2500-word article", () => {
+    const headings = normalizeOutlineHeadings(
+      ["S1", "S2", "S3", "S4", "S5", "Frequently Asked Questions About Test"],
+      2500,
+      "Test",
+      "test keyphrase",
+    );
+    expect(headings).toHaveLength(7);
+    expect(headings.slice(0, -1)).toHaveLength(6);
+    expect(headings.at(-1)).toMatch(/frequently asked questions/i);
+  });
+
+  it("removes conclusion headings and keeps one FAQ heading last", () => {
+    const headings = normalizeOutlineHeadings(
+      ["S1", "S2", "S3", "S4", "S5", "Conclusion", "FAQ About Test", "FAQ About Test"],
+      2500,
+      "Test",
+      "test keyphrase",
+    );
+    expect(headings.some((heading) => /^conclusion$/i.test(heading))).toBe(false);
+    expect(headings.filter((heading) => /faq|frequently asked/i.test(heading))).toHaveLength(1);
+    expect(headings.at(-1)).toMatch(/faq|frequently asked/i);
+  });
+});
 
 // ── Introduction failure ──
 

@@ -85,6 +85,41 @@ export function robustJsonParse(raw: string, stage?: string): unknown {
   // Direct parse
   try { return JSON.parse(raw); } catch (e) { logParseError("direct", e, raw); }
 
+  // JSON-aware content-quote repair: character-by-character scanner that
+  // replaces unescaped ASCII " inside string values with Unicode curly quotes.
+  // A " is a closing delimiter if the next non-ws char is , } ] \n or :
+  // (keys end with `":` and values end with `",` `"}` `"]` `"\n`).
+  // Anything else means the " is a content quote (e.g. "for you" in text).
+  const quoteRepairedOutput = (() => {
+    const out: string[] = [];
+    let inString = false, escaped = false, expectRight = false;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+      if (escaped) { out.push(ch); escaped = false; continue; }
+      if (ch === '\\') { out.push(ch); escaped = true; continue; }
+      if (ch === '"') {
+        if (inString) {
+          const after = raw.substring(i + 1).replace(/^[\s]*/, "");
+          if (after.length === 0 || ",]}\n:".includes(after[0])) {
+            out.push(ch); inString = false;
+          } else {
+            // Content quote — alternate between left and right curly quotes
+            out.push(expectRight ? '\u201D' : '\u201C');
+            expectRight = !expectRight;
+          }
+        } else {
+          out.push(ch); inString = true;
+        }
+      } else {
+        out.push(ch);
+      }
+    }
+    return out.join('');
+  })();
+  try { return JSON.parse(quoteRepairedOutput); } catch (e) { logParseError("quoteRepaired", e, quoteRepairedOutput); }
+
+  // Extract from markdown code blocks
+
   // Extract from markdown code blocks
   const codeBlock = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (codeBlock) {

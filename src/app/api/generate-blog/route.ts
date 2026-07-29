@@ -8,8 +8,7 @@ import {
   aiLogRepository,
 } from "@/lib/repositories";
 import { runBlogGeneration, type GenerationResult } from "@/lib/services/blog-generation-service";
-import { countReadableWords } from "@/lib/services/text-utils";
-import { countLongParagraphs } from "@/lib/services/text-utils";
+import { countReadableWords } from "@/lib/seo/seo-text-utils";
 
 export async function POST(request: Request) {
   const startTime = Date.now();
@@ -85,10 +84,12 @@ export async function POST(request: Request) {
       console.error(`[generate-blog:POST] Readback FAILED: word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
       throw AppError.internal(`Post-save word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
     }
-    const longParaCount = countLongParagraphs(finalBlogHtml, 3);
-    if (longParaCount > 0) {
-      console.error(`[generate-blog:POST] Readback FAILED: ${longParaCount} paragraph(s) exceed 3 sentences`);
-      throw AppError.internal(`Post-save validation failed: ${longParaCount} paragraph(s) exceed 3 sentences`);
+    // Use the same metric as final validation for long-paragraph detection
+    const { analyzeFinalArticle } = await import("@/lib/blog/final-article-policy");
+    const postSaveMetrics = analyzeFinalArticle(finalBlogHtml, result.generated.title ?? "", result.generated.title ?? "", result.generated.metaDescription ?? "");
+    if (postSaveMetrics.longParagraphCount > 0) {
+      console.error(`[generate-blog:POST] Readback FAILED: ${postSaveMetrics.longParagraphCount} paragraph(s) exceed 3 sentences`);
+      throw AppError.internal(`Post-save validation failed: ${postSaveMetrics.longParagraphCount} paragraph(s) exceed 3 sentences`);
     }
 
     return NextResponse.json({

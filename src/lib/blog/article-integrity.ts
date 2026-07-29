@@ -63,6 +63,13 @@ function extractScriptBlocks(html: string): string[] {
   return blocks;
 }
 
+function isCtaBlock(html: string): boolean {
+  return /app\.b2ihub\.com\/signup/i.test(html)
+    || /\bcta\b/i.test(html)
+    || /call.to.action/i.test(html)
+    || /B2I Hub profile/i.test(html);
+}
+
 function extractLinkHrefs(html: string): string[] {
   const hrefs: string[] = [];
   // Exclude wp:html blocks
@@ -117,9 +124,7 @@ export function createArticleIntegrityBaseline(html: string): ArticleIntegrityBa
   const languageSwitcherBlocks = wpHtmlBlocks.filter((b) =>
     /b2i-language-switcher/i.test(b),
   );
-  const ctaBlocks = wpHtmlBlocks.filter((b) =>
-    /\bcta\b/i.test(b) || /call.to.action/i.test(b) || /B2I Hub profile/i.test(b),
-  );
+  const ctaBlocks = wpHtmlBlocks.filter(isCtaBlock);
   const faqSchemaBlocks = scriptBlocks.filter((b) =>
     /FAQPage/i.test(b),
   );
@@ -283,7 +288,7 @@ export function validateFinalArticleIntegrity(
   }
 
   // CTA
-  const ctaPresent = /\bcta\b/i.test(html) || /call.to.action/i.test(html) || /B2I Hub profile/i.test(html);
+  const ctaPresent = extractWpHtmlBlocks(html).some(isCtaBlock);
   const hadCtaBefore = baseline.ctaBlocks.length > 0;
   if (hadCtaBefore && !ctaPresent) {
     errors.push("CTA existed before normalization but is now missing");
