@@ -224,6 +224,7 @@ describe("pipeline: canonical state invariants", () => {
       state.title,
       state.metaDescription,
       state.requestedWordCount,
+      pipelineCount,
     );
     expect(pipelineCount).toBe(metrics.readableWordCount);
   });
@@ -1080,6 +1081,12 @@ describe("FAQ parity", () => {
         faqHtml,
         "faq-heading",
       )],
+      visibleFaq: [
+        { question: "What is the main benefit", answerHtml: "", answerText: "It helps you save time and money. The solution is proven to work effectively." },
+        { question: "How do I get started", answerHtml: "", answerText: "Simply sign up and follow setup. It takes less than five minutes." },
+        { question: "Is it suitable for small businesses", answerHtml: "", answerText: "Yes, it scales to any size. Many small teams use it daily." },
+        { question: "What support is available", answerHtml: "", answerText: "24/7 email and chat support. Phone support during business hours." },
+      ],
     });
 
     const visibleFaq = extractVisibleFaqFromArticle("", doc);
@@ -1120,6 +1127,9 @@ describe("FAQ parity", () => {
         ),
       ],
       conclusion: componentFromHtml("conc", "<!-- wp:paragraph --><p>This is the conclusion. Sign up now for access.</p><!-- /wp:paragraph -->"),
+      visibleFaq: [
+        { question: "What is it", answerHtml: "", answerText: "It works well for users. Very effective approach here." },
+      ],
     });
 
     const visibleFaq = extractVisibleFaqFromArticle("", doc);

@@ -1,6 +1,7 @@
 import { cleanBodyText, countWords } from "@/lib/services/text-utils";
 import { FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
 import { englishTitleRange, englishMetaRange, englishWordTolerance, englishKeyphraseDensity, computeKeyphraseTargets } from "@/lib/content-standards";
+import { analyzePublicationQuality } from "@/lib/blog/publication-quality";
 
 // ── Types ──
 
@@ -25,6 +26,8 @@ export interface QualityScore {
   structure: CategoryScore;
   formatting: CategoryScore;
   content: CategoryScore;
+  factual: CategoryScore;
+  editorial: CategoryScore;
 }
 
 export interface GenerationReport {
@@ -126,10 +129,11 @@ export function scoreArticle(
   faqCount: number,
   editorialH2Count?: number,
   slug?: string,
+  canonicalWordCount?: number,
 ): QualityScore {
   const isChinese = slug ? slug.endsWith("-zh") : false;
   const blogCleaned = cleanBodyText(blog);
-  const actualWordCount = countWords(blog);
+  const actualWordCount = canonicalWordCount ?? countWords(blog);
   const keywordLower = keyword.toLowerCase().trim();
   const fleshScore = isChinese ? 100 : Math.round(fleschOnText(blog));
   const avgSentLen = avgSentenceLength(blog);
@@ -266,14 +270,50 @@ export function scoreArticle(
   // ── Overall ──
   const total = seoScore + readabilityScore + structureScore + formattingScore + contentScore;
   const maxTotal = 30 + 20 + 20 + 15 + 15; // 100
+  const baseScore = Math.round((total / maxTotal) * 100);
+  const publication = analyzePublicationQuality(blog);
+  const factualDetails: ScoreDetail[] = [
+    {
+      label: "Factual consistency",
+      score: publication.factualScore,
+      max: 100,
+      status: publication.factualScore === 100 ? "pass" : "fail",
+      message: publication.claimConflictCount === 0
+        ? "✓ No article-wide factual contradictions detected"
+        : `✗ ${publication.claimConflictCount} article-wide factual contradiction(s) detected`,
+    },
+  ];
+  const editorialDetails: ScoreDetail[] = [
+    {
+      label: "Editorial publication quality",
+      score: publication.editorialScore,
+      max: 100,
+      status: publication.editorialScore >= 80 ? "pass" : "fail",
+      message: publication.editorialScore >= 80
+        ? "✓ Editorial publication threshold met"
+        : `✗ Editorial score ${publication.editorialScore}/100 is below 80`,
+    },
+  ];
+  const blendedScore = Math.round(
+    baseScore * 0.7
+    + publication.factualScore * 0.15
+    + publication.editorialScore * 0.15,
+  );
+  const hasCriticalPublicationFailure =
+    publication.claimConflictCount > 0
+    || publication.malformedProseCount > 0
+    || publication.conclusionNewNumericClaimCount > 0
+    || publication.conclusionWordRatio > 0.18;
 
   return {
-    overall: Math.round((total / maxTotal) * 100),
+    overall: hasCriticalPublicationFailure ? Math.min(79, blendedScore) : blendedScore,
     seo: { score: seoScore, max: 30, details: seoDetails },
     readability: { score: readabilityScore, max: 20, details: readabilityDetails },
     structure: { score: structureScore, max: 20, details: structureDetails },
     formatting: { score: formattingScore, max: 15, details: formattingDetails },
     content: { score: contentScore, max: 15, details: contentDetails },
+    factual: { score: publication.factualScore, max: 100, details: factualDetails },
+    editorial: { score: publication.editorialScore, max: 100, details: editorialDetails },
   };
 }
 
@@ -293,9 +333,20 @@ export function buildGenerationReport(
   warnings: string[],
   estimatedTokens: number,
   editorialH2Count?: number,
+  canonicalWordCount?: number,
 ): GenerationReport {
   return {
-    qualityScore: scoreArticle(blog, title, metaDescription, keyword, targetWordCount, faqCount, editorialH2Count),
+    qualityScore: scoreArticle(
+      blog,
+      title,
+      metaDescription,
+      keyword,
+      targetWordCount,
+      faqCount,
+      editorialH2Count,
+      undefined,
+      canonicalWordCount,
+    ),
     generationTimeMs,
     retryCount,
     jsonRepairs,
@@ -303,7 +354,7 @@ export function buildGenerationReport(
     warnings,
     estimatedTokens,
     targetWordCount,
-    actualWordCount: countWords(blog),
+    actualWordCount: canonicalWordCount ?? countWords(blog),
   };
 }
 
@@ -323,6 +374,8 @@ export function formatReport(report: GenerationReport): string {
     ["Structure", q.structure],
     ["Formatting", q.formatting],
     ["Content", q.content],
+    ["Factual Reliability", q.factual],
+    ["Editorial Quality", q.editorial],
   ];
 
   for (const [name, cat] of categories) {

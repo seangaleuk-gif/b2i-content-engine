@@ -3,20 +3,31 @@ import fs from "fs";
 import { createClient } from "@supabase/supabase-js";
 
 // ── Configuration ──
-const SUPABASE_URL = "https://jwpnlylwhioteyaydbnl.supabase.co";
-const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp3cG5seWx3aGlvdGV5YXlkYm5sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQxOTYzMDIsImV4cCI6MjA5OTc3MjMwMn0.IWdAnUGsEdeNokNUXFO79yXcUjEFTSa5gsuSa6f-BSw";
-const SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp3cG5seWx3aGlvdGV5YXlkYm5sIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NDE5NjMwMiwiZXhwIjoyMDk5NzcyMzAyfQ.mJKd_cKc74GZiFoI6TEB0Z0-4Ta6aL9kk8emXb9JaFQ";
-const ADMIN_USER_ID = "5f399e6e-3a7a-4823-aa80-b265d45eb9a8";
-const ADMIN_EMAIL = "admin@b2i.com";
-const API_BASE = "http://localhost:3000";
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const ADMIN_USER_ID = process.env.B2I_TEST_ADMIN_USER_ID;
+const ADMIN_EMAIL = process.env.B2I_TEST_ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.B2I_TEST_ADMIN_PASSWORD;
+const API_BASE = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 const TOPIC = process.argv[2] || "threads marketing hong kong";
+
+const missing = [
+  ["NEXT_PUBLIC_SUPABASE_URL", SUPABASE_URL],
+  ["NEXT_PUBLIC_SUPABASE_ANON_KEY", ANON_KEY],
+  ["B2I_TEST_ADMIN_USER_ID", ADMIN_USER_ID],
+  ["B2I_TEST_ADMIN_EMAIL", ADMIN_EMAIL],
+  ["B2I_TEST_ADMIN_PASSWORD", ADMIN_PASSWORD],
+].filter(([, value]) => !value).map(([name]) => name);
+if (missing.length > 0) {
+  throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+}
 
 const supabase = createClient(SUPABASE_URL, ANON_KEY);
 
 async function signIn() {
   const { data, error } = await supabase.auth.signInWithPassword({
     email: ADMIN_EMAIL,
-    password: "TestGeneration123!",
+    password: ADMIN_PASSWORD,
   });
   if (error) throw new Error(`Sign-in failed: ${error.message}`);
   return data.session.access_token;

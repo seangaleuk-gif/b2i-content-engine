@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { normalizeFinalSeo, isAlreadyNormalized, type FinalSeoNormalizerResult, tokenizeProtectedBlocks, detokenizeProtectedBlocks, type ProtectedBlockToken } from "@/lib/blog/final-seo-normalizer";
+import { normalizeFinalSeo, isAlreadyNormalized, type FinalSeoNormalizerResult, tokenizeProtectedBlocks, detokenizeProtectedBlocks, type ProtectedBlockToken, type SeoNormalizationMetrics } from "@/lib/blog/final-seo-normalizer";
 
 import { createArticleIntegrityBaseline, validateFinalArticleIntegrity, validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { extractFaqBlock, extractCtaFromConclusion, stripProtectedBlocksFromConclusion, countCtaHeadings, countSignupUrls, countFaqBlocks } from "@/lib/blog/protected-block-extractor";
@@ -1162,6 +1162,18 @@ describe("article-integrity", () => {
 describe("normalizer acceptance logic", () => {
   const keyphrase = "Hong Kong marketing trends 2026";
 
+  function minimalNormalizationMetrics(): SeoNormalizationMetrics {
+    return {
+      ...passingMetrics(5),
+      readableWordCount: 5,
+      exactKeyphraseCount: 1,
+      keyphraseDensity: 0,
+      exactKeyphraseInH2: true,
+      longParagraphCount: 0,
+      readingEase: 65,
+    };
+  }
+
   function simulateAcceptance(result: FinalSeoNormalizerResult): boolean {
     return (
       result.passed === true &&
@@ -1195,8 +1207,8 @@ describe("normalizer acceptance logic", () => {
     // This test verifies the acceptance function works
     const mockResult: FinalSeoNormalizerResult = {
       html: "<p>test</p>",
-      before: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
-      after: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
+      before: minimalNormalizationMetrics(),
+      after: minimalNormalizationMetrics(),
       changes: [],
       passed: true,
       warnings: [],
@@ -1216,8 +1228,8 @@ describe("normalizer acceptance logic", () => {
   it("changed link destinations triggers rejection", async () => {
     const mockResult: FinalSeoNormalizerResult = {
       html: "<p>test</p>",
-      before: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
-      after: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
+      before: minimalNormalizationMetrics(),
+      after: minimalNormalizationMetrics(),
       changes: [],
       passed: true,
       warnings: [],
@@ -1237,8 +1249,8 @@ describe("normalizer acceptance logic", () => {
   it("invalid WordPress blocks triggers rejection", async () => {
     const mockResult: FinalSeoNormalizerResult = {
       html: "<p>test</p>",
-      before: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
-      after: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
+      before: minimalNormalizationMetrics(),
+      after: minimalNormalizationMetrics(),
       changes: [],
       passed: true,
       warnings: [],
@@ -1258,8 +1270,8 @@ describe("normalizer acceptance logic", () => {
   it("missing FAQ schema triggers rejection when it existed before", async () => {
     const mockResult: FinalSeoNormalizerResult = {
       html: "<p>test</p>",
-      before: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
-      after: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
+      before: minimalNormalizationMetrics(),
+      after: minimalNormalizationMetrics(),
       changes: [],
       passed: true,
       warnings: [],
@@ -1279,8 +1291,8 @@ describe("normalizer acceptance logic", () => {
   it("missing language switcher triggers rejection", async () => {
     const mockResult: FinalSeoNormalizerResult = {
       html: "<p>test</p>",
-      before: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
-      after: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
+      before: minimalNormalizationMetrics(),
+      after: minimalNormalizationMetrics(),
       changes: [],
       passed: true,
       warnings: [],
@@ -1300,8 +1312,8 @@ describe("normalizer acceptance logic", () => {
   it("missing CTA triggers rejection", async () => {
     const mockResult: FinalSeoNormalizerResult = {
       html: "<p>test</p>",
-      before: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
-      after: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
+      before: minimalNormalizationMetrics(),
+      after: minimalNormalizationMetrics(),
       changes: [],
       passed: true,
       warnings: [],
@@ -1321,8 +1333,8 @@ describe("normalizer acceptance logic", () => {
   it("all safety fields true with passed=true is accepted", async () => {
     const mockResult: FinalSeoNormalizerResult = {
       html: "<p>test</p>",
-      before: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
-      after: { readableWordCount: 5, exactKeyphraseCount: 1, keyphraseDensity: 0, exactKeyphraseInH2: true, longParagraphCount: 0, readingEase: 65 },
+      before: minimalNormalizationMetrics(),
+      after: minimalNormalizationMetrics(),
       changes: [],
       passed: true,
       warnings: [],
@@ -3413,7 +3425,7 @@ describe("claim conflict detection", () => {
     ];
     const conflicts = detectClaimConflicts(sections, { claims: [] });
     expect(conflicts.length).toBeGreaterThan(0);
-    expect(conflicts[0].detail).toContain("different time periods");
+    expect(conflicts[0].detail).toContain("recommends");
     expect(conflicts[0].sectionIndexA).toBe(0);
     expect(conflicts[0].sectionIndexB).toBe(1);
   });
@@ -3427,13 +3439,13 @@ describe("claim conflict detection", () => {
     expect(conflicts.length).toBe(0);
   });
 
-  it("no conflict when non-overlapping ranges and same period", () => {
+  it("detects incompatible non-overlapping ranges in the same period", () => {
     const sections = [
       { index: 0, body: "1 to 2 posts per day." },
       { index: 1, body: "5 to 10 posts per day." },
     ];
     const conflicts = detectClaimConflicts(sections, { claims: [] });
-    expect(conflicts.length).toBe(0); // ranges don't overlap
+    expect(conflicts.length).toBeGreaterThan(0);
   });
 
   it("normalizes time ranges for comparison", () => {
@@ -3445,6 +3457,17 @@ describe("claim conflict detection", () => {
     // These have same times so no frequency conflict (no period difference in time ranges alone)
     // But they do contain the same normalized time — no conflict
     expect(conflicts.length).toBe(0);
+  });
+
+  it("detects contradictory Threads post-link capability claims", () => {
+    const sections = [
+      { index: 0, body: "Threads doesn't support clickable links in individual posts yet." },
+      { index: 4, body: "Threads now allows one link per post for campaign tracking." },
+    ];
+    const conflicts = detectClaimConflicts(sections, { claims: [] });
+    expect(
+      conflicts.some((conflict) => conflict.claimKey === "threads-post-link-capability"),
+    ).toBe(true);
   });
 });
 
@@ -4722,19 +4745,22 @@ describe("pipeline stage order and fallback", () => {
   it("required stages must be present in correct order", () => {
     const state = makeEmptyState();
     state.stageOutputs = [
+      { stage: "conclusion-discipline", inputFingerprint: "a", outputFingerprint: "a", accepted: true },
       { stage: "expansion", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
       { stage: "paragraphs", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
       { stage: "regeneration", inputFingerprint: "c", outputFingerprint: "d", accepted: true },
-      { stage: "external-links", inputFingerprint: "d", outputFingerprint: "e", accepted: true },
-      { stage: "internal-links", inputFingerprint: "e", outputFingerprint: "f", accepted: true },
-      { stage: "cta-preserve", inputFingerprint: "f", outputFingerprint: "f1", accepted: true },
+      { stage: "language-switcher", inputFingerprint: "d", outputFingerprint: "d1", accepted: true },
+      { stage: "internal-links", inputFingerprint: "d1", outputFingerprint: "e", accepted: true },
+      { stage: "external-links", inputFingerprint: "e", outputFingerprint: "f", accepted: true },
+      { stage: "seo-normalization", inputFingerprint: "f", outputFingerprint: "f1", accepted: true },
       { stage: "factual-scan", inputFingerprint: "f1", outputFingerprint: "f2", accepted: true },
       { stage: "link-enforce", inputFingerprint: "f2", outputFingerprint: "f3", accepted: true },
-      { stage: "seo-normalization", inputFingerprint: "f3", outputFingerprint: "g", accepted: true },
-      { stage: "faq-recovery", inputFingerprint: "g", outputFingerprint: "g1", accepted: true },
-      { stage: "paragraphs-final", inputFingerprint: "g1", outputFingerprint: "h", accepted: true },
-      { stage: "wc-check", inputFingerprint: "h", outputFingerprint: "h1", accepted: true },
-      { stage: "final-validation", inputFingerprint: "h1", outputFingerprint: "i", accepted: true },
+      { stage: "paragraphs-final", inputFingerprint: "f3", outputFingerprint: "g", accepted: true },
+      { stage: "cta-preserve", inputFingerprint: "g", outputFingerprint: "g1", accepted: true },
+      { stage: "final-trim", inputFingerprint: "g1", outputFingerprint: "h", accepted: true },
+      { stage: "faq-recovery", inputFingerprint: "h", outputFingerprint: "h1", accepted: true },
+      { stage: "wc-check", inputFingerprint: "h1", outputFingerprint: "h2", accepted: true },
+      { stage: "final-validation", inputFingerprint: "h2", outputFingerprint: "i", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
     expect(issues.length).toBe(0);
@@ -4763,7 +4789,8 @@ describe("pipeline stage order and fallback", () => {
   it("accepted output flows into next stage via fingerprint chain", () => {
     const state = makeEmptyState();
     state.blog = "v1";
-    recordStage(state, "expansion", true);
+    const firstFp = fingerprintHtml(state.blog);
+    recordStage(state, "expansion", firstFp, firstFp, true);
     const outputFp = state.stageOutputs[0].outputFingerprint;
 
     // Next stage should see the same fingerprint as previous stage's output
@@ -4793,7 +4820,12 @@ describe("pipeline stage order and fallback", () => {
 describe("pipeline stage 2 integration", () => {
   it("every post-assembly stage executes once in the required order", () => {
     const state = makeEmptyState();
-    const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "cta-preserve", "factual-scan", "link-enforce", "seo-normalization", "faq-recovery", "paragraphs-final", "wc-check", "final-validation"];
+    const required = [
+      "conclusion-discipline", "expansion", "paragraphs", "regeneration", "language-switcher",
+      "internal-links", "external-links", "seo-normalization", "factual-scan",
+      "link-enforce", "paragraphs-final", "cta-preserve", "final-trim",
+      "faq-recovery", "wc-check", "final-validation",
+    ];
     // All required stages present
     state.stageOutputs = required.map((s, i) => ({
       stage: s, inputFingerprint: `in${i}`, outputFingerprint: `out${i}`, accepted: true,
@@ -5111,21 +5143,23 @@ describe("pipeline stage skip recording and rollback", () => {
     const state = makeFullState();
     state.stageOutputs = [
       { stage: "claim-check", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { skipped: true, reason: "no-conflicts" } },
+      { stage: "conclusion-discipline", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { removedBlocks: 0 } },
       { stage: "expansion", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { skipped: true, reason: "already-in-range" } },
       { stage: "trim", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { skipped: true, reason: "already-in-range" } },
       { stage: "paragraphs", inputFingerprint: "a", outputFingerprint: "a", accepted: true },
       { stage: "regeneration", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
       { stage: "language-switcher", inputFingerprint: "b", outputFingerprint: "b", accepted: true },
-      { stage: "external-links", inputFingerprint: "b", outputFingerprint: "b", accepted: true },
-      { stage: "external-dedup", inputFingerprint: "b", outputFingerprint: "b", accepted: true },
       { stage: "internal-links", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
-      { stage: "cta-preserve", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "external-links", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "external-dedup", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "seo-normalization", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "factual-scan", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "link-enforce", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "seo-normalization", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "title-repair", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "faq-recovery", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "paragraphs-final", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "cta-preserve", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "final-trim", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "faq-recovery", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "wc-check", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
       { stage: "final-validation", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
     ];
@@ -5526,6 +5560,7 @@ describe("single validation path", () => {
   it("no component can independently override policy failure", () => {
     const policy = buildPolicy(2500, 2375, 2750);
     const failing: FinalArticleMetrics = {
+      ...passingMetrics(500),
       readableWordCount: 500, exactKeyphraseCount: 0, keyphraseDensity: 0,
       exactKeyphraseInH2: false, longParagraphCount: 5,
       keyphraseInFirst100Words: false, uniqueInternalLinkCount: 0,
@@ -5916,12 +5951,10 @@ function makeEmptyState(): PipelineState {
     retryCount: 0, componentRegenerations: 0, warnings: [], startTime: 0,
     normalizationResult: null, normalizationAccepted: false,
     qualityReport: null,
-    policy: { wordCountMin: 2375, wordCountMax: 2750, keyphraseCountMin: 8, keyphraseCountMax: 15,
-      titleMinLength: 40, titleMaxLength: 70, requireKeyphraseInFirst100Words: true,
-      maxSentencesPerParagraph: 3, internalLinkMin: 3, internalLinkMax: 5,
-      requireLanguageSwitcher: true, requireFaqSchema: false, requireCtaBlock: false },
+    policy: buildPolicy(2500, 2375, 2750),
     ctx: null, baseline: null, wordMin: 2375, wordMax: 2750,
     estimatedTokens: 0, systemPrompt: "", userMessage: "",
+    currentWordCount: 0, expansionAttempts: 0, trimAttempts: 0,
   };
 }
 

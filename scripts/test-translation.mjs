@@ -9,12 +9,16 @@ config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env.local")
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ADMIN_EMAIL = process.env.B2I_TEST_ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.B2I_TEST_ADMIN_PASSWORD;
 const API_BASE = process.env.API_BASE || "http://localhost:3000";
 const PROJECT_ID = parseInt(process.argv[2] || "16");
 
 if (!SUPABASE_URL) { console.error("FATAL: NEXT_PUBLIC_SUPABASE_URL not set"); process.exit(1); }
 if (!ANON_KEY) { console.error("FATAL: NEXT_PUBLIC_SUPABASE_ANON_KEY not set"); process.exit(1); }
 if (!SERVICE_KEY) { console.error("FATAL: SUPABASE_SERVICE_ROLE_KEY not set"); process.exit(1); }
+if (!ADMIN_EMAIL) { console.error("FATAL: B2I_TEST_ADMIN_EMAIL not set"); process.exit(1); }
+if (!ADMIN_PASSWORD) { console.error("FATAL: B2I_TEST_ADMIN_PASSWORD not set"); process.exit(1); }
 
 const adminHeaders = {
   "apikey": SERVICE_KEY,
@@ -36,7 +40,7 @@ async function signIn() {
   const resp = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
     method: "POST",
     headers: { "apikey": ANON_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ email: "admin@b2i.com", password: "TestGeneration123!" }),
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
   });
   const data = await resp.json();
   if (!resp.ok) throw new Error(`Sign-in failed: ${JSON.stringify(data)}`);

@@ -1,6 +1,11 @@
 import { countChineseCharacters, countLongParagraphs } from "./text-utils";
 import { FLESCH_MIN, FLESCH_MAX } from "./generation-constants";
-import { extractVisibleFaqFromArticle } from "../blog/article-document";
+import {
+  countCanonicalVisibleWords,
+  extractVisibleFaqFromArticle,
+  parseArticleDocumentFromHtml,
+  type ArticleDocument,
+} from "../blog/article-document";
 import { analyzeFinalArticle, buildPolicy, type FinalArticleMetrics, type FinalArticlePolicy } from "@/lib/blog/final-article-policy";
 import {
   englishTitleRange,
@@ -59,6 +64,17 @@ const CATEGORY_WEIGHTS: Record<string, number> = {
   "Images": 5,
 };
 
+const ENGLISH_CATEGORY_WEIGHTS: Record<string, number> = {
+  "SEO Fundamentals": 25,
+  "Content & Keyphrase": 15,
+  "Readability": 10,
+  "Links": 5,
+  "Structure & Schema": 10,
+  "Images": 5,
+  "Factual Reliability": 15,
+  "Editorial Quality": 15,
+};
+
 // ── Density-aware keyphrase scoring ──
 
 // Local helpers for runChineseAudit() — not shared with English audit
@@ -90,8 +106,42 @@ export function runAudit(input: AuditInput): AuditResult {
   const keywordLower = keyword?.toLowerCase().trim() ?? "";
   const h2Texts = (blog.match(/<h2[^>]*>([\s\S]*?)<\/h2>/gi) ?? []).map((h) => h.replace(/<[^>]+>/g, "").trim());
 
-  // Compute metrics using the canonical analyzer (same as final validation)
-  const m = analyzeFinalArticle(blog, keyword, title, metaDescription, targetWordCount);
+  // Reconstruct the canonical document from the saved production HTML, then
+  // pass its one article-level word count into the shared analyzer.
+  const seedDoc: ArticleDocument = {
+    metadata: {
+      title,
+      slug: "",
+      metaDescription,
+      excerpt: "",
+      targetWordCount,
+      focusKeyphrase: keyword,
+    },
+    languageSwitcher: null,
+    introduction: { id: "audit-introduction", blocks: [], status: "generated" },
+    sections: [],
+    visibleFaq: (faq ?? []).map((entry) => ({
+      question: entry.question,
+      answerHtml: "",
+      answerText: entry.answer,
+    })),
+    conclusion: { id: "audit-conclusion", blocks: [], status: "generated" },
+    cta: null,
+    faqSchema: null,
+    insertedLinks: [],
+  };
+  const parsed = parseArticleDocumentFromHtml(blog, seedDoc);
+  const canonicalWordCount = parsed.doc
+    ? countCanonicalVisibleWords(parsed.doc)
+    : undefined;
+  const m = analyzeFinalArticle(
+    blog,
+    keyword,
+    title,
+    metaDescription,
+    targetWordCount,
+    canonicalWordCount,
+  );
   const policy = buildPolicy(targetWordCount, undefined, undefined, keyword);
 
   const { min: titleMin, max: titleMax } = englishTitleRange();
@@ -303,6 +353,105 @@ export function runAudit(input: AuditInput): AuditResult {
     "Must be present",
     "Language switcher is " + (m.hasLanguageSwitcher ? "present." : "missing (hard failure)."), "Structure & Schema"));
 
+  // ── Factual reliability (15%) ──
+  const claimConflicts = m.claimConflictCount ?? 0;
+  const newConclusionNumbers = m.conclusionNewNumericClaimCount ?? 0;
+  const factualScore = m.factualScore ?? 100;
+  checks.push(makeCheck(
+    "claim_consistency",
+    "Article-wide Claim Consistency",
+    claimConflicts === 0 ? 100 : 0,
+    claimConflicts === 0 ? "pass" : "fail",
+    `${claimConflicts} contradiction${claimConflicts === 1 ? "" : "s"}`,
+    "0 contradictions",
+    claimConflicts === 0
+      ? "No incompatible audience, feature-availability or posting-frequency claims were detected."
+      : "The article makes mutually incompatible factual or prescriptive claims (hard failure).",
+    "Factual Reliability",
+  ));
+  checks.push(makeCheck(
+    "conclusion_new_facts",
+    "New Numeric Claims in Conclusion",
+    newConclusionNumbers === 0 ? 100 : 0,
+    newConclusionNumbers === 0 ? "pass" : "fail",
+    `${newConclusionNumbers} new`,
+    "0 new numeric claims",
+    newConclusionNumbers === 0
+      ? "The conclusion introduces no numeric claims absent from the main article."
+      : "The conclusion introduces new numeric claims instead of summarising established content (hard failure).",
+    "Factual Reliability",
+  ));
+  checks.push(makeCheck(
+    "factual_score",
+    "Factual Reliability Score",
+    factualScore,
+    factualScore === 100 ? "pass" : "fail",
+    `${factualScore}/100`,
+    "100/100",
+    factualScore === 100
+      ? "All deterministic factual-consistency checks passed."
+      : "One or more deterministic factual-consistency checks failed.",
+    "Factual Reliability",
+  ));
+
+  // ── Editorial quality (15%) ──
+  const malformedProse = m.malformedProseCount ?? 0;
+  const repeatedIdeas = m.repeatedIdeaPairCount ?? 0;
+  const conclusionRatio = m.conclusionWordRatio ?? 0;
+  const editorialScore = m.editorialScore ?? 100;
+  checks.push(makeCheck(
+    "malformed_prose",
+    "Malformed or Corrupt Prose",
+    malformedProse === 0 ? 100 : 0,
+    malformedProse === 0 ? "pass" : "fail",
+    `${malformedProse} issue${malformedProse === 1 ? "" : "s"}`,
+    "0 issues",
+    malformedProse === 0
+      ? "No broken fragments, corrupt tokens or unresolved placeholders were detected."
+      : "The article contains malformed or corrupt prose (hard failure).",
+    "Editorial Quality",
+  ));
+  checks.push(makeCheck(
+    "repeated_ideas",
+    "Repeated Ideas",
+    repeatedIdeas <= 3 ? 100 : repeatedIdeas <= 5 ? 60 : 0,
+    repeatedIdeas <= 3 ? "pass" : "warning",
+    `${repeatedIdeas} similar pair${repeatedIdeas === 1 ? "" : "s"}`,
+    "0–3 pairs",
+    repeatedIdeas <= 3
+      ? "Semantic-overlap checks found no excessive repetition."
+      : "Multiple paragraphs substantially repeat earlier ideas.",
+    "Editorial Quality",
+  ));
+  checks.push(makeCheck(
+    "conclusion_share",
+    "Conclusion Length",
+    conclusionRatio <= 0.15 ? 100 : conclusionRatio <= 0.18 ? 70 : 0,
+    conclusionRatio <= 0.15 ? "pass" : conclusionRatio <= 0.18 ? "warning" : "fail",
+    `${((m.conclusionWordRatio ?? 0) * 100).toFixed(1)}% of article`,
+    "≤18% (preferred ≤15%)",
+    conclusionRatio <= 0.18
+      ? "The conclusion remains proportionate to the article."
+      : "The conclusion is over-expanded and functions like another article section (hard failure).",
+    "Editorial Quality",
+  ));
+  checks.push(makeCheck(
+    "editorial_score",
+    "Editorial Quality Score",
+    editorialScore,
+    editorialScore >= 80
+      ? "pass"
+      : malformedProse > 0 || conclusionRatio > 0.18
+        ? "fail"
+        : "warning",
+    `${editorialScore}/100`,
+    "≥80/100",
+    editorialScore >= 80
+      ? "Deterministic prose, repetition and conclusion checks passed."
+      : "The article does not meet the minimum editorial publication threshold.",
+    "Editorial Quality",
+  ));
+
   // ── Images (5%) ──
 
   // 16. Image Alt Text
@@ -318,18 +467,13 @@ export function runAudit(input: AuditInput): AuditResult {
   }
 
   // ── Weighted scoring (N/A checks excluded from denominator) ──
-  const CATEGORY_WEIGHTS: Record<string, number> = {
-    "SEO Fundamentals": 35, "Content & Keyphrase": 25, "Readability": 15,
-    "Links": 10, "Structure & Schema": 10, "Images": 5,
-  };
-
   let weightedSum = 0;
   let applicableWeight = 0;
   const categoryScores = new Map<string, { sum: number; weight: number; count: number }>();
 
   for (const check of checks) {
     if (!categoryScores.has(check.category)) {
-      categoryScores.set(check.category, { sum: 0, weight: CATEGORY_WEIGHTS[check.category] ?? 10, count: 0 });
+      categoryScores.set(check.category, { sum: 0, weight: ENGLISH_CATEGORY_WEIGHTS[check.category] ?? 10, count: 0 });
     }
     const cs = categoryScores.get(check.category)!;
     if (check.status !== "not_applicable" && check.score !== null) {
@@ -339,7 +483,7 @@ export function runAudit(input: AuditInput): AuditResult {
   }
 
   for (const [cat, cs] of categoryScores) {
-    const catWeight = CATEGORY_WEIGHTS[cat] ?? 10;
+    const catWeight = ENGLISH_CATEGORY_WEIGHTS[cat] ?? 10;
     if (cs.count > 0) {
       const avg = cs.sum / cs.count;
       weightedSum += (avg / 100) * catWeight;
@@ -349,11 +493,23 @@ export function runAudit(input: AuditInput): AuditResult {
 
   const naCategories = [...categoryScores.entries()].filter(([_, cs]) => cs.count === 0);
   if (naCategories.length > 0 && applicableWeight > 0) {
-    const naWeight = naCategories.reduce((s, [cat]) => s + (CATEGORY_WEIGHTS[cat] ?? 10), 0);
+    const naWeight = naCategories.reduce((s, [cat]) => s + (ENGLISH_CATEGORY_WEIGHTS[cat] ?? 10), 0);
     weightedSum *= (1 + naWeight / applicableWeight);
   }
 
-  const overallScore = applicableWeight > 0 ? Math.round(weightedSum) : 0;
+  const weightedScore = applicableWeight > 0 ? Math.round(weightedSum) : 0;
+  const publishBlockingIds = new Set([
+    "word_count", "h2_count", "faq_count", "keyphrase_density",
+    "internal_links", "faq_schema", "cta_presence", "language_switcher",
+    "claim_consistency", "conclusion_new_facts", "factual_score",
+    "malformed_prose", "conclusion_share", "editorial_score",
+  ]);
+  const hasPublishBlockingFailure = checks.some(
+    (check) => check.status === "fail" && publishBlockingIds.has(check.id),
+  );
+  const overallScore = hasPublishBlockingFailure
+    ? Math.min(79, weightedScore)
+    : weightedScore;
 
   return {
     overallScore,

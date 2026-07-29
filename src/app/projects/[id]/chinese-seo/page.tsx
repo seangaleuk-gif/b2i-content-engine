@@ -37,8 +37,8 @@ interface AuditResult {
   overallScore: number;
   checks: SeoCheck[];
   summary: { passed: number; warnings: number; failed: number; notApplicable: number };
-  _auditedVersionId?: number;
-  _auditedVersionNumber?: number;
+  auditedVersionId: number;
+  auditedVersionNumber: number;
 }
 
 function ZhSeoSkeleton() {
@@ -89,7 +89,7 @@ export default function ChineseSEOPage() {
   const resolvedKeyword = (latestZh?.excerpt || project?.keyword || "").trim();
 
   // Determine whether the saved audit is outdated
-  const savedVersionId = liveAuditResult?._auditedVersionId || (savedChecks as any)?._versionId;
+  const savedVersionId = liveAuditResult?.auditedVersionId || (savedChecks as any)?._versionId;
   const auditedVersion = (blogVersions ?? []).find((v: any) => v.id === savedVersionId);
   const isOutdated = latestZh && auditedVersion && latestZh.id !== auditedVersion.id;
 
@@ -108,6 +108,7 @@ export default function ChineseSEOPage() {
         metaDescription: latestZh?.metaDescription || "",
         blog: latestZh?.blog,
         language: "zh",
+        versionNumber: latestZh?.versionNumber,
         _auditRunId: auditRunId,
       });
       setLiveAuditResult(result);
@@ -122,7 +123,7 @@ export default function ChineseSEOPage() {
   if (projectLoading || (loading && !liveAuditResult)) return <ZhSeoSkeleton />;
 
   const auditChecks = liveAuditResult?.checks ?? (savedChecks ?? []) as SeoCheck[];
-  const auditedVersionNumber = liveAuditResult?._auditedVersionNumber ?? (savedChecks as any)?._version;
+  const auditedVersionNumber = liveAuditResult?.auditedVersionNumber ?? (savedChecks as any)?._version;
   // Use server-provided overall score; fall back to simple average for saved checks only
   const overallScore = liveAuditResult?.overallScore ?? (auditChecks.length > 0
     ? Math.round(auditChecks.filter((c) => c.status !== "not_applicable").reduce((sum, c) => sum + (c.score ?? 0), 0) / Math.max(1, auditChecks.filter((c) => c.status !== "not_applicable").length))
@@ -147,7 +148,7 @@ export default function ChineseSEOPage() {
           <h1 className="text-[38px] font-bold text-text-primary tracking-tight">Chinese SEO Audit</h1>
           <p className="text-[14px] text-text-secondary mt-1">
             {liveAuditResult
-              ? `Audited v${(liveAuditResult as any)._auditedVersionNumber ?? "?"} (id: ${(liveAuditResult as any)._auditedVersionId ?? "?"})`
+              ? `Audited v${liveAuditResult.auditedVersionNumber} (id: ${liveAuditResult.auditedVersionId})`
               : latestZh
                 ? `Auditing v${latestZh.versionNumber} — ${latestZh.title}`
                 : "Traditional Chinese content optimization report"}

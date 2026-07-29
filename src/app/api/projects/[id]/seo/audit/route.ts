@@ -21,11 +21,23 @@ export async function POST(
 
     console.log(`[SEO-AUDIT:${auditRunId}:api-input] keywordLen=${(body.keyword || "").length} blogLen=${(body.blog || "").length} lang=${language}`);
 
-    // Find the latest version matching the requested language.
+    // Resolve the exact requested saved version when the UI is viewing
+    // historical content; otherwise use the latest version for the language.
     const versions = await blogVersionRepository.findByProject(Number(id));
-    const targetedVersion = isChinese
-      ? versions?.find((v: any) => v.slug?.endsWith("-zh"))
-      : versions?.find((v: any) => !v.slug?.endsWith("-zh"));
+    const requestedVersionNumber = Number(body.versionNumber);
+    const languageVersions = (versions ?? []).filter((version: any) =>
+      isChinese ? version.slug?.endsWith("-zh") : !version.slug?.endsWith("-zh"),
+    );
+    const targetedVersion = Number.isInteger(requestedVersionNumber) && requestedVersionNumber > 0
+      ? languageVersions.find((version: any) => version.version_number === requestedVersionNumber)
+      : languageVersions[0];
+    if (!targetedVersion) {
+      throw AppError.badRequest(
+        Number.isInteger(requestedVersionNumber) && requestedVersionNumber > 0
+          ? `Blog version ${requestedVersionNumber} was not found for language ${language}.`
+          : `No saved blog version was found for language ${language}.`,
+      );
+    }
 
     let pairedEnglishVersion: any = undefined;
     if (isChinese) {
@@ -138,10 +150,10 @@ export async function POST(
 
     return NextResponse.json({
       ...result,
-      _auditRunId: auditRunId,
-      _engineVersion: "keyphrase-fix-1",
-      _auditedVersionId: (targetedVersion as any)?.id,
-      _auditedVersionNumber: (targetedVersion as any)?.version_number,
+      auditRunId,
+      engineVersion: "editorial-safety-2",
+      auditedVersionId: (targetedVersion as any).id,
+      auditedVersionNumber: (targetedVersion as any).version_number,
     }, { status: 201 });
   } catch (error) {
     console.error("[seo:audit]", error);

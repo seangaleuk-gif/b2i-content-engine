@@ -28,6 +28,7 @@ import {
   englishWordTolerance,
   englishTitleRange,
 } from "@/lib/content-standards";
+import { analyzePublicationQuality } from "@/lib/blog/publication-quality";
 
 /** Legacy alias — prefer englishWordTolerance from content-standards. */
 export const computeWordCountTolerance = englishWordTolerance;
@@ -55,6 +56,14 @@ export interface FinalArticlePolicy {
   requiredFaqJsonLdCount: number;
   requiredWpBlockBalance: boolean;
   requiredFaqParity: boolean;
+  maxClaimConflicts: number;
+  maxMalformedProseIssues: number;
+  maxRepeatedIdeaPairs: number;
+  maxConclusionWordRatio: number;
+  maxConclusionNewNumericClaims: number;
+  minimumFactualScore: number;
+  minimumEditorialScore: number;
+  enforcePublicationQuality: boolean;
 }
 
 export function buildPolicy(
@@ -90,6 +99,14 @@ export function buildPolicy(
     requiredFaqJsonLdCount: 1,
     requiredWpBlockBalance: true,
     requiredFaqParity: true,
+    maxClaimConflicts: 0,
+    maxMalformedProseIssues: 0,
+    maxRepeatedIdeaPairs: 3,
+    maxConclusionWordRatio: 0.18,
+    maxConclusionNewNumericClaims: 0,
+    minimumFactualScore: 100,
+    minimumEditorialScore: 80,
+    enforcePublicationQuality: process.env.ENABLE_EDITORIAL_POLISH === "true",
   };
 }
 
@@ -123,6 +140,15 @@ export interface FinalArticleMetrics {
   duplicateFaqSchemaCount: number;
   duplicateCtaBlockCount: number;
   hasConclusionContent: boolean;
+  claimConflictCount?: number;
+  malformedProseCount?: number;
+  repeatedIdeaPairCount?: number;
+  roboticPhraseCount?: number;
+  conclusionWordCount?: number;
+  conclusionWordRatio?: number;
+  conclusionNewNumericClaimCount?: number;
+  factualScore?: number;
+  editorialScore?: number;
 }
 
 // ── Helpers ──
@@ -271,7 +297,9 @@ export function analyzeFinalArticle(
   title?: string,
   metaDescription?: string,
   targetWordCount?: number,
+  canonicalVisibleWordCount?: number,
 ): FinalArticleMetrics {
+  const readableWordCount = canonicalVisibleWordCount ?? countReadableWords(html);
   const readableText = extractReadableText(html);
   const paraTexts = extractParagraphTexts(html);
   const kpLower = keyphrase.toLowerCase().trim();
@@ -409,13 +437,14 @@ export function analyzeFinalArticle(
       .trim();
     hasConclusionContent = conclusionContent.length >= 3; // at least a short readable word
   }
+  const publication = analyzePublicationQuality(html);
 
   return {
-    readableWordCount: countReadableWords(html),
+    readableWordCount,
     h2Count,
     faqEntryCount,
     exactKeyphraseCount: countExactPhrase(readableText, keyphrase),
-    keyphraseDensity: computeKeyphraseDensity(countExactPhrase(readableText, keyphrase), keyphrase, countReadableWords(html)),
+    keyphraseDensity: computeKeyphraseDensity(countExactPhrase(readableText, keyphrase), keyphrase, readableWordCount),
     exactKeyphraseInH2: editorialH2s.some((h) => h.toLowerCase().includes(kpLower)),
     longParagraphCount: paraTexts.filter((t) => countSentences(t) > paragraphSentenceLimit()).length,
     keyphraseInFirst100Words: first100.includes(kpLower),
@@ -438,6 +467,7 @@ export function analyzeFinalArticle(
     duplicateFaqSchemaCount,
     duplicateCtaBlockCount,
     hasConclusionContent,
+    ...publication,
   };
 }
 
@@ -513,6 +543,21 @@ export function evaluatePolicy(
   const dupFaqSchemaHard = metrics.duplicateFaqSchemaCount === 0;
   const dupCtaHard = metrics.duplicateCtaBlockCount === 0;
   const conclusionHard = metrics.hasConclusionContent;
+  const claimConflicts = metrics.claimConflictCount ?? 0;
+  const malformedProse = metrics.malformedProseCount ?? 0;
+  const repeatedIdeas = metrics.repeatedIdeaPairCount ?? 0;
+  const conclusionRatio = metrics.conclusionWordRatio ?? 0;
+  const conclusionNewNumbers = metrics.conclusionNewNumericClaimCount ?? 0;
+  const factualScore = metrics.factualScore ?? 100;
+  const editorialScore = metrics.editorialScore ?? 100;
+  const publicationGate = policy.enforcePublicationQuality;
+  const claimsHard = !publicationGate || claimConflicts <= policy.maxClaimConflicts;
+  const malformedProseHard = !publicationGate || malformedProse <= policy.maxMalformedProseIssues;
+  const repeatedIdeasHard = !publicationGate || repeatedIdeas <= policy.maxRepeatedIdeaPairs;
+  const conclusionRatioHard = !publicationGate || conclusionRatio <= policy.maxConclusionWordRatio;
+  const conclusionNumbersHard = !publicationGate || conclusionNewNumbers <= policy.maxConclusionNewNumericClaims;
+  const factualScoreHard = !publicationGate || factualScore >= policy.minimumFactualScore;
+  const editorialScoreHard = !publicationGate || editorialScore >= policy.minimumEditorialScore;
 
   // ── Soft warnings (never block) ──
   const kpSoft = metrics.keyphraseDensity >= kpWarning;
@@ -542,17 +587,40 @@ export function evaluatePolicy(
   if (!dupFaqSchemaHard) reasons.push(`duplicate FAQ schemas=${metrics.duplicateFaqSchemaCount}`);
   if (!dupCtaHard) reasons.push(`duplicate CTA blocks=${metrics.duplicateCtaBlockCount}`);
   if (!conclusionHard) reasons.push("conclusion content missing");
+  if (!claimsHard) reasons.push(`factual contradictions=${claimConflicts}`);
+  if (!malformedProseHard) reasons.push(`malformed prose issues=${malformedProse}`);
+  if (!repeatedIdeasHard) reasons.push(`repeated idea pairs=${repeatedIdeas}`);
+  if (!conclusionRatioHard) {
+    reasons.push(`conclusion share=${(conclusionRatio * 100).toFixed(1)}% (max: ${(policy.maxConclusionWordRatio * 100).toFixed(0)}%)`);
+  }
+  if (!conclusionNumbersHard) reasons.push(`new numeric claims in conclusion=${conclusionNewNumbers}`);
+  if (!factualScoreHard) reasons.push(`factual score=${factualScore} (minimum: ${policy.minimumFactualScore})`);
+  if (!editorialScoreHard) reasons.push(`editorial score=${editorialScore} (minimum: ${policy.minimumEditorialScore})`);
 
   // Soft warning reasons
   if (!kpSoft) reasons.push(`[SOFT] kp density=${metrics.keyphraseDensity.toFixed(2)}% < ${kpWarning}%`);
   if (!h2KpOk) reasons.push("[SOFT] no H2 keyphrase");
   if (!first100Ok) reasons.push("[SOFT] keyphrase not in first 100 words");
   if (!titleOk) reasons.push(`[SOFT] title length=${metrics.titleLength} (range: ${policy.titleMinLength}-${policy.titleMaxLength})`);
+  if (!publicationGate && claimConflicts > policy.maxClaimConflicts) {
+    reasons.push(`[SOFT] factual contradictions=${claimConflicts} (editorial polish disabled)`);
+  }
+  if (!publicationGate && malformedProse > policy.maxMalformedProseIssues) {
+    reasons.push(`[SOFT] malformed prose issues=${malformedProse} (editorial polish disabled)`);
+  }
+  if (!publicationGate && repeatedIdeas > policy.maxRepeatedIdeaPairs) {
+    reasons.push(`[SOFT] repeated idea pairs=${repeatedIdeas} (editorial polish disabled)`);
+  }
+  if (!publicationGate && conclusionRatio > policy.maxConclusionWordRatio) {
+    reasons.push(`[SOFT] conclusion share=${(conclusionRatio * 100).toFixed(1)}% (editorial polish disabled)`);
+  }
 
   const passed = wcHard && h2Hard && faqEntryHard && paraHard && kpStuffHard
     && linksHard && ctaHard && signupHard && switcherHard
     && faqBlockHard && faqJsonHard && wpHard && nestedHard && headingsHard && faqParityHard
-    && placeholderHard && rawProseHard && dupFaqSchemaHard && dupCtaHard && conclusionHard;
+    && placeholderHard && rawProseHard && dupFaqSchemaHard && dupCtaHard && conclusionHard
+    && claimsHard && malformedProseHard && repeatedIdeasHard && conclusionRatioHard
+    && conclusionNumbersHard && factualScoreHard && editorialScoreHard;
 
   return { passed, reasons };
 }

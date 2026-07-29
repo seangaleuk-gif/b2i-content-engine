@@ -658,9 +658,12 @@ describe("parser inline-content duplication", () => {
     if (block.type !== "paragraph") throw new Error("expected paragraph");
     const types = block.content.map((n) => n.type);
     expect(types).toEqual(["text", "link", "text"]);
-    expect(block.content[0].text).toBe("Before");
+    expect(block.content[0].text).toBe("Before ");
     expect(block.content[1].text).toBe("Link");
-    expect(block.content[2].text).toBe("After");
+    expect(block.content[2].text).toBe(" After");
+    expect(renderEditorialBlocksToWordPress(parsed.blocks)).toContain(
+      'Before <a href="https://x.com">Link</a> After',
+    );
   });
 
   it("legitimate repeated text remains unchanged", () => {

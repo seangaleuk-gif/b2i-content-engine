@@ -691,26 +691,34 @@ export function parseWordPressEditorialBlocks(
 
 function parseInlineContent(html: string, errors: string[], warnings: string[], blockId: string): InlineContent[] {
   const content: InlineContent[] = [];
-  // Strip outermost <p>, <blockquote>, <h3> etc. tags and get inner
   const doc = parse5.parseFragment(html) as any;
-  walkNodes(doc, (node: any) => {
-    if (node.nodeName === "#text" && node.value && node.value.trim()) {
-      // Skip text nodes whose parent is a formatting or link element —
-      // those handlers already capture the text via extractText() and
-      // would otherwise create duplicate content nodes.
-      const parent = node.parentNode?.nodeName;
-      if (parent === "a" || parent === "strong" || parent === "b" || parent === "em" || parent === "i") return;
-      content.push({ type: "text", text: node.value.trim() });
-    } else if (node.nodeName === "strong" || node.nodeName === "b") {
-      const text = extractText(node);
-      if (text) content.push({ type: "strong", text });
-    } else if (node.nodeName === "em" || node.nodeName === "i") {
-      const text = extractText(node);
-      if (text) content.push({ type: "emphasis", text });
-    } else if (node.nodeName === "a") {
+
+  function appendNode(node: any): void {
+    if (node.nodeName === "#text") {
+      const text = String(node.value ?? "").replace(/\s+/g, " ");
+      if (text) content.push({ type: "text", text });
+      return;
+    }
+    if (node.nodeName === "#comment" || node.nodeName === "br") return;
+    if (node.nodeName === "script" || node.nodeName === "style" || node.nodeName === "iframe") {
+      errors.push(`${blockId}: executable element <${node.nodeName}> rejected`);
+      return;
+    }
+
+    if (node.nodeName === "strong" || node.nodeName === "b") {
+      const text = extractTextPreservingEdges(node);
+      if (text.trim()) content.push({ type: "strong", text });
+      return;
+    }
+    if (node.nodeName === "em" || node.nodeName === "i") {
+      const text = extractTextPreservingEdges(node);
+      if (text.trim()) content.push({ type: "emphasis", text });
+      return;
+    }
+    if (node.nodeName === "a") {
       const href = node.attrs?.find((a: any) => a.name === "href")?.value || "";
-      const text = extractText(node);
-      if (text && href) {
+      const text = extractTextPreservingEdges(node);
+      if (text.trim() && href) {
         if (/^(https?:\/\/|\/)/i.test(href)) {
           content.push({ type: "link", text, href });
         } else {
@@ -718,59 +726,48 @@ function parseInlineContent(html: string, errors: string[], warnings: string[], 
           content.push({ type: "text", text });
         }
       }
-    } else if (node.nodeName === "br") {
-      // silent ignore
-    } else if (node.nodeName === "#comment") {
-      // ignore
-    } else if (node.nodeName === "script" || node.nodeName === "style" || node.nodeName === "iframe") {
-      errors.push(`${blockId}: executable element <${node.nodeName}> rejected`);
+      return;
     }
-  });
+
+    for (const child of node.childNodes || []) appendNode(child);
+  }
+
+  for (const child of doc.childNodes || []) appendNode(child);
+
+  // Whitespace at the outside of a block is formatting noise. Interior spaces
+  // are significant and must survive HTML → blocks → HTML round trips.
+  if (content.length > 0) {
+    content[0].text = content[0].text.replace(/^\s+/, "");
+    content[content.length - 1].text = content[content.length - 1].text.replace(/\s+$/, "");
+  }
   return content;
 }
 
-function extractText(node: any): string {
+function extractTextPreservingEdges(node: any): string {
   let result = "";
   if (node.childNodes) {
     for (const child of node.childNodes) {
       if (child.nodeName === "#text") {
         result += child.value || "";
       } else if (child.childNodes) {
-        result += extractText(child);
+        result += extractTextPreservingEdges(child);
       }
     }
   }
-  return result.replace(/\s+/g, " ").trim();
-}
-
-function walkNodes(node: any, fn: (node: any) => void): void {
-  fn(node);
-  if (node.childNodes) {
-    for (const child of node.childNodes) {
-      walkNodes(child, fn);
-    }
-  }
+  return result.replace(/\s+/g, " ");
 }
 
 function parseListItems(html: string, errors: string[], warnings: string[], blockId: string): InlineContent[][] {
   const items: InlineContent[][] = [];
   const doc = parse5.parseFragment(html) as any;
-  for (const child of doc.childNodes || []) {
-    if (child.nodeName === "li" || child.nodeName === "ol" || child.nodeName === "ul") {
-      if (child.nodeName === "li") {
-        const content = parseInlineContent(serializeNode(child), errors, warnings, blockId);
-        if (content.length > 0) items.push(content);
-      }
-      // Handle nested list tags
-      if (child.childNodes) {
-        for (const sub of child.childNodes) {
-          if (sub.nodeName === "li") {
-            const content = parseInlineContent(serializeNode(sub), errors, warnings, blockId);
-            if (content.length > 0) items.push(content);
-          }
-        }
-      }
-    }
+  const listNode = findFirstNode(doc, (node) => node.nodeName === "ul" || node.nodeName === "ol");
+  const itemNodes = listNode
+    ? (listNode.childNodes || []).filter((node: any) => node.nodeName === "li")
+    : findAllNodes(doc, (node) => node.nodeName === "li");
+
+  for (const itemNode of itemNodes) {
+    const content = parseInlineContent(parse5.serializeOuter(itemNode), errors, warnings, blockId);
+    if (content.length > 0) items.push(content);
   }
   return items;
 }
@@ -779,51 +776,22 @@ function parseTable(html: string, errors: string[], warnings: string[], blockId:
   const headers: InlineContent[][] = [];
   const rows: InlineContent[][][] = [];
   const doc = parse5.parseFragment(html) as any;
-  let inHeader = false;
+  const tableNode = findFirstNode(doc, (node) => node.nodeName === "table");
+  if (!tableNode) return null;
 
-  for (const child of doc.childNodes || []) {
-    if (child.nodeName === "thead") {
-      inHeader = true;
-      for (const row of child.childNodes || []) {
-        if (row.nodeName === "tr") {
-          for (const cell of row.childNodes || []) {
-            if (cell.nodeName === "th") {
-              const content = parseInlineContent(serializeNode(cell), errors, warnings, blockId);
-              if (content.length > 0) headers.push(content);
-            }
-          }
-        }
-      }
-      inHeader = false;
-    } else if (child.nodeName === "tr") {
-      const rowCells: InlineContent[][] = [];
-      for (const cell of child.childNodes || []) {
-        if (cell.nodeName === "td" || cell.nodeName === "th") {
-          const content = parseInlineContent(serializeNode(cell), errors, warnings, blockId);
-          if (content.length > 0) rowCells.push(content);
-        }
-      }
-      if (rowCells.length > 0) rows.push(rowCells);
-    } else if (child.nodeName === "tbody" && child.childNodes) {
-      for (const row of child.childNodes) {
-        if (row.nodeName === "tr") {
-          const rowCells: InlineContent[][] = [];
-          for (const cell of row.childNodes || []) {
-            if (cell.nodeName === "td" || cell.nodeName === "th") {
-              const content = parseInlineContent(serializeNode(cell), errors, warnings, blockId);
-              if (content.length > 0) rowCells.push(content);
-            }
-          }
-          if (rowCells.length > 0) rows.push(rowCells);
-        }
-      }
-    } else if (child.nodeName === "table" && child.childNodes) {
-      // Recursively handle nested table
-      const nested = parseTable(serializeNode(child), errors, warnings, blockId);
-      if (nested) {
-        headers.push(...nested.headers);
-        rows.push(...nested.rows);
-      }
+  const rowNodes = findAllNodes(tableNode, (node) => node.nodeName === "tr");
+  for (const rowNode of rowNodes) {
+    const cellNodes = (rowNode.childNodes || []).filter(
+      (node: any) => node.nodeName === "th" || node.nodeName === "td",
+    );
+    if (cellNodes.length === 0) continue;
+    const parsedCells = cellNodes.map((cell: any) =>
+      parseInlineContent(parse5.serializeOuter(cell), errors, warnings, blockId),
+    );
+    if (cellNodes.every((cell: any) => cell.nodeName === "th") && headers.length === 0) {
+      headers.push(...parsedCells);
+    } else {
+      rows.push(parsedCells);
     }
   }
 
@@ -831,14 +799,20 @@ function parseTable(html: string, errors: string[], warnings: string[], blockId:
   return { headers: headers.length > 0 ? headers : rows[0]?.map(() => [{ type: "text" as const, text: "" }]), rows };
 }
 
-function serializeNode(node: any): string {
-  // Simple serialization: just return the inner HTML content
-  if (node.nodeName === "#text") return node.value || "";
-  let result = "";
-  if (node.childNodes) {
-    for (const child of node.childNodes) {
-      result += serializeNode(child);
-    }
+function findFirstNode(node: any, predicate: (node: any) => boolean): any | null {
+  if (predicate(node)) return node;
+  for (const child of node.childNodes || []) {
+    const found = findFirstNode(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findAllNodes(node: any, predicate: (node: any) => boolean): any[] {
+  const result: any[] = [];
+  if (predicate(node)) result.push(node);
+  for (const child of node.childNodes || []) {
+    result.push(...findAllNodes(child, predicate));
   }
   return result;
 }

@@ -18,6 +18,7 @@ Automated blog article generation for the B2I Hub platform.
 | Errors | `src/lib/services/errors.ts` | `AppError` + `toErrorResponse()` — single error model |
 | Blocks | `src/lib/services/text-utils.ts` | `rebalanceWpBlocks()` — stack-based validation |
 | Integrity | `src/lib/blog/article-integrity.ts` | Baselines, link extraction, block validation |
+| Editorial | `src/lib/pipeline/editorial-polish.ts` | Atomic AI-proposed block edits with deterministic commit/reject |
 
 ## Getting Started
 
@@ -27,9 +28,20 @@ bun run build
 bun test
 ```
 
+Enable the optional editorial transaction in the runtime environment:
+
+```bash
+ENABLE_EDITORIAL_POLISH=true
+```
+
+When the flag is absent or not exactly `true`, the stage is skipped and the
+existing generation path is unchanged. Never commit API keys, Supabase session
+tokens, or access-token files to the repository.
+
 ## Key rules
 
 - `ArticleDocument` is the single canonical article state
+- `countCanonicalVisibleWords(articleDoc)` is the single article-level word counter
 - `state.blog` is rendered only through `renderArticleDocument()`
 - Final validation uses only `analyzeFinalArticle()` and `evaluatePolicy()`
 - AI calls go through `AiService` only
@@ -60,7 +72,24 @@ bun test
 - `assertValidStageInput()` validates pre-stage HTML before every mutation
 - Protected blocks (wp:html, scripts, links, buttons, images, media) tokenized during SEO normalization
 
-- Build: 481 tests passing, 0 failing
+- Build: 1,294 tests passing, 0 failing
+
+### Editorial polish safety
+
+- Sends only editable paragraphs, list blocks and existing H3 blocks to the editor
+- Uses stable opaque block IDs; the model never returns a complete article
+- Applies every proposed edit to a cloned `ArticleDocument`
+- Rejects the entire proposal on one malformed, duplicate, unknown or protected edit
+- Protects H2 headings, FAQ, schema, CTA, switcher, metadata, block structure and URLs
+- Allows anchor wording changes only while preserving the exact `href` sequence
+- Locks sentences containing numbers, attributions or links against factual rewrites
+- Repairs missing inline-anchor spaces on structured inline nodes
+- Runs WordPress round-trip, word-count, SEO, repetition, prose and production validation
+- Commits the clone only when every guard passes; otherwise returns the original object unchanged
+
+The protected post-assembly order is:
+
+`language switcher → internal links → external links → SEO normalization → paragraph normalization → editorial polish (flagged) → CTA preservation → final trim → FAQ schema → final validation`
 
 ---
 
@@ -103,8 +132,9 @@ The rendered article must appear in this order:
 2. Introduction
 3. Main sections (including visible FAQ)
 4. Conclusion
-5. CTA (exactly one)
+5. Visible FAQ
 6. FAQPage JSON-LD
+7. CTA (exactly one)
 
 ### Enforced rules
 
@@ -121,7 +151,12 @@ The rendered article must appear in this order:
 | Internal links | Hard | 0–4 unique editorial destinations (wp:html, CTA, switcher excluded) |
 | Keyphrase density >3% | Hard | Weighted article-wide; `(occurrences × kpWords / totalWords) × 100` |
 | Keyphrase density <0.5% | Soft | Warning only |
-| Word count outside tolerance | Soft | Warning only; article saved as flagged draft if out of range |
+| Word count outside tolerance | Hard | Generation must finish within the configured tolerance before it is saved |
+| Cross-section factual contradictions | Hard when editorial polish is enabled | Conflicting audience sizes, publishing cadences and platform-feature availability are rejected |
+| Malformed or corrupt prose | Hard when editorial polish is enabled | Broken fragments, placeholders and known corrupt tokens block publication |
+| Conclusion share >18% | Hard when editorial polish is enabled | The conclusion must remain a concise synthesis rather than another article section |
+| New numeric claims in conclusion | Hard when editorial polish is enabled | Conclusions may only recap numeric facts already established in the main article |
+| Factual/editorial audit categories | Scored | Saved audits report separate factual reliability and editorial quality scores |
 | Long paragraphs | Soft | Below readability threshold |
 | Keyphrase in first 100 words | Soft | Quality target, not requirement |
 | Internal links below minimum | Soft | 0 minimum means no lower bound |
@@ -137,11 +172,13 @@ The rendered article must appear in this order:
 | FAQ boundary | Uses structured `ArticleDocument` section body — never scans into CTA or conclusion |
 | FAQ answer trim | Trailing CTA phrases (`Ready to`, `Create your`, `Start your`, `Create a free`) stripped from last answer |
 | Keyphrase heading | Only prepended when heading does not already contain the keyphrase |
-| Word count hard failure | Changed to soft warning per architecture |
+| Canonical word count | All article-level generation, validation and save/readback checks use `countCanonicalVisibleWords(articleDoc)` |
 | CTA preservation | Pipeline stage re-injects CTA if lost during regeneration |
 | Internal link deduplication | Insertion array checked before injecting the same URL twice |
 | Internal link maximum | `enforceInternalLinkLimit()` removes excess links, preserving anchor text |
-| Factual-risk scanner | `scanFactualRisks()` + `removeUnsupportedSentences()` — automated scanning and sentence removal |
+| Factual-risk scanner | Evidence ledger validates number magnitude, source scope and average/median qualifiers before safe sentence removal |
+| Publication-quality gate | Detects contradictions, repeated ideas, malformed prose, robotic phrasing and overgrown conclusions |
+| Audit version identity | Audit requests resolve one saved language version and return its exact version number and row ID |
 | Factuality instruction | Shared `FACTUALITY_INSTRUCTION` wired into all generation prompts |
 | Malformed JSON recovery | `extractMalformedJsonStringProperty()` handles unescaped quotes in `body`, `intro`, `conclusion` |
 | Doubled block prefixes | `rebalanceWpBlocks()` normalizes `wp:wp:paragraph` → `wp:paragraph` |

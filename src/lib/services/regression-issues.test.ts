@@ -226,7 +226,7 @@ describe("paired English FAQ fallback", () => {
   });
 
   it("falls back to canonical parser when saved field is empty", () => {
-    const savedFaq = null;
+    const savedFaq: unknown = null;
     const hasSaved = Array.isArray(savedFaq) && savedFaq.length > 0;
     expect(hasSaved).toBe(false);
     // When hasSaved is false, the route should parse the blog HTML
@@ -236,8 +236,8 @@ describe("paired English FAQ fallback", () => {
   });
 
   it("returns 0 when both saved field and blog are empty", () => {
-    const savedFaq = null;
-    const blogHtml = "";
+    const savedFaq: unknown = null;
+    const blogHtml: string = "";
     const count = Array.isArray(savedFaq) && savedFaq.length > 0
       ? savedFaq.length
       : blogHtml ? (blogHtml.match(/<strong\b/g) || []).length : 0;

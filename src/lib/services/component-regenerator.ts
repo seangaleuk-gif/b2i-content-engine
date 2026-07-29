@@ -331,9 +331,19 @@ export async function regenerateConclusion(
   ctx: GenContext,
   title: string,
   wordTarget: number,
+  articleSummary = "",
 ): Promise<string> {
   const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.conclusion);
-  const userMsg = `Rewrite the conclusion (target ${wordTarget} words). Include a CTA to create a B2I Hub profile. WordPress block format. Return as JSON: {"conclusion": "..."}.\n\nTitle: ${title}`;
+  const userMsg = `Rewrite the conclusion (target ${wordTarget} words).
+
+Summarize only ideas already established in the supplied article context.
+Do not introduce statistics, dates, platform features, posting frequencies, research, links, offers or new recommendations.
+Do not include a CTA, signup copy, FAQ content or a heading.
+Use concise WordPress paragraph blocks and return JSON: {"conclusion": "..."}.
+
+Title: ${title}
+Article context:
+${articleSummary.slice(0, 6000)}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],

@@ -17,7 +17,7 @@ import { runComponentRegeneration, regenerateIntroduction, regenerateSection, re
 import { buildGenerationReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry } from "@/lib/services/generation-telemetry";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
-import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords } from "@/lib/blog/article-document";
+import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
 import { sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
@@ -529,6 +529,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     keyphrase, requestedWordCount, 0,
     Date.now(), pipelineState.retryCount, 0, pipelineState.componentRegenerations,
     pipelineState.warnings, 0, articleDoc.sections.length,
+    countCanonicalVisibleWords(pipelineState.articleDoc ?? articleDoc),
   );
 
   return {

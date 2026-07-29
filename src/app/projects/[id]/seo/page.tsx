@@ -39,6 +39,8 @@ interface AuditResult {
   overallScore: number;
   checks: SeoCheck[];
   summary: { passed: number; warnings: number; failed: number };
+  auditedVersionId: number;
+  auditedVersionNumber: number;
 }
 
 function statusIcon(status: string) {
@@ -103,7 +105,7 @@ export default function SEOAuditPage() {
     : "";
 
   // Outdated detection: compare audited version ID with latest English version ID
-  const auditedVersionId = (liveAuditResult as any)?._auditedVersionId;
+  const auditedVersionId = liveAuditResult?.auditedVersionId;
   const isOutdated = latestEn && auditedVersionId && latestEn.id !== auditedVersionId;
 
   const handleRunAudit = useCallback(async () => {
@@ -118,10 +120,11 @@ export default function SEOAuditPage() {
       const auditRunId = crypto.randomUUID();
       console.log(`[SEO-AUDIT:${auditRunId}:client-request] keywordLen=${resolvedKeyword.length}`);
 
-      const result = await api.post<any>(`/api/projects/${projectId}/seo/audit`, {
+      const result = await api.post<AuditResult>(`/api/projects/${projectId}/seo/audit`, {
         keyword: resolvedKeyword,
         metaDescription: targetMeta || latestEn?.metaDescription || "",
         blog: targetBlog || undefined,
+        versionNumber: targetVersion ?? latestEn?.versionNumber,
         _auditRunId: auditRunId,
       });
 
@@ -140,7 +143,16 @@ export default function SEOAuditPage() {
     } finally {
       setAuditing(false);
     }
-  }, [projectId, refetch, latestEn?.metaDescription, targetMeta, targetBlog, resolvedKeyword]);
+  }, [
+    projectId,
+    refetch,
+    latestEn?.metaDescription,
+    latestEn?.versionNumber,
+    targetMeta,
+    targetBlog,
+    targetVersion,
+    resolvedKeyword,
+  ]);
 
   if (loading && !liveAuditResult) return <SeoSkeleton />;
 
@@ -181,7 +193,7 @@ export default function SEOAuditPage() {
           </h1>
           <p className="text-[14px] text-text-secondary mt-1">
             {liveAuditResult
-              ? `Audited v${(liveAuditResult as any)._auditedVersionNumber ?? "?"} (id: ${(liveAuditResult as any)._auditedVersionId ?? "?"})`
+              ? `Audited v${liveAuditResult.auditedVersionNumber} (id: ${liveAuditResult.auditedVersionId})`
               : targetVersion
                 ? `Auditing v${targetVersion} content`
                 : "Content optimization report"}

@@ -23,6 +23,8 @@
 # misc
 .DS_Store
 *.pem
+/access_token.txt
+*.token
 
 # debug
 npm-debug.log*

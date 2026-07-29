@@ -76,6 +76,47 @@ export interface ArticleDocument {
   insertedLinks: InsertedLink[];
 }
 
+function countVisibleTextWords(text: string): number {
+  const normalized = text
+    .replace(/&(?:[a-z]+|#\d+|#x[\da-f]+);/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized ? normalized.split(" ").length : 0;
+}
+
+/**
+ * The single article-level word counter for the generation pipeline.
+ *
+ * It counts only canonical, user-visible ArticleDocument content: editorial
+ * headings and blocks, the conclusion, and visible FAQ copy. Application-owned
+ * language-switcher, schema and CTA blocks are deliberately excluded.
+ */
+export function countCanonicalVisibleWords(doc: ArticleDocument): number {
+  const parts: string[] = [];
+
+  parts.push(extractPlainTextFromEditorialBlocks(doc.introduction.blocks));
+
+  for (const section of doc.sections) {
+    if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") {
+      continue;
+    }
+    parts.push(section.heading);
+    parts.push(extractPlainTextFromEditorialBlocks(section.blocks));
+  }
+
+  parts.push(extractPlainTextFromEditorialBlocks(doc.conclusion.blocks));
+
+  if (doc.visibleFaq.length > 0) {
+    const faqSection = doc.sections.find((section) => section.sectionType === "faq-heading");
+    if (faqSection) parts.push(faqSection.heading);
+    for (const entry of doc.visibleFaq) {
+      parts.push(entry.question, entry.answerText);
+    }
+  }
+
+  return countVisibleTextWords(parts.filter(Boolean).join(" "));
+}
+
 // ── Fingerprint helper ──
 
 function simpleHash(text: string): string {
@@ -357,18 +398,13 @@ export function extractVisibleFaqFromArticle(
 ): Array<{ question: string; answerText: string }> {
   const result: Array<{ question: string; answerText: string }> = [];
 
-  // Prefer structured ArticleDocument section boundary over HTML scanning.
-  // When doc is available, find the FAQ section by its heading text.
+  // Prefer the canonical protected FAQ entries. The FAQ heading section owns
+  // only the H2 marker; its body is intentionally empty.
   if (doc) {
-    const faqSection = doc.sections.find((s) =>
-      /faq|frequently.asked|common.question/i.test(s.heading),
-    );
-    if (faqSection) {
-      const faqHtml = sectionHtmlFromBlocksOrString(faqSection);
-      const extracted = extractFaqPairsFromSectionBody(faqHtml);
-      result.push(...extracted);
-      return result; // Structured boundary — never scans beyond the section body.
-    }
+    return doc.visibleFaq.map((entry) => ({
+      question: entry.question,
+      answerText: entry.answerText,
+    }));
   }
 
   // Find the FAQ section: look for H2 heading that reads "FAQ" / "Frequently Asked Questions"
@@ -408,6 +444,12 @@ export function extractVisibleFaqFromArticle(
     const openerIdx = beforeSignup.lastIndexOf("<!-- wp:html -->");
     if (openerIdx >= 0) effectiveEnd = Math.min(effectiveEnd, faqStart + openerIdx);
   }
+
+  // Legacy articles could render the conclusion after the visible FAQ. Bound
+  // the fallback parser at the explicit conclusion marker so conclusion prose
+  // can never leak into the final FAQ answer or its regenerated schema.
+  const conclusionIdx = html.indexOf(CONCLUSION_START_MARKER, faqStart);
+  if (conclusionIdx >= 0) effectiveEnd = Math.min(effectiveEnd, conclusionIdx);
 
   const faqSection = html.substring(faqStart, effectiveEnd);
 
@@ -711,17 +753,66 @@ function normalizeTimeRange(text: string): string | null {
 }
 
 /** Extract frequency claims from text (e.g., "3–5 posts per day"). */
-function extractFrequencyClaims(text: string): Array<{ range: NumericClaimValue; raw: string }> {
-  const results: Array<{ range: NumericClaimValue; raw: string }> = [];
-  const re = /(\d+)\s*(?:[–\-—]|to)\s*(\d+)\s+(\w[\w\s]*?)\s+(?:per|a|each)\s+(day|week|month)/gi;
+function extractFrequencyClaims(text: string): Array<{
+  range: NumericClaimValue;
+  raw: string;
+  weeklyMinimum: number;
+  weeklyMaximum: number;
+}> {
+  const results: Array<{
+    range: NumericClaimValue;
+    raw: string;
+    weeklyMinimum: number;
+    weeklyMaximum: number;
+  }> = [];
+  const normalizedText = text.replace(
+    /\b(one|two|three|four|five|six|seven|eight|nine|ten)\b/gi,
+    (word) => String(
+      ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+        .indexOf(word.toLowerCase()) + 1,
+    ),
+  );
+  const re =
+    /\b(?:post|publish|schedule|share|aim for|recommend(?:ed)?|create)?\s*(\d+)(?:\s*(?:[–\-—]|to)\s*(\d+))?\s+(posts?|threads?|times)\s+(?:per|a|each)?\s*(day|daily|week|weekly|month|monthly)\b/gi;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = re.exec(normalizedText)) !== null) {
+    const minimum = parseInt(m[1]);
+    const maximum = m[2] ? parseInt(m[2]) : minimum;
+    const rawPeriod = m[4].toLowerCase();
+    const period = rawPeriod.startsWith("day")
+      ? "day"
+      : rawPeriod.startsWith("week")
+        ? "week"
+        : "month";
+    const weeklyMultiplier = period === "day" ? 7 : period === "month" ? 7 / 30 : 1;
     results.push({
-      range: { minimum: parseInt(m[1]), maximum: parseInt(m[2]), period: m[4].toLowerCase() as "day" | "week" | "month" },
+      range: { minimum, maximum, period },
       raw: m[0],
+      weeklyMinimum: minimum * weeklyMultiplier,
+      weeklyMaximum: maximum * weeklyMultiplier,
     });
   }
   return results;
+}
+
+function plainSentences(body: string): string[] {
+  const text = body
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&(?:#39|apos);/gi, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.match(/[^.!?]+(?:[.!?]+|$)/g)?.map((sentence) => sentence.trim()).filter(Boolean) ?? [];
+}
+
+function parseScaledNumber(value: string, scale?: string): number {
+  const base = Number(value.replace(/,/g, ""));
+  if (scale?.toLowerCase().startsWith("b")) return base * 1_000_000_000;
+  if (scale?.toLowerCase().startsWith("m")) return base * 1_000_000;
+  if (scale?.toLowerCase().startsWith("k")) return base * 1_000;
+  return base;
 }
 
 /** Detect conflicts between claims extracted from different sections. */
@@ -737,21 +828,152 @@ export function detectClaimConflicts(
       const freqsJ = extractFrequencyClaims(sections[j].body);
       for (const fA of freqs) {
         for (const fB of freqsJ) {
-          if (fA.range.period && fB.range.period && fA.range.period !== fB.range.period) {
-            // Same or overlapping numeric range but different period → conflict
-            const overlap = !(fA.range.maximum < fB.range.minimum || fB.range.maximum < fA.range.minimum);
-            if (overlap) {
-              conflicts.push({
-                claimKey: "posting-frequency",
-                sectionIndexA: sections[i].index,
-                sectionIndexB: sections[j].index,
-                valueA: fA.raw,
-                valueB: fB.raw,
-                detail: `Section ${sections[i].index} says "${fA.raw}" but section ${sections[j].index} says "${fB.raw}" — different time periods`,
-              });
-            }
+          const weeklyOverlap = !(
+            fA.weeklyMaximum < fB.weeklyMinimum
+            || fB.weeklyMaximum < fA.weeklyMinimum
+          );
+          if (!weeklyOverlap) {
+            conflicts.push({
+              claimKey: "posting-frequency",
+              sectionIndexA: sections[i].index,
+              sectionIndexB: sections[j].index,
+              valueA: fA.raw,
+              valueB: fB.raw,
+              detail: `Section ${sections[i].index} recommends "${fA.raw}" but section ${sections[j].index} recommends "${fB.raw}"`,
+            });
           }
         }
+      }
+    }
+  }
+
+  // Detect contradictory platform-link capability claims, such as one section
+  // saying Threads has no clickable post links while another says each post
+  // allows a link. The later section is regenerated by the claim-check stage;
+  // code never chooses which claim is true.
+  const linkClaims = sections.flatMap((section) => {
+    const text = section.body
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ");
+    const sentences = text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [];
+    return sentences
+      .filter((sentence) => /\bthreads\b/i.test(sentence) && /\blinks?\b/i.test(sentence))
+      .map((sentence) => {
+        const negative =
+          /\b(?:does(?:n't| not)|do not|cannot|can't|no)\b[^.!?]{0,50}\b(?:support|allow|clickable|links?)\b/i.test(sentence)
+          || /\b(?:no clickable links?|links? (?:are|remain) unavailable)\b/i.test(sentence);
+        const positive =
+          /\b(?:allows?|supports?|offers?|includes?|has)\b[^.!?]{0,50}\b(?:clickable )?links?\b/i.test(sentence)
+          || /\bone link per post\b/i.test(sentence);
+        return {
+          sectionIndex: section.index,
+          sentence: sentence.trim(),
+          polarity: negative ? "negative" : positive ? "positive" : "unknown",
+        };
+      })
+      .filter((claim) => claim.polarity !== "unknown");
+  });
+  for (let left = 0; left < linkClaims.length; left++) {
+    for (let right = left + 1; right < linkClaims.length; right++) {
+      const first = linkClaims[left];
+      const second = linkClaims[right];
+      if (
+        first.sectionIndex !== second.sectionIndex
+        && first.polarity !== second.polarity
+      ) {
+        conflicts.push({
+          claimKey: "threads-post-link-capability",
+          sectionIndexA: first.sectionIndex,
+          sectionIndexB: second.sectionIndex,
+          valueA: first.sentence,
+          valueB: second.sentence,
+          detail: `Sections ${first.sectionIndex} and ${second.sectionIndex} make contradictory Threads post-link claims`,
+        });
+      }
+    }
+  }
+
+  // Detect incompatible audience-size claims made about Hong Kong Threads.
+  const audienceClaims = sections.flatMap((section) =>
+    plainSentences(section.body).flatMap((sentence) => {
+      if (!/\b(?:threads|hong kong)\b/i.test(section.body)) return [];
+      const match = sentence.match(
+        /\b(\d+(?:\.\d+)?(?:,\d{3})*)\s*(billion|million|thousand|bn|m|k)?\+?\s+(?:monthly active\s+)?users?\b/i,
+      );
+      if (!match) return [];
+      return [{
+        sectionIndex: section.index,
+        sentence,
+        value: parseScaledNumber(match[1], match[2]),
+      }];
+    }),
+  );
+  for (let left = 0; left < audienceClaims.length; left++) {
+    for (let right = left + 1; right < audienceClaims.length; right++) {
+      const first = audienceClaims[left];
+      const second = audienceClaims[right];
+      if (
+        first.sectionIndex !== second.sectionIndex
+        && first.value > 0
+        && second.value > 0
+        && first.value !== second.value
+      ) {
+        conflicts.push({
+          claimKey: "threads-hong-kong-audience-size",
+          sectionIndexA: first.sectionIndex,
+          sectionIndexB: second.sectionIndex,
+          valueA: first.sentence,
+          valueB: second.sentence,
+          detail: `Sections ${first.sectionIndex} and ${second.sectionIndex} give different Threads audience sizes`,
+        });
+      }
+    }
+  }
+
+  // Detect contradictory availability statements for major Threads features.
+  const featureNames = ["ads", "advertising", "polls", "messaging", "direct messages", "dms", "links", "search"];
+  const articleIsAboutThreads = sections.some((section) => /\bthreads\b/i.test(section.body));
+  const featureClaims = sections.flatMap((section) =>
+    plainSentences(section.body).flatMap((sentence) => {
+      if (
+        !articleIsAboutThreads
+        || (!/\bthreads\b/i.test(sentence) && !/\b(?:the|this) platform(?:'s|’s)?\b/i.test(sentence))
+      ) return [];
+      const feature = featureNames.find((name) =>
+        new RegExp(`\\b${name.replace(" ", "\\s+")}\\b`, "i").test(sentence),
+      );
+      if (!feature) return [];
+      const negative =
+        /\b(?:unavailable|not yet|still (?:waiting|coming)|coming soon|when .{0,30} become available|aren't yet|isn't yet|not fully available|does not support|doesn't support)\b/i.test(sentence);
+      const positive =
+        /\b(?:available|launched|rolled out|supports?|allows?|offers?|includes?|native|can (?:run|use|add|send))\b/i.test(sentence);
+      if (!negative && !positive) return [];
+      return [{
+        feature: feature === "advertising" ? "ads" : feature === "direct messages" || feature === "dms" ? "messaging" : feature,
+        polarity: negative ? "negative" : "positive",
+        sectionIndex: section.index,
+        sentence,
+      }];
+    }),
+  );
+  for (let left = 0; left < featureClaims.length; left++) {
+    for (let right = left + 1; right < featureClaims.length; right++) {
+      const first = featureClaims[left];
+      const second = featureClaims[right];
+      if (
+        first.sectionIndex !== second.sectionIndex
+        && first.feature === second.feature
+        && first.polarity !== second.polarity
+      ) {
+        conflicts.push({
+          claimKey: `threads-${first.feature}-availability`,
+          sectionIndexA: first.sectionIndex,
+          sectionIndexB: second.sectionIndex,
+          valueA: first.sentence,
+          valueB: second.sentence,
+          detail: `Sections ${first.sectionIndex} and ${second.sectionIndex} contradict each other about Threads ${first.feature}`,
+        });
       }
     }
   }
@@ -774,7 +996,18 @@ export function detectClaimConflicts(
     }
   }
 
-  return conflicts;
+  const unique = new Map<string, ClaimConflict>();
+  for (const conflict of conflicts) {
+    const key = [
+      conflict.claimKey,
+      Math.min(conflict.sectionIndexA, conflict.sectionIndexB),
+      Math.max(conflict.sectionIndexA, conflict.sectionIndexB),
+      conflict.valueA,
+      conflict.valueB,
+    ].join("|");
+    if (!unique.has(key)) unique.set(key, conflict);
+  }
+  return [...unique.values()];
 }
 
 // ── HTML parser: reconstruct ArticleDocument from rendered HTML ──

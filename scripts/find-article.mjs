@@ -1,8 +1,17 @@
 import { createClient } from "@supabase/supabase-js";
 
-const SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp3cG5seWx3aGlvdGV5YXlkYm5sIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NDE5NjMwMiwiZXhwIjoyMDk5NzcyMzAyfQ.mJKd_cKc74GZiFoI6TEB0Z0-4Ta6aL9kk8emXb9JaFQ";
-const SUPABASE_URL = "https://jwpnlylwhioteyaydbnl.supabase.co";
-const ADMIN = "5f399e6e-3a7a-4823-aa80-b265d45eb9a8";
+const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const ADMIN = process.env.B2I_TEST_ADMIN_USER_ID;
+
+const missing = [
+  ["SUPABASE_SERVICE_ROLE_KEY", SERVICE_KEY],
+  ["NEXT_PUBLIC_SUPABASE_URL", SUPABASE_URL],
+  ["B2I_TEST_ADMIN_USER_ID", ADMIN],
+].filter(([, value]) => !value).map(([name]) => name);
+if (missing.length > 0) {
+  throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+}
 
 const adminClient = createClient(SUPABASE_URL, SERVICE_KEY);
 

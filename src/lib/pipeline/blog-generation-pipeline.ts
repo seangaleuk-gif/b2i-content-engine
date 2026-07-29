@@ -7,7 +7,7 @@
 // No stage treats raw HTML as independently canonical.
 
 import type { ArticleDocument } from "@/lib/blog/article-document";
-import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, extractVisibleFaqFromArticle, renderComponentHtml, parseWordPressEditorialBlocks } from "@/lib/blog/article-document";
+import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, parseWordPressEditorialBlocks, countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import { type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { normalizeFinalSeo } from "@/lib/blog/final-seo-normalizer";
 import {
@@ -18,15 +18,16 @@ import {
 } from "@/lib/blog/article-integrity";
 import type { FinalArticlePolicy, FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
-import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags, countReadableWords, containsExactPhrase } from "@/lib/seo/seo-text-utils";
-import { MAX_SENTENCES_PER_PARAGRAPH } from "@/lib/services/generation-constants";
-import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
+import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags, countReadableWords, containsExactPhrase, countExactPhrase } from "@/lib/seo/seo-text-utils";
+import { computeKeyphraseDensity } from "@/lib/content-standards";
+import { GENERATION_WORD_BUFFER, MAX_SENTENCES_PER_PARAGRAPH, WORD_ALLOCATION } from "@/lib/services/generation-constants";
 import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, ensureLanguageSwitcher, pairedSlugs } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
 import { runEditorialPolish, isEditorialPolishEnabled } from "@/lib/pipeline/editorial-polish";
-import { runComponentRegeneration, regenerateSection } from "@/lib/services/component-regenerator";
+import { runComponentRegeneration, regenerateConclusion, regenerateSection } from "@/lib/services/component-regenerator";
 import { scanFactualRisks, removeUnsupportedSentences, formatClaimLog } from "@/lib/blog/factual-risk-scanner";
 import { enforceInternalLinkLimit } from "@/lib/blog/final-article-policy";
+import { trimConclusionToBudget } from "@/lib/blog/publication-quality";
 
 const CANONICAL_CTA_HTML = `<!-- wp:html -->
 <div style="background: #1E3A8A; color: #fff; padding: 32px 28px; border-radius: 12px; margin: 40px 0; text-align: center;">
@@ -137,33 +138,16 @@ export function shouldAcceptSeoNormalization(result: FinalSeoNormalizerResult): 
 
 /** Compute the exact readable word count used by final validation. */
 export function finalReadableWordCount(
-  state: Pick<PipelineState, "blog" | "keyphrase" | "title" | "metaDescription" | "requestedWordCount">,
+  state: Pick<PipelineState, "articleDoc">,
 ): number {
-  return analyzeFinalArticle(
-    state.blog,
-    state.keyphrase,
-    state.title,
-    state.metaDescription,
-    state.requestedWordCount,
-  ).readableWordCount;
+  return countCanonicalVisibleWords(state.articleDoc);
 }
 
-/** Prevent different word-count helpers from silently disagreeing at the final gate. */
+/** Return the only article-level word count used by the pipeline and final gate. */
 export function assertFinalWordCountParity(
-  state: Pick<PipelineState, "blog" | "keyphrase" | "title" | "metaDescription" | "requestedWordCount">,
+  state: Pick<PipelineState, "articleDoc">,
 ): number {
-  const policyWordCount = finalReadableWordCount(state);
-  const pipelineWordCount = countReadableWords(state.blog);
-  const delta = Math.abs(policyWordCount - pipelineWordCount);
-  // The legacy helper may differ by one or two words around punctuation or
-  // underscores. Material divergence indicates stale/duplicated HTML and fails.
-  const allowedDelta = Math.max(2, Math.ceil(policyWordCount * 0.002));
-  if (delta > allowedDelta) {
-    throw new Error(
-      `Final word-count divergence: pipeline=${pipelineWordCount} policy=${policyWordCount} delta=${delta}`,
-    );
-  }
-  return policyWordCount;
+  return finalReadableWordCount(state);
 }
 
 /** Render a canonical structured component to WordPress HTML. */
@@ -407,14 +391,38 @@ export function createPipelineState(params: {
 export function validatePipelineOrder(state: PipelineState): Array<{ code: string; message: string; stage: string }> {
   const issues: Array<{ code: string; message: string; stage: string }> = [];
   const stages = state.stageOutputs.map((s) => s.stage);
-  const required = ["expansion", "paragraphs", "regeneration", "external-links", "internal-links", "seo-normalization", "factual-scan", "link-enforce", "faq-recovery", "paragraphs-final", "cta-preserve", "wc-check", "final-validation"];
+  const required = [
+    "expansion", "paragraphs", "regeneration", "internal-links",
+    "external-links", "seo-normalization", "factual-scan", "link-enforce",
+    "paragraphs-final", "cta-preserve", "final-trim", "faq-recovery",
+    "wc-check", "final-validation",
+  ];
+  if (isEditorialPolishEnabled()) {
+    required.push("conclusion-discipline", "editorial-polish");
+  }
   for (const req of required) {
     if (!stages.includes(req)) issues.push({ code: "MISSING_STAGE", message: `Required stage "${req}" not found`, stage: req });
   }
-  const intIdx = stages.indexOf("internal-links");
-  const seoIdx = stages.indexOf("seo-normalization");
-  if (intIdx >= 0 && seoIdx >= 0 && intIdx > seoIdx) {
-    issues.push({ code: "STAGE_ORDER", message: "internal-links must run before seo-normalization", stage: "internal-links" });
+  const expectedOrder = [
+    "language-switcher", "internal-links", "external-links", "seo-normalization",
+    "paragraphs-final",
+    ...(isEditorialPolishEnabled() ? ["editorial-polish"] : []),
+    "cta-preserve", "final-trim", "faq-recovery", "wc-check", "final-validation",
+  ];
+  for (let left = 0; left < expectedOrder.length; left++) {
+    for (let right = left + 1; right < expectedOrder.length; right++) {
+      const earlier = expectedOrder[left];
+      const later = expectedOrder[right];
+      const earlierIndex = stages.indexOf(earlier);
+      const laterIndex = stages.indexOf(later);
+      if (earlierIndex >= 0 && laterIndex >= 0 && earlierIndex > laterIndex) {
+        issues.push({
+          code: "STAGE_ORDER",
+          message: `${earlier} must run before ${later}`,
+          stage: earlier,
+        });
+      }
+    }
   }
   return issues;
 }
@@ -430,6 +438,7 @@ export async function runPostAssemblyPipeline(
   state.stageOutputs.push({ stage: "assembly", inputFingerprint: fp(state.blog), outputFingerprint: fp(state.blog), accepted: true });
 
   state = await runClaimCheck(state, deps);
+  if (isEditorialPolishEnabled()) state = runConclusionDiscipline(state);
   state = await runExpansion(state, deps);
   state = await runTrim(state, deps);
 
@@ -447,6 +456,8 @@ export async function runPostAssemblyPipeline(
     return /b2i-language-switcher/i.test(html) ? html : lsHtml + "\n\n" + html;
   });
 
+  state = await runInternalLinks(state, deps);
+
   // External links: HTML-returning
   state = runTrackedHtmlStage(state, "external-links", (html) => {
     const researchItems = deps.context?.research || [];
@@ -459,7 +470,6 @@ export async function runPostAssemblyPipeline(
     return deduplicateEditorialExternalLinks(html).html;
   });
 
-  state = await runInternalLinks(state, deps);
   state = await runSeoNormalization(state, deps);
 
   // Title repair: non-HTML mutation (title only)
@@ -497,38 +507,61 @@ export async function runPostAssemblyPipeline(
     return html;
   });
 
-  // Paragraph normalization moved to after faq-recovery (after all stages
-  // that modify section bodies). See paragraphs-final stage below.
+  // The final paragraph normalization runs after factual cleanup and link
+  // enforcement, immediately before the structured editorial transaction.
 
   // Factual-risk scan and repair: HTML-returning
   state = runTrackedHtmlStage(state, "factual-scan", (html) => {
     const research = deps.context?.research || [];
-    const risk = scanFactualRisks(html, state.keyphrase, research);
-    console.log(`[factual-scan] ${formatClaimLog(risk.claims)}`);
-    
-    if (risk.hasHighRisk) {
-      const unsupported = risk.claims.filter((c: any) => !c.supported);
-      // Group unsupported claims by section index
-      const bySection = new Map<number, typeof unsupported>();
-      for (const c of unsupported) {
-        if (!bySection.has(c.sectionIndex)) bySection.set(c.sectionIndex, []);
-        bySection.get(c.sectionIndex)!.push(c);
+    const editableComponents: Array<{
+      label: string;
+      component: ArticleDocument["introduction"];
+    }> = [
+      { label: "introduction", component: state.articleDoc.introduction },
+      ...state.articleDoc.sections
+        .filter(
+          (section) =>
+            section.sectionType !== "faq-heading"
+            && section.sectionType !== "conclusion-heading"
+            && section.status !== "missing",
+        )
+        .map((section) => ({ label: section.id, component: section })),
+      { label: "conclusion", component: state.articleDoc.conclusion },
+    ];
+
+    let repaired = false;
+    for (const { label, component } of editableComponents) {
+      const componentHtmlBefore = componentHtml(component);
+      const risk = scanFactualRisks(componentHtmlBefore, state.keyphrase, research);
+      console.log(`[factual-scan:${label}] ${formatClaimLog(risk.claims)}`);
+      if (!risk.hasHighRisk) continue;
+
+      const unsupported = risk.claims.filter((claim) => !claim.supported);
+      const cleanup = removeUnsupportedSentences(componentHtmlBefore, unsupported);
+      if (cleanup.sentencesRemoved > 0 && !cleanup.html.trim()) {
+        throw new Error(
+          `Factual repair would empty protected component ${label}; generation rejected`,
+        );
       }
-      
-      // Attempt targeted repair for each affected section
-      for (const [sectionIdx, sectionClaims] of bySection) {
-        const section = state.articleDoc.sections[sectionIdx];
-        if (!section || section.status === "missing") continue;
-        
-        // Remove unsupported sentences from the section
-        const { html: cleanedHtml, sentencesRemoved } = removeUnsupportedSentences(componentHtml(section), sectionClaims);
-        if (sentencesRemoved > 0 && cleanedHtml.length > 50) {
-          console.log(`[factual-scan] section=${sectionIdx} removed ${sentencesRemoved} unsupported sentence(s)`);
-          replaceComponentHtml(state.articleDoc.sections[sectionIdx], cleanedHtml, "normalized");
-        }
+      if (cleanup.sentencesRemoved > 0) {
+        replaceComponentHtml(component, cleanup.html, "normalized");
+        repaired = true;
+        console.log(
+          `[factual-scan:${label}] removed ${cleanup.sentencesRemoved} complete unsupported sentence(s)`,
+        );
       }
-      syncBlogFromDocument(state);
+      const remaining = scanFactualRisks(
+        cleanup.html,
+        state.keyphrase,
+        research,
+      ).claims.filter((claim) => !claim.supported);
+      if (remaining.length > 0) {
+        throw new Error(
+          `Unsupported factual claim could not be removed safely from ${label}: ${remaining[0].text}`,
+        );
+      }
     }
+    if (repaired) syncBlogFromDocument(state);
     return state.blog;
   });
 
@@ -539,152 +572,8 @@ export async function runPostAssemblyPipeline(
     return result.html;
   });
 
-  // Deterministic final trim: HTML-returning
-  // Removes repetition, filler and redundant examples from editable sections
-  // while preserving headings, FAQ, conclusion, CTA, sourced claims, links, and protected blocks.
-  // Runs after all editorial link enforcement but BEFORE FAQ recovery (which adds schema).
-  state = runTrackedHtmlStage(state, "final-trim", (html) => {
-    const initialWordCount = countReadableWords(html);
-    if (initialWordCount <= state.wordMax) {
-      console.log(`[final-trim] skipped (wc=${initialWordCount} <= ${state.wordMax})`);
-      return html;
-    }
-
-    const excess = initialWordCount - state.wordMax;
-    let totalRemoved = 0;
-    let workingHtml = html;
-    const maxPasses = Math.min(8, Math.ceil(excess / 100) + 1);
-
-    for (let pass = 0; pass < maxPasses; pass++) {
-      const currentWordCount = countReadableWords(workingHtml);
-      if (currentWordCount <= state.wordMax) break;
-
-      const stillExcess = currentWordCount - state.wordMax;
-      const editableSections = state.articleDoc.sections.filter((section) => section.sectionType !== "faq-heading");
-      const targetPerPass = Math.max(30, Math.ceil(stillExcess / Math.max(1, editableSections.length)));
-      let passRemoved = 0;
-
-      for (let index = 0; index < state.articleDoc.sections.length; index++) {
-        if (passRemoved >= targetPerPass * 1.5) break;
-
-        const section = state.articleDoc.sections[index];
-        if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
-
-        const sectionHtml = componentHtml(section);
-        if (sectionHtml.length < 100) continue;
-
-        const sectionWordCount = countReadableWords(sectionHtml);
-        if (sectionWordCount < 80) continue;
-
-        const paragraphBlocks = sectionHtml.match(
-          /<!--\s*wp:paragraph\s*-->\s*\n?<p>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi,
-        );
-        if (!paragraphBlocks || paragraphBlocks.length <= 1) continue;
-
-        const lastParagraph = paragraphBlocks[paragraphBlocks.length - 1];
-        const lastParagraphWordCount = countReadableWords(lastParagraph);
-        if (lastParagraphWordCount < 10) continue;
-        if (/<a\b/i.test(lastParagraph) || /\d+\s*(?:%|percent|times)/i.test(lastParagraph)) continue;
-
-        const lastIndex = sectionHtml.lastIndexOf(lastParagraph);
-        if (lastIndex < 0) continue;
-
-        const trimmedHtml = (
-          sectionHtml.substring(0, lastIndex).trim()
-          + sectionHtml.substring(lastIndex + lastParagraph.length)
-        ).trim();
-        replaceComponentHtml(section, trimmedHtml, "trimmed");
-        totalRemoved += lastParagraphWordCount;
-        passRemoved += lastParagraphWordCount;
-        console.log(`[final-trim] pass=${pass} section=${index} removed ${lastParagraphWordCount} words`);
-      }
-
-      if (passRemoved === 0) break;
-
-      // Commit each pass before measuring the next one. Measuring stale state.blog
-      // caused every pass to believe the original excess still existed and over-trim.
-      syncBlogFromDocument(state);
-      workingHtml = state.blog;
-    }
-
-    if (totalRemoved > 0) {
-      const finalWordCount = countReadableWords(workingHtml);
-      console.log(`[final-trim] total removed=${totalRemoved} final wc=${finalWordCount} target=${state.wordMax}`);
-    } else {
-      console.log(`[final-trim] no paragraphs removed — excess=${excess}`);
-    }
-
-    return workingHtml;
-  });
-
-  // FAQ recovery: HTML-returning.
-  // After all content-changing stages, extracts visible FAQ and ensures
-  // the FAQPage JSON-LD schema matches. Rebuilds if missing or parity mismatched.
-  state = runTrackedHtmlStage(state, "faq-recovery", (html) => {
-    const existingFaqBlock = extractFaqBlock(html);
-
-    // Extract visible FAQ using the SAME HTML-scanning method that analyzeFinalArticle uses.
-    // Passing no doc parameter ensures the FAQ count here matches what final-validation will compute.
-    const visibleFaq = extractVisibleFaqFromArticle(html);
-
-    // Check parity even when schema already exists — paragraph splitting,
-    // trimming, or factual-scan may have changed visible FAQ structure.
-    if (existingFaqBlock && visibleFaq.length > 0) {
-      const schemaQuestionCount = (existingFaqBlock.match(/"name"\s*:\s*"/gi) ?? []).length;
-      if (schemaQuestionCount === visibleFaq.length) {
-        console.log(`[faq-recovery] FAQ parity valid (${visibleFaq.length} visible = ${schemaQuestionCount} schema) — skipping`);
-        return html;
-      }
-      // Parity mismatch — rebuild schema from final visible FAQ.
-      console.log(`[faq-recovery] FAQ parity mismatch: ${visibleFaq.length} visible vs ${schemaQuestionCount} schema — rebuilding`);
-    } else if (existingFaqBlock && visibleFaq.length === 0) {
-      console.log(`[faq-recovery] Schema exists but no visible FAQ — keeping existing schema`);
-      return html;
-    } else if (!existingFaqBlock) {
-      console.log(`[faq-recovery] No existing FAQ schema found`);
-    }
-
-    if (visibleFaq.length === 0) {
-      console.log(`[faq-recovery] No visible FAQ found — skipping`);
-      return html;
-    }
-
-    // Build FAQPage JSON-LD from visible FAQ pairs.
-    console.log(`[faq-recovery] Rebuilding FAQ schema from ${visibleFaq.length} visible entries`);
-    const rebuilt = renderFaqSchema(visibleFaq.map((p: any) => ({ question: p.question, answerHtml: "", answerText: p.answerText })));
-
-    // Remove any existing FAQ schema block (stale/wrong-parity) before inserting the new one.
-    let targetHtml = html;
-    if (existingFaqBlock) {
-      targetHtml = targetHtml.replace(existingFaqBlock, "");
-    }
-
-    // Insert before the CTA block (last wp:html block containing signup URL).
-    const signupIdx = targetHtml.lastIndexOf("app.b2ihub.com/signup");
-    let insertAt = targetHtml.length;
-    if (signupIdx >= 0) {
-      // Find the nearest <!-- wp:html --> opener before the signup URL
-      const beforeSignup = targetHtml.substring(0, signupIdx);
-      const wpHtmlOpeners = beforeSignup.match(/<!--\s*wp:html\s*-->/g);
-      if (wpHtmlOpeners && wpHtmlOpeners.length > 0) {
-        const lastOpener = beforeSignup.lastIndexOf(wpHtmlOpeners[wpHtmlOpeners.length - 1]);
-        if (lastOpener >= 0) insertAt = lastOpener;
-      }
-    } else {
-      // Fallback: insert before the last wp:html block if no signup URL found
-      const wpHtmlIdx = targetHtml.lastIndexOf("<!-- /wp:html -->");
-      if (wpHtmlIdx >= 0) {
-        const openerAt = targetHtml.lastIndexOf("<!-- wp:html -->", wpHtmlIdx);
-        if (openerAt >= 0) insertAt = openerAt;
-      }
-    }
-
-    return targetHtml.substring(0, insertAt) + rebuilt + "\n\n" + targetHtml.substring(insertAt);
-  });
-
-  // Paragraph normalization — LAST content-changing stage before CTA and validation.
-  // Runs after factorial-scan, final-trim, and faq-recovery so no later
-  // syncBlogFromDocument() can rejoin split paragraphs.
+  // Paragraph normalization immediately precedes editorial polish so the AI
+  // receives the final paragraph boundaries it is allowed to edit.
   state = runTrackedHtmlStage(state, "paragraphs-final", (html) => {
     const result = normalizeParagraphs(html, MAX_SENTENCES_PER_PARAGRAPH);
     return result.html;
@@ -692,14 +581,65 @@ export async function runPostAssemblyPipeline(
 
   // Editorial polish: improves coherence, flow and natural language without
   // damaging structure, links, SEO, FAQ, CTA or schema. Runs after links are
-  // inserted and paragraphs are normalized but BEFORE CTA preservation so
-  // canonical CTA can be restored if the editor accidentally damages it.
+  // inserted and paragraphs are normalized. It proposes structured edits only;
+  // validation decides whether the cloned candidate is committed atomically.
   if (isEditorialPolishEnabled()) {
+    const inputFingerprint = fp(state.blog);
     const editorCtx = { chatWithRetry: deps.chatWithRetry };
     const epResult = await runEditorialPolish(
       state.articleDoc,
       state.keyphrase,
       async (messages, options) => editorCtx.chatWithRetry(messages, options, "editorial-polish"),
+      {
+        validateProductionCandidate(candidate) {
+          // Stage-aware evaluation: do NOT require CTA headings, signup URLs,
+          // or FAQ schema — these are inserted by cta-preserve and faq-recovery
+          // AFTER editorial-polish completes. Reject only on editorial defects.
+          const candidateHtml = renderArticleDocument(candidate);
+          const visibleWords = countCanonicalVisibleWords(candidate);
+          const research = deps.context?.research || [];
+
+          // H2 count
+          const h2Texts = extractH2Texts(candidateHtml);
+          const h2Count = h2Texts.length;
+          const editorialH2s = h2Texts.filter(
+            (h) => !/faq|frequently.asked|常見問題/i.test(h)
+          ).length;
+
+          // Keyphrase density on visible text only
+          const readable = extractReadableText ? extractReadableText(candidateHtml) : candidateHtml.replace(/<[^>]+>/g, " ");
+          const kpCount = countExactPhrase(readable, state.keyphrase);
+          const kpDensity = computeKeyphraseDensity(kpCount, state.keyphrase, visibleWords);
+
+          const reasons: string[] = [];
+          if (editorialH2s < state.policy.h2Min || editorialH2s > state.policy.h2Max) {
+            reasons.push(`H2 count ${editorialH2s} outside range ${state.policy.h2Min}-${state.policy.h2Max}`);
+          }
+          if (kpDensity > 3) {
+            reasons.push(`keyphrase density ${kpDensity.toFixed(1)}% > 3%`);
+          }
+          if (visibleWords > state.policy.wordCountMax) {
+            reasons.push(`word count ${visibleWords} exceeds max ${state.policy.wordCountMax}`);
+          }
+
+          // New unsupported factual claims
+          const existingUnsupported = new Set(
+            scanFactualRisks(state.blog, state.keyphrase, research).claims
+              .filter((claim) => !claim.supported)
+              .map((claim) => claim.text.replace(/\s+/g, " ").trim().toLowerCase()),
+          );
+          const newUnsupported = scanFactualRisks(candidateHtml, state.keyphrase, research).claims.filter(
+            (claim) =>
+              !claim.supported
+              && !existingUnsupported.has(claim.text.replace(/\s+/g, " ").trim().toLowerCase()),
+          );
+          for (const claim of newUnsupported) {
+            reasons.push(`new unsupported ${claim.category}: ${claim.text}`);
+          }
+
+          return { passed: reasons.length === 0, reasons };
+        },
+      },
     );
     if (epResult.result.accepted) {
       console.log(
@@ -712,9 +652,19 @@ export async function runPostAssemblyPipeline(
     } else {
       console.log(`[editorial-polish] rejected: ${epResult.result.reason}`);
     }
+    recordStage(
+      state,
+      "editorial-polish",
+      inputFingerprint,
+      fp(state.blog),
+      epResult.result.accepted,
+      epResult.result.accepted ? undefined : "pre-stage-restore",
+      { ...epResult.result },
+    );
   }
 
-  // CTA preservation: runs after ALL content-changing stages and FAQ recovery.
+  // CTA preservation: the editor cannot target the CTA, and this deterministic
+  // stage still verifies that exactly one canonical signup CTA remains.
   // Ensures exactly one CTA block with one CTA heading and one signup URL.
   // If the CTA is missing or damaged, sets it on the canonical ArticleDocument
   // and re-renders — avoiding fragile HTML string surgery that can break WP blocks.
@@ -739,9 +689,113 @@ export async function runPostAssemblyPipeline(
     return state.blog;
   });
 
-  // Post-CTA word-count parity check. CTA, visible FAQ cards and JSON-LD are
-  // application-owned wp:html blocks and therefore do not count as editorial
-  // body words. Use the exact final-policy metric and fail on helper divergence.
+  // Deterministic final trim. This can only remove complete, unlinked paragraph
+  // blocks from editable H2 sections; it never slices prose or touches protected
+  // blocks. All article-level measurements use the canonical document counter.
+  state = runTrackedHtmlStage(state, "final-trim", (html) => {
+    const initialWordCount = countCanonicalVisibleWords(state.articleDoc);
+    if (initialWordCount <= state.wordMax) {
+      console.log(`[final-trim] skipped (wc=${initialWordCount} <= ${state.wordMax})`);
+      return html;
+    }
+
+    const excess = initialWordCount - state.wordMax;
+    let totalRemoved = 0;
+    const maxPasses = Math.min(8, Math.ceil(excess / 100) + 1);
+
+    for (let pass = 0; pass < maxPasses; pass++) {
+      const currentWordCount = countCanonicalVisibleWords(state.articleDoc);
+      if (currentWordCount <= state.wordMax) break;
+
+      const stillExcess = currentWordCount - state.wordMax;
+      const editableSections = state.articleDoc.sections.filter(
+        (section) => section.sectionType !== "faq-heading"
+          && section.sectionType !== "conclusion-heading",
+      );
+      const targetPerPass = Math.max(
+        30,
+        Math.ceil(stillExcess / Math.max(1, editableSections.length)),
+      );
+      let passRemoved = 0;
+
+      for (let index = 0; index < state.articleDoc.sections.length; index++) {
+        if (passRemoved >= targetPerPass * 1.5) break;
+
+        const section = state.articleDoc.sections[index];
+        if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") {
+          continue;
+        }
+
+        const sectionHtml = componentHtml(section);
+        if (sectionHtml.length < 100) continue;
+        const sectionWordCount = countReadableWords(sectionHtml);
+        if (sectionWordCount < 80) continue;
+
+        const paragraphBlocks = sectionHtml.match(
+          /<!--\s*wp:paragraph\s*-->\s*\n?<p>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi,
+        );
+        if (!paragraphBlocks || paragraphBlocks.length <= 1) continue;
+
+        const lastParagraph = paragraphBlocks[paragraphBlocks.length - 1];
+        const lastParagraphWordCount = countReadableWords(lastParagraph);
+        if (lastParagraphWordCount < 10) continue;
+        if (/<a\b/i.test(lastParagraph) || /\d+\s*(?:%|percent|times)/i.test(lastParagraph)) {
+          continue;
+        }
+
+        const lastIndex = sectionHtml.lastIndexOf(lastParagraph);
+        if (lastIndex < 0) continue;
+        const trimmedHtml = (
+          sectionHtml.substring(0, lastIndex).trim()
+          + sectionHtml.substring(lastIndex + lastParagraph.length)
+        ).trim();
+        replaceComponentHtml(section, trimmedHtml, "trimmed");
+        totalRemoved += lastParagraphWordCount;
+        passRemoved += lastParagraphWordCount;
+        console.log(
+          `[final-trim] pass=${pass} section=${index} removed ${lastParagraphWordCount} words`,
+        );
+      }
+
+      if (passRemoved === 0) break;
+      syncBlogFromDocument(state);
+    }
+
+    const finalWordCount = countCanonicalVisibleWords(state.articleDoc);
+    if (totalRemoved > 0) {
+      console.log(
+        `[final-trim] total removed=${totalRemoved} final wc=${finalWordCount} target=${state.wordMax}`,
+      );
+    } else {
+      console.log(`[final-trim] no safe paragraphs removed — excess=${excess}`);
+    }
+    return state.blog;
+  });
+
+  // FAQ schema is application-owned. Always regenerate it from canonical,
+  // protected visible FAQ entries after every content-changing stage.
+  state = runTrackedHtmlStage(state, "faq-recovery", () => {
+    if (state.articleDoc.visibleFaq.length === 0) {
+      state.articleDoc.faqSchema = null;
+      syncBlogFromDocument(state);
+      return state.blog;
+    }
+    const schemaHtml = renderFaqSchema(state.articleDoc.visibleFaq);
+    state.articleDoc.faqSchema = {
+      id: "faq-schema",
+      type: "faq-schema",
+      html: schemaHtml,
+      fingerprint: fingerprintHtml(schemaHtml),
+    };
+    syncBlogFromDocument(state);
+    console.log(
+      `[faq-recovery] regenerated schema from ${state.articleDoc.visibleFaq.length} protected FAQ entries`,
+    );
+    return state.blog;
+  });
+
+  // CTA, language switcher and JSON-LD are application-owned and excluded by
+  // the canonical word counter.
   state = runTrackedHtmlStage(state, "wc-check", (html) => {
     const finalWordCount = assertFinalWordCountParity(state);
     console.log(`[wc-check] canonical word count=${finalWordCount} range=${state.wordMin}-${state.wordMax}`);
@@ -764,8 +818,17 @@ export async function runPostAssemblyPipeline(
 // ── Stage implementations ──
 
 async function runClaimCheck(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
-  const sections = state.articleDoc.sections;
-  const bodies = sections.map((section, index) => ({ index, body: componentHtml(section) }));
+  const components = [
+    { kind: "introduction" as const, component: state.articleDoc.introduction },
+    ...state.articleDoc.sections
+      .filter((section) => section.sectionType !== "faq-heading")
+      .map((component) => ({ kind: "section" as const, component })),
+    { kind: "conclusion" as const, component: state.articleDoc.conclusion },
+  ];
+  const bodies = components.map(({ component }, index) => ({
+    index,
+    body: componentHtml(component),
+  }));
   const conflicts = detectClaimConflicts(bodies, { claims: [] });
   if (conflicts.length === 0) {
     const fpSnap = fp(state.blog);
@@ -775,27 +838,87 @@ async function runClaimCheck(state: PipelineState, deps: PipelineDependencies): 
 
   const preHtml = state.blog;
   const snap = snapshotState(state);
-  for (const c of conflicts) {
-    const section = sections[c.sectionIndexB];
-    if (!section) continue;
+  const targetIndexes = [...new Set(conflicts.map((conflict) => conflict.sectionIndexB))];
+  for (const targetIndex of targetIndexes) {
+    const target = components[targetIndex];
+    if (!target || target.kind === "introduction") continue;
     try {
-      const prevHeading = c.sectionIndexB > 0 ? state.h2Headings[c.sectionIndexB - 1] : "none";
-      const nextHeading = c.sectionIndexB < state.h2Headings.length - 1 ? state.h2Headings[c.sectionIndexB + 1] : "none";
-      const regeneratedBody = await regenerateSection(
-        { chatWithRetry: deps.makeTrackedChatForStage("claim_fix"), promptContext: deps.context } as any,
-        state.title, section.heading, prevHeading, nextHeading, state.wordsPerSection, state.exactKeyphraseTarget, state.keyphrase,
+      const conclusionTarget = Math.round(
+        state.requestedWordCount * GENERATION_WORD_BUFFER * WORD_ALLOCATION.CONCLUSION,
       );
+      const regeneratedBody = target.kind === "conclusion"
+        ? await regenerateConclusion(
+            { chatWithRetry: deps.makeTrackedChatForStage("claim_fix"), promptContext: deps.context } as any,
+            state.title,
+            conclusionTarget,
+            extractReadableText(
+              [
+                componentHtml(state.articleDoc.introduction),
+                ...state.articleDoc.sections.map(componentHtml),
+              ].join("\n"),
+            ),
+          )
+        : await (async () => {
+            const sectionPosition = state.articleDoc.sections.findIndex(
+              (section) => section.id === target.component.id,
+            );
+            const previousHeading = sectionPosition > 0
+              ? state.articleDoc.sections[sectionPosition - 1]?.heading ?? "Introduction"
+              : "Introduction";
+            const nextHeading = sectionPosition >= 0
+              && sectionPosition < state.articleDoc.sections.length - 1
+              ? state.articleDoc.sections[sectionPosition + 1]?.heading ?? "Conclusion"
+              : "Conclusion";
+            return regenerateSection(
+              { chatWithRetry: deps.makeTrackedChatForStage("claim_fix"), promptContext: deps.context } as any,
+              state.title,
+              target.component.heading,
+              previousHeading,
+              nextHeading,
+              state.wordsPerSection,
+              state.exactKeyphraseTarget,
+              state.keyphrase,
+            );
+          })();
       if (regeneratedBody && countReadableWords(regeneratedBody) > 0) {
-        replaceComponentHtml(state.articleDoc.sections[c.sectionIndexB], regeneratedBody, "regenerated");
+        replaceComponentHtml(target.component, regeneratedBody, "regenerated");
         syncBlogFromDocument(state);
       }
-    } catch (err) { /* continue */ }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      state.warnings.push(
+        `Claim repair failed for ${target.component.id}: ${message}`,
+      );
+      console.warn(
+        `[claim-check] repair failed for ${target.component.id}: ${message}`,
+      );
+    }
   }
   return runTrackedHtmlStage(state, "claim-check", (html) => html, snap);
 }
 
+function runConclusionDiscipline(state: PipelineState): PipelineState {
+  const inputFingerprint = fp(state.blog);
+  const maxConclusionWords = Math.min(
+    300,
+    Math.max(80, Math.round(state.requestedWordCount * 0.12)),
+  );
+  const result = trimConclusionToBudget(state.articleDoc, maxConclusionWords);
+  if (result.removedBlocks > 0) syncBlogFromDocument(state);
+  recordStage(
+    state,
+    "conclusion-discipline",
+    inputFingerprint,
+    fp(state.blog),
+    true,
+    undefined,
+    { ...result, maxConclusionWords },
+  );
+  return state;
+}
+
 async function runExpansion(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
-  state.currentWordCount = countReadableWords(state.blog);
+  state.currentWordCount = countCanonicalVisibleWords(state.articleDoc);
   if (state.currentWordCount >= state.wordMin) {
     const fpSnap = fp(state.blog);
     recordStage(state, "expansion", fpSnap, fpSnap, true, undefined, { skipped: true, reason: "already-in-range" });
@@ -822,7 +945,7 @@ async function runExpansion(state: PipelineState, deps: PipelineDependencies): P
   }
   state.expansionAttempts = result.expansions;
   syncBlogFromDocument(state);
-  state.currentWordCount = countReadableWords(state.blog);
+  state.currentWordCount = countCanonicalVisibleWords(state.articleDoc);
 
   return runTrackedHtmlStage(state, "expansion", (html) => html, snap);
 }
@@ -852,7 +975,7 @@ async function runTrim(state: PipelineState, deps: PipelineDependencies): Promis
   }
   state.trimAttempts = result.trims;
   syncBlogFromDocument(state);
-  state.currentWordCount = countReadableWords(state.blog);
+  state.currentWordCount = countCanonicalVisibleWords(state.articleDoc);
 
   return runTrackedHtmlStage(state, "trim", (html) => html, snap);
 }
@@ -863,7 +986,14 @@ async function runRegeneration(state: PipelineState, deps: PipelineDependencies)
   const { blog: regeneratedBlog, title: regeneratedTitle, meta: regeneratedMeta } = await runComponentRegeneration(
     genCtx, { title: state.title, metaDescription: state.metaDescription, blog: state.blog },
     state.h2Headings, state.keyphrase,
-    { intro: state.wordsPerSection, conclusion: state.wordsPerSection, perSection: state.wordsPerSection, keyphraseTarget: state.exactKeyphraseTarget },
+    {
+      intro: state.wordsPerSection,
+      conclusion: Math.round(
+        state.requestedWordCount * GENERATION_WORD_BUFFER * WORD_ALLOCATION.CONCLUSION,
+      ),
+      perSection: state.wordsPerSection,
+      keyphraseTarget: state.exactKeyphraseTarget,
+    },
   );
   state.title = regeneratedTitle;
   state.metaDescription = regeneratedMeta;
@@ -915,7 +1045,17 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
 }
 
 export function runFinalValidation(state: PipelineState): { passed: boolean; reasons: string[] } {
-  const metrics = analyzeFinalArticle(state.blog, state.keyphrase, state.title, state.metaDescription, state.requestedWordCount);
+  const canonicalWordCount = state.articleDoc
+    ? countCanonicalVisibleWords(state.articleDoc)
+    : undefined;
+  const metrics = analyzeFinalArticle(
+    state.blog,
+    state.keyphrase,
+    state.title,
+    state.metaDescription,
+    state.requestedWordCount,
+    canonicalWordCount,
+  );
   const policy = buildPolicy(state.requestedWordCount, state.wordMin, state.wordMax, state.keyphrase);
   return evaluatePolicy(metrics, policy);
 }
