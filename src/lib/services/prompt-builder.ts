@@ -1,4 +1,5 @@
 import { FACTUALITY_INSTRUCTION } from "./generation-constants";
+import type { ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import {
   englishTitleRange,
   englishMetaRange,
@@ -40,6 +41,10 @@ export interface BlogContext {
     tags: string[];
   }[];
   promptSections: PromptSection[];
+  /** Deterministic section-level ownership for approved factual claims. */
+  claimOwnership?: ClaimOwnershipLedger;
+  /** ISO date used for temporal wording and freshness validation. */
+  generationDate?: string;
 }
 
 function findSection(sections: PromptSection[], key: string): string {
@@ -60,6 +65,51 @@ function formatProjectDetails(project: BlogContext["project"]): string {
   return lines.join("\n");
 }
 
+/**
+ * Topic-only context for the outline stage. Precise snippets, numbers and URLs
+ * are deliberately withheld until the Claim Ownership Ledger assigns them to
+ * a single body section.
+ */
+function outlineSafeTopic(value: string): string {
+  return value
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/(?:HK\$|US\$|[$£€¥])?\s*\d+(?:[.,]\d+)*(?:\s*(?:%|million|billion|thousand|m|bn|k))?/gi, " ")
+    .replace(/[“”"'`]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[-:–—\s]+|[-:–—\s]+$/g, "")
+    .trim();
+}
+
+export function buildOutlineBrief(context: BlogContext): string {
+  const parts = [
+    `## Project Details
+
+${formatProjectDetails(context.project)}`,
+  ];
+  // project.content is the last saved article in the current schema, not an
+  // outline brief. Feeding it back would copy old prose, claims and structure
+  // into a fresh generation before ownership has been assigned.
+  if (context.research.length > 0) {
+    const topics = context.research.map((item) => {
+      const safeTitle = outlineSafeTopic(item.title || "approved source") || "approved source";
+      return `- ${item.category || "research"}: ${safeTitle}`;
+    });
+    parts.push(`## Approved Research Topics
+
+${topics.join("\n")}
+
+Use these only to choose section topics. Do not infer or include statistics, dates, quotations, source URLs or findings in metadata or headings.`);
+  }
+  const knowledgeTopics = filterRelevantKnowledge(context.knowledge, context.project.keyword)
+    .map((item) => `- ${item.title}`);
+  if (knowledgeTopics.length > 0) {
+    parts.push(`## Relevant Knowledge Topics
+
+${knowledgeTopics.join("\n")}`);
+  }
+  return parts.join("\n\n---\n\n");
+}
+
 function formatResearch(research: BlogContext["research"]): string {
   if (!research.length) return "";
 
@@ -75,7 +125,8 @@ function formatResearch(research: BlogContext["research"]): string {
   for (const [category, items] of grouped) {
     lines.push(`## ${category.toUpperCase()}`);
     for (const item of items) {
-      lines.push(`- **${item.title}**`);
+      const sourceIndex = research.indexOf(item) + 1;
+      lines.push(`- **SOURCE-${sourceIndex}: ${item.title}**`);
       lines.push(`  ${item.snippet}`);
       if (item.url) {
         lines.push(`  Source: ${item.url}`);
@@ -85,6 +136,25 @@ function formatResearch(research: BlogContext["research"]): string {
   }
 
   return lines.join("\n").trim();
+}
+
+/**
+ * @deprecated Retained for migration/tests only. Production section generation
+ * must use the Claim Ownership Ledger and a section-specific evidence packet;
+ * broadcasting this full bundle would reintroduce duplicate statistics.
+ */
+export function formatStageResearchEvidence(
+  research: BlogContext["research"],
+): string {
+  if (!research.length) {
+    return "No approved research evidence was supplied. Do not use precise numbers, quotations, platform-performance claims, posting schedules or feature-availability claims.";
+  }
+
+  return research.map((item, index) => [
+    `SOURCE-${index + 1}: ${item.title}`,
+    `Approved evidence: ${item.snippet}`,
+    item.url ? `Source URL: ${item.url}` : "Source URL: unavailable",
+  ].join("\n")).join("\n\n");
 }
 
 function filterRelevantKnowledge(
@@ -142,11 +212,11 @@ function formatKnowledge(knowledge: BlogContext["knowledge"], keyword: string): 
 }
 
 export const STAGE_SYSTEM_PROMPTS: Record<string, string[]> = {
-  outline:      ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context", "blog_structure"],
-  introduction: ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context"],
-  section:      ["brand_voice", "seo_rules", "formatting_rules", "hong_kong_context", "blog_structure"],
-  faq:          ["brand_voice", "seo_rules", "formatting_rules"],
-  conclusion:   ["brand_voice", "formatting_rules"],
+  outline:      ["brand_voice", "seo_rules", "hong_kong_context", "blog_structure"],
+  introduction: ["brand_voice", "seo_rules", "hong_kong_context"],
+  section:      ["brand_voice", "seo_rules", "hong_kong_context"],
+  faq:          ["brand_voice", "seo_rules"],
+  conclusion:   ["brand_voice"],
 };
 
 export function buildSystemPrompt(context: BlogContext, modules?: string[]): string {
@@ -157,9 +227,31 @@ export function buildSystemPrompt(context: BlogContext, modules?: string[]): str
 
   // Factuality — always included for every stage
   parts.push(FACTUALITY_INSTRUCTION);
+  const generationDate = context.generationDate || new Date().toISOString().slice(0, 10);
+  parts.push(`## Publication Date and Temporal Accuracy
 
-  // CRITICAL FORMAT — always included for every stage
-  parts.push(`CRITICAL FORMAT REQUIREMENT: The blog content in your JSON response MUST use WordPress block format when generating full-article content or non-editorial components. Every heading must be <!-- wp:heading ... -->, every paragraph <!-- wp:paragraph -->, every list <!-- wp:list -->, every quote <!-- wp:quote -->, every table <!-- wp:table -->. Custom HTML (language switcher, CTA, FAQ schema) uses <!-- wp:html -->. NEVER use Markdown (##, **, backtick, [], etc.) or bare HTML tags. This is NON-NEGOTIABLE.`);
+The article is being generated on ${generationDate}.
+- Treat completed years and past-dated forecasts as historical context, never as current or future events.
+- Never write expired predictions such as "expected later in 2025" when that date has already passed.
+- Do not use unanchored phrases such as "later this year", "coming soon" or "in the months ahead".
+- Current feature availability, pricing, audience size and platform status must be supported by approved evidence that explicitly describes the current state.
+- When approved research contains an old prediction but no confirmed outcome, omit the prediction rather than guessing what happened.`);
+
+  const stage = modules
+    ? Object.entries(STAGE_SYSTEM_PROMPTS).find(([, configured]) =>
+        configured.length === modules.length
+        && configured.every((key, index) => key === modules[index]),
+      )?.[0]
+    : undefined;
+  if (stage === "outline") {
+    parts.push(`CRITICAL OUTPUT CONTRACT: Return one valid JSON object containing only title, slug, metaDescription and h2Headings. Do not write article prose, HTML, WordPress comments, Markdown, CTA, FAQ answers or research claims.`);
+  } else if (stage === "faq") {
+    parts.push(`CRITICAL OUTPUT CONTRACT: Return one valid JSON object with {"heading":"...","entries":[{"question":"...","answer":"..."}]}. Do not return HTML, WordPress comments, Markdown, CTA content or precise research claims.`);
+  } else if (stage === "introduction" || stage === "section" || stage === "conclusion") {
+    parts.push(`CRITICAL OUTPUT CONTRACT: Return one valid JSON object containing structured editorial blocks. Supported block types are paragraph, subheading (H3 only), list, quote and table. Do not return HTML, WordPress comments, Markdown, H2 headings, CTA or schema. The application renders canonical WordPress blocks.`);
+  } else {
+    parts.push(`CRITICAL FORMAT REQUIREMENT: Full-article HTML must use canonical WordPress blocks. Every heading, paragraph, list, quote and table must have balanced WordPress comments. Custom HTML is application-owned. Never use Markdown or bare HTML outside a wp:html block.`);
+  }
 
   // Brand Voice
   if (isFull || include?.has("brand_voice")) {
@@ -244,7 +336,7 @@ You are an expert at naturally integrating internal links. Follow these rules:
 
 The following elements are NON-NEGOTIABLE and MUST be present in every generated blog post. Failure to include any of them means the output is rejected.
 
-1. **CTA Block**: You MUST include the EXACT HTML from the CTA Block section above. The CTA must say "B2I Hub" — never use placeholders like "[Contact our team]" or "[Sign up]". Paste the CTA HTML verbatim between the last H2 section and the FAQ.
+1. **CTA Block**: Do not generate CTA content inside editorial components. The application inserts exactly one canonical CTA as the final visible block.
 
 2. **H2 Heading Count**: You MUST include ${h2R.min}–${h2R.max} H2-level sections (not counting FAQ or conclusion H2s). Do not exceed ${h2R.max} editorial H2s.
 
@@ -265,6 +357,11 @@ The following elements are NON-NEGOTIABLE and MUST be present in every generated
   return parts.join("\n\n---\n\n");
 }
 
+/**
+ * Legacy one-shot article prompt retained for migration reference only.
+ * The production pipeline deliberately starts with buildOutlineBrief() and
+ * distributes evidence through the Claim Ownership Ledger.
+ */
 function buildUserMessage(context: BlogContext): string {
   const sections = context.promptSections;
   const parts: string[] = [];
@@ -284,15 +381,15 @@ function buildUserMessage(context: BlogContext): string {
 
   parts.push(`## NON-NEGOTIABLE HARD REQUIREMENTS
 
-The following 4 requirements are NOT NEGOTIABLE. The blog is INVALID if any of them is not met. DO NOT SKIP any of these.
+The following structural and metadata requirements are enforced by the application. Do not bypass them.
 
 1. **H2 heading count**: Create exactly ${h2Range.min}–${h2Range.max} H2-level sections, each containing 150–300 words of body content. Do NOT create more than ${h2Range.max} H2s.
 
-2. **FAQ section**: Include a visible FAQ section at the end with ${faqRange.min}–${faqRange.max} question-answer pairs. Each FAQ must have a question (ending with ?) and a 2–3 sentence answer. Follow the FAQ section with the conclusion and then the CTA block.
+2. **FAQ section**: Include a visible FAQ section with ${faqRange.min}–${faqRange.max} practical or conceptual question-answer pairs. Each FAQ must have a question (ending with ?) and a 2–3 sentence answer. Canonical order is introduction → main sections → conclusion → FAQ → FAQ schema → CTA.
 
 3. **Focus keyphrase count**: Use the exact keyphrase naturally approximately ${kpTargets.preferred} times throughout the body (range ${kpTargets.min}–${kpTargets.max}). Do not force repetitions — natural placement is more important.
 
-4. **Focus keyphrase in H2**: The focus keyphrase MUST appear in at least one H2 heading. This is a hard requirement — the blog is INVALID if it doesn't. DO NOT SKIP THIS.
+4. **Natural keyphrase placement**: Keep the H1 and slug exact. A natural opening or H2 occurrence is preferred, but never rewrite a heading into awkward language merely to force the exact phrase.
 
 5. **Internal links**: Include ${linkMin}–${linkMax} unique internal content links. Only link where genuinely relevant. Do not repeat the same link.
 
@@ -320,7 +417,7 @@ Write a complete, publication-ready blog post based on the project details, rese
 **PRE-OUTPUT VALIDATION** — Before generating the JSON, verify ALL of these:
 - [ ] H2 count is ${h2Range.min}–${h2Range.max} → if outside this range, adjust
 - [ ] FAQ has ${faqRange.min}–${faqRange.max} Q&A pairs → if outside, adjust
-- [ ] Focus keyphrase appears in at least one H2 heading → if NOT, rewrite an H2 to include it
+- [ ] Focus keyphrase placement is natural; do not force an awkward H2 occurrence
 - [ ] Focus keyphrase appears ${kpTargets.preferred} times in body (range ${kpTargets.min}–${kpTargets.max}) → if outside, adjust
 - [ ] SEO title is ${titleMin}–${titleMax} characters → if not, adjust
 - [ ] Internal links: ${linkMin}–${linkMax} unique → if outside, adjust
@@ -355,7 +452,7 @@ export function buildBlogPrompt(context: BlogContext): {
   userMessage: string;
 } {
   return {
-    systemPrompt: buildSystemPrompt(context),
-    userMessage: buildUserMessage(context),
+    systemPrompt: buildSystemPrompt(context, STAGE_SYSTEM_PROMPTS.outline),
+    userMessage: buildOutlineBrief(context),
   };
 }

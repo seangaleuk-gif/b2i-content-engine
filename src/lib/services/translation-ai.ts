@@ -2,6 +2,8 @@ import { AiService, type ChatMessage } from "@/lib/services/deepseek";
 import type { FaqEntry, ProtectedArticleBlock } from "@/lib/blog/article-document";
 import type { RetryBudget } from "./translation-types";
 import type { StructuredTranslationShadowOptions } from "./editorial-block-translation";
+import { protectNumbersInHtml, tryRestoreNumbersInHtml, checkLinksPreserved, checkNoNewUrls, checkNumbersPreserved, extractLinks } from "./translation-validator";
+import { buildTranslationGlossaryPrompt } from "./translation-glossary";
 
 // ── Prompt constants ──
 
@@ -14,24 +16,30 @@ Rules:
 - Do NOT add, remove, or restructure any HTML elements
 - Return the COMPLETE HTML with only the text content translated
 - Hong Kong Traditional Chinese only
-- Example: "Ready to grow your brand" → "準備好壯大你嘅品牌"
+- Example: "Ready to grow your brand" → "準備好拓展你的品牌？"
 - Example: "Get started" → "立即開始" or "馬上開始"
-- Example: "Create your free profile" → "建立免費檔案"`;
+- Example: "Create your free profile" → "免費建立商業檔案"`;
 
-export const TRANSLATION_SYSTEM = `You are a professional translator specializing in Hong Kong Traditional Chinese (zh-HK).
+export const TRANSLATION_SYSTEM = `You are a senior bilingual editor translating an English business blog into professional Hong Kong Traditional Chinese (zh-HK).
 
-Rules:
-- Use Hong Kong Traditional Chinese characters (繁體中文)
-- Use colloquial Hong Kong Cantonese phrasing where appropriate
-- Use full-width punctuation （，。「」）
-- Adapt idioms naturally for a Hong Kong audience
-- Do NOT translate: brand names (B2I Hub, Threads, Instagram, Facebook, Meta, Google), URLs, code, statistics, proper nouns, numbers, dates
-- Preserve ALL WordPress block comments and HTML structure exactly as-is
-- Preserve all <a href="..."> links exactly — do not change any URL
-- Do NOT add or remove content
-- Translate the ENTIRE section completely — do NOT summarize or abbreviate`;
+QUALITY STANDARD:
+- Translate meaning, intent and emphasis faithfully; do not summarize, embellish or add facts.
+- Write natural professional Hong Kong Traditional Chinese, not literal English sentence order.
+- Keep the voice warm, direct and easy to read. Use spoken Cantonese particles only when they are genuinely natural for the brand voice; avoid slang-heavy copy.
+- Use Traditional Chinese characters and full-width Chinese punctuation （，。「」！？）.
+- Follow the canonical terminology glossary supplied in the prompt consistently across the whole article.
+- Preserve temporal meaning exactly: historical facts stay historical, current status stays current, and predictions stay predictions. Never turn an old forecast into present guidance or introduce relative wording such as 「今年稍後」、「即將」 or 「未來幾個月」 unless the English source contains the same valid, date-anchored meaning.
+- Prefer idiomatic written zh-HK: combine short English clauses naturally, avoid repeated pronouns and literal subject-first sentence patterns, and keep each paragraph's original purpose and tone.
 
-export const TITLE_META_SYSTEM = `You are a professional translator specializing in Hong Kong Traditional Chinese (zh-HK). Translate the following text to Traditional Chinese. Return ONLY the translated text, no JSON, no explanation.`;
+IMMUTABLE CONTENT:
+- Do NOT translate brand names (B2I Hub, Threads, Instagram, Facebook, Meta, Google), URLs, code, statistics, proper nouns, numbers or dates.
+- Preserve every __NUM_N__ token exactly.
+- Preserve ALL WordPress block comments and HTML structure exactly.
+- Preserve all <a href="..."> URLs exactly.
+- Do not add or remove paragraphs, list items, table cells, facts, examples, links or calls to action.
+- Translate the complete supplied component.`;
+
+export const TITLE_META_SYSTEM = `You are a senior Hong Kong Traditional Chinese editor. Translate faithfully into natural professional zh-HK. Preserve every number, date, proper noun, brand name and __NUM_N__ token exactly. Use Traditional Chinese and full-width punctuation. Return ONLY the translated text, with no JSON, markdown or explanation.`;
 
 export const INTRO_RETRY_STRICT = `This is a quality-gate retry. The previous translation contained too much English.
 
@@ -44,7 +52,7 @@ RULES (strict):
 - Brand names (B2I Hub, Threads, Instagram, Facebook, Meta, Google, YouTube) may remain in English
 - URLs, proper nouns, and technical terms (SEO, ROI, CTR, API) may remain in English
 - Numbers, percentages, dates and tokens like __NUM_0__, __NUM_1__ must be preserved exactly
-- Hong Kong Cantonese phrasing preferred
+- Use natural professional written Hong Kong Traditional Chinese; avoid literal English word order and excessive spoken particles
 - Full-width punctuation （，。「」）
 - Return ONLY the translated text — no JSON, no markdown, no explanation`;
 
@@ -81,23 +89,29 @@ FURTHER RESTRICTIONS:
 
 Return ONLY the translated JSON object.`;
 
-export const FAQ_QA_SYSTEM = `You are a professional translator. Translate each FAQ Q&A pair to Hong Kong Traditional Chinese. Return as JSON array:
-[
-  {"question": "translated question", "answer": "translated answer"}
-]
+export const FAQ_QA_SYSTEM = `You are a professional Hong Kong Traditional Chinese translator. Translate exactly one FAQ question and answer.
+
+Return exactly one valid JSON object in this shape:
+{"question":"translated question？","answer":"translated answer"}
 
 Rules:
-- Hong Kong Traditional Chinese only
-- Use full-width punctuation
-- Adapt idioms naturally for Hong Kong
-- Do NOT translate brand names, URLs, statistics, proper nouns
-- Keep question mark (？) at end of each question
-- Do NOT add or remove Q&A pairs
-- Translate every question and answer completely`;
+- Hong Kong Traditional Chinese only; use full-width punctuation.
+- Translate meaning faithfully and naturally. Do not summarize or add information.
+- Preserve brand names, URLs, statistics, dates, proper nouns and every __NUM_N__ token exactly.
+- Preserve historical/current/future tense and time framing exactly; do not introduce stale relative-time wording.
+- Preserve any HTML tags and every href URL in the answer exactly.
+- End the question with ？.
+- Do not add CTA, conclusion, headings, FAQ schema or another Q&A pair.
+- Return only the JSON object, with no markdown or explanation.`;
 
 // ── AI instance ──
 
 const ai = new AiService();
+
+export function translationDateInstruction(): string {
+  const date = new Date().toISOString().slice(0, 10);
+  return `PUBLICATION DATE: ${date}. Do not introduce expired predictions or unanchored relative-time wording. Preserve the source's historical/current/future meaning exactly.`;
+}
 
 // ── Budgeted AI call ──
 
@@ -110,16 +124,16 @@ export async function chatWithBudget(
 ): Promise<{ content: string; finishReason?: string }> {
   const requestedRetries = (options as any).maxRetries ?? 2;
   const maxRetries = budget ? budget.capRetries(requestedRetries) : requestedRetries;
-  (options as any).maxRetries = maxRetries;
+  const requestOptions = { ...options, maxRetries };
 
   try {
-    const result = await ai.chatWithRetry(messages, options as any);
+    const result = await ai.chatWithRetry(messages, requestOptions as any, component);
     const actualRetries = result.attemptsUsed ?? 0;
     const budgetCutOff = maxRetries < requestedRetries;
     if (budget) budget.record(component, actualRetries, budgetCutOff);
     return { content: result.content, finishReason: result.finishReason };
   } catch (error) {
-    if (budget) budget.record(component, requestedRetries, true);
+    if (budget) budget.record(component, maxRetries, true);
     throw error;
   }
 }
@@ -128,32 +142,85 @@ export async function chatWithBudget(
 
 export async function translateText(text: string, instruction: string, systemPrompt: string, keyphrase?: string, component?: string, budget?: RetryBudget): Promise<string> {
   if (!text || text.trim().length === 0) return text;
-  const kpMsg = keyphrase ? ` The SEO focus keyphrase is "${keyphrase}". You MUST include this exact keyphrase in the translation.` : "";
+  const kpMsg = keyphrase ? ` The SEO focus keyphrase is "${keyphrase}". Include it naturally when the source context supports it; do not force or repeat it.` : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt + kpMsg },
+    { role: "system", content: `${systemPrompt}${kpMsg}
+
+${translationDateInstruction()}
+
+${buildTranslationGlossaryPrompt()}` },
     { role: "user", content: `${instruction}\n\n${text}` },
   ];
   const result = await chatWithBudget(messages, { maxTokens: 1024, temperature: 0.3 }, component || "translate-text", budget);
-  return result.content.trim();
+  if (result.finishReason === "length") throw new Error(`${component || "translate-text"} response was truncated`);
+  const content = result.content.trim();
+  if (!content) throw new Error(`${component || "translate-text"} returned empty content`);
+  return content;
 }
 
 async function translateHtml(html: string, context: string, keyphrase?: string, component?: string, budget?: RetryBudget): Promise<string> {
   if (!html || html.trim().length === 0) return html;
-  const kpMsg = keyphrase ? `\n\nThe SEO focus keyphrase for this article is "${keyphrase}". Use this exact keyphrase naturally in headings and body where it fits organically.` : "";
+  const kpMsg = keyphrase ? `
+
+The SEO focus keyphrase is "${keyphrase}". Use it naturally only where the source context supports it.` : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: TRANSLATION_SYSTEM + kpMsg },
+    { role: "system", content: `${TRANSLATION_SYSTEM}${kpMsg}
+
+${translationDateInstruction()}
+
+${buildTranslationGlossaryPrompt()}` },
     { role: "user", content: `Translate this section to Traditional Chinese (Hong Kong):\n\nSection context: ${context}\n\n${html}` },
   ];
   const result = await chatWithBudget(messages, { maxTokens: 8192, temperature: 0.3 }, component || "translate-html", budget);
+  if (result.finishReason === "length") throw new Error(`${component || "translate-html"} response was truncated`);
+  const content = result.content.trim();
+  if (!content) throw new Error(`${component || "translate-html"} returned empty content`);
   try {
-    const parsed = JSON.parse(result.content);
-    if (parsed.translatedHtml) return parsed.translatedHtml;
+    const parsed = JSON.parse(content);
+    if (parsed.translatedHtml) return String(parsed.translatedHtml).trim();
   } catch { /* plain text */ }
-  return result.content.trim();
+  return content;
 }
 
 export async function translateSection(html: string, heading: string, prevHeading: string, nextHeading: string, keyphrase?: string, component?: string, budget?: RetryBudget): Promise<string> {
   return translateHtml(html, `Heading: "${heading}". Previous: "${prevHeading}". Next: "${nextHeading}"`, keyphrase, component, budget);
+}
+
+function protectedMarkupSignature(html: string): string[] {
+  return [...html.matchAll(/<!--[^]*?-->|<[^>]+>/g)]
+    .map((match) => match[0].replace(/\s+/g, " ").trim());
+}
+
+function sameSequence(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function validateProtectedHtmlTranslation(source: string, translated: string, label: string): void {
+  if (!translated.trim()) throw new Error(`${label} returned empty content`);
+  if (!sameSequence(protectedMarkupSignature(source), protectedMarkupSignature(translated))) {
+    throw new Error(`${label} HTML structure or attributes changed`);
+  }
+  if (!sameSequence(extractLinks(source), extractLinks(translated))) {
+    throw new Error(`${label} URLs changed`);
+  }
+  const numbers = checkNumbersPreserved(source, translated);
+  if (numbers.lost.length > 0 || numbers.extras.length > 0) {
+    throw new Error(`${label} numbers changed`);
+  }
+}
+
+function deterministicCtaFallback(html: string): string {
+  const replacements: Array<[RegExp, string]> = [
+    [/Ready to grow your brand with Hong Kong creators\?/gi, "準備好與香港創作者一同拓展品牌？"],
+    [/B2I Hub connects businesses directly with verified creators — no agencies, no commissions, no middlemen\./gi, "B2I Hub 讓企業直接連繫已驗證創作者，毋須經代理、毋須支付佣金，亦沒有中間人。"],
+    [/Create your free profile and start collaborating today\./gi, "立即建立免費檔案，開始尋找合作機會。"],
+    [/Create Your Free Profile/gi, "建立免費檔案"],
+    [/Get started/gi, "立即開始"],
+    [/Sign up now/gi, "立即註冊"],
+  ];
+  let result = html;
+  for (const [pattern, replacement] of replacements) result = result.replace(pattern, replacement);
+  return result;
 }
 
 export async function translateCtaBlock(cta: ProtectedArticleBlock, budget?: RetryBudget): Promise<ProtectedArticleBlock> {
@@ -168,10 +235,13 @@ export async function translateCtaBlock(cta: ProtectedArticleBlock, budget?: Ret
       const parsed = JSON.parse(translated);
       if (parsed.translatedHtml) translated = parsed.translatedHtml;
     } catch { /* plain text */ }
-    if (!translated.includes("app.b2ihub.com/signup")) return cta;
+    validateProtectedHtmlTranslation(cta.html, translated, "CTA");
+    if (!translated.includes("app.b2ihub.com/signup")) throw new Error("CTA signup URL changed");
+    if (!/[\u3400-\u9fff]/u.test(translated.replace(/<[^>]+>/g, " "))) throw new Error("CTA contains insufficient Chinese");
     return { ...cta, html: translated, fingerprint: fingerprintHtml(translated) };
   } catch {
-    return cta;
+    const translated = deterministicCtaFallback(cta.html);
+    return { ...cta, html: translated, fingerprint: fingerprintHtml(translated) };
   }
 }
 
@@ -217,71 +287,154 @@ export function buildStructuredConclusionRepairPrompt(
   ].join("\n");
 }
 
-export async function translateFaqEntries(entries: FaqEntry[], budget?: RetryBudget): Promise<FaqEntry[]> {
-  if (entries.length === 0) return [];
-  const input = entries.map((e) => ({ question: e.question, answer: e.answerText }));
-  const inputStr = JSON.stringify(input, null, 2);
-  const inputTokens = Math.ceil(inputStr.length / 4);
-  const outputBudget = Math.min(8192, Math.max(4096, inputTokens * 2));
+function validateFaqBoundary(
+  source: FaqEntry,
+  translatedQuestion: string,
+  translatedAnswer: string,
+  index: number,
+): void {
+  const q = translatedQuestion.trim();
+  const a = translatedAnswer.trim();
+  if (!q.endsWith("?") && !q.endsWith("？")) {
+    throw new Error(`FAQ #${index + 1} question does not end with a question mark`);
+  }
+  if (/app\.b2ihub\.com\/signup/i.test(a)) throw new Error(`FAQ #${index + 1} answer contains signup URL`);
+  if (/ready to grow|create your free|sign up now/i.test(a)) throw new Error(`FAQ #${index + 1} answer contains CTA text`);
+  if (/^conclusion|in conclusion|to sum up|final thought/i.test(a)) throw new Error(`FAQ #${index + 1} answer contains conclusion text`);
+  if (/"@type"\s*:\s*"faqpage"/i.test(a)) throw new Error(`FAQ #${index + 1} answer contains FAQPage schema`);
+  if (/<h2\b|<\/h2>/i.test(a)) throw new Error(`FAQ #${index + 1} answer contains disallowed heading markup`);
+  const sourceLen = (source.answerHtml || source.answerText || "").length || 1;
+  if (a.length > sourceLen * 3) throw new Error(`FAQ #${index + 1} answer is more than 3x source length`);
+}
 
-  const result = await chatWithBudget(
-    [
-      { role: "system", content: FAQ_QA_SYSTEM },
-      { role: "user", content: inputStr },
-    ],
-    { responseFormat: { type: "json_object" }, maxTokens: outputBudget, temperature: 0.3 },
-    "faq",
-    budget,
+export async function translateFaqEntry(
+  entry: FaqEntry,
+  index: number,
+  budget?: RetryBudget,
+): Promise<FaqEntry> {
+  const protectedQuestion = protectNumbersInHtml(entry.question);
+  const protectedAnswer = protectNumbersInHtml(entry.answerHtml || entry.answerText);
+  const payload = JSON.stringify({
+    question: protectedQuestion.protectedHtml,
+    answer: protectedAnswer.protectedHtml,
+  });
+  const messages: ChatMessage[] = [
+    { role: "system", content: `${FAQ_QA_SYSTEM}\n\n${buildTranslationGlossaryPrompt()}\nReturn exactly one JSON object with keys question and answer.` },
+    { role: "user", content: payload },
+  ];
+
+  let translatedQuestion = "";
+  let translatedAnswer = "";
+  let structuredFailure: unknown = null;
+
+  for (const [component, options, extra] of [
+    [`faq-${index + 1}`, { responseFormat: { type: "json_object" }, maxTokens: 3072, temperature: 0.25 }, ""],
+    [`faq-${index + 1}-plain`, { maxTokens: 3072, temperature: 0.2, maxRetries: 1 }, "Return only valid JSON. No markdown or explanation."],
+  ] as const) {
+    try {
+      const result = await chatWithBudget(
+        extra ? [...messages, { role: "user", content: extra }] : messages,
+        options,
+        component,
+        budget,
+      );
+      if (result.finishReason === "length") throw new Error(`FAQ #${index + 1} response was truncated`);
+      const cleaned = result.content.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      translatedQuestion = String(parsed.question || parsed.entries?.[0]?.question || "").trim();
+      translatedAnswer = String(parsed.answer || parsed.entries?.[0]?.answer || "").trim();
+      if (!translatedQuestion || !translatedAnswer) throw new Error(`FAQ #${index + 1} returned empty content`);
+      validateFaqBoundary(entry, translatedQuestion, translatedAnswer, index);
+      break;
+    } catch (error) {
+      structuredFailure = error;
+      translatedQuestion = "";
+      translatedAnswer = "";
+    }
+  }
+
+  // Last-resort component recovery: translate the question and answer
+  // independently. An intermittent empty JSON response must not discard the
+  // whole FAQ set or prevent the remaining article components from running.
+  if (!translatedQuestion || !translatedAnswer) {
+    try {
+      translatedQuestion = await translateText(
+        protectedQuestion.protectedHtml,
+        "Translate this FAQ question completely to natural Hong Kong Traditional Chinese. End with ？ and return only the question.",
+        TITLE_META_SYSTEM,
+        undefined,
+        `faq-${index + 1}-question-fallback`,
+        budget,
+      );
+      translatedAnswer = await translateText(
+        protectedAnswer.protectedHtml,
+        "Translate this FAQ answer completely to natural Hong Kong Traditional Chinese. Preserve all HTML tags and href URLs exactly. Return only the answer.",
+        TRANSLATION_SYSTEM,
+        undefined,
+        `faq-${index + 1}-answer-fallback`,
+        budget,
+      );
+    } catch (error) {
+      throw new Error(
+        `FAQ #${index + 1} translation failed after structured and component fallbacks: ${error instanceof Error ? error.message : String(error)}; initial=${structuredFailure instanceof Error ? structuredFailure.message : String(structuredFailure)}`,
+      );
+    }
+  }
+
+  const questionRestore = tryRestoreNumbersInHtml(
+    translatedQuestion,
+    protectedQuestion.placeholders,
+    protectedQuestion.originalValues,
   );
-
-  if (result.finishReason === "length") {
-    // Never parse or save a truncated FAQ response. A truncated FAQ means
-    // some entries were cut off — the output is unusable.
-    throw new Error(`FAQ truncated at ${result.content.length} chars (max_tokens=${outputBudget}). Marking hard failure.`);
+  const answerRestore = tryRestoreNumbersInHtml(
+    translatedAnswer,
+    protectedAnswer.placeholders,
+    protectedAnswer.originalValues,
+  );
+  if (!questionRestore.ok || !answerRestore.ok) {
+    throw new Error(`FAQ #${index + 1} failed deterministic number restoration`);
   }
 
-  const parsed = JSON.parse(result.content);
-  const translated = Array.isArray(parsed) ? parsed : parsed.entries || parsed.faq || [];
+  const question = questionRestore.html.trim().replace(/\?$/u, "？");
+  const answerHtml = answerRestore.html;
+  validateFaqBoundary(entry, question, answerHtml, index);
 
-  // Validate exact source count before any processing
-  if (translated.length !== entries.length) {
-    throw new Error(`FAQ count mismatch: ${translated.length} translated vs ${entries.length} source`);
+  const sourceAnswerHtml = entry.answerHtml || entry.answerText;
+  const sourceHtml = `${entry.question}
+${sourceAnswerHtml}`;
+  const translatedHtml = `${question}
+${answerHtml}`;
+  const lostLinks = checkLinksPreserved(sourceHtml, translatedHtml);
+  const newLinks = checkNoNewUrls(sourceHtml, translatedHtml);
+  if (lostLinks.length > 0 || newLinks.length > 0 || !sameSequence(extractLinks(sourceHtml), extractLinks(translatedHtml))) {
+    throw new Error(`FAQ #${index + 1} changed URLs`);
+  }
+  if (!sameSequence(protectedMarkupSignature(sourceAnswerHtml), protectedMarkupSignature(answerHtml))) {
+    throw new Error(`FAQ #${index + 1} answer HTML structure changed`);
+  }
+  const faqNumbers = checkNumbersPreserved(sourceHtml, translatedHtml);
+  if (faqNumbers.lost.length > 0 || faqNumbers.extras.length > 0) {
+    throw new Error(`FAQ #${index + 1} changed numbers`);
   }
 
-  // Validate FAQ boundaries: reject output containing conclusion, CTA, signup, or a second FAQ schema
-  const signupRe = /app\.b2ihub\.com\/signup/i;
-  const ctaHeadRe = /ready to grow|create your free|sign up now/i;
-  const conclHeadRe = /^conclusion|in conclusion|to sum up|let'?s wrap|final thought/i;
-  const faqSchemaRe = /"@type"\s*:\s*"faqpage"/i;
-  const headingRe = /<h2\b|<\/h2>/i;
-  const strongRe = /<strong\b[^>]*>/i;
+  return {
+    question,
+    answerHtml,
+    answerText: answerHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+  };
+}
 
-  for (let i = 0; i < translated.length; i++) {
-    const entry = translated[i];
-    const q = (entry.question || "").trim();
-    const a = (entry.answer || "").trim();
-
-    if (!q.endsWith("?") && !q.endsWith("？")) throw new Error(`FAQ #${i+1} question "${q.substring(0, 30)}..." does not end with ?`);
-
-    // Answer boundary checks
-    const aLower = a.toLowerCase();
-    if (signupRe.test(aLower)) throw new Error(`FAQ #${i+1} answer contains signup URL`);
-    if (ctaHeadRe.test(aLower)) throw new Error(`FAQ #${i+1} answer contains CTA button/heading text`);
-    if (conclHeadRe.test(aLower)) throw new Error(`FAQ #${i+1} answer contains conclusion text`);
-    if (faqSchemaRe.test(aLower)) throw new Error(`FAQ #${i+1} answer contains FAQPage schema`);
-    if (headingRe.test(a)) throw new Error(`FAQ #${i+1} answer contains HTML heading markup`);
-    if (strongRe.test(a)) throw new Error(`FAQ #${i+1} answer contains duplicated visible FAQ markup`);
-
-    // Reject answer disproportionately longer than source (>3x source length)
-    const sourceLen = entries[i]?.answerText?.length || 1;
-    if (a.length > sourceLen * 3) throw new Error(`FAQ #${i+1} answer ${a.length} chars is >3x source ${sourceLen} chars`);
+/**
+ * Translate FAQ entries independently. One malformed or empty model response no
+ * longer discards already valid entries or allows the model to change FAQ count
+ * and order in one large all-or-nothing response.
+ */
+export async function translateFaqEntries(entries: FaqEntry[], budget?: RetryBudget): Promise<FaqEntry[]> {
+  const translated: FaqEntry[] = [];
+  for (let index = 0; index < entries.length; index++) {
+    translated.push(await translateFaqEntry(entries[index], index, budget));
   }
-
-  return translated.map((t: any, i: number) => ({
-    question: t.question || entries[i]?.question || "",
-    answerHtml: t.answer || entries[i]?.answerText || "",
-    answerText: (t.answer || entries[i]?.answerText || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
-  }));
+  return translated;
 }
 
 // ── Shared production callback factory ──

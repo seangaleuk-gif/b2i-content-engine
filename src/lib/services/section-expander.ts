@@ -12,10 +12,13 @@ export interface SectionExpansionContext {
   chatWithRetry: (messages: ChatMessage[], options?: ChatOptions) => Promise<ChatResult>;
 }
 
-interface Section {
+export interface ExpandableSection {
   index: number;
+  id?: string;
   heading: string;
   body: string;
+  /** Approved evidence owned by this section; no other evidence is permitted. */
+  evidencePrompt?: string;
 }
 
 interface ExpansionResult {
@@ -30,15 +33,15 @@ interface ExpansionResult {
  *  APPENDS additional content — never replaces. Accepts only if word count increases. */
 export async function expandToMinimum(
   ctx: SectionExpansionContext,
-  sections: Section[],
-  originalSections: Section[],
+  sections: ExpandableSection[],
+  originalSections: ExpandableSection[],
   intro: string,
   conclusion: string,
   currentWordCount: number,
   minimumWordCount: number,
   allocatedPerSection: number,
   maxExpansions: number = MAX_SECTION_EXPANSIONS,
-): Promise<{ sections: Section[]; finalWordCount: number; expansions: number; expansionResults: ExpansionResult[] }> {
+): Promise<{ sections: ExpandableSection[]; finalWordCount: number; expansions: number; expansionResults: ExpansionResult[] }> {
   let expansions = 0;
   let wordCount = currentWordCount;
   const workingSections = sections.map((s) => ({ ...s }));
@@ -79,9 +82,12 @@ export async function expandToMinimum(
 
     console.log(`[section-expander:EXPAND] section=${target.origIndex} currentSectionWords=${target.wc} originalSectionTarget=${allocatedPerSection} articleShortfall=${articleShortfall} requestedAddition=${requestedAddition} isMissing=${isMissing}`);
 
+    const evidenceBoundary = target.evidencePrompt?.trim()
+      ? `\n\nCLAIM OWNERSHIP BOUNDARY:\n${target.evidencePrompt}\nUse only this assigned evidence. Do not introduce or repeat any other precise statistic, date, currency, quotation, benchmark, posting frequency, survey result or platform-availability claim.`
+      : `\n\nCLAIM OWNERSHIP BOUNDARY:\nNo precise evidence is assigned. Do not introduce statistics, dates, currencies, quotations, benchmarks, posting frequencies, survey results or platform-availability claims.`;
     const expandPrompt = isMissing
-      ? `Generate the full section body. Target approximately ${allocatedPerSection} words. WordPress block format. Return as JSON: {"body": "..."}\n\nSection heading: "${target.heading}"`
-      : `Return ONLY additional WordPress paragraph, list, quote, or table blocks.\n\nDo NOT rewrite the existing section.\nDo NOT repeat the heading.\nDo NOT output an H2.\nDo NOT output the complete section.\n\nWrite approximately ${requestedAddition} additional readable words that continue naturally from the existing section.\n\nSection heading for context (do NOT repeat): "${target.heading}"\n\nExisting section body:\n${target.body.substring(target.body.length - 500)}\n\nReturn as JSON: {"body": "additional blocks only"}`;
+      ? `Generate the full section body. Target approximately ${allocatedPerSection} words. WordPress block format. Return as JSON: {"body": "..."}\n\nSection heading: "${target.heading}"${evidenceBoundary}`
+      : `Return ONLY additional WordPress paragraph, list, quote, or table blocks.\n\nDo NOT rewrite the existing section.\nDo NOT repeat the heading.\nDo NOT output an H2.\nDo NOT output the complete section.\nDo NOT repeat a precise claim already present in the existing section. Prefer non-statistical practical guidance, examples and transitions.\n\nWrite approximately ${requestedAddition} additional readable words that continue naturally from the existing section.\n\nSection heading for context (do NOT repeat): "${target.heading}"\n\nExisting section body:\n${target.body.substring(target.body.length - 900)}${evidenceBoundary}\n\nReturn as JSON: {"body": "additional blocks only"}`;
 
     try {
       const res = await ctx.chatWithRetry(
@@ -138,13 +144,13 @@ export async function expandToMinimum(
 
 export async function trimToMaximum(
   ctx: SectionExpansionContext,
-  sections: Section[],
+  sections: ExpandableSection[],
   intro: string,
   conclusion: string,
   currentWordCount: number,
   maximumWordCount: number,
   maxTrims: number = MAX_SECTION_TRIMS,
-): Promise<{ sections: Section[]; finalWordCount: number; trims: number }> {
+): Promise<{ sections: ExpandableSection[]; finalWordCount: number; trims: number }> {
   let trims = 0;
   let wordCount = currentWordCount;
   const workingSections = sections.map((s) => ({ ...s }));
@@ -160,7 +166,7 @@ export async function trimToMaximum(
 
     console.log(`[section-expander:TRIM] section=${target.origIndex} before=${target.wc} reductionNeeded=${reductionNeeded}`);
 
-    const trimPrompt = `Trim this section body only.\n\nRemove approximately ${reductionNeeded} readable words while preserving:\n- Core meaning and evidence\n- Internal and external links\n- Keyphrase placement\n- H3 substructure where useful\n\nReturn valid WordPress body blocks only. Return as JSON: {"body": "..."}\n\nCurrent section body:\n${target.body}`;
+    const trimPrompt = `Trim this section body only.\n\nRemove approximately ${reductionNeeded} readable words while preserving:\n- Every factual sentence and its exact numbers, dates, currencies, named sources and URLs\n- Internal and external links\n- Keyphrase placement\n- H3 substructure where useful\n\nDo not add any new factual claim or move evidence to another section.\n\nReturn valid WordPress body blocks only. Return as JSON: {"body": "..."}\n\nCurrent section body:\n${target.body}`;
 
     try {
       const res = await ctx.chatWithRetry(

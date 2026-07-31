@@ -15,6 +15,8 @@ vi.mock("@/lib/services/prompt-compiler", () => ({
 
 vi.mock("@/lib/services/prompt-builder", () => ({
   buildBlogPrompt: vi.fn().mockReturnValue({ systemPrompt: "", userMessage: "" }),
+  buildOutlineBrief: vi.fn().mockReturnValue("Outline topic brief."),
+  formatStageResearchEvidence: vi.fn().mockReturnValue("No approved research evidence."),
   STAGE_SYSTEM_PROMPTS: { outline: [], introduction: [], section: [], faq: [], conclusion: [] },
 }));
 
@@ -34,7 +36,10 @@ vi.mock("@/lib/pipeline/blog-generation-pipeline", () => ({
   validatePipelineOrder: vi.fn(),
 }));
 
-vi.mock("@/lib/services/article-postprocessors", () => ({ sanitizeSectionUrls: vi.fn((h: string) => h) }));
+vi.mock("@/lib/services/article-postprocessors", () => ({
+  sanitizeSectionUrls: vi.fn((h: string) => h),
+  pairedSlugs: vi.fn((slug: string) => ({ englishSlug: slug.replace(/-zh$/, ""), chineseSlug: `${slug.replace(/-zh$/, "")}-zh` })),
+}));
 
 // ── Test setup ──
 

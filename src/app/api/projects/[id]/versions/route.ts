@@ -20,25 +20,8 @@ export async function GET(
     } else if (language === "zh") {
       versions = versions.filter((v: any) => v.slug?.endsWith("-zh"));
     }
-    // Supabase returns database column names. The client contract is camelCase;
-    // normalize here so version selectors and audit labels never receive an
-    // undefined `versionNumber`.
-    return NextResponse.json(versions.map((version: any) => ({
-      ...version,
-      projectId: version.project_id,
-      userId: version.user_id,
-      versionNumber: version.version_number,
-      metaDescription: version.meta_description,
-      internalLinks: version.internal_links,
-      externalLinks: version.external_links,
-      readingTime: version.reading_time,
-      wordCount: version.word_count,
-      promptVersion: version.prompt_version,
-      generationTimeMs: version.generation_time_ms,
-      tokenUsage: version.token_usage,
-      createdAt: version.created_at,
-      updatedAt: version.updated_at,
-    })));
+    // The repository normalizes Supabase rows to the camelCase BlogVersion contract.
+    return NextResponse.json(versions);
   } catch (error) {
     return toErrorResponse(error);
   }

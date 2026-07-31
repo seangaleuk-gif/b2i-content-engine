@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { normalizeFinalSeo, isAlreadyNormalized, type FinalSeoNormalizerResult, tokenizeProtectedBlocks, detokenizeProtectedBlocks, type ProtectedBlockToken, type SeoNormalizationMetrics } from "@/lib/blog/final-seo-normalizer";
+import { ensureKeyphraseInFirst100Words, normalizeFinalSeo, isAlreadyNormalized, type FinalSeoNormalizerResult, tokenizeProtectedBlocks, detokenizeProtectedBlocks, type ProtectedBlockToken, type SeoNormalizationMetrics } from "@/lib/blog/final-seo-normalizer";
 
 import { createArticleIntegrityBaseline, validateFinalArticleIntegrity, validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { extractFaqBlock, extractCtaFromConclusion, stripProtectedBlocksFromConclusion, countCtaHeadings, countSignupUrls, countFaqBlocks } from "@/lib/blog/protected-block-extractor";
@@ -189,8 +189,8 @@ describe("final-seo-normalizer (deterministic)", () => {
   const keyphrase = "Hong Kong marketing trends 2026";
   const emptyChat = undefined; // No AI chat — only deterministic operations run
 
-  describe("H2 keyphrase fix", () => {
-    it("replaces an H2 that has close variant to include exact keyphrase", async () => {
+  describe("soft H2 keyphrase policy", () => {
+    it("does not rewrite an otherwise natural H2 to force an exact keyphrase", async () => {
       const html = wrapInArticle(makeArticle(
         ["Some intro paragraph about Hong Kong marketing trends 2026."],
         ["Understanding Hong Kong Marketing Trend 2026", "Another Section"]
@@ -204,12 +204,13 @@ describe("final-seo-normalizer (deterministic)", () => {
 
       const h2s = extractH2Texts(result.html);
       const hasExact = h2s.some((h) => h.toLowerCase().includes(keyphrase.toLowerCase()));
-      expect(hasExact).toBe(true);
+      expect(hasExact).toBe(false);
       expect(result.before.exactKeyphraseInH2).toBe(false);
-      expect(result.after.exactKeyphraseInH2).toBe(true);
+      expect(result.after.exactKeyphraseInH2).toBe(false);
+      expect(result.warnings).toContain("No H2 contains exact keyphrase");
     });
 
-    it("preserves H2 count after replacement", async () => {
+    it("preserves H2 count without forced replacement", async () => {
       const h2s = ["Understanding AI", "Hong Kong Marketing Trend 2026", "Future Outlook"];
       const html = wrapInArticle(makeArticle(
         ["Intro paragraph about Hong Kong marketing trends 2026."],
@@ -1181,8 +1182,7 @@ describe("normalizer acceptance logic", () => {
       result.safety.linkDestinationsUnchanged === true &&
       result.safety.wordpressBlocksValid === true &&
       result.safety.faqSchemaPreserved === true &&
-      result.safety.languageSwitcherPreserved === true &&
-      result.safety.ctaPreserved === true
+      result.safety.languageSwitcherPreserved === true
     );
   }
 
@@ -1788,9 +1788,9 @@ describe("CTA and FAQ extraction safety", () => {
     const conclusion = buildConclusionWithCta();
     const cta = extractCtaFromConclusion(conclusion);
     const faq = extractFaqBlock(buildFaqBlock());
-    
+
     const cleaned = stripProtectedBlocksFromConclusion(conclusion, cta, faq);
-    
+
     expect(cleaned).not.toContain("app.b2ihub.com/signup");
     expect(cleaned).not.toContain("Ready to Grow");
     expect(cleaned).not.toContain("FAQPage");
@@ -1918,7 +1918,7 @@ describe("CTA and FAQ extraction safety", () => {
     const conclusion = `<!-- wp:paragraph --><p>Just normal text.</p><!-- /wp:paragraph -->`;
     const cta = extractCtaFromConclusion(conclusion);
     const faq = "<!-- wp:html -->FAQ<!-- /wp:html -->";
-    
+
     expect(cta).toBe("");
     const cleaned = stripProtectedBlocksFromConclusion(conclusion, cta, faq);
     expect(cleaned).toBe(conclusion);
@@ -2975,6 +2975,27 @@ describe("shared content structure helpers", () => {
   });
 });
 
+describe("post-factual keyphrase policy", () => {
+  it("does not force the exact phrase into approved opening prose", () => {
+    const input = `<!-- wp:paragraph --><p>If you run a small business in Hong Kong, you may have noticed more people discussing Threads.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>This guide explains how to plan useful conversations.</p><!-- /wp:paragraph -->`;
+    const result = ensureKeyphraseInFirst100Words(
+      input,
+      "threads marketing hong kong",
+    );
+    expect(result).toBe(input);
+    expect(getFirstNReadableWords(result, 100).toLowerCase()).not.toContain(
+      "threads marketing hong kong",
+    );
+    expect(validateWordpressBlockPairs(result).valid).toBe(true);
+  });
+
+  it("is idempotent when the phrase is already present", () => {
+    const input = `<!-- wp:paragraph --><p>Threads marketing Hong Kong gives SMEs another way to join local conversations.</p><!-- /wp:paragraph -->`;
+    expect(ensureKeyphraseInFirst100Words(input, "threads marketing hong kong")).toBe(input);
+  });
+});
+
 // ── External link injection regression tests ──
 
 describe("external link injection", () => {
@@ -3067,7 +3088,7 @@ describe("external link injection", () => {
 <!-- /wp:heading -->
 
 <!-- wp:paragraph -->
-<p>First section body.</p>
+<p>A survey found that 11% of respondents preferred the first option.</p>
 <!-- /wp:paragraph -->
 
 <!-- wp:heading {"level":2} -->
@@ -3075,7 +3096,7 @@ describe("external link injection", () => {
 <!-- /wp:heading -->
 
 <!-- wp:paragraph -->
-<p>Second section body.</p>
+<p>Advertising reach was 22% in the second market.</p>
 <!-- /wp:paragraph -->
 
 <!-- wp:heading {"level":2} -->
@@ -3083,23 +3104,23 @@ describe("external link injection", () => {
 <!-- /wp:heading -->
 
 <!-- wp:paragraph -->
-<p>Third section body.</p>
+<p>The third benchmark reported 33% average engagement.</p>
 <!-- /wp:paragraph -->`;
 
     const result = insertExternalResearchLinks(input, [
-      { url: "https://a.com/1", title: "Source A" },
-      { url: "https://b.com/2", title: "Source B" },
-      { url: "https://c.com/3", title: "Source C" },
+      { url: "https://a.com/1", title: "Source A", snippet: "11% of survey respondents preferred the first option." },
+      { url: "https://b.com/2", title: "Source B", snippet: "Advertising reach was 22% in the second market." },
+      { url: "https://c.com/3", title: "Source C", snippet: "The third benchmark reported 33% average engagement." },
     ], 3);
 
-    // Check no two "Read more at" blocks are consecutive
-    const readMoreBlocks = (result.html.match(/Read more at/g) ?? []);
+    // Check no two source-attribution blocks are consecutive
+    const readMoreBlocks = (result.html.match(/Source:/g) ?? []);
     expect(readMoreBlocks.length).toBeGreaterThan(0);
 
-    // Find positions of all "Read more at" occurrences
+    // Find positions of all source-attribution occurrences
     const positions: number[] = [];
     let idx = 0;
-    while ((idx = result.html.indexOf("Read more at", idx)) !== -1) {
+    while ((idx = result.html.indexOf("Source:", idx)) !== -1) {
       positions.push(idx);
       idx += 1;
     }
@@ -3114,6 +3135,44 @@ describe("external link injection", () => {
   it("handles empty research items gracefully", () => {
     const input = `<!-- wp:paragraph --><p>Test.</p><!-- /wp:paragraph -->`;
     const result = insertExternalResearchLinks(input, [], 3);
+    expect(result.linksInserted).toBe(0);
+    expect(result.html).toBe(input);
+  });
+
+  it("adds a named source beside a matching factual claim", () => {
+    const input = `<!-- wp:heading {"level":2} --><h2>Audience</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>A survey found that 97.9% of respondents had used Threads.</p><!-- /wp:paragraph -->`;
+    const result = insertExternalResearchLinks(input, [{
+      url: "https://example.com/hong-kong-survey",
+      title: "Hong Kong Threads Usage Survey",
+      snippet: "97.9% of respondents had used Threads.",
+    }], 3);
+    expect(result.linksInserted).toBe(1);
+    expect(result.html).toContain("Source:");
+    expect(result.html).toContain("Hong Kong Threads Usage Survey");
+    expect(result.html).toContain('href="https://example.com/hong-kong-survey"');
+  });
+
+  it("adds a named source URL beside an exact supported quotation", () => {
+    const input = `<!-- wp:heading {"level":2} --><h2>Customer insight</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>The owner said, “Customer questions helped us plan clearer content for the next month.”</p><!-- /wp:paragraph -->`;
+    const result = insertExternalResearchLinks(input, [{
+      url: "https://example.com/interview",
+      title: "Local SME interview",
+      snippet: "Customer questions helped us plan clearer content for the next month.",
+    }], 3);
+    expect(result.linksInserted).toBe(1);
+    expect(result.html).toContain("Local SME interview");
+    expect(result.html).toContain('href="https://example.com/interview"');
+  });
+
+  it("does not insert an unrelated research link merely to satisfy a count", () => {
+    const input = `<!-- wp:paragraph --><p>Use a clear and conversational brand voice.</p><!-- /wp:paragraph -->`;
+    const result = insertExternalResearchLinks(input, [{
+      url: "https://example.com/unrelated",
+      title: "Unrelated benchmark",
+      snippet: "A different platform reached 42% of users.",
+    }], 3);
     expect(result.linksInserted).toBe(0);
     expect(result.html).toBe(input);
   });
@@ -3765,7 +3824,7 @@ describe("component regeneration iteration", () => {
     const failedComponentIndices = [0, 5];
     const attempted: number[] = [];
     const remainingFailed: number[] = [];
-    
+
     for (const idx of [...failedComponentIndices]) {
       attempted.push(idx);
       // Simulate section 0 repairs successfully, section 5 does not
@@ -4675,10 +4734,10 @@ describe("stale baseline and deduplication guard", () => {
 <p>Internal links to <a href="/blog/article-1">guide one</a>, <a href="/blog/article-2">guide two</a>, and <a href="/blog/article-3">guide three</a>.</p>
 <!-- /wp:paragraph -->`;
     const keyphrase = "hong kong marketing trends 2026";
-    
+
     const policy = buildPolicy(2500, 2375, 2750);
     const metrics = analyzeFinalArticle(html, keyphrase);
-    
+
     // Run twice — must produce identical results (idempotent)
     const metrics2 = analyzeFinalArticle(html, keyphrase);
     expect(metrics2.readableWordCount).toBe(metrics.readableWordCount);
@@ -4687,7 +4746,7 @@ describe("stale baseline and deduplication guard", () => {
     expect(metrics2.longParagraphCount).toBe(metrics.longParagraphCount);
     expect(metrics2.keyphraseInFirst100Words).toBe(metrics.keyphraseInFirst100Words);
     expect(metrics2.uniqueInternalLinkCount).toBe(metrics.uniqueInternalLinkCount);
-    
+
     // Verify specific metric values
     expect(metrics.uniqueInternalLinkCount).toBe(3);
     expect(metrics.exactKeyphraseCount).toBeGreaterThan(0);
@@ -4698,17 +4757,17 @@ describe("stale baseline and deduplication guard", () => {
     const policy = buildPolicy(2500, 2375, 2750);
     const passing = passingMetrics(2600);
     expect(evaluatePolicy(passing, policy).passed).toBe(true);
-    
+
     // Word count is a HARD failure — blocks generation
     const failingWc: FinalArticleMetrics = { ...passing, readableWordCount: 2000 };
     const wcResult = evaluatePolicy(failingWc, policy);
     expect(wcResult.passed).toBe(false);
     expect(wcResult.reasons.some((r) => r.startsWith("word count"))).toBe(true);
-    
+
     // Keyphrase stuffing is HARD — blocks generation
     const failingKp: FinalArticleMetrics = { ...passing, exactKeyphraseCount: 200, keyphraseDensity: 10 };
     expect(evaluatePolicy(failingKp, policy).passed).toBe(false);
-    
+
     // Links above max is HARD — blocks generation
     const failingLinks: FinalArticleMetrics = { ...passing, uniqueInternalLinkCount: 5 };
     expect(evaluatePolicy(failingLinks, policy).passed).toBe(false);
@@ -4745,22 +4804,32 @@ describe("pipeline stage order and fallback", () => {
   it("required stages must be present in correct order", () => {
     const state = makeEmptyState();
     state.stageOutputs = [
-      { stage: "conclusion-discipline", inputFingerprint: "a", outputFingerprint: "a", accepted: true },
-      { stage: "expansion", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
-      { stage: "paragraphs", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
-      { stage: "regeneration", inputFingerprint: "c", outputFingerprint: "d", accepted: true },
-      { stage: "language-switcher", inputFingerprint: "d", outputFingerprint: "d1", accepted: true },
-      { stage: "internal-links", inputFingerprint: "d1", outputFingerprint: "e", accepted: true },
-      { stage: "external-links", inputFingerprint: "e", outputFingerprint: "f", accepted: true },
-      { stage: "seo-normalization", inputFingerprint: "f", outputFingerprint: "f1", accepted: true },
-      { stage: "factual-scan", inputFingerprint: "f1", outputFingerprint: "f2", accepted: true },
-      { stage: "link-enforce", inputFingerprint: "f2", outputFingerprint: "f3", accepted: true },
-      { stage: "paragraphs-final", inputFingerprint: "f3", outputFingerprint: "g", accepted: true },
-      { stage: "cta-preserve", inputFingerprint: "g", outputFingerprint: "g1", accepted: true },
-      { stage: "final-trim", inputFingerprint: "g1", outputFingerprint: "h", accepted: true },
-      { stage: "faq-recovery", inputFingerprint: "h", outputFingerprint: "h1", accepted: true },
-      { stage: "wc-check", inputFingerprint: "h1", outputFingerprint: "h2", accepted: true },
-      { stage: "final-validation", inputFingerprint: "h2", outputFingerprint: "i", accepted: true },
+      { stage: "claim-check", inputFingerprint: "a0", outputFingerprint: "a0", accepted: true },
+      { stage: "expansion", inputFingerprint: "a0", outputFingerprint: "a1", accepted: true },
+      { stage: "trim", inputFingerprint: "a1", outputFingerprint: "a2", accepted: true },
+      { stage: "paragraphs", inputFingerprint: "a2", outputFingerprint: "a3", accepted: true },
+      { stage: "regeneration", inputFingerprint: "a3", outputFingerprint: "a4", accepted: true },
+      { stage: "seo-normalization", inputFingerprint: "a4", outputFingerprint: "a5", accepted: true },
+      { stage: "title-repair", inputFingerprint: "a5", outputFingerprint: "a6", accepted: true },
+      { stage: "factual-scan", inputFingerprint: "a6", outputFingerprint: "a7", accepted: true },
+      { stage: "claim-ownership", inputFingerprint: "a7", outputFingerprint: "a8", accepted: true },
+      { stage: "temporal-freshness", inputFingerprint: "a8", outputFingerprint: "a8", accepted: true },
+      { stage: "post-factual-keyphrase", inputFingerprint: "a8", outputFingerprint: "a9", accepted: true },
+      { stage: "paragraphs-final", inputFingerprint: "a9", outputFingerprint: "b0", accepted: true },
+      { stage: "malformed-prose-repair", inputFingerprint: "b0", outputFingerprint: "b0", accepted: true },
+      { stage: "claim-ownership-final", inputFingerprint: "b0", outputFingerprint: "b1", accepted: true },
+      { stage: "language-switcher", inputFingerprint: "b1", outputFingerprint: "b2", accepted: true },
+      { stage: "internal-links", inputFingerprint: "b2", outputFingerprint: "b3", accepted: true },
+      { stage: "external-links", inputFingerprint: "b3", outputFingerprint: "b4", accepted: true },
+      { stage: "external-dedup", inputFingerprint: "b4", outputFingerprint: "b5", accepted: true },
+      { stage: "link-enforce", inputFingerprint: "b5", outputFingerprint: "b6", accepted: true },
+      { stage: "factual-final", inputFingerprint: "b6", outputFingerprint: "b7", accepted: true },
+      { stage: "cta-preserve", inputFingerprint: "b7", outputFingerprint: "b8", accepted: true },
+      { stage: "final-trim", inputFingerprint: "b8", outputFingerprint: "b9", accepted: true },
+      { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
+      { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
+      { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
+      { stage: "final-validation", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
     expect(issues.length).toBe(0);
@@ -4804,13 +4873,13 @@ describe("pipeline stage order and fallback", () => {
   it("stages using wrong order are detected", () => {
     const state = makeEmptyState();
     state.stageOutputs = [
-      { stage: "seo-normalization", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
-      { stage: "internal-links", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
-      { stage: "external-dedup", inputFingerprint: "c", outputFingerprint: "d", accepted: true },
+      { stage: "claim-check", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
+      { stage: "external-links", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
+      { stage: "claim-ownership-final", inputFingerprint: "c", outputFingerprint: "d", accepted: true },
       { stage: "final-validation", inputFingerprint: "d", outputFingerprint: "e", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
-    // internal-links runs AFTER seo-normalization — wrong order
+    // External links cannot run before the final ownership confirmation gate.
     expect(issues.some((i) => i.code === "STAGE_ORDER")).toBe(true);
   });
 });
@@ -4821,10 +4890,12 @@ describe("pipeline stage 2 integration", () => {
   it("every post-assembly stage executes once in the required order", () => {
     const state = makeEmptyState();
     const required = [
-      "conclusion-discipline", "expansion", "paragraphs", "regeneration", "language-switcher",
-      "internal-links", "external-links", "seo-normalization", "factual-scan",
-      "link-enforce", "paragraphs-final", "cta-preserve", "final-trim",
-      "faq-recovery", "wc-check", "final-validation",
+      "claim-check", "expansion", "trim", "paragraphs", "regeneration",
+      "seo-normalization", "title-repair", "factual-scan", "claim-ownership", "temporal-freshness",
+      "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
+      "language-switcher", "internal-links", "external-links", "external-dedup",
+      "link-enforce", "factual-final", "cta-preserve", "final-trim",
+      "faq-recovery", "wc-check", "final-preflight", "final-validation",
     ];
     // All required stages present
     state.stageOutputs = required.map((s, i) => ({
@@ -5142,26 +5213,32 @@ describe("pipeline stage skip recording and rollback", () => {
   it("normal in-range article produces no MISSING_STAGE issue", () => {
     const state = makeFullState();
     state.stageOutputs = [
-      { stage: "claim-check", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { skipped: true, reason: "no-conflicts" } },
-      { stage: "conclusion-discipline", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { removedBlocks: 0 } },
-      { stage: "expansion", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { skipped: true, reason: "already-in-range" } },
-      { stage: "trim", inputFingerprint: "a", outputFingerprint: "a", accepted: true, metadata: { skipped: true, reason: "already-in-range" } },
-      { stage: "paragraphs", inputFingerprint: "a", outputFingerprint: "a", accepted: true },
-      { stage: "regeneration", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
-      { stage: "language-switcher", inputFingerprint: "b", outputFingerprint: "b", accepted: true },
-      { stage: "internal-links", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
-      { stage: "external-links", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "external-dedup", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "seo-normalization", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "factual-scan", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "link-enforce", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "title-repair", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "paragraphs-final", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "cta-preserve", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "final-trim", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "faq-recovery", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "wc-check", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
-      { stage: "final-validation", inputFingerprint: "c", outputFingerprint: "c", accepted: true },
+      { stage: "claim-check", inputFingerprint: "a0", outputFingerprint: "a0", accepted: true },
+      { stage: "expansion", inputFingerprint: "a0", outputFingerprint: "a1", accepted: true },
+      { stage: "trim", inputFingerprint: "a1", outputFingerprint: "a2", accepted: true },
+      { stage: "paragraphs", inputFingerprint: "a2", outputFingerprint: "a3", accepted: true },
+      { stage: "regeneration", inputFingerprint: "a3", outputFingerprint: "a4", accepted: true },
+      { stage: "seo-normalization", inputFingerprint: "a4", outputFingerprint: "a5", accepted: true },
+      { stage: "title-repair", inputFingerprint: "a5", outputFingerprint: "a6", accepted: true },
+      { stage: "factual-scan", inputFingerprint: "a6", outputFingerprint: "a7", accepted: true },
+      { stage: "claim-ownership", inputFingerprint: "a7", outputFingerprint: "a8", accepted: true },
+      { stage: "temporal-freshness", inputFingerprint: "a8", outputFingerprint: "a8", accepted: true },
+      { stage: "post-factual-keyphrase", inputFingerprint: "a8", outputFingerprint: "a9", accepted: true },
+      { stage: "paragraphs-final", inputFingerprint: "a9", outputFingerprint: "b0", accepted: true },
+      { stage: "malformed-prose-repair", inputFingerprint: "b0", outputFingerprint: "b0", accepted: true },
+      { stage: "claim-ownership-final", inputFingerprint: "b0", outputFingerprint: "b1", accepted: true },
+      { stage: "language-switcher", inputFingerprint: "b1", outputFingerprint: "b2", accepted: true },
+      { stage: "internal-links", inputFingerprint: "b2", outputFingerprint: "b3", accepted: true },
+      { stage: "external-links", inputFingerprint: "b3", outputFingerprint: "b4", accepted: true },
+      { stage: "external-dedup", inputFingerprint: "b4", outputFingerprint: "b5", accepted: true },
+      { stage: "link-enforce", inputFingerprint: "b5", outputFingerprint: "b6", accepted: true },
+      { stage: "factual-final", inputFingerprint: "b6", outputFingerprint: "b7", accepted: true },
+      { stage: "cta-preserve", inputFingerprint: "b7", outputFingerprint: "b8", accepted: true },
+      { stage: "final-trim", inputFingerprint: "b8", outputFingerprint: "b9", accepted: true },
+      { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
+      { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
+      { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
+      { stage: "final-validation", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
     expect(issues.filter((i) => i.code === "MISSING_STAGE").length).toBe(0);

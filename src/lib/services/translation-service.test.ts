@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { ArticleDocument } from "@/lib/blog/article-document";
+import { renderArticleDocument, type ArticleDocument, type EditorialBlock } from "@/lib/blog/article-document";
 import {
   checkCompleteness,
   visibleChars,
@@ -18,6 +18,8 @@ import {
   localiseSources,
   applySourceDecisions,
   translateArticle,
+  deterministicMetadataFallback,
+  validateTranslatedDocument,
 } from "./translation-service";
 import { formatWordCount } from "@/lib/services/text-utils";
 
@@ -47,10 +49,39 @@ function makeMinimalEnHtml(): string {
 <!-- b2i-conclusion-end -->`;
 }
 
+function chineseTestBlocks(blocks: EditorialBlock[]): EditorialBlock[] {
+  return blocks.map((block) => {
+    if (block.type === "list") {
+      return {
+        ...block,
+        items: block.items.map((item) => item.map((inline) => (
+          inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text: "香港中文內容。" }
+        ))),
+      };
+    }
+    if (block.type === "table") {
+      const convert = (group: typeof block.headers[number]) => group.map((inline) => (
+        inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text: "香港中文內容。" }
+      ));
+      return {
+        ...block,
+        headers: block.headers.map(convert),
+        rows: block.rows.map((row) => row.map(convert)),
+      };
+    }
+    return {
+      ...block,
+      content: block.content.map((inline) => (
+        inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text: "香港中文內容。" }
+      )),
+    };
+  });
+}
+
 function makeMockHelper(calls: Array<{ componentId: string; componentKind: string }>): typeof import("./editorial-block-translation").translateEditorialBlocks {
   return async (opts) => {
     calls.push({ componentId: opts.componentId, componentKind: opts.componentKind });
-    return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
+    return { blocks: chineseTestBlocks(opts.blocks), translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
   };
 }
 
@@ -65,7 +96,7 @@ describe("translateArticle — structured helper orchestration", () => {
   it("introduction invokes the helper once", async () => {
     const calls: Array<{ componentId: string; componentKind: string }> = [];
 
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: makeMockHelper(calls) });
 
     expect(calls.length).toBeGreaterThanOrEqual(1);
     const introCall = calls.find((c) => c.componentKind === "introduction");
@@ -76,7 +107,7 @@ describe("translateArticle — structured helper orchestration", () => {
   it("each ordinary editorial section invokes the helper once", async () => {
     const calls: Array<{ componentId: string; componentKind: string }> = [];
 
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: makeMockHelper(calls) });
 
     expect(calls.filter((c) => c.componentKind === "section").length).toBe(1);
     const secCall = calls.find((c) => c.componentKind === "section");
@@ -87,7 +118,7 @@ describe("translateArticle — structured helper orchestration", () => {
   it("conclusion invokes the helper once", async () => {
     const calls: Array<{ componentId: string; componentKind: string }> = [];
 
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: makeMockHelper(calls) });
 
     const concCall = calls.find((c) => c.componentKind === "conclusion");
     expect(concCall).toBeTruthy();
@@ -107,7 +138,7 @@ describe("translateArticle — structured helper orchestration", () => {
         };
       };
 
-    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: mockHelper });
 
     expect(result.doc.introduction.blocks.length).toBe(1);
     expect(result.doc.introduction.blocks[0].type).toBe("paragraph");
@@ -115,7 +146,59 @@ describe("translateArticle — structured helper orchestration", () => {
     expect(result.doc.conclusion.blocks.length).toBe(1);
   });
 
-  it("helper failure falls back to source blocks", async () => {
+  it("returns HTML rendered exactly from the canonical Chinese ArticleDocument", async () => {
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+    const result = await translateArticle(
+      makeMinimalEnHtml(),
+      makeSourceDoc(),
+      [], { translateEditorialBlocks: makeMockHelper(calls) },
+    );
+
+    expect(result.doc.metadata.slug).toBe("test-zh");
+    expect(result.doc.languageSwitcher?.html).toContain('/blog/test');
+    expect(result.html).toBe(renderArticleDocument(result.doc));
+  });
+
+  it("rejects a translated component that drops a protected brand name", async () => {
+    const html = makeMinimalEnHtml().replace("Introduction text.", "Threads helps local teams start conversations.");
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+    const result = await translateArticle(
+      html,
+      makeSourceDoc(),
+      [], { translateEditorialBlocks: makeMockHelper(calls) },
+    );
+
+    expect(result.failedComponents.some((component) => component.includes("named entities changed: Threads"))).toBe(true);
+  });
+
+  it("clears an initial component failure after targeted recovery succeeds", async () => {
+    const attempts = new Map<string, number>();
+    const helper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
+      const count = (attempts.get(opts.componentId) || 0) + 1;
+      attempts.set(opts.componentId, count);
+      if (opts.componentId === "zh-intro" && count === 1) {
+        return {
+          blocks: opts.blocks,
+          translatedHtml: "",
+          passed: false,
+          metrics: { sourceChars: 10, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 0 },
+        };
+      }
+      return {
+        blocks: chineseTestBlocks(opts.blocks),
+        translatedHtml: "",
+        passed: true,
+        metrics: { sourceChars: 10, translatedChars: 10, ratio: 1, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 },
+      };
+    };
+
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: helper });
+    expect(attempts.get("zh-intro")).toBeGreaterThanOrEqual(2);
+    expect(result.failedComponents).not.toContain("introduction");
+    expect(result.failedComponents).not.toContain("zh-intro-editorial");
+  });
+
+  it("helper failure is surfaced so English fallback cannot be persisted", async () => {
     const calls: Array<{ componentId: string; componentKind: string }> = [];
     const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks =
       async (opts) => {
@@ -128,11 +211,14 @@ describe("translateArticle — structured helper orchestration", () => {
         };
       };
 
-    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: mockHelper });
 
-    // When the helper fails (passed=false), the service falls back to source blocks
+    // Source blocks remain available for diagnostics, but failedComponents makes
+    // the route reject the candidate before any bilingual persistence.
     expect(result.doc.sections.length).toBeGreaterThan(0);
     expect(result.doc.sections[0].blocks.length).toBeGreaterThan(0);
+    expect(result.failedComponents).toContain("section-0");
+    expect(result.failedComponents.some((component) => component.startsWith("validation:"))).toBe(true);
   });
 });
 
@@ -140,7 +226,7 @@ describe("FAQ and CTA do not use structured helper", () => {
   it("FAQ translation does not invoke the helper", async () => {
     const calls: Array<{ componentId: string; componentKind: string }> = [];
 
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: makeMockHelper(calls) });
 
     const faqCalls = calls.filter((c: any) => c.componentId?.includes("faq") || c.componentId?.includes("zh-faq"));
     expect(faqCalls.length).toBe(0);
@@ -149,7 +235,7 @@ describe("FAQ and CTA do not use structured helper", () => {
   it("CTA translation does not invoke the helper", async () => {
     const calls: Array<{ componentId: string; componentKind: string }> = [];
 
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: makeMockHelper(calls) });
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: makeMockHelper(calls) });
 
     const ctaCalls = calls.filter((c: any) => c.componentId?.includes("cta"));
     expect(ctaCalls.length).toBe(0);
@@ -167,7 +253,7 @@ describe("structured translation shadow orchestration", () => {
   it("shadow disabled by default makes zero shadow calls", async () => {
     const mockCalls: Array<string> = [];
     const mockHelper = makeShadowMock(mockCalls);
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: mockHelper });
     // No structured shadow was configured, so zero DTO-related calls
     expect(mockCalls.filter((c) => c === "conclusion").length).toBe(1); // HTML path conclusion call
   });
@@ -179,7 +265,7 @@ describe("structured translation shadow orchestration", () => {
       mockCalls.push("shadow-conclusion");
       return JSON.stringify({ componentKind: "conclusion", blocks: [] });
     });
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], {
       translateEditorialBlocks: mockHelper,
       structuredTranslationShadow: {
         enabled: true,
@@ -195,7 +281,7 @@ describe("structured translation shadow orchestration", () => {
     const mockCalls: Array<string> = [];
     const mockHelper = makeShadowMock(mockCalls);
     const shadowTranslate = vi.fn();
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], {
       translateEditorialBlocks: mockHelper,
       structuredTranslationShadow: { enabled: false, translatePayload: shadowTranslate },
     });
@@ -208,7 +294,7 @@ describe("structured translation shadow orchestration", () => {
       return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
     };
     const shadowTranslate = vi.fn(async () => "invalid json that will fail");
-    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], {
       translateEditorialBlocks: mockHelper,
       structuredTranslationShadow: { enabled: true, translatePayload: shadowTranslate },
     });
@@ -227,7 +313,7 @@ describe("structured conclusion shadow callbacks", () => {
     const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
       return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
     };
-    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], {
       translateEditorialBlocks: mockHelper,
       // No structuredTranslationShadow injected — env flag builds production defaults
     });
@@ -279,7 +365,7 @@ describe("structured conclusion shadow callbacks", () => {
     const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
       return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
     };
-    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], {
       translateEditorialBlocks: mockHelper,
     });
     delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION;
@@ -294,7 +380,7 @@ describe("structured conclusion shadow callbacks", () => {
     const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks = async (opts) => {
       return { blocks: opts.blocks, translatedHtml: "", passed: true, metrics: { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 } };
     };
-    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], new Set(), {
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], {
       translateEditorialBlocks: mockHelper,
     });
     delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION;
@@ -598,7 +684,7 @@ describe("localiseSources", () => {
     const decisions = localiseSources(html, []);
     const censtatd = decisions.find((d: any) => d.originalUrl === "https://www.censtatd.gov.hk/en/data");
     expect(censtatd?.decision).toBe("preserved");
-    expect(censtatd?.reason).toContain("Authoritative");
+    expect(censtatd?.reason).toContain("preserves");
   });
 
   it("preserves internal /blog/ links (not external)", () => {
@@ -611,16 +697,16 @@ describe("localiseSources", () => {
     const decisions = localiseSources(html, []);
     const example = decisions.find((d: any) => d.originalUrl === "https://example.com/report");
     expect(example?.decision).toBe("preserved");
-    expect(example?.matchScore).toBe(0);
+    expect(example?.matchScore).toBe(10);
   });
 
-  it("replaces source when strong research match exists", () => {
+  it("preserves source even when a related research candidate exists", () => {
     const research = [
       { title: "Threads成長報告 | 香港社交媒體統計", url: "https://hk-research.com/threads-2026", snippet: "Threads users grew 250% in Hong Kong in 2026", category: "news" },
     ];
     const decisions = localiseSources('<p><a href="https://example.com/threads-report">Threads report</a></p>', research);
     const replaced = decisions.find((d: any) => d.originalUrl === "https://example.com/threads-report");
-    expect(replaced?.decision).toMatch(/preserved|replaced/);
+    expect(replaced?.decision).toBe("preserved");
   });
 
   it("rejects weak or mismatched research candidate", () => {
@@ -650,12 +736,12 @@ describe("localiseSources", () => {
 });
 
 describe("applySourceDecisions", () => {
-  it("replaces URL in anchor tag", () => {
+  it("never rewrites a source URL even when a legacy replacement decision is supplied", () => {
     const decisions = [
       { originalUrl: "https://old.com/page", finalUrl: "https://new.com/page", decision: "replaced" as const, reason: "Test", matchScore: 5 },
     ];
     const result = applySourceDecisions('<a href="https://old.com/page">Link</a>', decisions);
-    expect(result).toBe('<a href="https://new.com/page">Link</a>');
+    expect(result).toBe('<a href="https://old.com/page">Link</a>');
   });
 
   it("does not modify preserved URLs", () => {
@@ -696,17 +782,15 @@ describe("End-to-end source localisation — all 5 link types", () => {
     const decisions = localiseSources(ALL_LINK_TYPES_HTML, RESEARCH_WITH_CHINESE);
     const censtatd = decisions.find((d: any) => d.originalUrl.includes("censtatd.gov.hk"));
     expect(censtatd?.decision).toBe("preserved");
-    expect(censtatd?.reason).toContain("Authoritative");
+    expect(censtatd?.reason).toContain("preserves");
     expect(censtatd?.matchScore).toBe(10);
   });
 
-  it("replaces secondary source when verified Chinese alternative exists in research", () => {
+  it("preserves secondary sources even when a Chinese alternative exists", () => {
     const decisions = localiseSources(ALL_LINK_TYPES_HTML, RESEARCH_WITH_CHINESE);
     const marketingLink = decisions.find((d: any) => d.originalUrl === "https://marketing-insider.com/threads-hk-2026");
-    // If a Chinese research item matches, the URL stays because the research also has the same URL
-    // The test verifies the URL is at minimum not removed or invented
-    expect(marketingLink?.finalUrl).toMatch(/^https?:\/\//);
-    expect(marketingLink?.decision).toMatch(/preserved|replaced/);
+    expect(marketingLink?.finalUrl).toBe(marketingLink?.originalUrl);
+    expect(marketingLink?.decision).toBe("preserved");
   });
 
   it("preserves a source when no research matches", () => {
@@ -1030,3 +1114,79 @@ describe("Scaled number equivalence", () => {
   });
 });
 
+
+describe("translation metadata and fail-closed parity", () => {
+  it("builds usable Chinese metadata deterministically when the provider is empty", () => {
+    const fallback = deterministicMetadataFallback(
+      "Threads Marketing Hong Kong Guide 2026",
+      "香港中小企可以透過 Threads 建立真誠互動，並以實用內容逐步累積品牌信任。",
+      [],
+      "title",
+      "香港Threads市場推廣",
+    );
+
+    expect(fallback).toContain("香港Threads市場推廣");
+    expect(fallback).toContain("Threads");
+    expect(fallback).toContain("2026");
+    expect(fallback).toMatch(/[\u3400-\u9fff]/u);
+  });
+
+  it("rejects English fallback content and a title missing the Chinese keyphrase", () => {
+    const enDoc: ArticleDocument = {
+      metadata: {
+        title: "Threads Marketing Hong Kong Guide",
+        slug: "threads-marketing-hong-kong",
+        metaDescription: "A practical guide for Hong Kong SMEs.",
+        excerpt: "A practical guide.",
+        targetWordCount: 1000,
+        focusKeyphrase: "threads marketing hong kong",
+      },
+      languageSwitcher: null,
+      introduction: { id: "intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "English source paragraph." }] }] },
+      sections: [{ id: "s1", heading: "Getting Started", headingLevel: 2, sectionType: "main", status: "generated", blocks: [{ id: "p2", type: "paragraph", content: [{ type: "text", text: "English section." }] }] }],
+      visibleFaq: [],
+      conclusion: { id: "conc", status: "generated", blocks: [{ id: "p3", type: "paragraph", content: [{ type: "text", text: "English conclusion." }] }] },
+      cta: null,
+      faqSchema: null,
+      insertedLinks: [],
+    };
+    const zhDoc: ArticleDocument = {
+      ...enDoc,
+      metadata: {
+        ...enDoc.metadata,
+        slug: "threads-marketing-hong-kong-zh",
+        title: "香港 Threads 實用指南",
+        metaDescription: "為香港中小企整理 Threads 市場推廣策略。",
+        excerpt: "香港中小企實用指南。",
+        focusKeyphrase: "香港Threads市場推廣",
+      },
+      introduction: enDoc.introduction,
+      sections: enDoc.sections,
+      conclusion: enDoc.conclusion,
+    };
+
+    const errors = validateTranslatedDocument(enDoc, zhDoc, []);
+    expect(errors.some((error) => error.includes("keyphrase missing from SEO title"))).toBe(true);
+    expect(errors.some((error) => error.includes("insufficient Chinese") || error.includes("excessive English"))).toBe(true);
+  });
+});
+
+describe("translated temporal parity gate", () => {
+  it("rejects stale Chinese predictions introduced by translation", () => {
+    const enDoc: ArticleDocument = {
+      metadata: { title: "Threads Guide", slug: "threads-guide", metaDescription: "Guide", excerpt: "", targetWordCount: 500, focusKeyphrase: "threads marketing" },
+      languageSwitcher: null,
+      introduction: { id: "intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "Advertising is available through Meta Ads Manager." }] }] },
+      sections: [], visibleFaq: [],
+      conclusion: { id: "conc", status: "generated", blocks: [] },
+      cta: null, faqSchema: null, insertedLinks: [],
+    };
+    const zhDoc: ArticleDocument = {
+      ...enDoc,
+      metadata: { ...enDoc.metadata, slug: "threads-guide-zh", title: "香港Threads市場推廣指南", metaDescription: "香港Threads市場推廣指南", focusKeyphrase: "香港Threads市場推廣" },
+      introduction: { id: "zh-intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "廣告功能預計於2025年稍後擴展。" }] }] },
+    };
+    const errors = validateTranslatedDocument(enDoc, zhDoc, []);
+    expect(errors.some((error) => error.includes("stale temporal wording"))).toBe(true);
+  });
+});

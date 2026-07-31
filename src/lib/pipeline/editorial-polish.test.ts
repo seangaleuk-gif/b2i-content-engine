@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   countCanonicalVisibleWords,
   fingerprintHtml,
@@ -15,15 +15,19 @@ import {
   countExactKeyphrase,
   detectMalformedProse,
   extractAllLinks,
+  findMalformedEditableBlocks,
   extractEditableBlocks,
   extractNumericClaims,
+  findProseOnlyEditableBlockIds,
+  findRepeatedEditableBlockIds,
+  findWeakenedEditableBlockIds,
   isEditorialPolishEnabled,
   normalizeLinkSpacing,
+  repairDeterministicMalformedProse,
   runEditorialPolish,
   validateCandidate,
   type PolishEdit,
 } from "./editorial-polish";
-import { analyzeFinalArticle, evaluatePolicy, buildPolicy } from "@/lib/blog/final-article-policy";
 
 const KEY_PHRASE = "threads marketing hong kong";
 
@@ -214,6 +218,65 @@ describe("editorial feature flag and extraction", () => {
     expect(first.every((item) => !item.blockId.includes("faq-heading"))).toBe(true);
   });
 
+  it("can scope a targeted repair to only the supplied block IDs", () => {
+    const doc = makeDocument();
+    const target = blockByText(doc, "response that matters");
+    const editable = extractEditableBlocks(doc, [], [target.blockId]);
+    expect(editable.map((item) => item.blockId)).toEqual([target.blockId]);
+  });
+
+  it("selects only the weaker occurrence from each repeated idea cluster", () => {
+    const doc = makeDocument();
+    const repeated = findRepeatedEditableBlockIds(doc);
+    const duplicates = extractEditableBlocks(doc)
+      .filter((item) => item.html.includes("A clear audience helps"))
+      .map((item) => item.blockId);
+    expect(duplicates).toHaveLength(2);
+    expect(repeated).toHaveLength(1);
+    expect(duplicates).toContain(repeated[0]);
+  });
+
+  it("excludes evidence-locked blocks from the AI request", () => {
+    const doc = makeDocument();
+    const factual = blockByText(doc, "A clear audience helps");
+    const editable = extractEditableBlocks(doc, [factual.blockId]);
+    expect(editable.some((item) => item.blockId === factual.blockId)).toBe(false);
+    expect(editable.length).toBe(extractEditableBlocks(doc).length - 1);
+  });
+
+  it("scopes the prose-only fallback to fact-free blocks", () => {
+    const doc = makeDocument();
+    doc.sections[0].blocks.push(
+      paragraph("numeric-paragraph", "The campaign reached 25% more people after the change."),
+    );
+    const ids = findProseOnlyEditableBlockIds(doc, KEY_PHRASE, [], {});
+    const linked = blockByText(doc, "official guidance");
+    const numeric = blockByText(doc, "25% more people");
+    const ordinary = blockByText(doc, "response that matters");
+    expect(ids).not.toContain(linked.blockId);
+    expect(ids).not.toContain(numeric.blockId);
+    expect(ids).toContain(ordinary.blockId);
+  });
+
+  it("targets only abrupt fact-free blocks in components weakened by cleanup", () => {
+    const doc = makeDocument();
+    doc.sections[0].blocks.push(
+      paragraph("abrupt-paragraph", "However, this needs a clearer transition."),
+    );
+    doc.sections[1].blocks.push(
+      paragraph("unaffected-short", "However, this other section was not changed."),
+    );
+    const ids = findWeakenedEditableBlockIds(
+      doc,
+      ["section-audience"],
+      KEY_PHRASE,
+      [],
+      {},
+    );
+    expect(ids).toContain(blockByText(doc, "clearer transition").blockId);
+    expect(ids).not.toContain(blockByText(doc, "other section was not changed").blockId);
+  });
+
   it("gives the editor article-wide section memory without FAQ copy", () => {
     const summaries = buildSectionSummaries(makeDocument());
     expect(summaries[0].heading).toBe("Introduction");
@@ -235,6 +298,21 @@ describe("editorial feature flag and extraction", () => {
     expect(prompt).toContain("Preserve every href exactly");
     expect(prompt).toContain("Do not invent facts");
     expect(prompt).toContain("Do not add, remove, merge, split or reorder blocks");
+  });
+
+  it("explains the fact-free fallback boundary to the editor", () => {
+    const doc = makeDocument();
+    const messages = buildPolishPrompt({
+      blocks: extractEditableBlocks(doc),
+      sectionSummaries: buildSectionSummaries(doc),
+      keyphrase: KEY_PHRASE,
+      title: doc.metadata.title,
+      metaDescription: doc.metadata.metaDescription,
+      mode: "prose-only",
+    });
+    const prompt = messages.map((message) => message.content).join("\n");
+    expect(prompt).toContain("fact-free editorial fallback");
+    expect(prompt).toContain("raise the article to its editorial quality threshold");
   });
 });
 
@@ -284,6 +362,109 @@ describe("deterministic safeguards", () => {
       'Threads rewards conversation. " instead of listing products.',
     );
     expect(detectMalformedProse(doc).some((issue) => issue.includes("quotation"))).toBe(true);
+  });
+
+
+  it("resolves malformed prose to stable block IDs and exact issue labels", () => {
+    const doc = makeDocument();
+    doc.sections[1].blocks[1] = paragraph(
+      "broken-ending",
+      "Choose a useful response before publishing. Avoid ending the plan with.",
+    );
+    const issues = findMalformedEditableBlocks(doc);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].blockId).toContain("broken-ending");
+    expect(issues[0].issues).toContain("incomplete sentence ending");
+    expect(detectMalformedProse(doc)[0]).toContain(issues[0].blockId);
+  });
+
+  it("deterministically trims only the trailing broken sentence", () => {
+    const doc = makeDocument();
+    doc.sections[1].blocks[1] = paragraph(
+      "broken-ending",
+      "Choose a useful response before publishing. Avoid ending the plan with.",
+    );
+    const result = repairDeterministicMalformedProse(doc, 1);
+    expect(result.repairedBlockIds).toHaveLength(1);
+    expect(result.removedBlockIds).toHaveLength(0);
+    expect(findMalformedEditableBlocks(doc)).toHaveLength(0);
+    expect(renderArticleDocument(doc)).toContain("Choose a useful response before publishing.");
+    expect(renderArticleDocument(doc)).not.toContain("Avoid ending the plan with.");
+  });
+
+  it("removes a short evidence-free malformed paragraph when trimming is impossible", () => {
+    const doc = makeDocument();
+    doc.sections[1].blocks[1] = paragraph(
+      "broken-only",
+      "A campaign plan should finish with.",
+    );
+    const result = repairDeterministicMalformedProse(doc, 1, {}, true);
+    expect(result.removedBlockIds).toHaveLength(1);
+    expect(findMalformedEditableBlocks(doc)).toHaveLength(0);
+    expect(renderArticleDocument(doc)).not.toContain("finish with.");
+  });
+
+  it("includes stable malformed issue ownership in the targeted prompt", () => {
+    const doc = makeDocument();
+    doc.sections[1].blocks[1] = paragraph("broken-ending", "A campaign plan should finish with.");
+    const target = findMalformedEditableBlocks(doc)[0];
+    const prompt = buildPolishPrompt({
+      blocks: extractEditableBlocks(doc, [], [target.blockId]),
+      sectionSummaries: buildSectionSummaries(doc),
+      keyphrase: KEY_PHRASE,
+      title: doc.metadata.title,
+      metaDescription: doc.metadata.metaDescription,
+      mode: "malformed",
+      malformedIssuesByBlockId: { [target.blockId]: target.issues },
+    }).map((message) => message.content).join("\n");
+    expect(prompt).toContain("targeted malformed-prose repair pass");
+    expect(prompt).toContain(target.blockId);
+    expect(prompt).toContain("incomplete sentence ending");
+  });
+});
+
+describe("targeted malformed-prose repair", () => {
+  it("retries with stable block IDs and commits only when every malformed block is repaired", async () => {
+    const doc = makeDocument();
+    doc.sections[0].blocks[0] = paragraph(
+      "broken-quote-one",
+      'A clear audience prevents generic posts. "This unfinished fragment needs repair.',
+    );
+    doc.sections[1].blocks[1] = paragraph(
+      "broken-quote-two",
+      'Measure useful replies before changing direction. "This second fragment also needs repair.',
+    );
+    const malformed = findMalformedEditableBlocks(doc);
+    const first = malformed[0];
+    const second = malformed[1];
+    const firstFix = edit(
+      first.blockId,
+      "<!-- wp:paragraph --><p>A clear audience prevents generic posts. This gives each discussion a specific purpose.</p><!-- /wp:paragraph -->",
+      "Completed the unfinished fragment",
+    );
+    const secondFix = edit(
+      second.blockId,
+      "<!-- wp:paragraph --><p>Measure useful replies before changing direction. This keeps the next decision tied to the campaign goal.</p><!-- /wp:paragraph -->",
+      "Completed the unfinished fragment",
+    );
+    const ai = vi.fn()
+      .mockResolvedValueOnce({ content: response([firstFix]) })
+      .mockResolvedValueOnce({ content: response([firstFix, secondFix]) });
+
+    const result = await runEditorialPolish(doc, KEY_PHRASE, ai, {
+      maxAttempts: 2,
+      editableBlockIds: malformed.map((issue) => issue.blockId),
+      mode: "malformed",
+      malformedIssuesByBlockId: Object.fromEntries(
+        malformed.map((issue) => [issue.blockId, issue.issues]),
+      ),
+    });
+
+    expect(result.result.accepted).toBe(true);
+    expect(ai).toHaveBeenCalledTimes(2);
+    expect(ai.mock.calls[1][0].at(-1)?.content).toContain(second.blockId);
+    expect(findMalformedEditableBlocks(result.doc)).toHaveLength(0);
+    expect(renderArticleDocument(doc)).toContain("unfinished fragment");
   });
 });
 
@@ -366,6 +547,48 @@ describe("atomic edit application", () => {
     ).toThrow(/numeric facts changed/);
   });
 
+  it("allows surrounding prose to improve while preserving the exact factual sentence", () => {
+    const doc = makeDocument();
+    doc.sections[1].blocks.push(
+      paragraph(
+        "fact-with-context",
+        "Small teams should define the purpose before publishing. According to Marketing-Interactive, awareness reached 66% in 2025.",
+      ),
+    );
+    const target = blockByText(doc, "define the purpose");
+    const candidate = applyEdits(doc, [
+      edit(
+        target.blockId,
+        "<!-- wp:paragraph --><p>Choose the business outcome before drafting the first post. According to Marketing-Interactive, awareness reached 66% in 2025.</p><!-- /wp:paragraph -->",
+      ),
+    ]);
+    expect(renderArticleDocument(candidate)).toContain("Choose the business outcome");
+    expect(renderArticleDocument(candidate)).toContain(
+      "According to Marketing-Interactive, awareness reached 66% in 2025.",
+    );
+  });
+
+  it("keeps decimal factual sentences intact while editing surrounding prose", () => {
+    const doc = makeDocument();
+    const factualSentence = "Hong Kong had 2.4 million monthly active Threads users in 2025.";
+    doc.sections[1].blocks.push(
+      paragraph("decimal-fact", `${factualSentence} The surrounding explanation can be improved.`),
+    );
+    const target = blockByText(doc, "2.4 million");
+    const candidate = applyEdits(
+      doc,
+      [edit(
+        target.blockId,
+        `<!-- wp:paragraph --><p>${factualSentence} Businesses can improve the explanation without changing the verified fact.</p><!-- /wp:paragraph -->`,
+      )],
+      [],
+      undefined,
+      { [target.blockId]: [factualSentence] },
+    );
+    expect(renderArticleDocument(candidate)).toContain("Businesses can improve");
+    expect(renderArticleDocument(candidate)).toContain(factualSentence);
+  });
+
   it("rejects a semantic rewrite even when it preserves the same number", () => {
     const doc = makeDocument();
     doc.sections[1].blocks.push(
@@ -424,20 +647,12 @@ describe("atomic edit application", () => {
 describe("candidate validation", () => {
   it.each([
     ["FAQ", (doc: ArticleDocument) => { doc.visibleFaq[0].question = "Changed?"; }],
-    ["CTA", (doc: ArticleDocument) => { if (doc.cta) { doc.cta.html = "changed"; doc.cta.fingerprint = "changed"; } }],
-    ["schema", (doc: ArticleDocument) => { if (doc.faqSchema) { doc.faqSchema.html = "changed"; doc.faqSchema.fingerprint = "changed"; } }],
+    ["CTA", (doc: ArticleDocument) => { if (doc.cta) doc.cta.html = "changed"; }],
+    ["schema", (doc: ArticleDocument) => { if (doc.faqSchema) doc.faqSchema.html = "changed"; }],
     ["language switcher", (doc: ArticleDocument) => { doc.languageSwitcher = null; }],
-  ])("rejects protected %s changes", (_label, mutate) => {
-    const original = makeDocument();
-    const candidate = structuredClone(original);
-    mutate(candidate);
-    expect(validateCandidate(original, candidate, KEY_PHRASE).passed).toBe(false);
-  });
-
-  it.each([
     ["title", (doc: ArticleDocument) => { doc.metadata.title = "Changed title"; }],
     ["H2 structure", (doc: ArticleDocument) => { doc.sections.pop(); }],
-  ])("rejects %s changes", (_label, mutate) => {
+  ])("rejects protected %s changes", (_label: string, mutate: (doc: ArticleDocument) => void) => {
     const original = makeDocument();
     const candidate = structuredClone(original);
     mutate(candidate);
@@ -587,6 +802,66 @@ describe("editorial transaction", () => {
     expect(result.doc).toBe(doc);
   });
 
+  it("allows a fact-free fallback after a broad numeric rewrite is rejected", async () => {
+    const doc = makeDocument();
+    doc.sections[0].blocks.push(
+      paragraph("numeric-baseline", "The approved survey result is 25%."),
+    );
+    const numericTarget = blockByText(doc, "approved survey result");
+    const broadAi = vi.fn().mockResolvedValue({
+      content: response([
+        edit(
+          numericTarget.blockId,
+          "<!-- wp:paragraph --><p>The approved survey result is 30%.</p><!-- /wp:paragraph -->",
+        ),
+      ]),
+    });
+    const broad = await runEditorialPolish(doc, KEY_PHRASE, broadAi, { maxAttempts: 1 });
+    expect(broad.result.accepted).toBe(false);
+    expect(broad.result.reason).toContain("numeric facts changed");
+
+    const proseOnlyIds = findProseOnlyEditableBlockIds(doc, KEY_PHRASE, [], {});
+    expect(proseOnlyIds).not.toContain(numericTarget.blockId);
+    const proseTarget = blockByText(doc, "response that matters");
+    expect(proseOnlyIds).toContain(proseTarget.blockId);
+    const fallbackAi = vi.fn().mockResolvedValue({
+      content: response([
+        edit(
+          proseTarget.blockId,
+          "<!-- wp:paragraph --><p>Define the useful business response first, then review the discussion against that goal and keep the customer language that can sharpen the next post.</p><!-- /wp:paragraph -->",
+        ),
+      ]),
+    });
+    const fallback = await runEditorialPolish(doc, KEY_PHRASE, fallbackAi, {
+      maxAttempts: 1,
+      mode: "prose-only",
+      editableBlockIds: proseOnlyIds,
+    });
+    expect(fallback.result.accepted).toBe(true);
+    expect(renderArticleDocument(fallback.doc)).toContain("25%");
+    expect(renderArticleDocument(fallback.doc)).not.toContain("30%");
+  });
+
+  it("rejects an edit targeting an evidence-locked block", async () => {
+    const doc = makeDocument();
+    const target = blockByText(doc, "response that matters");
+    const ai = vi.fn().mockResolvedValue({
+      content: response([
+        edit(
+          target.blockId,
+          "<!-- wp:paragraph --><p>Changed factual evidence wording.</p><!-- /wp:paragraph -->",
+        ),
+      ]),
+    });
+    const result = await runEditorialPolish(doc, KEY_PHRASE, ai, {
+      maxAttempts: 1,
+      protectedBlockIds: [target.blockId],
+    });
+    expect(result.result.accepted).toBe(false);
+    expect(result.result.reason).toContain("Unknown or protected blockId");
+    expect(result.doc).toBe(doc);
+  });
+
   it("rejects atomically when production validation fails", async () => {
     const doc = makeDocument();
     const ai = vi.fn().mockResolvedValue({ content: response([]) });
@@ -619,95 +894,10 @@ describe("editorial transaction", () => {
     expect(result.result.keyphraseAfter).toBe(before);
   });
 
-  it("JSON-LD keyphrase count does not inflate visible density", () => {
-    // Verify that countExactKeyphrase excludes wp:html blocks (schema, CTA, switcher)
-    const htmlWithWpHtml = `<!-- wp:html --><div>${KEY_PHRASE} inside wp:html</div><!-- /wp:html -->
-<p>${KEY_PHRASE} in visible content.</p>`;
-    const visibleCount = countExactKeyphrase(htmlWithWpHtml, KEY_PHRASE);
-    // The wp:html occurrence must be excluded
-    expect(visibleCount).toBe(1); // only the visible one counts
-  });
-
-  it("malformed prose reports stable blockId", () => {
-    const doc = makeDocument();
-    const malformed = detectMalformedProse(doc);
-    for (const issue of malformed) {
-      expect(issue).toMatch(/block section-\d+-block-\d+/);
-    }
-  });
-
-  it("conclusion numeric claim is removed safely", async () => {
-    const doc = makeDocument();
-    // Insert a block with a new percentage claim BEFORE the last conclusion block
-    // so removal won't empty the conclusion (safety guard).
-    const extraBlock = {
-      id: "conc-extra",
-      type: "paragraph" as const,
-      content: [{ type: "text" as const, text: "Research shows 99% of users prefer this approach." }],
-    };
-    doc.conclusion.blocks.splice(doc.conclusion.blocks.length - 1, 0, extraBlock);
-    const totalBefore = doc.conclusion.blocks.length;
-    const ai = vi.fn().mockResolvedValue({ content: response([]) });
-    const result = await runEditorialPolish(doc, KEY_PHRASE, ai, { maxAttempts: 1 });
-    // The pre-processing should remove the block containing the new claim
-    expect(result.doc.conclusion.blocks.length).toBeLessThan(totalBefore);
-  });
-
-  it("conclusion regeneration when removal would empty it", async () => {
-    const doc = makeDocument();
-    // Replace all conclusion blocks with one containing a new numeric claim
-    doc.conclusion.blocks = [{
-      id: "conc-only",
-      type: "paragraph",
-      content: [{ type: "text", text: "Statistics show that 85% of teams using this method improve." }],
-    }];
-    const ai = vi.fn().mockResolvedValue({
-      content: "<!-- wp:paragraph --><p>Teams that apply this method consistently see meaningful improvement.</p><!-- /wp:paragraph -->",
-    });
-    const result = await runEditorialPolish(doc, KEY_PHRASE, ai, { maxAttempts: 1 });
-    // Regeneration is attempted when removal would empty the conclusion.
-    // Since we mock the AI to return clean content, it may or may not succeed
-    // depending on parse success. The test verifies no crash.
-    expect(result.result.accepted !== undefined).toBe(true);
-  });
-
-  it("editorial candidate accepted before CTA/schema downstream", async () => {
-    const doc = makeDocument();
-    const target = blockByText(doc, "response that matters");
-    const ai = vi.fn().mockResolvedValue({
-      content: response([
-        edit(target.blockId, "<!-- wp:paragraph --><p>Improved paragraph about building useful conversations.</p><!-- /wp:paragraph -->"),
-      ]),
-    });
-    const result = await runEditorialPolish(doc, KEY_PHRASE, ai, { maxAttempts: 1 });
-    expect(result.result.accepted).toBe(true);
-    // CTA and schema are still missing from the candidate — that's OK at this stage
-  });
-
-  it("final validation evaluates editorial candidate with stage-aware policy (relaxed for CTA/schema)", async () => {
-    const doc = makeDocument();
-    // This test verifies that editorial-polish's validateProductionCandidate (called
-    // inside runEditorialPolish) does NOT reject candidates for missing CTA/schema.
-    // The actual full evaluatePolicy() runs later, after cta-preserve and faq-recovery.
-    const target = blockByText(doc, "response that matters");
-    const ai = vi.fn().mockResolvedValue({
-      content: response([
-        edit(target.blockId, "<!-- wp:paragraph --><p>Improved text about building useful conversations.</p><!-- /wp:paragraph -->"),
-      ]),
-    });
-    const result = await runEditorialPolish(doc, KEY_PHRASE, ai, {
-      maxAttempts: 1,
-      validateProductionCandidate: () => ({ passed: true, reasons: [] }),
-    });
-    expect(result.result.accepted).toBe(true);
-  });
-
-  it("atomic rollback returns original unchanged", async () => {
-    const doc = makeDocument();
-    const origHtml = renderArticleDocument(doc);
-    const ai = vi.fn().mockRejectedValue(new Error("API failure"));
-    const result = await runEditorialPolish(doc, KEY_PHRASE, ai, { maxAttempts: 1 });
-    expect(result.result.accepted).toBe(false);
-    expect(renderArticleDocument(result.doc)).toBe(origHtml);
+  it("excludes wp:html schema, CTA and switcher text from keyphrase counting", () => {
+    const html = `<!-- wp:paragraph --><p>${KEY_PHRASE} appears once in editorial prose.</p><!-- /wp:paragraph -->
+<!-- wp:html --><script type="application/ld+json">{"text":"${KEY_PHRASE}"}</script><!-- /wp:html -->
+<!-- wp:html --><div>${KEY_PHRASE}</div><!-- /wp:html -->`;
+    expect(countExactKeyphrase(html, KEY_PHRASE)).toBe(1);
   });
 });

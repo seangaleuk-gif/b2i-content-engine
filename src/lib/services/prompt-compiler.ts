@@ -23,7 +23,7 @@ function buildCacheKey(context: BlogContext): string {
     .map((s) => `${s.key}:${hashString(s.content)}`)
     .sort()
     .join("|");
-  return `p${context.project.name}|${sections}`;
+  return `p${context.project.name}|d${context.generationDate || "current"}|${sections}`;
 }
 
 // ── LRU cache ──

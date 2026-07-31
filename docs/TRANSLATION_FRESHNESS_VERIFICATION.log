@@ -1,0 +1,79 @@
+B2I Content Engine — Translation & Freshness v3 Verification
+Date: 2026-07-30
+
+== Repository AST audit ==
+{
+  "files": 185,
+  "errors": 0
+}
+
+== Strict semantic TypeScript audit (changed production graph) ==
+core semantic diagnostics: 0
+
+== Runtime translation/freshness invariants ==
+{"temporal":"pass","metadata":"pass","glossary":"pass","structure":"pass","faqCount":5,"translationGate":"pass"}
+
+== Architecture invariants ==
+architecture invariants: pass
+
+== Supplied article temporal scan ==
+[
+  {
+    "type": "expired_prediction",
+    "sentence": "With the platform's user base still growing and advertising features expected to expand later in 2025, getting your profile ready now positions you ahead of the curve.",
+    "year": 2025,
+    "reason": "future or predictive wording refers to a year before 2026"
+  }
+]
+
+== Git whitespace audit ==
+git diff --check: pass
+
+== Changed files ==
+ M src/app/api/projects/[id]/seo/audit/route.ts
+ M src/app/api/projects/[id]/translate/route.ts
+ M src/app/projects/[id]/chinese-seo/page.tsx
+ M src/lib/blog/article-document.ts
+ M src/lib/blog/temporal-freshness.test.ts
+ M src/lib/blog/temporal-freshness.ts
+ M src/lib/services/editorial-block-translation.test.ts
+ M src/lib/services/editorial-block-translation.ts
+ M src/lib/services/translation-ai.ts
+ M src/lib/services/translation-glossary.ts
+ M src/lib/services/translation-service.test.ts
+ M src/lib/services/translation-service.ts
+?? docs/TRANSLATION_FRESHNESS_AUDIT.md
+?? src/lib/services/translation-version-metadata.test.ts
+?? src/lib/services/translation-version-metadata.ts
+
+== Diff summary ==
+ src/app/api/projects/[id]/seo/audit/route.ts       |  31 +--
+ src/app/api/projects/[id]/translate/route.ts       |  27 ++-
+ src/app/projects/[id]/chinese-seo/page.tsx         |  14 +-
+ src/lib/blog/article-document.ts                   |  23 +-
+ src/lib/blog/temporal-freshness.test.ts            |  25 +++
+ src/lib/blog/temporal-freshness.ts                 |  82 ++++---
+ .../services/editorial-block-translation.test.ts   |  36 +++
+ src/lib/services/editorial-block-translation.ts    |  67 +++++-
+ src/lib/services/translation-ai.ts                 | 118 +++++++---
+ src/lib/services/translation-glossary.ts           |  64 +++---
+ src/lib/services/translation-service.test.ts       |  53 ++++-
+ src/lib/services/translation-service.ts            | 246 ++++++++++++++-------
+ 12 files changed, 566 insertions(+), 220 deletions(-)
+
+== Native command availability ==
+npm test:
+
+> b2i-content-engine@0.1.0 test
+> vitest run
+
+sh: 1: vitest: not found
+
+npm run build:
+
+> b2i-content-engine@0.1.0 build
+> next build
+
+sh: 1: next: not found
+
+Native commands are not reported as passing because the uploaded project contained no usable node_modules and npm ci timed out against the registry.

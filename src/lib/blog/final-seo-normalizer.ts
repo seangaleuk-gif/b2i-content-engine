@@ -905,50 +905,15 @@ function fixParagraphLength(html: string, changes: SeoNormalizationChange[]): st
 
 // ── Fix 5b: Ensure keyphrase in first 100 visible words ──
 
-function fixKeyphraseInFirst100Words(
+export function ensureKeyphraseInFirst100Words(
   html: string,
-  keyphrase: string,
-  changes: SeoNormalizationChange[],
+  _keyphrase: string,
+  _changes: SeoNormalizationChange[] = [],
 ): string {
-  const kpLower = keyphrase.toLowerCase().trim();
-  const first100 = getFirstNReadableWords(html, 100).toLowerCase();
-  if (first100.includes(kpLower)) return html; // already present
-
-  // Find the first editable paragraph
-  const paraBlocks = extractParagraphBlocks(html);
-  if (paraBlocks.length === 0) return html;
-
-  // Insert keyphrase naturally into the first paragraph
-  const firstBlock = paraBlocks[0];
-  const paraText = extractReadableText(firstBlock.html);
-  const sentences = paraText.split(/(?<=[.!?])\s+/);
-
-  // Append keyphrase as a natural sentence after the first sentence
-  let modified: string;
-  if (sentences.length >= 1) {
-    const insertion = ` ${keyphrase.charAt(0).toUpperCase() + keyphrase.slice(1)} is a key focus area.`;
-    const firstSentenceEnd = firstBlock.html.indexOf(sentences[0]) + sentences[0].length;
-    modified =
-      firstBlock.html.substring(0, firstSentenceEnd) +
-      insertion +
-      firstBlock.html.substring(firstSentenceEnd);
-  } else {
-    // Wrap the entire block with an introductory lead-in
-    modified =
-      `<!-- wp:paragraph -->\n<p>When it comes to ${keyphrase}, understanding the fundamentals is essential. ${firstBlock.html.replace(/^<!--\s*wp:paragraph\s*-->\s*\n?/i, "").replace(/\n?\s*<!--\s*\/wp:paragraph\s*-->\s*$/i, "")}\n<!-- /wp:paragraph -->`;
-  }
-
-  if (modified !== firstBlock.html) {
-    changes.push({
-      type: "keyphrase_inserted",
-      description: `Inserted keyphrase into first 100 words`,
-    });
-    console.log(`[SEO-NORMALIZER] inserted keyphrase into first 100 words`);
-
-    // Replace the first paragraph block in the HTML
-    return html.replace(firstBlock.html, () => modified);
-  }
-
+  // Opening placement is a soft SEO signal. This legacy helper is retained for
+  // API compatibility but deliberately performs no mutation: injecting a stock
+  // sentence after factual approval can reintroduce repetition, damage tone and
+  // create a new claim context outside the ownership ledger.
   return html;
 }
 
@@ -1135,8 +1100,9 @@ export async function normalizeFinalSeo(
 
   let currentHtml = tokenizedHtml;
 
-  // Step 3: Fix exact keyphrase in H2
-  currentHtml = fixH2Keyphrase(currentHtml, focusKeyphrase, changes);
+  // Exact-keyphrase H2 placement is a soft editorial signal. Do not rewrite
+  // headings deterministically merely to satisfy it; unnatural H2 mutation can
+  // damage meaning and contradict the final publication policy.
 
   // Step 4-5: Fix keyphrase count — reduce if above max (stuffing), warn if below min
   const kpBefore = beforeRaw.exactKeyphraseCount;
@@ -1175,8 +1141,9 @@ export async function normalizeFinalSeo(
     currentHtml = await fixReadability(currentHtml, focusKeyphrase, minReadingEase, maxReadingEase, chat, changes);
   }
 
-  // Step 9b: Ensure keyphrase in first 100 visible words
-  currentHtml = fixKeyphraseInFirst100Words(currentHtml, focusKeyphrase, changes);
+  // Opening placement is also a soft signal. Factual cleanup may legitimately
+  // remove an opening statistic, so the normalizer must not inject boilerplate
+  // solely to restore a first-100-word match.
 
   // Step 10: Detokenize — restore protected blocks byte-for-byte
   currentHtml = detokenizeProtectedBlocks(currentHtml, tokens);
@@ -1254,7 +1221,7 @@ export async function normalizeFinalSeo(
   const { valid: structValid, issues: structIssues, faqPresent, switcherPresent, ctaPresent } = verifyStructuralIntegrity(currentHtml);
   warnings.push(...structIssues);
 
-  const passed = kpDensityOk && wcOk && h2Ok && parasOk && blocksUnchanged && linksUnchanged && structValid && kpInFirst100Ok && internalLinksOk;
+  const passed = kpDensityOk && wcOk && parasOk && blocksUnchanged && linksUnchanged && structValid && internalLinksOk;
   if (!passed) {
     const failures: string[] = [];
     if (!kpDensityOk) failures.push("kpDensityOk");
@@ -1264,7 +1231,6 @@ export async function normalizeFinalSeo(
     if (!blocksUnchanged) failures.push("blocksUnchanged");
     if (!linksUnchanged) failures.push("linksUnchanged");
     if (!structValid) failures.push(`structValid(${structIssues.join("; ")})`);
-    if (!kpInFirst100Ok) failures.push("kpInFirst100Ok");
     if (!internalLinksOk) failures.push(`internalLinksOk(links=${after.uniqueInternalLinkCount})`);
     console.log(`[SEO-NORMALIZER] passed=false reasons=[${failures.join(", ")}]`);
   }
@@ -1299,7 +1265,6 @@ export function isAlreadyNormalized(
 ): boolean {
   const m = computeMetrics(html, keyphrase);
   return (
-    m.exactKeyphraseInH2 &&
     m.exactKeyphraseCount === targetKeyphraseCount &&
     m.readableWordCount >= targetWordCount &&
     m.longParagraphCount === 0

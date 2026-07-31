@@ -51,7 +51,7 @@ Bad (complex): "The rapid evolution of Hong Kong's marketing landscape necessita
 
 ## Focus keyphrase
 - Unique per post. Do not reuse a keyphrase from another published post.
-- Must appear in: H1 title, first 100 words of body, at least one H2 heading, URL slug.
+- Must appear in the H1 title and URL slug. Appearance in the opening and an H2 is a quality target, not a reason to force unnatural wording.
 
 ## Keyphrase usage
 - The acceptable exact-keyphrase range is calculated dynamically from the final article word count and supplied separately by the generation pipeline.
@@ -62,7 +62,7 @@ Bad (complex): "The rapid evolution of Hong Kong's marketing landscape necessita
 - Never repeat the exact keyphrase simply to satisfy SEO.
 - Never use the exact keyphrase more than once in the same paragraph.
 - Do not force the exact keyphrase into grammatically unnatural sentences.
-- The exact keyphrase must still appear in the H1 title, first 100 words, at least one H2 heading, and URL slug.
+- The exact keyphrase must appear in the H1 title and URL slug. Prefer a natural opening or H2 occurrence when it improves clarity, but never force it.
 - Use 3–5 semantically related terms naturally throughout the article.
 
 ## Heading hierarchy
@@ -72,12 +72,12 @@ Bad (complex): "The rapid evolution of Hong Kong's marketing landscape necessita
 - Never use H4, H5, or H6.
 
 ## Internal links
-- 3–5 unique internal links. Do not repeat the same link more than once.
+- 0–4 unique internal links. Do not repeat the same link more than once. Only add a link when it is genuinely useful.
 - Use descriptive, keyword-rich anchor text. Never use "click here" or "read more".
 
 ## External links
-- 2–3 links to high-authority sources.
-- Use target="_blank" and rel="noopener".
+- 0–6 unique links, drawn only from approved project research. Zero is acceptable when no relevant approved source is available.
+- Use target="_blank" and rel="noopener". Never invent or substitute a URL.
 
 ## Readability target
 - Flesch Reading Ease target: 60–70.
@@ -144,69 +144,42 @@ Rules:
 ## Special elements
 Language switcher, CTA block, and FAQ Schema JSON-LD must use <!-- wp:html --> blocks containing raw HTML.`,
 
-  hong_kong_context: `Write with authentic Hong Kong context.
+  hong_kong_context: `Write with authentic Hong Kong localisation without inventing market facts.
 
-## Locations
-Reference Hong Kong districts naturally: Central, Mong Kok, Kwun Tong, Sai Kung, Tsim Sha Tsui, Causeway Bay, Cyberport, Science Park, Sheung Wan, Wan Chai.
-
-## Currency and payments
-- Currency: Hong Kong dollars (HKD). Use "$" or "HKD" consistently.
-- Local payment systems: FPS (Faster Payment System), PayMe, AlipayHK.
-
-## Spelling and conventions
+## Localisation conventions
 - Use British English spelling: colour, organisation, centre, programme, analyse.
+- Use Hong Kong dollars (HKD) only when the approved evidence or user brief supplies a monetary example.
 - Date format: DD Month YYYY (e.g. 20 July 2026).
 - Time format: 12-hour clock with "am/pm" (e.g. 3:00 pm).
+- Hong Kong districts, payment tools, platforms and business practices may appear only when they are relevant and supported by the brief, approved research or clearly labelled hypothetical examples.
 
-## Business culture
-- High commercial rent drives lean operations.
-- Small teams (2–20 people) wear multiple hats.
-- WhatsApp is the dominant business communication tool. Email is secondary.
-- 中英雙語 (Chinese-English bilingual) workplace culture is standard.
-- Face-to-face meetings (傾生意) still matter. Guanxi (關係) and trust are currency.
-
-## Audience profile
-The reader is typically: a shop owner in Mong Kok, a bakery in Sai Kung, a freelance photographer in Kwun Tong, or a small brand doing their own marketing. They understand hustle, tight margins, and doing everything themselves. They have no budget for big agencies.
-
-## Creator economy context
-- Hong Kong has a growing micro-influencer scene (500–50,000 followers).
-- Brands are shifting from mega-influencers to authentic micro-creators.
-- Direct brand-creator collaboration is replacing agency-mediated deals.
-- Cantonese-language content dominates local social media; English content reaches a different audience segment.
+## Examples and audience
+- Keep examples practical for local creators and SMEs, but do not assert team sizes, budgets, platform dominance, language behaviour or market trends unless the Claim Ownership Ledger provides that evidence.
+- Hypothetical examples must be visibly hypothetical and must not contain invented statistics, prices, performance claims or survey findings.
+- Avoid decorative district-name dropping. Use a location only when it adds real context.
 
 ## Cantonese usage
-- Use 「你」 generously when addressing the reader in Chinese.
-- Cantonese proverbs and colloquial expressions are welcome when they add colour.
-- Write in 書面語 (written vernacular) for formal business content, but let Cantonese rhythm and phrasing come through naturally.`,
+- Use 「你」 naturally when addressing the reader in Chinese.
+- Cantonese expressions may be used when they fit the tone and do not change factual meaning.
+- Write in 書面語 suitable for business readers, with natural Hong Kong rhythm rather than Mainland formal phrasing.`,
 
-  blog_structure: `Structure every blog post with this exact section order.
+  blog_structure: `The application owns final assembly. Generate content that fits this canonical order exactly.
 
-1. **Language Switcher Block** — First element. Custom HTML block linking EN and ZH versions.
-   Format: "Read in 中文 | Read in English" with href pointing to the alternate version slug.
+1. **Language Switcher Block** — application-owned first element linking the paired EN and ZH slugs.
 
-2. **H1 Title** — Include focus keyphrase (see SEO Rules).
+2. **Introduction** — 2–3 short paragraphs. Frame the problem, Hong Kong relevance and reader promise. The introduction is synthesis-only and must not repeat precise statistics owned by body sections.
 
-3. **Introduction** — 2–3 paragraphs:
-   - Hook: State the problem or insight immediately.
-   - Context: Why this matters for HK creators/businesses right now.
-   - Promise: What the reader will gain.
+3. **Main H2 sections** — the dynamic outline supplies the required count. Each approved research claim belongs to exactly one section through the Claim Ownership Ledger. A section may use only its assigned evidence. Common-mistakes content is optional and appears only when the outline includes it.
 
-4. **Main topic H2 sections** — 4–6 sections, excluding the required Common Mistakes section, FAQ section, CTA heading, and conclusion. Each section includes:
-   - 2–3 paragraphs of explanation.
-   - Bulleted implementation steps.
-   - A concrete Hong Kong example or reference.
+4. **Conclusion** — concise synthesis of ideas already established in the body. No new facts, statistics, links, offers, recommendations or CTA content.
 
-5. **H2: Common Mistakes / What to Avoid** — 3–5 pitfalls with explanations and alternatives.
+5. **FAQ section** — application-owned visible FAQ after the conclusion. Questions and answers are practical or conceptual and must not repeat precise evidence from body sections.
 
-6. **CTA Block** — Custom HTML block. Use the exact HTML from the CTA module. Place between the last body section and the FAQ. Include both English and Chinese versions.
+6. **FAQPage JSON-LD** — application-owned schema generated from the exact visible FAQ entries.
 
-7. **H2: FAQ** — 4–6 questions. Questions use bold paragraph text, not headings. Answers are 2–4 sentences each, practical and direct.
+7. **CTA Block** — application-owned final visible block. Exactly one language-specific CTA is rendered; section generators must never emit it.
 
-8. **FAQ Schema JSON-LD Block** — Custom HTML block containing \`<script type="application/ld+json">\` with FAQPage schema. Include the same 4–6 question/answer pairs from the FAQ section.
-
-9. **Conclusion** — 2 paragraphs. Summarise key takeaways. No CTA content — the CTA block is separate and handled automatically by the application.
-
-10. **Internal Links Section** — Inline links distributed across body sections (not a separate block). Links should appear naturally within relevant paragraphs, never in a dedicated "Related Links" section.`,
+Internal links are distributed naturally across relevant body paragraphs and are never placed in a separate related-links section. The H1 is stored as article metadata and is not emitted inside the body HTML.`,
 
   social_rules: `Rules for generating social media posts to accompany the blog.
 
@@ -241,40 +214,36 @@ The reader is typically: a shop owner in Mong Kok, a bakery in Sai Kung, a freel
 Start with the subject, then add style, lighting, and composition. Example template:
 "Professional editorial photography, [subject], Hong Kong setting, warm natural lighting, clean composition, no text overlay"`,
 
-  translation_rules: `Rules for translating or adapting content for bilingual (EN ↔ ZH-HK) audiences.
+  translation_rules: `Rules for faithful Hong Kong Traditional Chinese (zh-HK) translation.
 
 ## Translation approach
-- Preserve tone. Adapt idioms rather than translating literally.
-- English and Chinese versions do not need to be direct translations — each should be SEO-optimised for its language.
-- Use 書面語 (written vernacular Chinese) for business content. Let Cantonese phrasing come through naturally.
+- Translate every canonical structured block faithfully from the approved English ArticleDocument.
+- Use natural Hong Kong Traditional Chinese rather than literal English sentence structure. Phrasing may change, but meaning, scope and factual relationships may not.
+- Use 書面語 suitable for business readers with natural Hong Kong rhythm. Do not use Mainland Simplified Chinese wording.
 
-## What to preserve
-- Never translate: brand names, URLs, code, statistics, numerical data, proper nouns.
-- Transliterate technical terms with the English original in parentheses on first use.
+## Exact preservation
+- Preserve every number, percentage, date, currency, named source, proper noun, URL, link count and factual meaning.
+- Never invent, remove, generalise or strengthen a claim.
+- Preserve the source block order, block type, H2/H3 hierarchy, FAQ count, CTA, schema and language-switcher parity.
+- Brand names and URLs remain unchanged. Technical terms may retain the English original on first use when natural.
 
-## Formatting differences
-- Chinese text: use full-width punctuation （，。）.
-- Chinese text: use 「」 corner brackets for quoted speech and proverbs.
-- Chinese text is typically 30–40% shorter than English. Do not pad to match length.
+## Chinese writing
+- Use full-width Chinese punctuation and 「」 quotation marks.
+- Remove English sentence patterns, robotic transitions and literal machine-translation phrasing during the dedicated Chinese editorial pass.
+- Chinese may be more concise where the same meaning is preserved, but no fixed percentage reduction is required and no source idea may be omitted.
 
-## Bilingual post conventions
+## Bilingual conventions
 - English slug: /blog/topic-name
 - Chinese slug: /blog/topic-name-zh
-- Language switcher must link the paired EN ↔ ZH slugs.`,
+- Only the application-owned language switcher changes to the paired language URL. All editorial content URLs remain exactly as in the English source.`,
 
-  cta: `<!-- wp:html -->
+  cta: `The CTA is application-owned and must not be generated by editorial components. English rendering uses exactly this single block; the translation pipeline creates the corresponding validated Chinese block.
+
+<!-- wp:html -->
 <div style="background: #1E3A8A; color: #fff; padding: 32px 28px; border-radius: 12px; margin: 40px 0; text-align: center;">
   <h2 style="color: #fff; margin-top: 0; font-size: 22px;">Ready to grow your brand with Hong Kong creators?</h2>
   <p style="font-size: 16px; line-height: 1.6; margin-bottom: 24px;">B2I Hub connects businesses directly with verified creators — no agencies, no commissions, no middlemen. Create your free profile and start collaborating today.</p>
   <a href="https://app.b2ihub.com/signup" style="display: inline-block; background: #F97316; color: #fff; padding: 14px 36px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px;" target="_blank" rel="noopener">Create Your Free Profile →</a>
-</div>
-<!-- /wp:html -->
-
-<!-- wp:html -->
-<div style="background: #1E3A8A; color: #fff; padding: 32px 28px; border-radius: 12px; margin: 40px 0; text-align: center;">
-  <h2 style="color: #fff; margin-top: 0; font-size: 22px;">準備好同香港創作人一齊成長？</h2>
-  <p style="font-size: 16px; line-height: 1.6; margin-bottom: 24px;">B2I Hub 直接連結品牌同認證創作人——無中介、無佣金、無中間人。免費建立你嘅個人檔案，即刻開始合作。</p>
-  <a href="https://app.b2ihub.com/signup" style="display: inline-block; background: #F97316; color: #fff; padding: 14px 36px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px;" target="_blank" rel="noopener">免費建立檔案 →</a>
 </div>
 <!-- /wp:html -->`,
 
@@ -284,17 +253,17 @@ Start with the subject, then add style, lighting, and composition. Example templ
 2. ☐ Meta description is 155–200 characters with focus keyphrase and CTA → See SEO Rules.
 3. ☐ URL slug is clean, keyword-friendly, no dates. Append -zh for Chinese → See SEO Rules.
 4. ☐ Focus keyphrase is unique and not reused from another published post → See SEO Rules.
-5. ☐ Focus keyphrase appears in H1, first 100 words, at least one H2 → See SEO Rules.
+5. ☐ Focus keyphrase appears in H1 and slug; opening/H2 use is natural rather than forced → See SEO Rules.
 6. ☐ Exact keyphrase count is within the dynamic range calculated for the final body word count → See SEO Rules.
-7. ☐ 3–5 unique internal links with descriptive anchor text → See SEO Rules.
-8. ☐ 2–3 external links to high-authority sources with target="_blank" → See SEO Rules.
+7. ☐ 0–4 unique internal links with descriptive anchor text → See SEO Rules.
+8. ☐ 0–6 unique external links, all from approved project research, with target="_blank" → See SEO Rules.
 9. ☐ Flesch Reading Ease is 60–70 → See SEO Rules.
 10. ☐ All content uses WordPress block format. No Markdown anywhere → See Formatting Rules.
 11. ☐ Paragraphs are 3 sentences max. Numbers are written as numerals → See Formatting Rules.
 12. ☐ Cantonese quotes use 「」 corner brackets → See Formatting Rules.
 13. ☐ Language switcher block is the first content element → See Blog Structure.
 14. ☐ CTA block is present in the correct position → See Blog Structure.
-15. ☐ FAQ section has 4–6 questions → See Blog Structure.
+15. ☐ FAQ count matches the dynamic range supplied by the pipeline → See Blog Structure.
 16. ☐ FAQ Schema JSON-LD block is present with matching questions → See Blog Structure.
 17. ☐ Categories set to "Creator Economy" and "Resources". 5–8 relevant tags assigned.
 18. ☐ Target word count met — body text only (headings, paragraphs, list items, table cells).`,

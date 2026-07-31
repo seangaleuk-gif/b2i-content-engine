@@ -1,6 +1,6 @@
 # B2I Content Engine Editorial Audit
 
-Reviewed: 29 July 2026
+Reviewed: 30 July 2026
 
 Scope:
 
@@ -81,6 +81,20 @@ The replacement implementation:
 - Evidence is evaluated per source entry, including Hong Kong/global scope and
   average/median qualifiers. Matching a number somewhere in combined research
   is no longer sufficient.
+- Research is now supplied to every generation component as stable
+  `SOURCE-N-CLAIM-N` evidence records with the exact snippet and URL.
+- Matching now checks the complete sentence meaning, not only an isolated
+  number. Survey respondents cannot become all users, advertising reach cannot
+  become monthly active users, and account preference cannot become “follows no
+  brands.”
+- Supported quotations require their named source URL. Research citations are
+  inserted only beside semantically matching claims; unrelated links are never
+  added to satisfy a count.
+- FAQ answers receive the same deterministic factual pass. Unsupported
+  sentences are removed, supported precise claims receive their supplied source
+  URL, and schema is rebuilt from the sanitized canonical FAQ entries.
+- Evidence-bearing and `Source:` blocks are excluded from the AI editor’s
+  target list, while their links remain protected by the atomic candidate gate.
 - Cross-article checks detect incompatible audience sizes, publishing cadence
   and platform-feature availability before the editor runs.
 
@@ -161,22 +175,27 @@ client contract, preventing `versionNumber` from becoming undefined.
 3. External links
 4. SEO normalization
 5. Factual cleanup and link enforcement
-6. Final paragraph normalization
-7. Editorial polish when `ENABLE_EDITORIAL_POLISH=true`
-8. CTA preservation
-9. Final trim
-10. FAQ schema regeneration from protected canonical FAQ entries
-11. Canonical word-count check
-12. Final validation
+6. Deterministic first-100-word keyphrase restoration when factual cleanup
+   removed the original opening sentence
+7. Final paragraph normalization
+8. Editorial polish when `ENABLE_EDITORIAL_POLISH=true`
+9. CTA preservation
+10. Final trim
+11. FAQ schema regeneration from protected canonical FAQ entries
+12. Canonical word-count check
+13. Final validation
 
 ## Verification
 
-- `npx vitest run`: 1,294 tests passed
-- `npx tsc --noEmit`: passed
-- `npm run build`: passed with non-secret placeholder Supabase build variables
-- Production build warning retained: the pre-existing translation evidence
-  writer uses a dynamic filesystem path and causes a Turbopack NFT trace warning.
-  It does not fail compilation or page generation.
+- `npx vitest run`: 1,317 tests passed across 22 files
+- `npx tsc --noEmit`: passed with zero errors
+- `npm run build`: passed with non-secret placeholder build variables
+- The Turbopack NFT tracing warning was removed by confining optional
+  translation evidence output to a statically scoped project `tmp` directory.
+- Editorial candidate validation is stage-aware and no longer rejects a safe
+  candidate because CTA/signup restoration has not run yet.
+- Exact-keyphrase counting now excludes protected `wp:html` content, matching
+  the canonical visible-word denominator.
 
 Three real production generations were not executed in this workspace because
 the upload contains no configured Supabase or DeepSeek environment variables.

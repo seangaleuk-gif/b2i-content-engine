@@ -39,7 +39,14 @@ export interface ConclusionShadowEvidenceRecord {
 }
 
 function getEvidenceDir(): string {
-  return process.env.CONCLUSION_SHADOW_EVIDENCE_DIR || "tmp/structured-translation-production-evidence";
+  const configured = process.env.CONCLUSION_SHADOW_EVIDENCE_DIR
+    || "structured-translation-production-evidence";
+  // Evidence is diagnostic output, so confine it to the project's tmp folder.
+  // basename also prevents a configured value from escaping that boundary.
+  const safeDirectoryName = path.basename(configured)
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    || "structured-translation-production-evidence";
+  return path.join(process.cwd(), "tmp", safeDirectoryName);
 }
 
 // ── Error categorization ──
@@ -228,7 +235,7 @@ export async function recordConclusionShadowEvidence(
     characterRatio: result.metrics?.characterRatio ?? 0,
   };
 
-  const dir = path.resolve(getEvidenceDir());
+  const dir = getEvidenceDir();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }

@@ -9,6 +9,7 @@ import {
 } from "@/lib/repositories";
 import { runBlogGeneration, type GenerationResult } from "@/lib/services/blog-generation-service";
 import { countCanonicalVisibleWords } from "@/lib/blog/article-document";
+import { analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 
 export async function POST(request: Request) {
   const startTime = Date.now();
@@ -22,7 +23,7 @@ export async function POST(request: Request) {
       throw AppError.badRequest("projectId is required");
     }
 
-    await requireProjectAccess(userId, Number(projectId));
+    const project = await requireProjectAccess(userId, Number(projectId));
 
     const result: GenerationResult = await runBlogGeneration(userId, Number(projectId));
 
@@ -32,7 +33,10 @@ export async function POST(request: Request) {
     const generationTimeMs = Date.now() - startTime;
 
     const nextVersion = await blogVersionRepository.getNextVersionNumber(Number(projectId));
+    const previousProjectContent = project.content ?? "";
     let savedVersionId: number | null = null;
+    let projectUpdateAttempted = false;
+
     try {
       const created = await blogVersionRepository.create({
         projectId: Number(projectId), userId, versionNumber: nextVersion,
@@ -52,20 +56,84 @@ export async function POST(request: Request) {
         tokenUsage: { totalTokens: 0 },
         status: "draft",
       });
-      savedVersionId = (created as any).id ?? null;
-      await projectRepository.update(Number(projectId), { content: finalBlogHtml });
-    } catch (saveErr) {
-      console.error(`[generate-blog:SAVE] Save failed: projectId=${projectId} versionId=${savedVersionId ?? "none"}`, saveErr);
-      if (savedVersionId !== null) {
-        try { await blogVersionRepository.delete(savedVersionId); } catch {}
+      savedVersionId = Number((created as any).id);
+      if (!Number.isFinite(savedVersionId)) {
+        throw new Error("Created blog version did not return a valid ID");
       }
-      throw AppError.internal(saveErr);
-    }
 
-    // Readback: verify the exact created version by ID exists
-    const readbackVersion = await blogVersionRepository.findById(savedVersionId!);
-    if (!readbackVersion) {
-      throw AppError.internal(`Post-save readback failed: version ${savedVersionId} not found`);
+      projectUpdateAttempted = true;
+      await projectRepository.update(Number(projectId), { content: finalBlogHtml });
+
+      const [readbackVersion, readbackProject] = await Promise.all([
+        blogVersionRepository.findById(savedVersionId),
+        projectRepository.findByIdAndUser(Number(projectId), userId),
+      ]);
+      if (
+        !readbackVersion
+        || readbackVersion.blog !== finalBlogHtml
+        || readbackVersion.title !== finalTitle
+        || readbackVersion.slug !== result.generated.slug
+        || !readbackProject
+        || readbackProject.content !== finalBlogHtml
+      ) {
+        throw new Error(`Post-save readback did not match generated version ${savedVersionId} and project ${projectId}`);
+      }
+
+      const wordCountRecheck = countCanonicalVisibleWords(result.pipelineState.articleDoc);
+      if (wordCountRecheck < result.wordMin || wordCountRecheck > result.wordMax) {
+        throw new Error(`Post-save word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
+      }
+      const postSaveMetrics = analyzeFinalArticle(
+        readbackVersion.blog,
+        result.pipelineState.keyphrase,
+        readbackVersion.title ?? "",
+        readbackVersion.metaDescription ?? "",
+        result.pipelineState.requestedWordCount,
+        wordCountRecheck,
+        {
+          articleDoc: result.pipelineState.articleDoc,
+          research: result.pipelineState.ctx?.research || [],
+          claimOwnership: result.pipelineState.ctx?.claimOwnership,
+        },
+      );
+      const postSavePolicy = result.pipelineState.policy;
+      const postSaveValidation = evaluatePolicy(postSaveMetrics, postSavePolicy);
+      if (!postSaveValidation.passed) {
+        throw new Error(`Post-save validation failed: ${postSaveValidation.reasons.join("; ")}`);
+      }
+    } catch (saveErr) {
+      const rollbackErrors: string[] = [];
+      if (projectUpdateAttempted) {
+        try {
+          await projectRepository.update(Number(projectId), { content: previousProjectContent });
+        } catch (rollbackError) {
+          rollbackErrors.push(`Project rollback failed: ${String(rollbackError)}`);
+        }
+      }
+      let rollbackVersionId = savedVersionId;
+      if (rollbackVersionId === null) {
+        try {
+          const candidates = await blogVersionRepository.findByProject(Number(projectId));
+          const ambiguousCreate = candidates.find((version: any) =>
+            version.versionNumber === nextVersion
+            && version.slug === result.generated.slug
+            && version.blog === finalBlogHtml
+          );
+          rollbackVersionId = ambiguousCreate ? Number((ambiguousCreate as any).id) : null;
+        } catch (lookupError) {
+          rollbackErrors.push(`Version rollback lookup failed: ${String(lookupError)}`);
+        }
+      }
+      if (rollbackVersionId !== null && Number.isFinite(rollbackVersionId)) {
+        try {
+          await blogVersionRepository.delete(rollbackVersionId);
+        } catch (rollbackError) {
+          rollbackErrors.push(`Version rollback failed: ${String(rollbackError)}`);
+        }
+      }
+      const suffix = rollbackErrors.length > 0 ? `; ${rollbackErrors.join("; ")}` : "";
+      console.error(`[generate-blog:SAVE] Compensated save failure: projectId=${projectId} versionId=${savedVersionId ?? "none"}${suffix}`, saveErr);
+      throw AppError.internal(new Error(`Generation save failed and was compensated${suffix}: ${String(saveErr)}`));
     }
 
     try {
@@ -77,27 +145,6 @@ export async function POST(request: Request) {
         tokensIn: 0, tokensOut: 0, tokensTotal: 0, generationTimeMs,
       });
     } catch (e) { console.error("[AI-LOG] Non-fatal:", String(e)); }
-
-    // Post-save content validation
-    const wordCountRecheck = countCanonicalVisibleWords(result.pipelineState.articleDoc);
-    if (wordCountRecheck < result.wordMin || wordCountRecheck > result.wordMax) {
-      console.error(`[generate-blog:POST] Readback FAILED: word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
-      throw AppError.internal(`Post-save word count ${wordCountRecheck} outside range ${result.wordMin}-${result.wordMax}`);
-    }
-    // Use the same metric as final validation for long-paragraph detection
-    const { analyzeFinalArticle } = await import("@/lib/blog/final-article-policy");
-    const postSaveMetrics = analyzeFinalArticle(
-      finalBlogHtml,
-      result.pipelineState.keyphrase,
-      result.generated.title ?? "",
-      result.generated.metaDescription ?? "",
-      result.pipelineState.requestedWordCount,
-      wordCountRecheck,
-    );
-    if (postSaveMetrics.longParagraphCount > 0) {
-      console.error(`[generate-blog:POST] Readback FAILED: ${postSaveMetrics.longParagraphCount} paragraph(s) exceed 3 sentences`);
-      throw AppError.internal(`Post-save validation failed: ${postSaveMetrics.longParagraphCount} paragraph(s) exceed 3 sentences`);
-    }
 
     return NextResponse.json({
       success: true,

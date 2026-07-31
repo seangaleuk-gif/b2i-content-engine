@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/blog/final-seo-normalizer", () => ({
+  ensureKeyphraseInFirst100Words: vi.fn((html: string) => html),
   normalizeFinalSeo: vi.fn(async (input: { html: string }) => {
     const extraParagraphs = Array.from(
       { length: 9 },

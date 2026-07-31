@@ -1,0 +1,30 @@
+B2I Content Engine v3.4 Editorial Scanner & Fact-Free Fallback Verification
+Date: 2026-07-31
+
+1) Changed files
+docs/EDITORIAL_SCANNER_FALLBACK_FIX.md
+src/lib/blog/claim-ownership.test.ts
+src/lib/blog/claim-ownership.ts
+src/lib/blog/factual-risk-scanner.test.ts
+src/lib/blog/factual-risk-scanner.ts
+src/lib/pipeline/blog-generation-pipeline.ts
+src/lib/pipeline/editorial-polish.test.ts
+src/lib/pipeline/editorial-polish.ts
+
+2) Repository syntax transpilation
+files=186 syntaxErrors=0
+
+3) Changed production semantic audit
+diagnostics=0
+
+4) Changed regression-test semantic audit
+diagnostics=0
+
+5) Repository AST duplicate audit
+files=186 duplicateObjectProps=0 duplicateBlockDecls=0
+
+6) Runtime scanner and safe-scope checks
+illustrativeQuotes=pass attributedQuote=pass proseOnlyScope=pass weakenedComponentScope=pass
+
+7) Native dependency limitation
+npm ci attempted and failed because the configured package mirror returned 404 for zod-validation-error@4.0.2. Native Vitest/Next build must be run on the development laptop.

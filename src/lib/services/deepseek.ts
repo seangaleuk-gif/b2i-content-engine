@@ -3,6 +3,64 @@ const DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions";
 /** Default timeout per request. Individual stages may override via ChatOptions.timeoutMs. */
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+/** Provider-supported maximum output tokens for deepseek-v4-flash. */
+const MAX_TOKENS_LIMIT = 32768;
+
+/** Retry budget multipliers for reasoning-token exhaustion (finish_reason=length with empty content). */
+const TOKEN_EXHAUSTION_MULTIPLIERS = [1.5, 2];
+
+// ── Stage-aware thinking configuration ──
+// deepseek-v4-flash performs hidden reasoning (reasoning_content) by default,
+// consuming the max_tokens budget before producing message.content. Every call
+// must explicitly assign a thinking mode; the provider default is never relied on.
+
+export type ThinkingMode = "enabled" | "disabled";
+
+/** Routine deterministic stages — thinking disabled. */
+const THINKING_DISABLED_STAGES = new Set([
+  // blog generation
+  "outline", "outline_retry",
+  "intro", "intro_retry", "intro_repair",
+  "faq",
+  "conclusion", "conclusion_retry", "conclusion_repair",
+  // component regenerator / fixers / section expander (default stage)
+  "pipeline",
+  "claim_fix",
+  // editorial rewriting & repairs
+  "editorial-polish", "editorial-malformed-repair", "editorial-post-cleanup-repair",
+  "editorial-repetition-repair", "editorial-prose-only-fallback",
+  // translation
+  "cta", "metadata-final",
+  "conc-shadow", "conc-shadow-repair",
+  "translate-text", "translate-html", "metadata",
+  "introduction",
+]);
+
+/** Stage prefixes that are routine and deterministic — thinking disabled. */
+const THINKING_DISABLED_PREFIXES = ["section_", "section-", "faq-", "translate-"];
+
+/** Stage suffixes that indicate routine repair/rewrite operations — thinking disabled. */
+const THINKING_DISABLED_SUFFIXES = ["-strict-repair", "-editorial-repair", "-plain", "_repair", "-repair", "_retry", "-retry"];
+
+/** High-level reasoning stages that genuinely benefit from thinking. */
+const THINKING_ENABLED_STAGES = new Set([
+  "factual-risk", "factual-risk-diagnosis", "factual-scan",
+  "evidence", "evidence-reconciliation",
+  "editorial-evaluation", "quality-diagnosis", "quality-assessment",
+]);
+
+function resolveThinkingMode(stage: string, explicit?: ThinkingMode): ThinkingMode {
+  if (explicit === "enabled" || explicit === "disabled") return explicit;
+  const s = stage.toLowerCase().trim();
+  if (THINKING_ENABLED_STAGES.has(s)) return "enabled";
+  if (THINKING_DISABLED_STAGES.has(s)) return "disabled";
+  if (THINKING_DISABLED_PREFIXES.some((prefix) => s.startsWith(prefix))) return "disabled";
+  if (THINKING_DISABLED_SUFFIXES.some((suffix) => s.endsWith(suffix))) return "disabled";
+  // Unknown stage — never rely on the provider default (which is thinking ON).
+  console.warn(`[deepseek:${stage}] ⚠️ no thinking mode assigned for stage — defaulting to disabled`);
+  return "disabled";
+}
+
 /** Generate a short unique request ID for tracing. */
 let requestIdCounter = 0;
 function nextRequestId(): string {
@@ -16,7 +74,9 @@ export type DeepSeekErrorType =
   | "rate_limit"
   | "api_failure"
   | "network_failure"
-  | "empty_response";
+  | "empty_response"
+  | "token_exhaustion"
+  | "truncated";
 
 export class DeepSeekError extends Error {
   type: DeepSeekErrorType;
@@ -40,6 +100,7 @@ export interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
   timeoutMs?: number;
+  thinkingMode?: ThinkingMode;
   topP?: number;
   frequencyPenalty?: number;
   presencePenalty?: number;
@@ -70,6 +131,7 @@ export interface ChatResponse {
     message: {
       role: string;
       content: string;
+      reasoning_content?: string;
     };
     finish_reason: string;
   }[];
@@ -79,6 +141,9 @@ export interface ChatResponse {
     total_tokens: number;
     prompt_cache_hit_tokens?: number;
     prompt_cache_miss_tokens?: number;
+    completion_tokens_details?: {
+      reasoning_tokens?: number;
+    };
   };
 }
 
@@ -153,6 +218,7 @@ export async function chat(
   const apiKey = getApiKey();
   const model = options.model ?? "deepseek-v4-flash";
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const thinkingMode = resolveThinkingMode(stage, options.thinkingMode);
 
   const body: Record<string, unknown> = {
     model,
@@ -160,6 +226,7 @@ export async function chat(
     stream: false,
     temperature: options.temperature ?? 0.7,
     max_tokens: options.maxTokens ?? 32768,
+    thinking: { type: thinkingMode },
   };
 
   if (options.topP !== undefined) body.top_p = options.topP;
@@ -168,7 +235,7 @@ export async function chat(
   if (options.stop) body.stop = options.stop;
   if (options.responseFormat) body.response_format = options.responseFormat;
 
-  console.log(`[deepseek:${stage}:${requestId}] model=${model} | max_tokens=${body.max_tokens} | timeout=${timeoutMs}ms | attempt=${attempt} | input_tokens≈${Math.round(messages.reduce((s, m) => s + m.content.length, 0) / 4)}`);
+  console.log(`[deepseek:${stage}:${requestId}] model=${model} | thinking=${thinkingMode} | max_tokens=${body.max_tokens} | timeout=${timeoutMs}ms | attempt=${attempt} | input_tokens≈${Math.round(messages.reduce((s, m) => s + m.content.length, 0) / 4)}`);
 
   const response = await fetchWithTimeout(
     DEEPSEEK_API_URL,
@@ -204,21 +271,52 @@ export async function chat(
 
   const data = await parseResponseBody(response);
 
-  if (!data.choices || data.choices.length === 0 || !data.choices[0].message?.content) {
-    throw new DeepSeekError("empty_response", "DeepSeek response had no content in choices");
-  }
-
-  const content = data.choices[0].message.content;
-  const finishReason = data.choices[0].finish_reason;
+  const choice = data.choices?.[0];
+  const rawContent = choice?.message?.content;
+  const reasoningContent = choice?.message?.reasoning_content;
+  const finishReason = choice?.finish_reason;
   const usage = data.usage ?? {
     prompt_tokens: 0,
     completion_tokens: 0,
     total_tokens: 0,
   };
+  const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens;
 
-  // ── Response path verification ──
-  console.log(`[deepseek:${stage}:${requestId}] finish_reason=${finishReason} | tokens_in=${usage.prompt_tokens} tokens_out=${usage.completion_tokens} total=${usage.total_tokens}`);
-  console.log(`[deepseek:${stage}:${requestId}] content_chars=${content.length} | ~${content.split(/\s+/).filter(Boolean).length} words`);
+  // ── Token-budget diagnostics (never logs prompts, generated content or keys) ──
+  console.log(`[deepseek:${stage}:${requestId}] finish_reason=${finishReason} | completion_tokens=${usage.completion_tokens} | reasoning_tokens=${reasoningTokens ?? 0} | content_chars=${typeof rawContent === "string" ? rawContent.length : "n/a"} | reasoning_chars=${typeof reasoningContent === "string" ? reasoningContent.length : "n/a"}`);
+
+  // Genuinely empty response (no choices, or no content and no reasoning) →
+  // existing empty_response path.
+  if (!data.choices || data.choices.length === 0) {
+    throw new DeepSeekError("empty_response", "DeepSeek response had no choices");
+  }
+  if (typeof rawContent !== "string") {
+    throw new DeepSeekError("empty_response", "DeepSeek response had no content in choices");
+  }
+  if (rawContent.length === 0 && !(typeof reasoningContent === "string" && reasoningContent.length > 0)) {
+    throw new DeepSeekError("empty_response", "DeepSeek response had no content in choices");
+  }
+
+  // Reasoning-token exhaustion: content empty, finish_reason=length and the model
+  // spent the whole budget thinking. Retried with a larger budget by chatWithRetry.
+  if (rawContent.length === 0 && finishReason === "length" && typeof reasoningContent === "string" && reasoningContent.length > 0) {
+    throw new DeepSeekError(
+      "token_exhaustion",
+      `Reasoning tokens exhausted the max_tokens budget (completion_tokens=${usage.completion_tokens}, reasoning_tokens=${reasoningTokens ?? 0}, finish_reason=length, content empty)`,
+    );
+  }
+
+  // Truncated partial content: finish_reason=length with non-empty content means
+  // the response was cut off mid-generation. The partial prose/JSON is unusable
+  // and must NEVER be parsed or accepted — escalate the budget and retry.
+  if (rawContent.length > 0 && finishReason === "length") {
+    throw new DeepSeekError(
+      "truncated",
+      `Response truncated (finish_reason=length) after ${rawContent.length} chars — partial content discarded (completion_tokens=${usage.completion_tokens}, reasoning_tokens=${reasoningTokens ?? 0})`,
+    );
+  }
+
+  const content = rawContent;
   if (finishReason === "length") {
     console.warn(`[deepseek:${stage}:${requestId}] ⚠️ finish_reason=length — generation truncated`);
   }
@@ -249,8 +347,19 @@ export async function chatWithRetry(
   let lastError: DeepSeekError | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Escalate the budget on reasoning-token exhaustion OR truncation:
+    // first retry ×1.5, second retry ×2, capped at the provider maximum.
+    let attemptOptions = options;
+    if (attempt > 0 && (lastError?.type === "token_exhaustion" || lastError?.type === "truncated")) {
+      const originalBudget = options.maxTokens ?? 32768;
+      const multiplier = TOKEN_EXHAUSTION_MULTIPLIERS[attempt - 1] ?? TOKEN_EXHAUSTION_MULTIPLIERS[TOKEN_EXHAUSTION_MULTIPLIERS.length - 1];
+      const escalated = Math.min(MAX_TOKENS_LIMIT, Math.floor(originalBudget * multiplier));
+      attemptOptions = { ...options, maxTokens: escalated };
+      console.log(`[deepseek:${stage}:${requestId}] ${lastError.type} — retrying with max_tokens ${originalBudget} → ${escalated}`);
+    }
+
     try {
-      const result = await chat(messages, options, stage, requestId, attempt + 1);
+      const result = await chat(messages, attemptOptions, stage, requestId, attempt + 1);
       result.attemptsUsed = attempt;
       return result;
     } catch (err) {

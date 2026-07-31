@@ -3,6 +3,8 @@ import { buildSystemPrompt, STAGE_SYSTEM_PROMPTS, type BlogContext } from "@/lib
 import { cleanBodyText, countWords, robustJsonParse } from "@/lib/services/text-utils";
 import { FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
 import { englishTitleRange, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount } from "@/lib/content-standards";
+import { formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
+import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
 
 // ── Types ──
 
@@ -86,6 +88,10 @@ function extractSections(blog: string): SectionBlock[] {
 }
 
 // Simpler approach: find sections by heading position
+function isFaqSectionHeading(heading: string): boolean {
+  return /^(?:frequently asked questions|faq|common questions|常見問題)/i.test(heading.trim());
+}
+
 function extractSectionsSimple(blog: string): { index: number; headingBlock: string; headingText: string; bodyText: string; start: number; bodyStart: number; end: number }[] {
   const sections: { index: number; headingBlock: string; headingText: string; bodyText: string; start: number; bodyStart: number; end: number }[] = [];
   const re = /(<!--\s*wp:heading\s*\{[^}]*"level":2[^}]*\}\s*-->\s*<h2[^>]*>[\s\S]*?<\/h2>\s*<!--\s*\/wp:heading\s*-->)/gi;
@@ -155,7 +161,7 @@ export function validateComponents(
   const wc = countWords(blogCleaned);
   const kpTargets = computeKeyphraseTargets(wc, keyphrase);
   if (kc < kpTargets.min || kc > kpTargets.max) {
-    const sections = extractSectionsSimple(blog);
+    const sections = extractSectionsSimple(blog).filter((section) => !isFaqSectionHeading(section.headingText));
     if (sections.length > 0) {
       if (kc < kpTargets.min) {
         // Find section with fewest keyphrases to add to
@@ -182,7 +188,7 @@ export function validateComponents(
   // Readability — identifies worst sections
   const fs = Math.round(fleschOnText(blog));
   if (fs < FLESCH_MIN || fs > FLESCH_MAX) {
-    const sections = extractSectionsSimple(blog);
+    const sections = extractSectionsSimple(blog).filter((section) => !isFaqSectionHeading(section.headingText));
     const scored = sections
       .filter((s) => cleanBodyText(s.bodyText).length > 40)
       .map((s) => ({ index: s.index, score: Math.round(fleschOnText(s.bodyText)) }))
@@ -214,6 +220,16 @@ export function validateComponents(
 }
 
 // ── Regeneration functions ──
+
+
+function parseStructuredEditorialResponse(content: string, componentId: string): string {
+  const payload = robustJsonParse(content, componentId);
+  const normalized = normalizeAiEditorialPayload(payload, componentId);
+  if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
+    throw new Error(`${componentId} returned invalid structured blocks: ${normalized.errors.join("; ") || "empty block list"}`);
+  }
+  return renderEditorialBlocksToWordPress(normalized.blocks);
+}
 
 export async function regenerateTitle(
   ctx: GenContext,
@@ -272,14 +288,14 @@ export async function regenerateIntroduction(
   wordTarget: number,
 ): Promise<string> {
   const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.introduction);
-  const userMsg = `Rewrite the introduction for this blog (target ${wordTarget} words). WordPress block format. Return as JSON: {"intro": "..."}.\n\nTitle: ${title}\nMeta: ${meta}\nKeyword: ${keyword}`;
+  const userMsg = `Rewrite the introduction for this blog (target ${wordTarget} words). Return structured JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}.\n\nThis introduction is synthesis-only. Do not include statistics, dates, currencies, quotations, performance benchmarks, survey findings, posting frequencies or platform-availability claims. Frame the topic without repeating precise evidence owned by body sections.\n\nTitle: ${title}\nMeta: ${meta}\nKeyword: ${keyword}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],
     { responseFormat: { type: "json_object" }, maxTokens: 4096 }
   );
 
-  return (robustJsonParse(res.content) as Record<string, string>).intro || "";
+  return parseStructuredEditorialResponse(res.content, "regenerated-introduction");
 }
 
 export async function regenerateSection(
@@ -291,40 +307,20 @@ export async function regenerateSection(
   wordTarget: number,
   keyphraseTarget: number,
   keyphrase: string,
+  sectionId?: string,
 ): Promise<string> {
   const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.section);
-  const sectionResearchPrompt = ctx.promptContext.research?.length
-    ? `\n\nREFERENCE SOURCES (use these URLs when referencing claims — cite with descriptive anchor text like "According to [Source Name]..." and link to the URL):\n${ctx.promptContext.research.map((r: any) => `- ${r.title || "Source"}: ${r.url || ""}`).join("\n")}`
-    : "";
-  const userMsg = `Return section BODY content only. Do NOT return the H2 heading. Start directly with a paragraph or list. The application will insert the heading.\n\nSection heading for context only (do NOT repeat):\n"${heading}"\n\nRewrite the body content for this section. Target exactly ${wordTarget} words. Include the keyphrase "${keyphrase}" naturally (target ${keyphraseTarget} across full article). WordPress block format.\n\nArticle title: ${title}\nPrevious heading: ${prevHeading}\nNext heading: ${nextHeading}\n\nGUIDANCE:\n- Do NOT repeat statistics, examples, or explanations from other sections.\n- Focus exclusively on the content for THIS heading.${sectionResearchPrompt}\n\nReturn as JSON: {"body": "..."}`;
+  const sectionResearchPrompt = sectionId && ctx.promptContext.claimOwnership
+    ? `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${formatOwnedEvidencePacket(ctx.promptContext.claimOwnership, sectionId)}\nUse only assigned evidence. Preserve its complete meaning and natural named attribution. Never print evidence IDs. Do not move or repeat another section's evidence.`
+    : `\n\nNo precise evidence packet is assigned to this regeneration. Do not introduce statistics, dates, currencies, quotations, performance benchmarks, survey findings, posting frequencies or platform-availability claims.`;
+  const userMsg = `Return section BODY content only. Do NOT return the H2 heading. Start directly with a paragraph or list. The application will insert the heading.\n\nSection heading for context only (do NOT repeat):\n"${heading}"\n\nRewrite the body content for this section. Target exactly ${wordTarget} words. Include the keyphrase "${keyphrase}" naturally (target ${keyphraseTarget} across full article). Return structured editorial blocks; the application renders WordPress HTML.\n\nArticle title: ${title}\nPrevious heading: ${prevHeading}\nNext heading: ${nextHeading}\n\nGUIDANCE:\n- Do NOT repeat statistics, examples, or explanations from other sections.\n- Focus exclusively on the content for THIS heading.${sectionResearchPrompt}\n\nReturn as JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],
     { responseFormat: { type: "json_object" }, maxTokens: 8192 }
   );
 
-  const raw = (robustJsonParse(res.content) as Record<string, string>).body || "";
-  const clean = raw
-    .replace(/<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*<h2[^>]*>[\s\S]*?<\/h2>\s*<!--\s*\/wp:heading\s*-->/gi, "")
-    .replace(/<h2[^>]*>[\s\S]*?<\/h2>/gi, "");
-  if (clean !== raw) console.log(`[component-regenerator:SANITIZE] Removed leaked H2 from regenerated section`);
-  return clean;
-}
-
-export async function regenerateFAQ(
-  ctx: GenContext,
-  title: string,
-  contentSummary: string,
-): Promise<string> {
-  const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.faq);
-  const userMsg = `Regenerate the FAQ section. 4-6 questions. WordPress block format with FAQ schema. Return as JSON: {"faqSchemaBlock": "..."}.\n\nTitle: ${title}\nContent: ${contentSummary.substring(0, 1500)}`;
-
-  const res = await ctx.chatWithRetry(
-    [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],
-    { responseFormat: { type: "json_object" }, maxTokens: 8192 }
-  );
-
-  return (robustJsonParse(res.content) as Record<string, string>).faqSchemaBlock || "";
+  return parseStructuredEditorialResponse(res.content, `regenerated-section-${sectionId || "unowned"}`);
 }
 
 export async function regenerateConclusion(
@@ -339,7 +335,7 @@ export async function regenerateConclusion(
 Summarize only ideas already established in the supplied article context.
 Do not introduce statistics, dates, platform features, posting frequencies, research, links, offers or new recommendations.
 Do not include a CTA, signup copy, FAQ content or a heading.
-Use concise WordPress paragraph blocks and return JSON: {"conclusion": "..."}.
+Return structured JSON blocks, using concise paragraphs: {"blocks": [{"type": "paragraph", "text": "..."}]}.
 
 Title: ${title}
 Article context:
@@ -350,7 +346,7 @@ ${articleSummary.slice(0, 6000)}`;
     { responseFormat: { type: "json_object" }, maxTokens: 4096 }
   );
 
-  return (robustJsonParse(res.content) as Record<string, string>).conclusion || "";
+  return parseStructuredEditorialResponse(res.content, "regenerated-conclusion");
 }
 
 // ── Main regeneration loop ──
@@ -419,7 +415,17 @@ export async function runComponentRegeneration(
             const s = sections[secIdx];
             const prevH = secIdx > 0 ? sections[secIdx - 1].headingText : "none";
             const nextH = secIdx < sections.length - 1 ? sections[secIdx + 1].headingText : "none";
-            const newBody = await regenerateSection(ctx, currentTitle, s.headingText, prevH, nextH, wordTargets.perSection, wordTargets.keyphraseTarget, keyphrase);
+            const newBody = await regenerateSection(
+              ctx,
+              currentTitle,
+              s.headingText,
+              prevH,
+              nextH,
+              wordTargets.perSection,
+              wordTargets.keyphraseTarget,
+              keyphrase,
+              ctx.promptContext.claimOwnership?.sectionIds[secIdx],
+            );
             currentBlog = replaceSectionInBlog(currentBlog, secIdx, newBody);
           }
           break;
@@ -437,6 +443,7 @@ export async function runComponentRegeneration(
           // Full-article readability issue — regenerate worst sections
           const sections = extractSectionsSimple(currentBlog);
           const scored = sections
+            .filter((s) => !isFaqSectionHeading(s.headingText))
             .filter((s) => cleanBodyText(s.bodyText).length > 40)
             .map((s) => ({ index: s.index, score: Math.round(fleschOnText(s.bodyText)) }))
             .sort((a, b) => a.score - b.score);
@@ -445,7 +452,17 @@ export async function runComponentRegeneration(
             const s = sections[worst.index];
             const prevH = worst.index > 0 ? sections[worst.index - 1].headingText : "none";
             const nextH = worst.index < sections.length - 1 ? sections[worst.index + 1].headingText : "none";
-            const newBody = await regenerateSection(ctx, currentTitle, s.headingText, prevH, nextH, Math.round(wordTargets.perSection * 1.3), wordTargets.keyphraseTarget, keyphrase);
+            const newBody = await regenerateSection(
+              ctx,
+              currentTitle,
+              s.headingText,
+              prevH,
+              nextH,
+              Math.round(wordTargets.perSection * 1.3),
+              wordTargets.keyphraseTarget,
+              keyphrase,
+              ctx.promptContext.claimOwnership?.sectionIds[worst.index],
+            );
             currentBlog = replaceSectionInBlog(currentBlog, worst.index, newBody);
           }
           break;

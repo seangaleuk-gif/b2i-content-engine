@@ -21,6 +21,7 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { useData } from "@/lib/use-data";
 import { api } from "@/lib/api-client";
+import { parseTranslationVersionSummary } from "@/lib/services/translation-version-metadata";
 
 interface SeoCheck {
   id: string;
@@ -75,18 +76,15 @@ export default function ChineseSEOPage() {
     api.get(`/api/projects/${projectId}/seo?language=zh`)
   );
 
-  const { data: blogVersions } = useData<{ id: number; versionNumber: number; title: string; slug: string; blog?: string; metaDescription?: string; excerpt?: string }[]>(() =>
+  const { data: blogVersions } = useData<{ id: number; versionNumber: number; title: string; slug: string; blog?: string; metaDescription?: string; excerpt?: string; summary?: string }[]>(() =>
     api.get(`/api/projects/${projectId}/versions`)
-  );
-
-  const { data: project, loading: projectLoading } = useData<{ keyword?: string; name?: string }>(() =>
-    api.get(`/api/projects/${projectId}`)
   );
 
   const latestZh = (blogVersions ?? []).find((v) => v.slug?.endsWith("-zh"));
   const hasZhBlog = !!latestZh;
-  // Use the saved Chinese keyphrase from excerpt, or fall back to project keyword
-  const resolvedKeyword = (latestZh?.excerpt || project?.keyword || "").trim();
+  const translationMetadata = parseTranslationVersionSummary(latestZh?.summary);
+  const legacyKeyphrase = /^source-en-version:\d+$/.test(latestZh?.summary || "") ? latestZh?.excerpt || "" : "";
+  const resolvedKeyword = (translationMetadata?.focusKeyphrase || legacyKeyphrase).trim();
 
   // Determine whether the saved audit is outdated
   const savedVersionId = liveAuditResult?.auditedVersionId || (savedChecks as any)?._versionId;
@@ -120,7 +118,7 @@ export default function ChineseSEOPage() {
     }
   }, [projectId, refetch, hasZhBlog, latestZh, resolvedKeyword]);
 
-  if (projectLoading || (loading && !liveAuditResult)) return <ZhSeoSkeleton />;
+  if (loading && !liveAuditResult) return <ZhSeoSkeleton />;
 
   const auditChecks = liveAuditResult?.checks ?? (savedChecks ?? []) as SeoCheck[];
   const auditedVersionNumber = liveAuditResult?.auditedVersionNumber ?? (savedChecks as any)?._version;

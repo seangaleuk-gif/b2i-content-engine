@@ -288,7 +288,11 @@ export const FACTUALITY_INSTRUCTION = `## Factuality Rules (CRITICAL)
 You MUST follow these factuality rules:
 - NEVER invent statistics, percentages, prices, survey findings, quotations, testimonials, case studies, customer outcomes, follower growth numbers, sales results or business performance figures.
 - Use a precise number ONLY when that exact number is present in the supplied project research sources above. Do not alter, round, or extrapolate any sourced number.
+- Preserve the complete meaning attached to every sourced number: subject, population or survey sample, metric, geography, timeframe and qualifier. A matching number alone is not evidence.
+- Never turn "survey respondents" into "Hong Kong users", "prefer personal accounts" into "follow no brands", or "advertising reach" into "monthly active users".
+- When using a precise claim, identify its SOURCE-N and keep the wording faithful to that source's approved evidence. If the source URL is unavailable, omit the precise claim.
 - Do not attribute a claim to a source (e.g. "According to DataReportal") unless the supplied research explicitly supports that specific claim.
+- Do not state posting frequencies, peak posting times, algorithm behaviour, lower advertising costs, comparative performance or current product availability as facts unless the supplied evidence explicitly supports them.
 - When illustrating an unsourced situation, make it unmistakably hypothetical:
   * "For example, a bakery could..."
   * "Imagine a local shop..."

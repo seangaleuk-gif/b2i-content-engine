@@ -4,6 +4,7 @@ import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { seoRepository, blogVersionRepository } from "@/lib/repositories";
 import { runAudit, runChineseAudit } from "@/lib/services/seo-auditor";
+import { parseTranslationVersionSummary } from "@/lib/services/translation-version-metadata";
 
 export async function POST(
   request: Request,
@@ -25,11 +26,11 @@ export async function POST(
     // historical content; otherwise use the latest version for the language.
     const versions = await blogVersionRepository.findByProject(Number(id));
     const requestedVersionNumber = Number(body.versionNumber);
-    const languageVersions = (versions ?? []).filter((version: any) =>
+    const languageVersions = (versions ?? []).filter((version) =>
       isChinese ? version.slug?.endsWith("-zh") : !version.slug?.endsWith("-zh"),
     );
     const targetedVersion = Number.isInteger(requestedVersionNumber) && requestedVersionNumber > 0
-      ? languageVersions.find((version: any) => version.version_number === requestedVersionNumber)
+      ? languageVersions.find((version) => version.versionNumber === requestedVersionNumber)
       : languageVersions[0];
     if (!targetedVersion) {
       throw AppError.badRequest(
@@ -42,38 +43,40 @@ export async function POST(
     let pairedEnglishVersion: any = undefined;
     if (isChinese) {
       // Read the source English version ID from the Chinese version's summary field.
-      // Format: "source-en-version:<ID>" (set during translation).
-      const summary: string = (targetedVersion as any)?.summary || "";
-      const sourceMatch = summary.match(/^source-en-version:(\d+)$/);
-      if (sourceMatch) {
-        const sourceId = Number(sourceMatch[1]);
-        pairedEnglishVersion = versions?.find((v: any) => v.id === sourceId);
+      // Supports the current structured envelope and the legacy source-en-version:<ID> marker.
+      const summaryMetadata = parseTranslationVersionSummary(targetedVersion.summary);
+      if (summaryMetadata) {
+        pairedEnglishVersion = versions?.find((v) => v.id === summaryMetadata.sourceEnVersionId);
       }
       // Fallback for legacy versions without summary marker: find by slug matching
       if (!pairedEnglishVersion) {
-        const enSlug = ((targetedVersion as any)?.slug || "").replace(/-zh$/, "");
-        pairedEnglishVersion = versions?.find((v: any) => v.slug === enSlug);
+        const enSlug = (targetedVersion.slug || "").replace(/-zh$/, "");
+        pairedEnglishVersion = versions?.find((v) => v.slug === enSlug);
       }
       if (!pairedEnglishVersion) {
         throw AppError.badRequest(
-          `Cannot identify the English source version for Chinese version ${(targetedVersion as any)?.id}. ` +
+          `Cannot identify the English source version for Chinese version ${targetedVersion.id}. ` +
           `Re-translate the article to create a proper paired version.`
         );
       }
     }
 
-    const title = (targetedVersion as any)?.title || body.title || project.name || "";
-    const metaDescription = (targetedVersion as any)?.meta_description || body.metaDescription || "";
+    const title = targetedVersion.title || body.title || project.name || "";
+    const metaDescription = targetedVersion.metaDescription || body.metaDescription || "";
 
-    // For Chinese: use the saved Chinese keyphrase from the version's excerpt only.
-    // Never fall back to the English project keyword.
+    // For Chinese, read the keyphrase from the structured translation metadata.
+    // Legacy versions stored it in excerpt, so retain that narrow fallback only
+    // when the summary is the old source-en-version:<ID> marker.
     if (isChinese) {
-      const zhKeyword = ((targetedVersion as any)?.excerpt || "").trim();
-      if (!zhKeyword || !/[\u4e00-\u9fff]/.test(zhKeyword)) {
+      const summaryValue = String(targetedVersion.summary || "");
+      const translationMetadata = parseTranslationVersionSummary(summaryValue);
+      const legacySummary = /^source-en-version:\d+$/.test(summaryValue.trim());
+      const legacyExcerptKeyphrase = legacySummary ? String(targetedVersion.excerpt || "").trim() : "";
+      const zhKeyword = (translationMetadata?.focusKeyphrase || legacyExcerptKeyphrase).trim();
+      if (!zhKeyword || !/[\u3400-\u9fff]/u.test(zhKeyword)) {
         throw AppError.badRequest(
-          `Chinese SEO audit requires a valid Chinese keyphrase. ` +
-          `The Chinese version's excerpt field is empty or lacks CJK characters. ` +
-          `Re-translate the article to generate the Chinese keyphrase.`
+          `Chinese SEO audit requires a valid Chinese keyphrase in the translation metadata. ` +
+          `Re-translate the article to create an updated paired version.`
         );
       }
       body.keyword = zhKeyword;
@@ -82,13 +85,13 @@ export async function POST(
     const projectKeyword = typeof project.keyword === "string" ? project.keyword.trim() : "";
     const keyword = isChinese ? clientKeyword : (clientKeyword || projectKeyword);
 
-    console.log(`[KEYPHRASE-RESOLVE] zh="${(targetedVersion as any)?.excerpt}" client="${clientKeyword}" project="${projectKeyword}" resolved="${keyword}" len=${keyword.length}`);
+    console.log(`[KEYPHRASE-RESOLVE] client="${clientKeyword}" project="${projectKeyword}" resolved="${keyword}" len=${keyword.length}`);
 
     if (!keyword) {
       console.warn("[seo:audit] No focus keyphrase available — marking keyphrase checks as not_applicable");
     }
-    const blog = (targetedVersion as any)?.blog || body.blog || (project as any).content || "";
-    const faq = (targetedVersion as any)?.faq || [];
+    const blog = targetedVersion.blog || body.blog || project.content || "";
+    const faq = targetedVersion.faq || [];
     const targetWordCount = (project as any).wordCount || (project as any).word_count || 2500;
     const targetKeyphraseCount = 5;
 
@@ -96,20 +99,20 @@ export async function POST(
     // Fall back to canonical HTML parsing when the saved faq field is empty.
     let pairedEnglishFaqCount = 0;
     if (isChinese && pairedEnglishVersion) {
-      const savedFaq = (pairedEnglishVersion as any)?.faq;
+      const savedFaq = pairedEnglishVersion?.faq;
       if (Array.isArray(savedFaq) && savedFaq.length > 0) {
         pairedEnglishFaqCount = savedFaq.length;
-      } else if ((pairedEnglishVersion as any)?.blog) {
+      } else if (pairedEnglishVersion?.blog) {
         const { extractVisibleFaqFromArticle } = await import("@/lib/blog/article-document");
-        const parsedFaq = extractVisibleFaqFromArticle((pairedEnglishVersion as any).blog);
+        const parsedFaq = extractVisibleFaqFromArticle(pairedEnglishVersion.blog);
         pairedEnglishFaqCount = parsedFaq.length;
       }
     }
     const englishWordCount = isChinese
-      ? ((pairedEnglishVersion as any)?.word_count || targetWordCount)
+      ? (pairedEnglishVersion?.wordCount || targetWordCount)
       : targetWordCount;
 
-    console.log(`[seo:audit] versionId=${(targetedVersion as any)?.id} sourceEnVersionId=${(pairedEnglishVersion as any)?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language} enWordCount=${englishWordCount} enFaqCount=${pairedEnglishFaqCount}`);
+    console.log(`[seo:audit] versionId=${targetedVersion.id} sourceEnVersionId=${pairedEnglishVersion?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language} enWordCount=${englishWordCount} enFaqCount=${pairedEnglishFaqCount}`);
 
     if (!blog) {
       throw AppError.badRequest("No blog content to audit");
@@ -152,8 +155,8 @@ export async function POST(
       ...result,
       auditRunId,
       engineVersion: "editorial-safety-2",
-      auditedVersionId: (targetedVersion as any).id,
-      auditedVersionNumber: (targetedVersion as any).version_number,
+      auditedVersionId: targetedVersion.id,
+      auditedVersionNumber: targetedVersion.versionNumber,
     }, { status: 201 });
   } catch (error) {
     console.error("[seo:audit]", error);

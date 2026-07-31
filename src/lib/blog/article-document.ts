@@ -395,8 +395,8 @@ export function validateFaqParity(
 export function extractVisibleFaqFromArticle(
   html: string,
   doc?: ArticleDocument,
-): Array<{ question: string; answerText: string }> {
-  const result: Array<{ question: string; answerText: string }> = [];
+): Array<{ question: string; answerText: string; answerHtml: string }> {
+  const result: Array<{ question: string; answerText: string; answerHtml: string }> = [];
 
   // Prefer the canonical protected FAQ entries. The FAQ heading section owns
   // only the H2 marker; its body is intentionally empty.
@@ -404,6 +404,7 @@ export function extractVisibleFaqFromArticle(
     return doc.visibleFaq.map((entry) => ({
       question: entry.question,
       answerText: entry.answerText,
+      answerHtml: entry.answerHtml,
     }));
   }
 
@@ -453,6 +454,20 @@ export function extractVisibleFaqFromArticle(
 
   const faqSection = html.substring(faqStart, effectiveEnd);
 
+  // Canonical FAQ renderer: one protected HTML block per .faq-item. Preserve the
+  // answer HTML so translation can retain inline links and emphasis exactly.
+  const faqItemRe = /<div\b[^>]*class=["'][^"']*\bfaq-item\b[^"']*["'][^>]*>\s*<h3\b[^>]*>([\s\S]*?)<\/h3>([\s\S]*?)<\/div>/gi;
+  let faqItemMatch: RegExpExecArray | null;
+  while ((faqItemMatch = faqItemRe.exec(faqSection)) !== null) {
+    const question = decodeHtmlEntities(faqItemMatch[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+    const answerHtml = faqItemMatch[2].trim();
+    const answerText = decodeHtmlEntities(
+      answerHtml.replace(/<!--[^]*?-->/g, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+    );
+    if (question && answerText) result.push({ question, answerText, answerHtml });
+  }
+  if (result.length > 0) return result;
+
   // Extract Q&A pairs: each question is an <h3>, answers follow until next <h3> or end
   const h3Split = faqSection.split(/<\/h3>/i);
   for (let i = 0; i < h3Split.length - 1; i++) {
@@ -463,16 +478,16 @@ export function extractVisibleFaqFromArticle(
     const h3OpenIdx = beforeH3Close.lastIndexOf("<h3");
     if (h3OpenIdx < 0) continue;
     const questionHtml = beforeH3Close.substring(h3OpenIdx).replace(/<h3\b[^>]*>/i, "");
-    const question = questionHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    const question = decodeHtmlEntities(questionHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
     if (!question) continue;
 
     // Extract answer from after </h3> until the next <h3>
     const nextH3Idx = afterH3Close.search(/<h3\b/i);
     const answerHtml = nextH3Idx >= 0 ? afterH3Close.substring(0, nextH3Idx) : afterH3Close;
-    const answerText = answerHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    const answerText = decodeHtmlEntities(answerHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
 
     if (answerText.length > 0) {
-      result.push({ question, answerText });
+      result.push({ question, answerText, answerHtml: answerHtml.trim() });
     }
   }
 
@@ -487,7 +502,7 @@ export function extractVisibleFaqFromArticle(
     const strongRe = /<strong\b[^>]*>([\s\S]*?)<\/strong>(?:\s*<br\s*\/?\s*>)?/gi;
     let sm: RegExpExecArray | null;
     while ((sm = strongRe.exec(faqSection)) !== null) {
-      const rawQuestion = sm[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      const rawQuestion = decodeHtmlEntities(sm[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
       // Skip if not a question — guards against keyphrase <strong> inside answers
       if (!rawQuestion.endsWith("?") && !rawQuestion.endsWith("？")) continue;
       const question = rawQuestion.replace(/[?？]$/, "").trim();
@@ -500,14 +515,16 @@ export function extractVisibleFaqFromArticle(
       // If answer starts with a WordPress paragraph closer, skip to the next opener's content
       answerHtml = answerHtml.replace(/^\s*<!--\s*\/wp:paragraph\s*-->\s*\n?\s*<!--\s*wp:paragraph\s*-->\s*\n?\s*<p\b[^>]*>/i, "");
       answerHtml = answerHtml.replace(/^\s*<p\b[^>]*>/i, "");
-      const answerText = answerHtml
-        .replace(/<!--[\s\S]*?-->/g, "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+      const answerText = decodeHtmlEntities(
+        answerHtml
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim(),
+      );
 
       if (answerText.length > 0) {
-        result.push({ question, answerText });
+        result.push({ question, answerText, answerHtml: answerHtml.trim() });
       }
     }
 
@@ -545,12 +562,12 @@ export function extractFaqPairsFromSectionBody(sectionHtml: string): Array<{ que
     const h3OpenIdx = beforeH3Close.lastIndexOf("<h3");
     if (h3OpenIdx < 0) continue;
     const questionHtml = beforeH3Close.substring(h3OpenIdx).replace(/<h3\b[^>]*>/i, "");
-    const question = questionHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    const question = decodeHtmlEntities(questionHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
     if (!question) continue;
 
     const nextH3Idx = afterH3Close.search(/<h3\b/i);
     const answerHtml = nextH3Idx >= 0 ? afterH3Close.substring(0, nextH3Idx) : afterH3Close;
-    const answerText = answerHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    const answerText = decodeHtmlEntities(answerHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
     if (answerText.length > 0) result.push({ question, answerText });
   }
 
@@ -559,23 +576,25 @@ export function extractFaqPairsFromSectionBody(sectionHtml: string): Array<{ que
   // Second: try <strong>Question?</strong> style (must end with "?")
   const strongRe = /<strong\b[^>]*>([\s\S]*?)<\/strong>(?:\s*<br\s*\/?\s*>)?/gi;
   let sm: RegExpExecArray | null;
-  while ((sm = strongRe.exec(sectionHtml)) !== null) {
-    const rawQuestion = sm[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-    if (!rawQuestion.endsWith("?") && !rawQuestion.endsWith("？")) continue;
-    const question = rawQuestion.replace(/[?？]$/, "").trim();
-    if (!question) continue;
+    while ((sm = strongRe.exec(sectionHtml)) !== null) {
+      const rawQuestion = decodeHtmlEntities(sm[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+      if (!rawQuestion.endsWith("?") && !rawQuestion.endsWith("？")) continue;
+      const question = rawQuestion.replace(/[?？]$/, "").trim();
+      if (!question) continue;
 
-    const afterStrong = sm.index + sm[0].length;
-    const nextStrongIdx = sectionHtml.substring(afterStrong).search(/<strong\b/i);
-    const answerEnd = nextStrongIdx >= 0 ? afterStrong + nextStrongIdx : sectionHtml.length;
-    let answerHtml = sectionHtml.substring(afterStrong, answerEnd);
-    answerHtml = answerHtml.replace(/^\s*<!--\s*\/wp:paragraph\s*-->\s*\n?\s*<!--\s*wp:paragraph\s*-->\s*\n?\s*<p\b[^>]*>/i, "");
-    answerHtml = answerHtml.replace(/^\s*<p\b[^>]*>/i, "");
-    const answerText = answerHtml
-      .replace(/<!--[\s\S]*?-->/g, "")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+      const afterStrong = sm.index + sm[0].length;
+      const nextStrongIdx = sectionHtml.substring(afterStrong).search(/<strong\b/i);
+      const answerEnd = nextStrongIdx >= 0 ? afterStrong + nextStrongIdx : sectionHtml.length;
+      let answerHtml = sectionHtml.substring(afterStrong, answerEnd);
+      answerHtml = answerHtml.replace(/^\s*<!--\s*\/wp:paragraph\s*-->\s*\n?\s*<!--\s*wp:paragraph\s*-->\s*\n?\s*<p\b[^>]*>/i, "");
+      answerHtml = answerHtml.replace(/^\s*<p\b[^>]*>/i, "");
+      const answerText = decodeHtmlEntities(
+        answerHtml
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim(),
+      );
 
     if (answerText.length > 0) result.push({ question, answerText });
   }
@@ -1166,7 +1185,7 @@ export function parseArticleDocumentFromHtml(
     visibleFaq: (() => {
       const parsedFaq = extractVisibleFaqFromArticle(html);
       return parsedFaq.length > 0
-        ? parsedFaq.map((entry) => ({ question: entry.question, answerHtml: "", answerText: entry.answerText }))
+        ? parsedFaq.map((entry) => ({ question: entry.question, answerHtml: entry.answerHtml, answerText: entry.answerText }))
         : existingDoc.visibleFaq;
     })(),
     conclusion: {

@@ -6,13 +6,13 @@ import {
   projectRepository, researchRepository, knowledgeRepository,
   promptSectionRepository,
 } from "@/lib/repositories";
-import { buildBlogPrompt } from "@/lib/services/prompt-builder";
+import { buildBlogPrompt, buildOutlineBrief, type BlogContext } from "@/lib/services/prompt-builder";
 import { getCompiledBundle } from "@/lib/services/prompt-compiler";
 import { AiService, type ChatMessage, type ChatOptions } from "@/lib/services/deepseek";
 import { AppError } from "@/lib/services/errors";
 import { countReadableWords, robustJsonParse, repairMetaDescription, containsExactPhrase } from "@/lib/services/text-utils";
 import { WORD_ALLOCATION, GENERATION_WORD_BUFFER } from "@/lib/services/generation-constants";
-import { englishWordTolerance, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount, dynamicH2Range } from "@/lib/content-standards";
+import { englishWordTolerance, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount, dynamicH2Range, dynamicFaqRange } from "@/lib/content-standards";
 import { runComponentRegeneration, regenerateIntroduction, regenerateSection, regenerateConclusion, type GenContext } from "@/lib/services/component-regenerator";
 import { buildGenerationReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry } from "@/lib/services/generation-telemetry";
@@ -20,9 +20,10 @@ import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
-import { sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
+import { pairedSlugs, sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
 import { rebalanceWpBlocks } from "@/lib/services/text-utils";
 import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks } from "@/lib/blog/article-content";
+import { buildClaimOwnershipLedger, formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
 
 /** Strip ALL heading blocks (H2, H3, bare <h2>, bare <h3>) from section body content.
  *  Handles complete blocks, orphaned openers/closers, and malformed heading markup
@@ -179,7 +180,7 @@ export async function runBlogGeneration(
   await promptSectionRepository.seedDefaults(userId);
   const promptSections = await promptSectionRepository.findByUser(userId);
 
-  const context = {
+  const context: BlogContext = {
     project: {
       name: project.name, keyword: project.keyword,
       audience: project.audience, country: project.country,
@@ -189,9 +190,11 @@ export async function runBlogGeneration(
     research: research.map((r: any) => ({ category: r.category, title: r.title, snippet: r.snippet, url: r.url })),
     knowledge: knowledge.map((k: any) => ({ title: k.title, content: k.content, tags: k.tags })),
     promptSections: promptSections.map((s: any) => ({ key: s.section_key ?? "", label: s.section_key ?? "", content: s.content })),
+    generationDate: new Date().toISOString().slice(0, 10),
   };
 
-  const { systemPrompt, userMessage } = buildBlogPrompt(context);
+  const { systemPrompt } = buildBlogPrompt(context);
+  const userMessage = buildOutlineBrief(context);
   const { bundle } = getCompiledBundle(context);
   const requestedWordCount = context.project.wordCount || 2500;
 
@@ -205,24 +208,24 @@ export async function runBlogGeneration(
   const outlinePrompt = userMessage + `
 
 === STEP 1 ===
-Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section headings (the accepted editorial range is ${editorialH2Min}-${editorialH2Max}), followed by one final FAQ H2 heading (${editorialH2Min + 1} headings total). Do not include a Conclusion or Summary H2. The LAST heading MUST be an FAQ section. Do NOT write full content yet. Return as JSON: {"title": "...", "slug": "...", "metaDescription": "...", "h2Headings": ["Editorial Heading 1", "Editorial Heading 2", "...", "Frequently Asked Questions About [Topic]"]}.`;
-  
+Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section headings (the accepted editorial range is ${editorialH2Min}-${editorialH2Max}), followed by one final FAQ H2 heading (${editorialH2Min + 1} headings total). Do not include a Conclusion or Summary H2. The LAST heading MUST be an FAQ section. Do NOT write full content yet. Keep the title, slug, meta description and headings topic-level: do not place research statistics, percentages, dates, currencies, survey findings, quotations or source names in metadata or headings. Precise evidence will be assigned to one body section after the outline is approved. Return as JSON: {"title": "...", "slug": "...", "metaDescription": "...", "h2Headings": ["Editorial Heading 1", "Editorial Heading 2", "...", "Frequently Asked Questions About [Topic]"]}.`;
+
   const outlineRes = await trackedChat("outline",
     [{ role: "system", content: outlineSystemPrompt }, { role: "user", content: outlinePrompt }],
-    { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 }
+    { responseFormat: { type: "json_object" }, maxTokens: 4096, timeoutMs: 60_000 }
   );
-  
+
   let outline: any;
   try {
     outline = robustJsonParse(outlineRes.content, "outline");
   } catch {
     const retryRes = await trackedChat("outline_retry",
       [{ role: "system", content: outlineSystemPrompt }, { role: "user", content: outlinePrompt + "\n\nCRITICAL: You MUST output valid JSON only." }],
-      { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 }
+      { responseFormat: { type: "json_object" }, maxTokens: 4096, timeoutMs: 60_000 }
     );
     outline = robustJsonParse(retryRes.content, "outline-retry");
   }
-  
+
   let h2Headings: string[] = outline?.h2Headings ?? [];
   if (h2Headings.length === 0) {
     h2Headings = outline?.headings ?? [];
@@ -253,30 +256,16 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   const introTarget = Math.round(internalTarget * WORD_ALLOCATION.INTRO);
   const conclusionTarget = Math.round(internalTarget * WORD_ALLOCATION.CONCLUSION);
   const faqTarget = Math.round(internalTarget * WORD_ALLOCATION.FAQ);
+  const faqRange = dynamicFaqRange(requestedWordCount);
   const h2TotalTarget = internalTarget - introTarget - conclusionTarget - faqTarget;
   const editorialHeadingCount = Math.max(1, h2Headings.length - 1);
   const wordsPerSection = Math.round(h2TotalTarget / editorialHeadingCount);
   const kpTargets = computeKeyphraseTargets(requestedWordCount, keyphrase);
   const exactKeyphraseTarget = kpTargets.preferred;
 
-  // Keyphrase injection into best H2
-  let keyphraseH2Index = 0;
-  if (keyphrase && h2Headings.length > 1) {
-    const skipPatterns = /mistake|avoid|faq|conclusion|summary|final|wrap.?up/i;
-    for (let i = 0; i < h2Headings.length; i++) {
-      if (!skipPatterns.test(h2Headings[i].toLowerCase())) { keyphraseH2Index = i; break; }
-    }
-    const heading = h2Headings[keyphraseH2Index];
-    // Only prepend keyphrase if the heading doesn't already contain it.
-    // This prevents unnatural duplicates like "threads marketing hong kong: Why Threads Marketing Hong Kong Matters".
-    if (!heading.toLowerCase().includes(keyphrase.toLowerCase())) {
-      h2Headings[keyphraseH2Index] = `${keyphrase}: ${heading}`;
-    }
-  }
-
   // Keyphrase placement: article-level density target, not per-section quotas.
   const kpNote = keyphrase
-    ? `\n\nUse the exact keyphrase "${keyphrase}" naturally across the article, approximately ${exactKeyphraseTarget} times total. Do NOT force it into every section. Place it naturally in the introduction, at least one heading, and the body where it reads naturally.`
+    ? `\n\nUse the exact keyphrase "${keyphrase}" naturally across the article, approximately ${exactKeyphraseTarget} times total. Do NOT force it into every section. Place it naturally in the introduction or a heading only when it reads naturally, and use it in the body without forcing repetition.`
     : "";
 
   // Section bodies array
@@ -284,10 +273,18 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     index: i, heading: h, body: "", status: "pending",
   }));
 
-  // Research summary
-  const sectionResearchPrompt = context.research?.length
-    ? `\n\nREFERENCE SOURCES (use these URLs when referencing claims):\n${(context.research as any[]).map((r: any) => `- ${r.title || "Source"}: ${r.url || ""}`).join("\n")}`
-    : "";
+  // Nuclear evidence boundary: every approved claim is assigned to exactly one
+  // editorial section before any prose is generated. Introduction, FAQ and
+  // conclusion are synthesis-only and receive no precise research evidence.
+  const ownershipSections = h2Headings
+    .map((heading, index) => ({
+      id: `section-${index}`,
+      heading,
+      sectionType: index === h2Headings.length - 1 ? "faq-heading" as const : "main" as const,
+    }));
+  const claimOwnership = buildClaimOwnershipLedger(ownershipSections, context.research);
+  context.claimOwnership = claimOwnership;
+  const synthesisOnlyPrompt = `\n\nEVIDENCE OWNERSHIP: This component is synthesis-only. Do not use statistics, dates, currencies, quotations, performance benchmarks, posting frequencies, survey findings or platform-availability claims. Summarize or frame ideas without repeating precise evidence owned by body sections.`;
   const researchUrls = (context.research || []).map((r: any) => r.url || r.link || "").filter(Boolean);
 
   // Phase B: Parallel section generation
@@ -322,18 +319,18 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   // only `limit` HTTP requests are in flight simultaneously.
   const taskFactories: (() => Promise<TaskResult>)[] = [];
 
-  const introUserMsg = `Write the introduction (${introTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another supported type is clearly useful.\n\nTitle: ${outline.title}${kpNote}`;
-  taskFactories.push(() => trackedChat("intro", [{ role: "system", content: bundle.introSystem }, { role: "user", content: introUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 3072, timeoutMs: 90_000 }).then(async (res: any) => {
+  const introUserMsg = `Write the introduction (${introTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another supported type is clearly useful.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+  taskFactories.push(() => trackedChat("intro", [{ role: "system", content: bundle.introSystem }, { role: "user", content: introUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
     let parsed: any;
     try { parsed = robustJsonParse(res.content, "intro"); } catch {
       const retryMsg = introUserMsg + `\n\nYour previous response was not valid JSON. Return ONLY valid JSON with the format: {"blocks": [{"type": "paragraph", "text": "..."}]}. No HTML, no WordPress comments, no Markdown fences.`;
-      const retryRes = await trackedChat("intro_retry", [{ role: "system", content: bundle.introSystem }, { role: "user", content: retryMsg }], { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 });
+      const retryRes = await trackedChat("intro_retry", [{ role: "system", content: bundle.introSystem }, { role: "user", content: retryMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       parsed = robustJsonParse(retryRes.content, "intro-retry");
     }
     const normalized = normalizeAiEditorialPayload(parsed, "intro");
     if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}.\n\nReturn ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences.`;
-      const repairRes = await trackedChat("intro_repair", [{ role: "system", content: bundle.introSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 });
+      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}.\n\nReturn ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences.\n\nOriginal request and approved evidence:\n${introUserMsg}`;
+      const repairRes = await trackedChat("intro_repair", [{ role: "system", content: bundle.introSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "intro-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "intro");
       if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
@@ -344,7 +341,6 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     return { type: "intro", content: renderEditorialBlocksToWordPress(normalized.blocks) };
   }));
 
-  const faqFaqHeading = h2Headings[h2Headings.length - 1];
   const faqIndex = h2Headings.length - 1;
 
   for (let i = 0; i < h2Headings.length; i++) {
@@ -355,13 +351,13 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
 
     if (isFaq) {
       // FAQ: structured output with heading + entries, not an editorial section
-      const faqMsg = `Return FAQ content as structured JSON. Use: {"heading": "...", "entries": [{"question": "...", "answer": "..."}]}. Generate ${faqTarget} words total across 4-6 entries. Each answer must be 1-3 complete sentences. Do not include HTML, WordPress comments, Markdown fences, signup URLs, or CTA content.\n\nHeading: "${h2Text}"\n\nTitle: ${outline.title}${kpNote}`;
-      taskFactories.push(() => trackedChat("faq", [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: faqMsg }], { responseFormat: { type: "json_object" }, maxTokens: 4096, timeoutMs: 90_000 }).then(async (res: any) => {
+      const faqMsg = `Return FAQ content as structured JSON. Use: {"heading": "...", "entries": [{"question": "...", "answer": "..."}]}. Generate ${faqTarget} words total across ${faqRange.min}-${faqRange.max} entries. Each answer must be 1-3 complete sentences. Do not include HTML, WordPress comments, Markdown fences, signup URLs, CTA content, or precise statistics. Questions must be conceptual or practical rather than asking for a number already owned by a body section.\n\nHeading: "${h2Text}"\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+      taskFactories.push(() => trackedChat("faq", [{ role: "system", content: bundle.faqSystem }, { role: "user", content: faqMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
         const raw = robustJsonParse(res.content, "faq");
         const heading = (raw as any).heading || h2Text;
         const entries: Array<{ question: string; answer: string }> = (raw as any).entries || [];
-        if (entries.length < 2) {
-          throw AppError.internal(new Error(`FAQ generation returned only ${entries.length} entries`));
+        if (entries.length < faqRange.min || entries.length > faqRange.max) {
+          throw AppError.internal(new Error(`FAQ generation returned ${entries.length} entries; expected ${faqRange.min}-${faqRange.max}`));
         }
         // Sanitize answers — strip any signup URL or CTA content
         for (const e of entries) {
@@ -371,13 +367,15 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       }));
     } else {
       // Editorial section: structured JSON blocks
+      const ownedEvidence = formatOwnedEvidencePacket(claimOwnership, `section-${i}`);
+      const sectionResearchPrompt = `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${ownedEvidence}\n\nUse only assigned evidence. Preserve complete meaning and use natural named attribution. Never print SOURCE-N identifiers. Do not repeat precise evidence from earlier or later sections.`;
       const msg = `Return section BODY as structured JSON blocks. Do NOT return H2 heading. Section heading: "${h2Text}". Target ${wordsPerSection} words. Previous heading: ${prev}. Next heading: ${next}. Title: ${outline.title}. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Use paragraph, subheading (H3 only), list, quote or table types as needed.${kpNote}${sectionResearchPrompt}`;
-      taskFactories.push(() => trackedChat(`section_${i}`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: msg }], { responseFormat: { type: "json_object" }, maxTokens: 4096, timeoutMs: 90_000 }).then(async (res: any) => {
+      taskFactories.push(() => trackedChat(`section_${i}`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: msg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 90_000 }).then(async (res: any) => {
         const raw = robustJsonParse(res.content, `section_${i}`);
         const normalized = normalizeAiEditorialPayload(raw, `section-${i}`);
         if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-          const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}. Return ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences. Do NOT include H2 headings.`;
-          const repairRes = await trackedChat(`section_${i}_repair`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 });
+          const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}. Return ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences. Do NOT include H2 headings.\n\nOriginal request and approved evidence:\n${msg}`;
+          const repairRes = await trackedChat(`section_${i}_repair`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
           const repaired = robustJsonParse(repairRes.content, `section-${i}-repair`);
           const repairedNorm = normalizeAiEditorialPayload(repaired, `section-${i}`);
           if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
@@ -394,18 +392,18 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     }
   }
 
-  const concUserMsg = `Write the conclusion (${conclusionTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another type is clearly useful. Do NOT include any CTA content, signup buttons, or CTA headings — the application handles the CTA separately.\n\nTitle: ${outline.title}${kpNote}`;
-  taskFactories.push(() => trackedChat("conclusion", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: concUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 3072, timeoutMs: 90_000 }).then(async (res: any) => {
+  const concUserMsg = `Write the conclusion (${conclusionTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another type is clearly useful. Do NOT include any CTA content, signup buttons, or CTA headings — the application handles the CTA separately. Summarize only ideas already established in the body and do not repeat any precise factual claim.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+  taskFactories.push(() => trackedChat("conclusion", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: concUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
     let parsed: any;
     try { parsed = robustJsonParse(res.content, "conclusion"); } catch {
       const retryMsg = concUserMsg + `\n\nYour previous response was not valid JSON. Return ONLY valid JSON with the format: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA, no signup content, no HTML, no WordPress comments.`;
-      const retryRes = await trackedChat("conclusion_retry", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: retryMsg }], { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 });
+      const retryRes = await trackedChat("conclusion_retry", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: retryMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       parsed = robustJsonParse(retryRes.content, "conclusion-retry");
     }
     const normalized = normalizeAiEditorialPayload(parsed, "conclusion", { disallowCtaContent: true });
     if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ") || "empty blocks"}. Return ONLY valid conclusion JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA content. No signup buttons. No HTML.`;
-      const repairRes = await trackedChat("conclusion_repair", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 });
+      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ") || "empty blocks"}. Return ONLY valid conclusion JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA content. No signup buttons. No HTML.\n\nOriginal request and approved evidence:\n${concUserMsg}`;
+      const repairRes = await trackedChat("conclusion_repair", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "conclusion-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "conclusion", { disallowCtaContent: true });
       if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
@@ -483,7 +481,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   }
 
   const articleDoc: ArticleDocument = {
-    metadata: { title: outline.title || "Untitled", slug: outline.slug || "", metaDescription: repairedMeta, excerpt: outline.excerpt || "", targetWordCount: requestedWordCount, focusKeyphrase: keyphrase },
+    metadata: { title: outline.title || "Untitled", slug: slugs.englishSlug, metaDescription: repairedMeta, excerpt: outline.excerpt || "", targetWordCount: requestedWordCount, focusKeyphrase: keyphrase },
     languageSwitcher: { id: "ls", type: "language-switcher", html: `<!-- wp:html --><div class="b2i-language-switcher"><span>English</span> | <a href="/blog/${slugs.chineseSlug}">繁體中文</a></div><!-- /wp:html -->`, fingerprint: fingerprintHtml("switcher") },
     introduction: { id: "intro", blocks: parseWordPressEditorialBlocks(intro, "intro").blocks, status: "generated" },
     sections: docSections,
@@ -519,7 +517,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   const finalMeta = pipelineState.metaDescription;
 
   const generated = {
-    title: finalTitle, slug: outline.slug || "", metaDescription: finalMeta,
+    title: finalTitle, slug: slugs.englishSlug, metaDescription: finalMeta,
     excerpt: outline.excerpt || "", blog: finalBlog, faq: pipelineState.faq || [],
     internalLinks: [], externalLinks: [], categories: [], tags: [], readingTime: "", summary: "",
   };
@@ -543,8 +541,4 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     estimatedTokens: 0,
     systemPrompt, userMessage,
   };
-}
-
-function pairedSlugs(slug: string): { englishSlug: string; chineseSlug: string } {
-  return { englishSlug: slug, chineseSlug: slug + "-zh" };
 }

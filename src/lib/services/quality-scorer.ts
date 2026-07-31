@@ -1,6 +1,14 @@
 import { cleanBodyText, countWords } from "@/lib/services/text-utils";
 import { FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
-import { englishTitleRange, englishMetaRange, englishWordTolerance, englishKeyphraseDensity, computeKeyphraseTargets } from "@/lib/content-standards";
+import {
+  englishTitleRange,
+  englishMetaRange,
+  englishWordTolerance,
+  englishKeyphraseDensity,
+  dynamicH2Range,
+  dynamicFaqRange,
+  externalLinkRange,
+} from "@/lib/content-standards";
 import { analyzePublicationQuality } from "@/lib/blog/publication-quality";
 
 // ── Types ──
@@ -198,12 +206,12 @@ export function scoreArticle(
   // ── Structure (20 points) ──
   const structureDetails: ScoreDetail[] = [];
 
-  // H2 count 4-6: 5 pts — uses editorial H2 count when available (excludes CTA/FAQ headings)
+  // Dynamic structural ranges share the same canonical content standards as final validation.
   const h2Count = editorialH2Count ?? (blog.match(/<h2[^>]*>/gi) || []).length;
-  structureDetails.push(scoreCountInRange(h2Count, 4, 6, 5, "H2 sections"));
-
-  // FAQ count 4-6: 5 pts
-  structureDetails.push(scoreCountInRange(faqCount, 4, 6, 5, "FAQ questions"));
+  const h2Range = dynamicH2Range(targetWordCount || actualWordCount);
+  const faqRange = dynamicFaqRange(targetWordCount || actualWordCount);
+  structureDetails.push(scoreCountInRange(h2Count, h2Range.min, h2Range.max, 5, "H2 sections"));
+  structureDetails.push(scoreCountInRange(faqCount, faqRange.min, faqRange.max, 5, "FAQ questions"));
 
   // CTA present: 5 pts
   const ctaPresent = /B2I Hub/i.test(blog) && /signup/i.test(blog);
@@ -261,9 +269,23 @@ export function scoreArticle(
       : `⚠ Keyphrase density: ${density.toFixed(2)}% — ${density > kpHigh ? "too high" : `below minimum ${kpLow}%`}`,
   });
 
-  // External links 2-3: 5 pts — excludes B2I Hub signup and language switcher links
-  const extLinks = (blog.match(/href="https?:\/\/(?!b2ihub\.com|app\.b2ihub\.com)[^"]*"/gi) || []).length;
-  contentDetails.push(scoreCountInRange(extLinks, 2, 3, 5, "External links"));
+  // External research links are optional. Only the canonical maximum is scored;
+  // zero is valid when no relevant approved source is available.
+  const extLinks = new Set(
+    (blog.match(/href="https?:\/\/(?!b2ihub\.com|app\.b2ihub\.com)[^"]*"/gi) || [])
+      .map((match) => match.replace(/^href="|"$/g, "")),
+  ).size;
+  const externalRange = externalLinkRange();
+  const extLinksOk = extLinks >= externalRange.min && extLinks <= externalRange.max;
+  contentDetails.push({
+    label: "External links",
+    score: extLinksOk ? 5 : 0,
+    max: 5,
+    status: extLinksOk ? "pass" : "fail",
+    message: extLinksOk
+      ? `✓ External links: ${extLinks} (approved-source policy)`
+      : `✗ External links: ${extLinks} exceeds the canonical maximum`,
+  });
 
   const contentScore = contentDetails.reduce((s, d) => s + d.score, 0);
 

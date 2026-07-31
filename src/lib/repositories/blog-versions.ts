@@ -1,5 +1,85 @@
 import { getDb } from "@/db";
-import type { BlogVersion, NewBlogVersion } from "@/db/schema/blog-versions";
+import type { BlogFaqItem, BlogVersion, NewBlogVersion } from "@/db/schema/blog-versions";
+
+type BlogVersionRow = Record<string, unknown>;
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function toFaqItems(value: unknown): BlogFaqItem[] {
+  if (!Array.isArray(value)) return [];
+  const items: BlogFaqItem[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const question = typeof record.question === "string" ? record.question.trim() : "";
+    const answerSource = record.answer ?? record.answerText ?? record.answerHtml;
+    const answer = typeof answerSource === "string" ? answerSource.trim() : "";
+    if (question && answer) items.push({ question, answer });
+  }
+  return items;
+}
+
+function toFiniteNumber(value: unknown, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid blog version ${field}: ${String(value)}`);
+  }
+  return parsed;
+}
+
+function toNullableNumber(value: unknown, field: string): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  return toFiniteNumber(value, field);
+}
+
+function toDate(value: unknown): Date {
+  if (value instanceof Date) return value;
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`Invalid blog version createdAt: ${String(value)}`);
+  }
+  return parsed;
+}
+
+/**
+ * Supabase returns database column names in snake_case, while the application
+ * and Drizzle schema use camelCase. Normalize once at the repository boundary
+ * so callers receive the BlogVersion shape promised by the TypeScript contract.
+ */
+export function normalizeBlogVersionRow(input: unknown): BlogVersion {
+  const row = (input ?? {}) as BlogVersionRow;
+  return {
+    id: toFiniteNumber(row.id, "id"),
+    projectId: toFiniteNumber(row.projectId ?? row.project_id, "projectId"),
+    userId: String(row.userId ?? row.user_id ?? ""),
+    versionNumber: toFiniteNumber(row.versionNumber ?? row.version_number, "versionNumber"),
+    title: (row.title ?? null) as string | null,
+    slug: (row.slug ?? null) as string | null,
+    metaDescription: (row.metaDescription ?? row.meta_description ?? null) as string | null,
+    excerpt: (row.excerpt ?? null) as string | null,
+    blog: (row.blog ?? null) as string | null,
+    faq: toFaqItems(row.faq),
+    internalLinks: toStringArray(row.internalLinks ?? row.internal_links),
+    externalLinks: toStringArray(row.externalLinks ?? row.external_links),
+    categories: toStringArray(row.categories),
+    tags: toStringArray(row.tags),
+    readingTime: (row.readingTime ?? row.reading_time ?? null) as string | null,
+    wordCount: toNullableNumber(row.wordCount ?? row.word_count, "wordCount"),
+    summary: (row.summary ?? null) as string | null,
+    model: (row.model ?? null) as string | null,
+    promptVersion: (row.promptVersion ?? row.prompt_version ?? null) as string | null,
+    generationTimeMs: toNullableNumber(row.generationTimeMs ?? row.generation_time_ms, "generationTimeMs"),
+    tokenUsage: ((row.tokenUsage ?? row.token_usage ?? null) as Record<string, unknown> | null),
+    status: String(row.status ?? "draft"),
+    createdAt: toDate(row.createdAt ?? row.created_at),
+  };
+}
 
 function toSnakeCase(record: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -22,7 +102,7 @@ export const blogVersionRepository = {
       if (error.code === "PGRST116") return null;
       throw error;
     }
-    return data;
+    return normalizeBlogVersionRow(data);
   },
 
   async findByProject(projectId: number): Promise<BlogVersion[]> {
@@ -33,7 +113,7 @@ export const blogVersionRepository = {
       .eq("project_id", projectId)
       .order("version_number", { ascending: false });
     if (error) throw error;
-    return data;
+    return (data ?? []).map(normalizeBlogVersionRow);
   },
 
   async findLatest(projectId: number): Promise<BlogVersion | undefined> {
@@ -45,12 +125,12 @@ export const blogVersionRepository = {
       .order("version_number", { ascending: false })
       .limit(1);
     if (error) throw error;
-    return data?.[0];
+    return data?.[0] ? normalizeBlogVersionRow(data[0]) : undefined;
   },
 
   async create(data: NewBlogVersion): Promise<BlogVersion> {
     const db = getDb() as any;
-    const snakeData = toSnakeCase(data as Record<string, unknown>);
+    const snakeData = toSnakeCase(data as unknown as Record<string, unknown>);
     console.log(`[blog-versions] create project=${(data as any).projectId} version=${(data as any).versionNumber} snakeData keys:`, Object.keys(snakeData));
     const { data: created, error } = await db
       .from("blog_versions")
@@ -62,7 +142,20 @@ export const blogVersionRepository = {
       throw error;
     }
     console.log(`[blog-versions] created: id=${(created as any)?.id} version_number=${(created as any)?.version_number}`);
-    return created;
+    return normalizeBlogVersionRow(created);
+  },
+
+  async update(id: number, data: Partial<NewBlogVersion>): Promise<BlogVersion> {
+    const db = getDb() as any;
+    const snakeData = toSnakeCase(data as unknown as Record<string, unknown>);
+    const { data: updated, error } = await db
+      .from("blog_versions")
+      .update(snakeData)
+      .eq("id", id)
+      .select()
+      .single();
+    if (error) throw error;
+    return normalizeBlogVersionRow(updated);
   },
 
   async delete(id: number): Promise<void> {

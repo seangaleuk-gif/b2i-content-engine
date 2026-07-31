@@ -15,7 +15,16 @@ import {
   countCtaHeadingTags,
   hasLanguageSwitcher,
 } from "@/lib/seo/seo-text-utils";
-import { detectNestedParagraphs, extractVisibleFaqFromArticle, validateFaqParity, CONCLUSION_START_MARKER, CONCLUSION_END_MARKER, FAQ_HEADING_MARKER } from "@/lib/blog/article-document";
+import {
+  type ArticleDocument,
+  detectNestedParagraphs,
+  extractVisibleFaqFromArticle,
+  validateFaqParity,
+  renderComponentHtml,
+  CONCLUSION_START_MARKER,
+  CONCLUSION_END_MARKER,
+  FAQ_HEADING_MARKER,
+} from "@/lib/blog/article-document";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import {
   paragraphSentenceLimit,
@@ -29,6 +38,9 @@ import {
   englishTitleRange,
 } from "@/lib/content-standards";
 import { analyzePublicationQuality } from "@/lib/blog/publication-quality";
+import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
+import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
+import { scanTemporalFreshness } from "@/lib/blog/temporal-freshness";
 
 /** Legacy alias — prefer englishWordTolerance from content-standards. */
 export const computeWordCountTolerance = englishWordTolerance;
@@ -64,6 +76,9 @@ export interface FinalArticlePolicy {
   minimumFactualScore: number;
   minimumEditorialScore: number;
   enforcePublicationQuality: boolean;
+  maxUnsupportedFactualClaims: number;
+  maxClaimOwnershipViolations: number;
+  maxStaleTemporalClaims: number;
 }
 
 export function buildPolicy(
@@ -107,6 +122,9 @@ export function buildPolicy(
     minimumFactualScore: 100,
     minimumEditorialScore: 80,
     enforcePublicationQuality: process.env.ENABLE_EDITORIAL_POLISH === "true",
+    maxUnsupportedFactualClaims: 0,
+    maxClaimOwnershipViolations: 0,
+    maxStaleTemporalClaims: 0,
   };
 }
 
@@ -149,6 +167,9 @@ export interface FinalArticleMetrics {
   conclusionNewNumericClaimCount?: number;
   factualScore?: number;
   editorialScore?: number;
+  unsupportedFactualClaimCount?: number;
+  claimOwnershipViolationCount?: number;
+  staleTemporalClaimCount?: number;
 }
 
 // ── Helpers ──
@@ -291,6 +312,39 @@ export function enforceInternalLinkLimit(
 
 // ── Canonical analyzer ──
 
+// Optional factual context is supplied only by the final pipeline gate.
+// Other consumers can still compute structural/SEO metrics without research.
+export interface FinalArticleValidationContext {
+  articleDoc: ArticleDocument;
+  research: Array<{ title?: string; snippet?: string; url?: string }>;
+  claimOwnership?: ClaimOwnershipLedger;
+  referenceDate?: Date;
+}
+
+function countUnsupportedFactualClaims(
+  doc: ArticleDocument,
+  keyphrase: string,
+  research: FinalArticleValidationContext["research"],
+): number {
+  const components = [
+    renderComponentHtml(doc.introduction),
+    ...doc.sections
+      .filter((section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading")
+      .map((section) => renderComponentHtml(section)),
+    renderComponentHtml(doc.conclusion),
+    ...doc.visibleFaq.map((entry) => `${entry.question} ${entry.answerHtml || entry.answerText}`),
+  ];
+  const unique = new Set<string>();
+  components.forEach((componentHtml, componentIndex) => {
+    for (const claim of scanFactualRisks(componentHtml, keyphrase, research).claims) {
+      if (claim.supported) continue;
+      const sentence = (claim.sentenceText ?? claim.text).replace(/\s+/g, " ").trim().toLowerCase();
+      unique.add(`${componentIndex}:${sentence}`);
+    }
+  });
+  return unique.size;
+}
+
 export function analyzeFinalArticle(
   html: string,
   keyphrase: string,
@@ -298,6 +352,7 @@ export function analyzeFinalArticle(
   metaDescription?: string,
   targetWordCount?: number,
   canonicalVisibleWordCount?: number,
+  validationContext?: FinalArticleValidationContext,
 ): FinalArticleMetrics {
   const readableWordCount = canonicalVisibleWordCount ?? countReadableWords(html);
   const readableText = extractReadableText(html);
@@ -438,6 +493,25 @@ export function analyzeFinalArticle(
     hasConclusionContent = conclusionContent.length >= 3; // at least a short readable word
   }
   const publication = analyzePublicationQuality(html);
+  const unsupportedFactualClaimCount = validationContext
+    ? countUnsupportedFactualClaims(
+        validationContext.articleDoc,
+        keyphrase,
+        validationContext.research,
+      )
+    : 0;
+  const claimOwnershipViolationCount = validationContext?.claimOwnership
+    ? validateClaimOwnership(
+        validationContext.articleDoc,
+        validationContext.claimOwnership,
+        keyphrase,
+        validationContext.research,
+      ).length
+    : 0;
+  const staleTemporalClaimCount = scanTemporalFreshness(
+    [title || "", metaDescription || "", html].filter(Boolean).join("\n"),
+    validationContext?.referenceDate ?? new Date(),
+  ).length;
 
   return {
     readableWordCount,
@@ -468,6 +542,9 @@ export function analyzeFinalArticle(
     duplicateCtaBlockCount,
     hasConclusionContent,
     ...publication,
+    unsupportedFactualClaimCount,
+    claimOwnershipViolationCount,
+    staleTemporalClaimCount,
   };
 }
 
@@ -550,6 +627,9 @@ export function evaluatePolicy(
   const conclusionNewNumbers = metrics.conclusionNewNumericClaimCount ?? 0;
   const factualScore = metrics.factualScore ?? 100;
   const editorialScore = metrics.editorialScore ?? 100;
+  const unsupportedFactualClaims = metrics.unsupportedFactualClaimCount ?? 0;
+  const claimOwnershipViolations = metrics.claimOwnershipViolationCount ?? 0;
+  const staleTemporalClaims = metrics.staleTemporalClaimCount ?? 0;
   const publicationGate = policy.enforcePublicationQuality;
   const claimsHard = !publicationGate || claimConflicts <= policy.maxClaimConflicts;
   const malformedProseHard = !publicationGate || malformedProse <= policy.maxMalformedProseIssues;
@@ -558,6 +638,9 @@ export function evaluatePolicy(
   const conclusionNumbersHard = !publicationGate || conclusionNewNumbers <= policy.maxConclusionNewNumericClaims;
   const factualScoreHard = !publicationGate || factualScore >= policy.minimumFactualScore;
   const editorialScoreHard = !publicationGate || editorialScore >= policy.minimumEditorialScore;
+  const factualClaimsHard = unsupportedFactualClaims <= policy.maxUnsupportedFactualClaims;
+  const ownershipHard = claimOwnershipViolations <= policy.maxClaimOwnershipViolations;
+  const temporalHard = staleTemporalClaims <= policy.maxStaleTemporalClaims;
 
   // ── Soft warnings (never block) ──
   const kpSoft = metrics.keyphraseDensity >= kpWarning;
@@ -596,6 +679,9 @@ export function evaluatePolicy(
   if (!conclusionNumbersHard) reasons.push(`new numeric claims in conclusion=${conclusionNewNumbers}`);
   if (!factualScoreHard) reasons.push(`factual score=${factualScore} (minimum: ${policy.minimumFactualScore})`);
   if (!editorialScoreHard) reasons.push(`editorial score=${editorialScore} (minimum: ${policy.minimumEditorialScore})`);
+  if (!factualClaimsHard) reasons.push(`unsupported factual claims=${unsupportedFactualClaims}`);
+  if (!ownershipHard) reasons.push(`claim ownership violations=${claimOwnershipViolations}`);
+  if (!temporalHard) reasons.push(`stale temporal claims=${staleTemporalClaims}`);
 
   // Soft warning reasons
   if (!kpSoft) reasons.push(`[SOFT] kp density=${metrics.keyphraseDensity.toFixed(2)}% < ${kpWarning}%`);
@@ -620,7 +706,8 @@ export function evaluatePolicy(
     && faqBlockHard && faqJsonHard && wpHard && nestedHard && headingsHard && faqParityHard
     && placeholderHard && rawProseHard && dupFaqSchemaHard && dupCtaHard && conclusionHard
     && claimsHard && malformedProseHard && repeatedIdeasHard && conclusionRatioHard
-    && conclusionNumbersHard && factualScoreHard && editorialScoreHard;
+    && conclusionNumbersHard && factualScoreHard && editorialScoreHard
+    && factualClaimsHard && ownershipHard && temporalHard;
 
   return { passed, reasons };
 }

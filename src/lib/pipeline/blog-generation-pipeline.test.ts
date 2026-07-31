@@ -12,6 +12,8 @@ import {
   renderFaqSchema,
   extractVisibleFaqFromArticle,
   extractFaqPairsFromSectionBody,
+  countCanonicalVisibleWords,
+  validateFaqParity,
 } from "@/lib/blog/article-document";
 import {
   createArticleIntegrityBaseline,
@@ -25,11 +27,16 @@ import { wordCountRange } from "@/lib/services/generation-constants";
 import {
   assertFinalWordCountParity,
   assertRenderedCacheMatchesDocument,
+  chooseEditorialCommitDoc,
   createPipelineState,
+  evaluateEditorialStageCandidate,
   guardStageOutput,
+  sanitizeFaqFactualClaims,
   shouldAcceptSeoNormalization,
   validatePipelineOrder,
+  validateTemporalCandidate,
 } from "@/lib/pipeline/blog-generation-pipeline";
+import { findMalformedEditableBlocks } from "@/lib/pipeline/editorial-polish";
 import { enforceInternalLinkLimit, analyzeFinalArticle, evaluatePolicy, buildPolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
 
@@ -151,6 +158,52 @@ function createBaseline(doc: ArticleDocument): ArticleIntegrityBaseline {
 // ── Tests ──
 
 describe("pipeline: canonical state invariants", () => {
+  it("does not require the downstream CTA during editorial candidate validation", () => {
+    const policy = buildPolicy(2500, 2125, 2875, "test keyphrase");
+    const metrics: FinalArticleMetrics = {
+      readableWordCount: 2500,
+      h2Count: 6,
+      faqEntryCount: 5,
+      exactKeyphraseCount: 10,
+      keyphraseDensity: 1,
+      exactKeyphraseInH2: true,
+      longParagraphCount: 0,
+      keyphraseInFirst100Words: true,
+      uniqueInternalLinkCount: 2,
+      externalSourceLinkCount: 2,
+      ctaHeadingCount: 0,
+      signupUrlCount: 0,
+      faqBlockCount: 1,
+      faqJsonLdCount: 1,
+      hasLanguageSwitcher: true,
+      nestedParagraphCount: 0,
+      malformedHeadingCount: 0,
+      wpBlockCountMismatch: false,
+      faqParityValid: true,
+      titleLength: 55,
+      metaDescriptionLength: 170,
+      fleschReadingEase: 64,
+      hasPlaceholderContent: false,
+      hasRawProseOutsideBlocks: false,
+      duplicateFaqSchemaCount: 0,
+      duplicateCtaBlockCount: 0,
+      hasConclusionContent: true,
+      claimConflictCount: 0,
+      malformedProseCount: 0,
+      repeatedIdeaPairCount: 0,
+      conclusionWordRatio: 0.08,
+      conclusionNewNumericClaimCount: 0,
+      factualScore: 100,
+      editorialScore: 92,
+    };
+
+    expect(evaluatePolicy(metrics, policy).passed).toBe(false);
+    expect(evaluateEditorialStageCandidate(metrics, policy)).toEqual({
+      passed: true,
+      reasons: [],
+    });
+  });
+
   it("detects rendered cache divergence immediately", () => {
     const doc = makeArticleDoc();
     const blog = renderArticleDocument(doc);
@@ -597,6 +650,45 @@ describe("pipeline error hardening", () => {
 describe("FAQ generation guarantees", () => {
   const faqHeadingPattern = /faq|frequently.asked|common.question/i;
 
+  it("removes unsupported FAQ statistics while keeping safe guidance", () => {
+    const result = sanitizeFaqFactualClaims(
+      [{
+        question: "How should an SME start?",
+        answerHtml: "",
+        answerText: "Post 5 times per day for guaranteed reach. Start with one useful customer question.",
+      }],
+      "threads marketing hong kong",
+      [],
+    );
+
+    expect(result.unsupportedSentencesRemoved).toBe(1);
+    expect(result.entries[0].answerText).not.toContain("5 times");
+    expect(result.entries[0].answerText).toContain("Start with one useful customer question.");
+    expect(result.entries[0].answerHtml).not.toContain("5 times");
+  });
+
+  it("removes supported statistics from the synthesis-only FAQ", () => {
+    const result = sanitizeFaqFactualClaims(
+      [{
+        question: "What did the survey find?",
+        answerHtml: "",
+        answerText: "97.9% of surveyed respondents used Threads. Review the audience section for the evidence and practical implications.",
+      }],
+      "threads marketing hong kong",
+      [{
+        title: "Hong Kong usage survey",
+        snippet: "97.9% of surveyed respondents used Threads.",
+        url: "https://example.com/hk-survey",
+      }],
+    );
+
+    expect(result.unsupportedSentencesRemoved).toBe(1);
+    expect(result.citationsAdded).toBe(0);
+    expect(result.entries[0].answerText).not.toContain("97.9%");
+    expect(result.entries[0].answerText).toContain("Review the audience section");
+    expect(result.entries[0].answerHtml).not.toContain("https://example.com/hk-survey");
+  });
+
   function articleWithFaqSection(faqBody: string): ArticleDocument {
     const ls = `<!-- wp:html --><div class="b2i-language-switcher"><span>EN</span></div><!-- /wp:html -->`;
     const intro = `<!-- wp:paragraph --><p>Introduction text with keyphrase.</p><!-- /wp:paragraph -->`;
@@ -673,6 +765,49 @@ describe("FAQ generation guarantees", () => {
     // FAQ section should still be present
     expect(html2).toContain("Frequently Asked Questions");
     expect(html2).toContain("Question One");
+  });
+
+  it("FAQ visible/schema parity survives an HTML round-trip with encoded characters", () => {
+    // Temporal-freshness repair escapes apostrophes and ampersands inside
+    // answerHtml while keeping answerText plain. Every tracked pipeline stage
+    // round-trips HTML back into ArticleDocument via parseArticleDocumentFromHtml,
+    // so the re-parsed answerText must not stay double-encoded: the schema
+    // (rendered from answerText) would then mismatch the entity-decoded visible
+    // body and final validation would report a FAQ parity mismatch.
+    const answerText = "Here's what works for growth & reach.";
+    const answerHtml = "<p>Here&#39;s what works for growth &amp; reach.</p>";
+    const doc = makeArticleDoc({
+      visibleFaq: [
+        { question: "What grows a brand?", answerHtml, answerText },
+      ],
+      faqSchema: {
+        id: "faq-schema",
+        type: "faq-schema",
+        html: renderFaqSchema([{ question: "What grows a brand?", answerHtml, answerText }]),
+        fingerprint: "x",
+      },
+    });
+    const parsed = parseArticleDocumentFromHtml(renderArticleDocument(doc), doc);
+    expect(parsed.doc).not.toBeNull();
+    if (!parsed.doc) return;
+    const html2 = renderArticleDocument(parsed.doc);
+    const metrics = analyzeFinalArticle(
+      html2,
+      "test keyphrase",
+      "Test Article Title",
+      "A test article for pipeline validation",
+      2500,
+      countCanonicalVisibleWords(parsed.doc),
+    );
+    expect(metrics.faqParityValid).toBe(true);
+  });
+
+  it("validateFaqParity passes for decoded canonical FAQ answerText", () => {
+    const entries = [
+      { question: "What grows a brand?", answerHtml: "<p>Here&#39;s what works.</p>", answerText: "Here's what works." },
+      { question: "How do I start?", answerHtml: "<p>Growth &amp; reach.</p>", answerText: "Growth & reach." },
+    ];
+    expect(validateFaqParity(entries, renderFaqSchema(entries)).valid).toBe(true);
   });
 
   it("FAQ section without visible questions logs and returns empty", () => {
@@ -887,16 +1022,16 @@ describe("FAQ generation guarantees", () => {
 <!-- wp:paragraph --><p>Third paragraph with filler content that is less essential. This is the type of repetitive text that can be safely removed when trimming word count. It doesn't add much value to the overall article content.</p><!-- /wp:paragraph -->`;
     const beforeWc = countReadableWords(sectionHtml);
     expect(beforeWc).toBeGreaterThan(60);
-    
+
     // Simulate trim: remove last paragraph
     const paras = sectionHtml.match(/<!--\s*wp:paragraph\s*-->\s*\n?<p>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi);
     expect(paras).not.toBeNull();
     expect(paras!.length).toBe(3);
-    
+
     const lastPara = paras![paras!.length - 1];
     const lastIdx = sectionHtml.lastIndexOf(lastPara);
     const trimmed = sectionHtml.substring(0, lastIdx).trim() + sectionHtml.substring(lastIdx + lastPara.length);
-    
+
     const afterWc = countReadableWords(trimmed);
     expect(afterWc).toBeLessThan(beforeWc);
     expect(afterWc).toBeGreaterThan(30); // Still has substantial content
@@ -1261,5 +1396,105 @@ describe("Word count validation", () => {
     const wc = countReadableWords(html);
     // Only the paragraph text should count: "This is the only readable content that should be counted for word count purposes." = 14 words
     expect(wc).toBe(14);
+  });
+});
+
+
+describe("temporal freshness comparative acceptance", () => {
+  const baseMetrics = {
+    staleTemporalClaimCount: 1,
+    unsupportedFactualClaimCount: 0,
+    claimOwnershipViolationCount: 0,
+    factualScore: 100,
+    claimConflictCount: 0,
+    editorialScore: 90,
+    conclusionNewNumericClaimCount: 0,
+    repeatedIdeaPairCount: 2,
+    malformedProseCount: 0,
+    readableWordCount: 2500,
+  } as FinalArticleMetrics;
+  const state = { wordMin: 2125, wordMax: 2875 } as any;
+
+  it("accepts a freshness repair that removes stale wording without regressions", () => {
+    const after = { ...baseMetrics, staleTemporalClaimCount: 0 } as FinalArticleMetrics;
+    expect(validateTemporalCandidate(state, baseMetrics, after)).toEqual([]);
+  });
+
+  it("rejects the exact regression that previously damaged English generation", () => {
+    const after = {
+      ...baseMetrics,
+      staleTemporalClaimCount: 0,
+      repeatedIdeaPairCount: 4,
+      conclusionNewNumericClaimCount: 1,
+      factualScore: 85,
+      editorialScore: 47,
+    } as FinalArticleMetrics;
+    const reasons = validateTemporalCandidate(state, baseMetrics, after);
+    expect(reasons.some((reason) => reason.includes("repetition regressed"))).toBe(true);
+    expect(reasons.some((reason) => reason.includes("new conclusion numbers regressed"))).toBe(true);
+    expect(reasons.some((reason) => reason.includes("factual score regressed"))).toBe(true);
+    expect(reasons.some((reason) => reason.includes("editorial score regressed"))).toBe(true);
+  });
+});
+
+describe("editorial malformed-repair persistence by stable block ID", () => {
+  function docWithMalformedBlock(): { doc: ArticleDocument; malformedId: string } {
+    const doc = makeArticleDoc();
+    const malformedId = "section-0-wp-9";
+    doc.sections[0].blocks.push({
+      id: malformedId,
+      type: "paragraph",
+      content: [{ type: "text", text: "Some owners post erratically.\" instead of a steady routine." }],
+    });
+    return { doc, malformedId };
+  }
+
+  it("detects the malformed block by its stable ID", () => {
+    const { doc, malformedId } = docWithMalformedBlock();
+    const blocks = findMalformedEditableBlocks(doc);
+    expect(blocks.length).toBeGreaterThan(0);
+    expect(blocks.some((block) => block.blockId.includes(malformedId))).toBe(true);
+  });
+
+  it("a rejected general polish cannot restore a repaired malformed block", () => {
+    const { doc, malformedId } = docWithMalformedBlock();
+    expect(findMalformedEditableBlocks(doc).length).toBeGreaterThan(0);
+
+    // Simulate a successful targeted repair: same stable block ID, fixed text.
+    const repairedDoc = structuredClone(doc);
+    const targetIndex = repairedDoc.sections[0].blocks.findIndex((block) => block.id === malformedId);
+    expect(targetIndex).toBeGreaterThanOrEqual(0);
+    repairedDoc.sections[0].blocks[targetIndex] = {
+      id: malformedId,
+      type: "paragraph",
+      content: [{ type: "text", text: "Some owners post erratically instead of building a steady routine." }],
+    };
+    expect(findMalformedEditableBlocks(repairedDoc).length).toBe(0);
+
+    // The score-gated general polish is rejected (score below the 80 minimum).
+    // The commit decision must persist the repaired stable block, never the
+    // original malformed text, so no later restore resurrects the fragment.
+    const commit = chooseEditorialCommitDoc({
+      workingDoc: repairedDoc,
+      targetedRepairsDoc: repairedDoc,
+      accepted: false,
+    });
+    expect(commit.targetedRepairsPersisted).toBe(true);
+    expect(findMalformedEditableBlocks(commit.doc).length).toBe(0);
+    expect(commit.doc).not.toBe(doc);
+  });
+
+  it("an accepted polish commits the full working document", () => {
+    const { doc } = docWithMalformedBlock();
+    const commit = chooseEditorialCommitDoc({ workingDoc: doc, targetedRepairsDoc: null, accepted: true });
+    expect(commit.targetedRepairsPersisted).toBe(false);
+    expect(commit.doc).toBe(doc);
+  });
+
+  it("a rejected polish with no successful targeted repair keeps the original document", () => {
+    const { doc } = docWithMalformedBlock();
+    const commit = chooseEditorialCommitDoc({ workingDoc: doc, targetedRepairsDoc: null, accepted: false });
+    expect(commit.targetedRepairsPersisted).toBe(false);
+    expect(commit.doc).toBe(doc);
   });
 });

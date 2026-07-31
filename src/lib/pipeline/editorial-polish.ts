@@ -18,14 +18,17 @@ import {
 import type { InlineContent } from "@/lib/blog/article-content";
 import { validateEditorialBlocks } from "@/lib/blog/article-content";
 import { computeKeyphraseDensity } from "@/lib/content-standards";
+import { extractReadableText, splitSentences } from "@/lib/seo/seo-text-utils";
 import { createNumberExpressionRegex } from "@/lib/services/translation-number-grammar";
 import type { ChatMessage, ChatOptions } from "@/lib/services/deepseek";
 import {
   countRepeatedIdeaPairs,
-  detectMalformedProseTexts,
   editableTextsFromDocument,
+  findMalformedProseTextIssues,
+  findRepeatedIdeaPairs,
+  type MalformedProseIssueCode,
 } from "@/lib/blog/publication-quality";
-import { extractReadableText } from "@/lib/seo/seo-text-utils";
+import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 
 export function isEditorialPolishEnabled(): boolean {
   return process.env.ENABLE_EDITORIAL_POLISH === "true";
@@ -61,6 +64,8 @@ export interface PolishRequest {
   keyphrase: string;
   title: string;
   metaDescription: string;
+  mode?: EditorialPolishMode;
+  malformedIssuesByBlockId?: Record<string, string[]>;
 }
 
 export interface CandidateValidation {
@@ -71,7 +76,23 @@ export interface CandidateValidation {
 export interface EditorialPolishOptions {
   validateProductionCandidate?: (candidate: ArticleDocument) => CandidateValidation;
   maxAttempts?: number;
+  /** Stable block IDs containing approved evidence; excluded from AI editing. */
+  protectedBlockIds?: string[];
+  /** Optional allow-list used by targeted repair passes. */
+  editableBlockIds?: string[];
+  /** Scanner-approved factual sentences that must remain byte-for-byte stable. */
+  protectedSentencesByBlockId?: Record<string, string[]>;
+  mode?: EditorialPolishMode;
+  /** Stable block-level malformed-prose reasons supplied to targeted repair. */
+  malformedIssuesByBlockId?: Record<string, string[]>;
 }
+
+export type EditorialPolishMode =
+  | "general"
+  | "repetition"
+  | "malformed"
+  | "weakened"
+  | "prose-only";
 
 export interface EditorialPolishResult {
   accepted: boolean;
@@ -98,6 +119,23 @@ interface EditableTarget {
   componentId: string;
   blockIndex: number;
   originalBlock: EditorialBlock;
+}
+
+export interface MalformedEditableBlock {
+  blockId: string;
+  componentKind: EditableTarget["componentKind"];
+  componentId: string;
+  blockIndex: number;
+  issueCodes: MalformedProseIssueCode[];
+  issues: string[];
+  text: string;
+  html: string;
+}
+
+export interface DeterministicMalformedRepairResult {
+  repairedBlockIds: string[];
+  removedBlockIds: string[];
+  unresolved: MalformedEditableBlock[];
 }
 
 interface LinkRecord {
@@ -145,11 +183,13 @@ function collectComponentTargets(
   targets: EditableTarget[],
   kind: EditableTarget["componentKind"],
   component: ArticleComponent,
+  protectedBlockIds: Set<string>,
 ): void {
   for (let blockIndex = 0; blockIndex < component.blocks.length; blockIndex++) {
     const block = component.blocks[blockIndex];
     if (!isEditableBlock(block)) continue;
     const blockId = stableBlockId(kind, component.id, block.id);
+    if (protectedBlockIds.has(blockId)) continue;
     targets.push({
       publicBlock: {
         blockId,
@@ -164,19 +204,34 @@ function collectComponentTargets(
   }
 }
 
-function createEditableTargets(doc: ArticleDocument): EditableTarget[] {
+function createEditableTargets(
+  doc: ArticleDocument,
+  protectedBlockIds: Set<string> = new Set(),
+  editableBlockIds?: Set<string>,
+): EditableTarget[] {
   const targets: EditableTarget[] = [];
-  collectComponentTargets(targets, "introduction", doc.introduction);
+  collectComponentTargets(targets, "introduction", doc.introduction, protectedBlockIds);
   for (const section of doc.sections) {
     if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
-    collectComponentTargets(targets, "section", section);
+    collectComponentTargets(targets, "section", section, protectedBlockIds);
   }
-  collectComponentTargets(targets, "conclusion", doc.conclusion);
-  return targets;
+  collectComponentTargets(targets, "conclusion", doc.conclusion, protectedBlockIds);
+  return editableBlockIds
+    ? targets.filter((target) => editableBlockIds.has(target.publicBlock.blockId))
+    : targets;
 }
 
-export function extractEditableBlocks(doc: ArticleDocument): PolishBlock[] {
-  return createEditableTargets(doc).map((target) => target.publicBlock);
+export function extractEditableBlocks(
+  doc: ArticleDocument,
+  protectedBlockIds: string[] = [],
+  editableBlockIds?: string[],
+): PolishBlock[] {
+  return createEditableTargets(
+    doc,
+    new Set(protectedBlockIds),
+    editableBlockIds ? new Set(editableBlockIds) : undefined,
+  )
+    .map((target) => target.publicBlock);
 }
 
 function summarizeBlocks(blocks: EditorialBlock[], maxLength = 700): string {
@@ -213,6 +268,15 @@ export function buildSectionSummaries(doc: ArticleDocument): SectionSummary[] {
 }
 
 export function buildPolishPrompt(request: PolishRequest): ChatMessage[] {
+  const modeInstruction = request.mode === "repetition"
+    ? `\nThis is a targeted repetition-repair pass. Every supplied block is the deterministically selected weaker occurrence from a near-duplicate cluster; the strongest occurrence is intentionally not editable. Rewrite each supplied block as specific, non-factual practical guidance or a transition that adds genuinely new value.`
+    : request.mode === "malformed"
+      ? `\nThis is a targeted malformed-prose repair pass. Every supplied block has deterministic issue labels in malformedIssuesByBlockId. Repair every listed issue in its exact stable block ID. Do not return an empty edits array, and do not edit blocks that are not supplied.`
+      : request.mode === "weakened"
+        ? `\nThis is a targeted post-cleanup continuity pass. The supplied blocks belong only to components where deterministic factual or ownership cleanup removed sentences. Repair abrupt transitions, isolated setup lines, lost-example lead-ins and choppy paragraph flow. Do not add facts, numbers, quotations, sources or claims.`
+        : request.mode === "prose-only"
+          ? `\nThis is a fact-free editorial fallback after a broader candidate was rejected for touching protected facts. Every supplied block has been deterministically confirmed to contain no number, URL, attribution or factual-risk claim. Improve only repetition, robotic wording, choppy prose, transitions and useful non-factual depth. The accepted candidate must raise the article to its editorial quality threshold without inventing facts.`
+      : "";
   const systemPrompt = `You are the senior copy editor for a Hong Kong-focused SEO article.
 
 Read all supplied blocks before proposing edits. The article was generated section by section, so make it read as one coherent, professionally written article.
@@ -239,6 +303,7 @@ Your authority is deliberately narrow:
 - Reduce forced exact-keyphrase repetition. Do not add another occurrence of "${request.keyphrase}".
 - Keep the total article word count within 10% of the original.
 - Make every replacement valid WordPress block HTML with its matching opening and closing block comments.
+${modeInstruction}
 
 If no block needs editing, return {"edits":[]}.`;
 
@@ -250,6 +315,9 @@ If no block needs editing, return {"edits":[]}.`;
     },
     sectionMemory: request.sectionSummaries,
     editableBlocks: request.blocks,
+    ...(request.mode === "malformed"
+      ? { malformedIssuesByBlockId: request.malformedIssuesByBlockId ?? {} }
+      : {}),
   };
 
   return [
@@ -368,31 +436,56 @@ function extractAttributions(text: string): string[] {
   );
 }
 
+function splitEditorialSentences(text: string): string[] {
+  // Decimal points are not sentence boundaries. Protect them before the
+  // generic sentence matcher so factual locks such as “2.4 million” remain
+  // one byte-stable sentence through editorial validation.
+  const decimalToken = "__B2I_DECIMAL_POINT__";
+  const protectedText = text.replace(/(?<=\d)\.(?=\d)/g, decimalToken);
+  return (protectedText.match(/[^.!?]+(?:[.!?]+(?:["”’)]*)|$)/g) ?? [])
+    .map((sentence) => sentence.replaceAll(decimalToken, "."));
+}
+
 function protectedFactSentences(block: EditorialBlock): string[] {
   let linkIndex = 0;
   const groupTexts = inlineGroups(block).map((group) =>
     group.map((inline) => {
-      if (inline.type === "link") return ` __B2I_LINK_${linkIndex++}__ `;
+      if (inline.type === "link") {
+        const index = linkIndex++;
+        return ` __B2I_LINK_${index}_START__${inline.text}__B2I_LINK_${index}_END__ `;
+      }
       return inline.text;
     }).join(""),
   );
-  const sentences = groupTexts.flatMap(
-    (text) => text.match(/[^.!?]+(?:[.!?]+(?:["”’)]*)|$)/g) ?? [],
-  );
+  const sentences = groupTexts.flatMap(splitEditorialSentences);
   return sentences
     .filter((sentence) =>
-      /__B2I_LINK_\d+__/.test(sentence)
-      || extractNumbers(sentence).length > 0
+      extractNumbers(sentence).length > 0
       || new RegExp(ATTRIBUTION_RE.source, "i").test(sentence),
     )
-    .map((sentence) => sentence.replace(/\s+/g, " ").trim().toLowerCase());
+    .map((sentence) => sentence.replace(/\s+/g, " ").trim());
 }
 
 function sameStrings(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
-function parseReplacement(edit: PolishEdit, target: EditableTarget): EditorialBlock {
+function normalizeProtectedSentence(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function plainSentences(block: EditorialBlock): string[] {
+  return inlineGroups(block)
+    .flatMap((group) => splitEditorialSentences(group.map((inline) => inline.text).join("")))
+    .map(normalizeProtectedSentence)
+    .filter(Boolean);
+}
+
+function parseReplacement(
+  edit: PolishEdit,
+  target: EditableTarget,
+  externallyProtectedSentences: string[] = [],
+): EditorialBlock {
   const parsed = parseWordPressEditorialBlocks(edit.replacementHtml, `editorial-polish-${target.originalBlock.id}`);
   if (parsed.errors.length > 0) {
     throw new Error(`${edit.blockId}: ${parsed.errors.join("; ")}`);
@@ -451,8 +544,19 @@ function parseReplacement(edit: PolishEdit, target: EditableTarget): EditorialBl
     )
   ) {
     throw new Error(
-      `${edit.blockId}: sentence containing a number, attribution or link was rewritten`,
+      `${edit.blockId}: sentence containing a number or attribution was rewritten`,
     );
+  }
+
+  if (externallyProtectedSentences.length > 0) {
+    const replacementSentences = new Set(plainSentences(replacement));
+    const changed = externallyProtectedSentences
+      .map(normalizeProtectedSentence)
+      .filter(Boolean)
+      .filter((sentence) => !replacementSentences.has(sentence));
+    if (changed.length > 0) {
+      throw new Error(`${edit.blockId}: scanner-approved factual sentence was rewritten`);
+    }
   }
 
   replacement.id = target.originalBlock.id;
@@ -463,8 +567,14 @@ function parseReplacement(edit: PolishEdit, target: EditableTarget): EditorialBl
   return replacement;
 }
 
-function prepareEdits(doc: ArticleDocument, edits: PolishEdit[]): PreparedEdit[] {
-  const targets = createEditableTargets(doc);
+function prepareEdits(
+  doc: ArticleDocument,
+  edits: PolishEdit[],
+  protectedBlockIds: Set<string> = new Set(),
+  editableBlockIds?: Set<string>,
+  protectedSentencesByBlockId: Record<string, string[]> = {},
+): PreparedEdit[] {
+  const targets = createEditableTargets(doc, protectedBlockIds, editableBlockIds);
   const byId = new Map(targets.map((target) => [target.publicBlock.blockId, target]));
   if (edits.length > targets.length * MAX_RESPONSE_EDITS_MULTIPLIER) {
     throw new Error(`Editorial response contains too many edits (${edits.length})`);
@@ -479,7 +589,11 @@ function prepareEdits(doc: ArticleDocument, edits: PolishEdit[]): PreparedEdit[]
     return {
       edit,
       target,
-      replacementBlock: parseReplacement(edit, target),
+      replacementBlock: parseReplacement(
+        edit,
+        target,
+        protectedSentencesByBlockId[edit.blockId] ?? [],
+      ),
     };
   });
 }
@@ -495,8 +609,20 @@ function resolveComponent(
   return section;
 }
 
-export function applyEdits(doc: ArticleDocument, edits: PolishEdit[]): ArticleDocument {
-  const prepared = prepareEdits(doc, edits);
+export function applyEdits(
+  doc: ArticleDocument,
+  edits: PolishEdit[],
+  protectedBlockIds: string[] = [],
+  editableBlockIds?: string[],
+  protectedSentencesByBlockId: Record<string, string[]> = {},
+): ArticleDocument {
+  const prepared = prepareEdits(
+    doc,
+    edits,
+    new Set(protectedBlockIds),
+    editableBlockIds ? new Set(editableBlockIds) : undefined,
+    protectedSentencesByBlockId,
+  );
   const clone = cloneDoc(doc);
   for (const item of prepared) {
     const component = resolveComponent(clone, item.target);
@@ -595,10 +721,7 @@ export function extractAllLinks(doc: ArticleDocument): LinkRecord[] {
 export function countExactKeyphrase(html: string, keyphrase: string): number {
   const target = keyphrase.trim().toLowerCase();
   if (!target) return 0;
-  // Strip wp:html blocks so FAQ schema, CTA and language-switcher text
-  // (which are application-owned) are excluded from the visible count.
-  const stripped = extractReadableText(html);
-  const text = stripped.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").toLowerCase();
+  const text = extractReadableText(html).replace(/\s+/g, " ").toLowerCase();
   let count = 0;
   let position = 0;
   while ((position = text.indexOf(target, position)) >= 0) {
@@ -635,10 +758,10 @@ function structureSignature(doc: ArticleDocument): unknown {
 
 function protectedSignature(doc: ArticleDocument): unknown {
   return {
-    visibleFaq: doc.visibleFaq.map((e) => ({ question: e.question, answerText: e.answerText })),
-    languageSwitcher: doc.languageSwitcher ? { fingerprint: doc.languageSwitcher.fingerprint } : null,
-    cta: doc.cta ? { fingerprint: doc.cta.fingerprint } : null,
-    faqSchema: doc.faqSchema ? { fingerprint: doc.faqSchema.fingerprint } : null,
+    languageSwitcher: doc.languageSwitcher,
+    visibleFaq: doc.visibleFaq,
+    cta: doc.cta,
+    faqSchema: doc.faqSchema,
   };
 }
 
@@ -646,19 +769,263 @@ function repeatedIdeaPairs(doc: ArticleDocument): number {
   return countRepeatedIdeaPairs(editableTextsFromDocument(doc));
 }
 
-export function detectMalformedProse(doc: ArticleDocument): string[] {
-  const texts = editableTextsFromDocument(doc);
-  const issues = detectMalformedProseTexts(texts);
-  const blockIds = extractEditableBlocks(doc).map((b) => b.blockId);
-  return issues.map((issue, idx) => {
-    const match = issue.match(/^text (\d+)/);
-    if (match) {
-      const ti = parseInt(match[1], 10);
-      const blockId = ti < blockIds.length ? blockIds[ti] : `block-${ti}`;
-      return issue.replace(/^text \d+/, `block ${blockId}`);
-    }
-    return issue;
+function malformedTextsForBlock(block: EditorialBlock): string[] {
+  if (block.type === "list") {
+    return block.items.map((item) => item.map((inline) => inline.text).join(""));
+  }
+  return [textFromBlock(block)];
+}
+
+/** Resolve canonical malformed-prose findings to stable editable block IDs. */
+export function findMalformedEditableBlocks(doc: ArticleDocument): MalformedEditableBlock[] {
+  return createEditableTargets(doc).flatMap((target) => {
+    const issues = findMalformedProseTextIssues(malformedTextsForBlock(target.originalBlock));
+    if (issues.length === 0) return [];
+    return [{
+      blockId: target.publicBlock.blockId,
+      componentKind: target.componentKind,
+      componentId: target.componentId,
+      blockIndex: target.blockIndex,
+      issueCodes: [...new Set(issues.map((issue) => issue.code))],
+      issues: issues.map((issue) =>
+        target.originalBlock.type === "list"
+          ? `item ${issue.textIndex + 1}: ${issue.message}`
+          : issue.message,
+      ),
+      text: textFromBlock(target.originalBlock),
+      html: target.publicBlock.html,
+    }];
   });
+}
+
+export function detectMalformedProse(doc: ArticleDocument): string[] {
+  return findMalformedEditableBlocks(doc).flatMap((block) =>
+    block.issues.map((issue) => `block ${block.blockId}: ${issue}`),
+  );
+}
+
+function trimTrailingMalformedSentence(text: string): string | null {
+  const sentences = splitSentences(text);
+  if (sentences.length < 2) return null;
+  const trailing = sentences[sentences.length - 1];
+  const trailingIssues = findMalformedProseTextIssues([trailing]);
+  if (!trailingIssues.some((issue) => issue.code === "incomplete-sentence-ending")) return null;
+  const trailingStart = text.lastIndexOf(trailing);
+  if (trailingStart <= 0) return null;
+  const prefix = text.slice(0, trailingStart).trim();
+  if (!prefix || findMalformedProseTextIssues([prefix]).length > 0) return null;
+  return prefix;
+}
+
+function canRebuildAsPlainText(block: EditorialBlock): block is Extract<EditorialBlock, { type: "paragraph" }> {
+  return block.type === "paragraph" && block.content.every((inline) => inline.type === "text");
+}
+
+/**
+ * Deterministic first aid after factual/ownership sentence deletion.
+ * It trims only a trailing broken sentence from plain-text paragraphs. If that
+ * is impossible, a short evidence-free malformed paragraph may be removed as
+ * a last-resort fallback, provided the article remains above its word minimum.
+ */
+export function repairDeterministicMalformedProse(
+  doc: ArticleDocument,
+  minimumWordCount: number,
+  protectedSentencesByBlockId: Record<string, string[]> = {},
+  allowBlockRemoval = false,
+): DeterministicMalformedRepairResult {
+  const repairedBlockIds: string[] = [];
+  const removedBlockIds: string[] = [];
+  const initial = findMalformedEditableBlocks(doc)
+    .sort((left, right) =>
+      left.componentId.localeCompare(right.componentId) || right.blockIndex - left.blockIndex,
+    );
+
+  for (const issueBlock of initial) {
+    const target = createEditableTargets(doc).find(
+      (candidate) => candidate.publicBlock.blockId === issueBlock.blockId,
+    );
+    if (!target) continue;
+    const component = resolveComponent(doc, target);
+    const currentIndex = component.blocks.findIndex((block) => block.id === target.originalBlock.id);
+    if (currentIndex < 0) continue;
+    const block = component.blocks[currentIndex];
+
+    if (
+      issueBlock.issueCodes.every((code) => code === "incomplete-sentence-ending")
+      && canRebuildAsPlainText(block)
+    ) {
+      const trimmed = trimTrailingMalformedSentence(textFromBlock(block));
+      if (trimmed) {
+        block.content = [{ type: "text", text: trimmed }];
+        component.status = "normalized";
+        repairedBlockIds.push(issueBlock.blockId);
+        continue;
+      }
+    }
+
+    if (!allowBlockRemoval) continue;
+
+    const blockWords = textFromBlock(block).split(/\s+/).filter(Boolean).length;
+    const canRemove = block.type === "paragraph"
+      && component.blocks.length > 1
+      && blockWords <= 80
+      && linksFromBlock(block).length === 0
+      && extractNumbers(textFromBlock(block)).length === 0
+      && extractAttributions(textFromBlock(block)).length === 0
+      && (protectedSentencesByBlockId[issueBlock.blockId]?.length ?? 0) === 0;
+    if (!canRemove) continue;
+
+    const candidate = cloneDoc(doc);
+    const candidateTarget = createEditableTargets(candidate).find(
+      (item) => item.publicBlock.blockId === issueBlock.blockId,
+    );
+    if (!candidateTarget) continue;
+    const candidateComponent = resolveComponent(candidate, candidateTarget);
+    candidateComponent.blocks = candidateComponent.blocks.filter(
+      (candidateBlock) => candidateBlock.id !== candidateTarget.originalBlock.id,
+    );
+    if (countCanonicalVisibleWords(candidate) < minimumWordCount) continue;
+
+    component.blocks.splice(currentIndex, 1);
+    component.status = "normalized";
+    removedBlockIds.push(issueBlock.blockId);
+  }
+
+  return {
+    repairedBlockIds,
+    removedBlockIds,
+    unresolved: findMalformedEditableBlocks(doc),
+  };
+}
+
+/** Stable paragraph block IDs participating in the canonical near-duplicate pairs. */
+function repetitionStrength(block: EditorialBlock, order: number): number {
+  const text = textFromBlock(block);
+  const linkCount = linksFromBlock(block).length;
+  const numericCount = extractNumbers(text).length;
+  const attributionCount = extractAttributions(text).length;
+  // Prefer the occurrence that is best evidenced and most complete. Earlier
+  // outline order is the final deterministic tie-breaker.
+  return (
+    linkCount * 1_000
+    + numericCount * 150
+    + attributionCount * 100
+    + Math.min(80, text.split(/\s+/).filter(Boolean).length)
+    - order / 10_000
+  );
+}
+
+/**
+ * Return only the weaker blocks from each connected near-duplicate cluster.
+ * The strongest occurrence remains untouched; targeted editorial repair is
+ * therefore deterministic and never asks the model to choose which copy wins.
+ */
+export function findRepeatedEditableBlockIds(doc: ArticleDocument): string[] {
+  const targets = createEditableTargets(doc)
+    .filter((target) => target.originalBlock.type === "paragraph")
+    .map((target, order) => ({
+      id: target.publicBlock.blockId,
+      block: target.originalBlock,
+      text: textFromBlock(target.originalBlock),
+      order,
+    }));
+  const pairs = findRepeatedIdeaPairs(targets.map((target) => target.text));
+  if (pairs.length === 0) return [];
+
+  const adjacency = new Map<number, Set<number>>();
+  for (const pair of pairs) {
+    const left = adjacency.get(pair.leftIndex) ?? new Set<number>();
+    left.add(pair.rightIndex);
+    adjacency.set(pair.leftIndex, left);
+    const right = adjacency.get(pair.rightIndex) ?? new Set<number>();
+    right.add(pair.leftIndex);
+    adjacency.set(pair.rightIndex, right);
+  }
+
+  const visited = new Set<number>();
+  const weaker = new Set<string>();
+  for (const start of adjacency.keys()) {
+    if (visited.has(start)) continue;
+    const stack = [start];
+    const cluster: number[] = [];
+    while (stack.length > 0) {
+      const index = stack.pop()!;
+      if (visited.has(index)) continue;
+      visited.add(index);
+      cluster.push(index);
+      for (const neighbour of adjacency.get(index) ?? []) stack.push(neighbour);
+    }
+    const strongest = [...cluster].sort((left, right) =>
+      repetitionStrength(targets[right].block, targets[right].order)
+      - repetitionStrength(targets[left].block, targets[left].order)
+      || targets[left].order - targets[right].order
+    )[0];
+    for (const index of cluster) {
+      if (index !== strongest) weaker.add(targets[index].id);
+    }
+  }
+  return [...weaker];
+}
+
+/**
+ * Stable block IDs that are safe for a prose-only fallback. These blocks have
+ * no deterministic factual surface at all: no approved/unsupported scanner
+ * claim, number, attribution, URL or externally protected sentence.
+ */
+export function findProseOnlyEditableBlockIds(
+  doc: ArticleDocument,
+  keyphrase: string,
+  research: Array<{ title?: string; snippet?: string; url?: string }> = [],
+  protectedSentencesByBlockId: Record<string, string[]> = {},
+  componentIds?: Iterable<string>,
+): string[] {
+  const allowedComponents = componentIds ? new Set(componentIds) : null;
+  return createEditableTargets(doc)
+    .filter((target) => !allowedComponents || allowedComponents.has(target.componentId))
+    .filter((target) => {
+      const blockId = target.publicBlock.blockId;
+      const text = textFromBlock(target.originalBlock).trim();
+      if (!text) return false;
+      if ((protectedSentencesByBlockId[blockId]?.length ?? 0) > 0) return false;
+      if (linksFromBlock(target.originalBlock).length > 0) return false;
+      if (extractNumbers(text).length > 0) return false;
+      if (extractAttributions(text).length > 0) return false;
+      return scanFactualRisks(target.publicBlock.html, keyphrase, research).claims.length === 0;
+    })
+    .map((target) => target.publicBlock.blockId);
+}
+
+/**
+ * Post-cleanup continuity candidates. Only fact-free blocks in components that
+ * actually lost sentences are exposed. The AI still decides which of these
+ * blocks need rewriting, but it cannot touch unaffected sections or facts.
+ */
+export function findWeakenedEditableBlockIds(
+  doc: ArticleDocument,
+  affectedComponentIds: Iterable<string>,
+  keyphrase: string,
+  research: Array<{ title?: string; snippet?: string; url?: string }> = [],
+  protectedSentencesByBlockId: Record<string, string[]> = {},
+): string[] {
+  const proseOnly = new Set(findProseOnlyEditableBlockIds(
+    doc,
+    keyphrase,
+    research,
+    protectedSentencesByBlockId,
+    affectedComponentIds,
+  ));
+  const transitionLead = /^(?:and|but|so|however|meanwhile|instead|therefore|for example|for instance|this|that|these|those|because|as a result)\b/i;
+  const setupOnly = /\b(?:here(?:'|’)s why|the numbers tell a compelling story|the opportunity is clear|this matters|that is where|the result is simple|consider this)\s*[.!?]?$/i;
+
+  return createEditableTargets(doc)
+    .filter((target) => proseOnly.has(target.publicBlock.blockId))
+    .filter((target) => {
+      if (target.originalBlock.type !== "paragraph") return false;
+      const text = textFromBlock(target.originalBlock).trim();
+      const wordCount = text.split(/\s+/).filter(Boolean).length;
+      return wordCount < 18 || transitionLead.test(text) || setupOnly.test(text);
+    })
+    .map((target) => target.publicBlock.blockId);
 }
 
 export function validateCandidate(
@@ -774,88 +1141,21 @@ export async function runEditorialPolish(
   const repeatsBefore = repeatedIdeaPairs(articleDoc);
   const maxAttempts = Math.max(1, Math.min(2, options.maxAttempts ?? 2));
   const request: PolishRequest = {
-    blocks: extractEditableBlocks(articleDoc),
+    blocks: extractEditableBlocks(articleDoc, options.protectedBlockIds, options.editableBlockIds),
     sectionSummaries: buildSectionSummaries(articleDoc),
     keyphrase,
     title: articleDoc.metadata.title,
     metaDescription: articleDoc.metadata.metaDescription,
+    mode: options.mode,
+    malformedIssuesByBlockId: options.malformedIssuesByBlockId,
   };
+  if (request.blocks.length === 0) {
+    return resultForFailure(articleDoc, keyphrase, "No editable blocks matched the repair scope", 0, 0, 0);
+  }
   const baseMessages = buildPolishPrompt(request);
   let previousResponse = "";
   let rejectionReason = "";
   let lastProposedEdits = 0;
-
-  // Pre-processing: detect conclusion numeric claims that do not appear in the
-  // main editorial sections. The conclusion must not introduce new unsupported
-  // percentages, counts or statistics.
-  const conclusionHtml = renderEditorialBlocksToWordPress(articleDoc.conclusion.blocks);
-  const sectionHtml = articleDoc.sections
-    .filter((s) => s.sectionType !== "faq-heading")
-    .map((s) => renderEditorialBlocksToWordPress(s.blocks))
-    .join(" ");
-  const conclusionNumbers = extractNumericClaims(conclusionHtml);
-  const sectionNumbers = extractNumericClaims(sectionHtml);
-  const newConclusionClaims = conclusionNumbers.filter((n) => !sectionNumbers.includes(n));
-  if (newConclusionClaims.length > 0) {
-    console.log(`[editorial-polish] conclusion has ${newConclusionClaims.length} new numeric claim(s): ${newConclusionClaims.join(", ")}`);
-
-    // Try to remove the complete conclusion block containing each new claim.
-    // Only removes blocks that aren't the last one (to avoid emptying the conclusion).
-    const conclusionBlocks = [...articleDoc.conclusion.blocks];
-    const originalBlockCount = conclusionBlocks.length;
-    const blocksToRemove = conclusionBlocks
-      .map((block, idx) => ({ block, idx, html: renderEditorialBlocksToWordPress([block]) }))
-      .filter(({ html }) => extractNumericClaims(html).some((n) => newConclusionClaims.includes(n)))
-      .filter(({ idx }) => idx < originalBlockCount - 1 || originalBlockCount <= 1);
-
-    if (blocksToRemove.length > 0 && blocksToRemove.length < originalBlockCount) {
-      // Remove offending blocks
-      const removeIndices = new Set(blocksToRemove.map((b) => b.idx));
-      const remainingBlocks = conclusionBlocks.filter((_, idx) => !removeIndices.has(idx));
-      console.log(`[editorial-polish] removed ${blocksToRemove.length} conclusion block(s) containing new numeric claims`);
-      articleDoc.conclusion.blocks = remainingBlocks;
-
-      // Re-scan after removal
-      const newConcHtml = renderEditorialBlocksToWordPress(articleDoc.conclusion.blocks);
-      const remainingClaims = extractNumericClaims(newConcHtml).filter((n) => newConclusionClaims.includes(n));
-      if (remainingClaims.length === 0) {
-        console.log(`[editorial-polish] all new conclusion numeric claims resolved by block removal`);
-      } else {
-        console.log(`[editorial-polish] ${remainingClaims.length} claim(s) remain after removal — will attempt AI regeneration`);
-        // Fall through to regeneration
-      }
-    }
-
-    // If removal didn't resolve all claims, try AI regeneration
-    const remainingAfterRemoval = extractNumericClaims(renderEditorialBlocksToWordPress(articleDoc.conclusion.blocks))
-      .filter((n) => newConclusionClaims.includes(n));
-    if (remainingAfterRemoval.length > 0) {
-      console.log(`[editorial-polish] regenerating conclusion to resolve ${remainingAfterRemoval.length} remaining new claim(s)`);
-      try {
-        const regenMsg = `Rewrite the conclusion WITHOUT these unsupported claims: ${remainingAfterRemoval.join(", ")}. Do not invent new statistics, percentages, user counts or dates. Use only information present in the article.`;
-        const regenRes = await aiCall(
-          [
-            { role: "system", content: "You are an editor removing unsupported numeric claims from the conclusion. Return ONLY the cleaned conclusion HTML." },
-            { role: "user", content: `${regenMsg}\n\nConclusion:\n${renderEditorialBlocksToWordPress(articleDoc.conclusion.blocks)}` },
-          ],
-          { maxTokens: 2048, timeoutMs: 60_000 },
-        );
-        const regenHtml = regenRes.content;
-        const regenParsed = parseWordPressEditorialBlocks(regenHtml, "conclusion-regen");
-        if (regenParsed.blocks.length > 0) {
-          articleDoc.conclusion.blocks = regenParsed.blocks;
-          const regenClaims = extractNumericClaims(regenHtml).filter((n) => newConclusionClaims.includes(n));
-          if (regenClaims.length > 0) {
-            console.log(`[editorial-polish] regenerated conclusion STILL contains ${regenClaims.length} new claim(s) — hard rejection`);
-          } else {
-            console.log(`[editorial-polish] regenerated conclusion is clean`);
-          }
-        }
-      } catch {
-        console.log(`[editorial-polish] conclusion regeneration failed — will proceed with editorial polish`);
-      }
-    }
-  }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const messages = attempt === 1
@@ -909,7 +1209,13 @@ export async function runEditorialPolish(
     let candidate = cloneDoc(articleDoc);
     let spacingFixesApplied = repairEditableSpacing(candidate);
     try {
-      candidate = applyEdits(candidate, proposal.edits);
+      candidate = applyEdits(
+        candidate,
+        proposal.edits,
+        options.protectedBlockIds,
+        options.editableBlockIds,
+        options.protectedSentencesByBlockId,
+      );
       spacingFixesApplied += repairEditableSpacing(candidate);
     } catch (error) {
       rejectionReason = error instanceof Error ? error.message : "Invalid editorial edit";

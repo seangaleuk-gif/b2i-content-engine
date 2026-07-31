@@ -1,5 +1,5 @@
 import { type EditorialBlock, type InlineContent, parseWordPressEditorialBlocks, renderEditorialBlocksToWordPress, validateEditorialBlocks } from "@/lib/blog/article-content";
-import { checkCompleteness, checkLinksPreserved, checkNumbersPreserved, extractVisibleNumbers } from "./translation-validator";
+import { checkCompleteness, checkLinksPreserved, checkNumbersPreserved } from "./translation-validator";
 import { protectNumbersInEditorialBlocks, restoreNumbersInEditorialBlocks, checkBlockNumbersPreserved, checkBlockLinksPreserved, extractNumbersFromEditorialBlocks, extractLinksFromEditorialBlocks, type NumberProtectionState } from "./editorial-block-protection";
 import { serializeTranslationPayload, extractTranslationJson, normalizeTranslationPayload, reconstructEditorialBlocks, validateConclusionPolicy, type TranslationComponentPayload, type TranslationLinkMap } from "./translation-dto";
 
@@ -114,6 +114,35 @@ export function checkNoPlaceholdersRemain(blocks: EditorialBlock[]): string[] {
   return found || [];
 }
 
+
+function inlineShape(content: InlineContent[]): string {
+  return content.map((node) => node.type === "link" ? `link:${node.href}` : node.type).join(",");
+}
+
+/**
+ * Translation may change text only. Block order, block kinds, list/table
+ * dimensions and inline formatting/link positions remain canonical.
+ */
+export function editorialStructureSignature(blocks: EditorialBlock[]): string[] {
+  return blocks.map((block) => {
+    switch (block.type) {
+      case "paragraph":
+      case "quote":
+        return `${block.type}[${inlineShape(block.content)}]`;
+      case "subheading":
+        return `${block.type}:${block.level}[${inlineShape(block.content)}]`;
+      case "list":
+        return `${block.type}:${block.ordered}:${block.items.length}[${block.items.map(inlineShape).join("|")}]`;
+      case "table":
+        return `${block.type}:${block.headers.length}:${block.rows.length}[h:${block.headers.map(inlineShape).join("|")};r:${block.rows.map((row) => row.map(inlineShape).join("|")).join(";")}]`;
+    }
+  });
+}
+
+function sameStringSequence(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 // ── Candidate evaluation (shared for initial and repaired candidates) ──
 // Parse → validate placeholders → restore → block validate → structured number/link (authoritative) → HTML shadow
 
@@ -169,17 +198,39 @@ function evaluateCandidate(
     };
   }
 
-  // 4. Structured number/link validation (AUTHORITATIVE)
+  // 4. Canonical structure and content validation (AUTHORITATIVE)
+  const structureMatch = sameStringSequence(
+    editorialStructureSignature(sourceBlocks),
+    editorialStructureSignature(translatedBlocks),
+  );
+  const blockValidationErrors = validateEditorialBlocks(translatedBlocks);
+
+  // 5. Structured number/link validation (AUTHORITATIVE)
   const blockNumCheck = checkBlockNumbersPreserved(sourceBlocks, translatedBlocks);
+  const sourceLinks = extractLinksFromEditorialBlocks(sourceBlocks);
+  const translatedLinks = extractLinksFromEditorialBlocks(translatedBlocks);
   const blockLinksLost = checkBlockLinksPreserved(sourceBlocks, translatedBlocks);
   const numbersMatch = blockNumCheck.lost.length === 0 && blockNumCheck.extras.length === 0;
-  const linksMatch = blockLinksLost.length === 0;
+  const linksMatch = sameStringSequence(sourceLinks, translatedLinks);
 
-  // 5. HTML shadow validation (diagnostic only, on restored content)
+  // Render restored blocks once for completeness and the final result.
+  const translatedHtml = renderEditorialBlocksToWordPress(translatedBlocks);
+  const completeness = checkCompleteness(sourceHtml, translatedHtml, componentId);
+
+  // 6. HTML shadow validation (diagnostic only, on restored content)
   const shadow = runHtmlShadow(sourceBlocks, translatedBlocks);
 
-  // 6. Build fail reason
+  // 7. Build fail reason
   const failParts: string[] = [];
+  if (!structureMatch) {
+    failParts.push("editorial block or inline structure changed");
+  }
+  if (blockValidationErrors.length > 0) {
+    failParts.push(`invalid editorial blocks: ${blockValidationErrors.join("; ")}`);
+  }
+  if (!completeness.passed) {
+    failParts.push(`translation incomplete or contains excessive English (ratio=${completeness.ratio.toFixed(2)})`);
+  }
   if (!numbersMatch) {
     const details: string[] = [];
     if (blockNumCheck.lost.length > 0) details.push(`lost: ${blockNumCheck.lost.join(", ")}`);
@@ -187,13 +238,11 @@ function evaluateCandidate(
     failParts.push(`number mismatch (${details.join("; ")})`);
   }
   if (!linksMatch) {
-    failParts.push(`links lost: ${blockLinksLost.join(", ")}`);
+    const extraLinks = translatedLinks.filter((link, index) => sourceLinks[index] !== link);
+    failParts.push(`URL sequence changed${blockLinksLost.length > 0 ? `; lost: ${blockLinksLost.join(", ")}` : ""}${extraLinks.length > 0 ? `; changed/extra: ${extraLinks.join(", ")}` : ""}`);
   }
 
   const passed = failParts.length === 0;
-
-  // Render restored blocks to HTML for the translatedHtml result
-  const translatedHtml = renderEditorialBlocksToWordPress(translatedBlocks);
 
   return {
     blocks: translatedBlocks, translatedHtml, passed,
@@ -321,32 +370,45 @@ export async function translateEditorialBlocks(
   // 2. Render protected blocks to HTML (AI still receives protected WordPress HTML)
   const protectedHtml = renderEditorialBlocksToWordPress(protectedBlocks);
 
-  // 3. Call AI translation
+  // 3. Call AI translation. Provider failures are isolated to this component:
+  // return a failed fallback so the orchestrator can continue translating the
+  // remaining article and report one complete diagnostic set.
   let translatedProtectedHtml: string;
   try {
     translatedProtectedHtml = await translateProtectedHtml(protectedHtml);
-  } catch (cause) {
-    throw new EditorialBlockTranslationError(
-      `Translation call failed for ${componentId}: ${(cause as Error).message}`,
-      componentId,
-    );
+  } catch {
+    const fallback = fallbackResult(blocks, componentId, sourceNumCount);
+    if (onStatus) onStatus({ passed: false, metrics: fallback.metrics });
+    return fallback;
   }
 
-  // 4. Attempt 1: evaluate the initial candidate
-  const firstAttempt = await tryCandidate(
-    blocks, translatedProtectedHtml, componentId, protectionState, protectedHtml, sourceNumCount, onStatus,
-  );
+  // 4. Attempt 1: evaluate the initial candidate. Malformed provider output is
+  // treated like any other component failure rather than aborting the route.
+  let firstAttempt: Awaited<ReturnType<typeof tryCandidate>>;
+  try {
+    firstAttempt = await tryCandidate(
+      blocks, translatedProtectedHtml, componentId, protectionState, protectedHtml, sourceNumCount, onStatus,
+    );
+  } catch {
+    const fallback = fallbackResult(blocks, componentId, sourceNumCount);
+    if (onStatus) onStatus({ passed: false, metrics: fallback.metrics });
+    return fallback;
+  }
 
   if ("retry" in firstAttempt) {
     // Structured validation failed — attempt repair
     if (repairProtectedHtml) {
       const repaired = await attemptRepair(protectedHtml, firstAttempt.retry.failReason, repairProtectedHtml);
       if (repaired) {
-        const secondAttempt = await tryCandidate(
-          blocks, repaired, componentId, protectionState, protectedHtml, sourceNumCount, onStatus,
-        );
-        if (!("retry" in secondAttempt)) {
-          return secondAttempt;
+        try {
+          const secondAttempt = await tryCandidate(
+            blocks, repaired, componentId, protectionState, protectedHtml, sourceNumCount, onStatus,
+          );
+          if (!("retry" in secondAttempt)) {
+            return secondAttempt;
+          }
+        } catch {
+          // Fall through to the source-preserving failed result below.
         }
       }
     }

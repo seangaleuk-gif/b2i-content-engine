@@ -333,7 +333,7 @@ describe("evidence flow via translateArticle", () => {
     const { translateArticle } = await import("./translation-service");
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "false";
     delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_EVIDENCE;
-    await translateArticle(minimalEnHtml(), sourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    await translateArticle(minimalEnHtml(), sourceDoc(), [], { translateEditorialBlocks: mockHelper });
     expect(fs.readdirSync(EVIDENCE_DIR).length).toBe(0);
   });
 
@@ -341,7 +341,7 @@ describe("evidence flow via translateArticle", () => {
     const { translateArticle } = await import("./translation-service");
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "false";
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_EVIDENCE = "true";
-    await translateArticle(minimalEnHtml(), sourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    await translateArticle(minimalEnHtml(), sourceDoc(), [], { translateEditorialBlocks: mockHelper });
     expect(fs.readdirSync(EVIDENCE_DIR).length).toBe(0);
   });
 
@@ -349,7 +349,7 @@ describe("evidence flow via translateArticle", () => {
     const { translateArticle } = await import("./translation-service");
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
     delete process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_EVIDENCE;
-    await translateArticle(minimalEnHtml(), sourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    await translateArticle(minimalEnHtml(), sourceDoc(), [], { translateEditorialBlocks: mockHelper });
     expect(fs.readdirSync(EVIDENCE_DIR).length).toBe(0);
   });
 
@@ -357,7 +357,7 @@ describe("evidence flow via translateArticle", () => {
     const { translateArticle } = await import("./translation-service");
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_EVIDENCE = "true";
-    await translateArticle(minimalEnHtml(), sourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    await translateArticle(minimalEnHtml(), sourceDoc(), [], { translateEditorialBlocks: mockHelper });
     const files = fs.readdirSync(EVIDENCE_DIR);
     expect(files.length).toBe(1);
     const parsed = JSON.parse(fs.readFileSync(path.join(EVIDENCE_DIR, files[0]), "utf-8")) as ConclusionShadowEvidenceRecord;
@@ -370,7 +370,7 @@ describe("evidence flow via translateArticle", () => {
     const { translateArticle } = await import("./translation-service");
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_EVIDENCE = "true";
-    const result = await translateArticle(minimalEnHtml(), sourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    const result = await translateArticle(minimalEnHtml(), sourceDoc(), [], { translateEditorialBlocks: mockHelper });
     expect(result.doc.conclusion.blocks).toBeDefined();
   });
 
@@ -378,7 +378,7 @@ describe("evidence flow via translateArticle", () => {
     const { translateArticle } = await import("./translation-service");
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_EVIDENCE = "true";
-    const result = await translateArticle(minimalEnHtml(), sourceDoc(), [], new Set(), { translateEditorialBlocks: mockHelper });
+    const result = await translateArticle(minimalEnHtml(), sourceDoc(), [], { translateEditorialBlocks: mockHelper });
     expect(result.failedComponents).toBeDefined();
   });
 
@@ -387,7 +387,7 @@ describe("evidence flow via translateArticle", () => {
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_CONCLUSION = "true";
     process.env.ENABLE_STRUCTURED_TRANSLATION_SHADOW_EVIDENCE = "true";
     const shadowTranslate = vi.fn();
-    await translateArticle(minimalEnHtml(), sourceDoc(), [], new Set(), {
+    await translateArticle(minimalEnHtml(), sourceDoc(), [], {
       translateEditorialBlocks: mockHelper,
       structuredTranslationShadow: { enabled: false, translatePayload: shadowTranslate },
     });

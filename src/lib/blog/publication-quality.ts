@@ -49,11 +49,48 @@ const ROBOTIC_PHRASES = [
   /\bit(?:'|’)s not just .{0,80};? it(?:'|’)s\b/gi,
 ];
 
-const CORRUPT_TEXT_PATTERNS: Array<{ regex: RegExp; label: string }> = [
-  { regex: /\b(?:manyf|asdf|qwerty|lorem ipsum)\b/i, label: "corrupt or placeholder token" },
-  { regex: /\b(?:undefined|null|nan)\b/i, label: "serialized program value" },
-  { regex: /\[(?:insert|add|replace|example|citation)[^\]]*\]/i, label: "unresolved instruction placeholder" },
-  { regex: /�/, label: "replacement character" },
+export type MalformedProseIssueCode =
+  | "unmatched-parentheses"
+  | "unmatched-quotation"
+  | "broken-quoted-fragment"
+  | "incomplete-sentence-ending"
+  | "corrupt-token"
+  | "serialized-program-value"
+  | "instruction-placeholder"
+  | "replacement-character";
+
+export interface MalformedProseTextIssue {
+  textIndex: number;
+  code: MalformedProseIssueCode;
+  message: string;
+  text: string;
+}
+
+const CORRUPT_TEXT_PATTERNS: Array<{
+  regex: RegExp;
+  code: MalformedProseIssueCode;
+  label: string;
+}> = [
+  {
+    regex: /\b(?:manyf|asdf|qwerty|lorem ipsum)\b/i,
+    code: "corrupt-token",
+    label: "corrupt or placeholder token",
+  },
+  {
+    regex: /\b(?:undefined|null|nan)\b/i,
+    code: "serialized-program-value",
+    label: "serialized program value",
+  },
+  {
+    regex: /\[(?:insert|add|replace|example|citation)[^\]]*\]/i,
+    code: "instruction-placeholder",
+    label: "unresolved instruction placeholder",
+  },
+  {
+    regex: /�/,
+    code: "replacement-character",
+    label: "replacement character",
+  },
 ];
 
 function words(text: string): string[] {
@@ -65,42 +102,81 @@ function normalizedWordSet(text: string): Set<string> {
   return new Set(words(text));
 }
 
-export function countRepeatedIdeaPairs(texts: string[]): number {
-  const eligible = texts.filter((text) => text.trim().split(/\s+/).length >= 12);
-  const sets = eligible.map(normalizedWordSet);
-  let pairs = 0;
+export interface RepeatedIdeaPair {
+  leftIndex: number;
+  rightIndex: number;
+}
+
+/** Returns original text indexes for the canonical near-duplicate rule. */
+export function findRepeatedIdeaPairs(texts: string[]): RepeatedIdeaPair[] {
+  const eligible = texts
+    .map((text, index) => ({ text, index }))
+    .filter(({ text }) => text.trim().split(/\s+/).length >= 12);
+  const sets = eligible.map(({ text }) => normalizedWordSet(text));
+  const pairs: RepeatedIdeaPair[] = [];
   for (let left = 0; left < sets.length; left++) {
     for (let right = left + 1; right < sets.length; right++) {
       const smaller = Math.min(sets[left].size, sets[right].size);
       if (smaller < 6) continue;
       let intersection = 0;
       for (const word of sets[left]) if (sets[right].has(word)) intersection++;
-      if (intersection >= 5 && intersection / smaller >= 0.55) pairs++;
+      if (intersection >= 5 && intersection / smaller >= 0.55) {
+        pairs.push({ leftIndex: eligible[left].index, rightIndex: eligible[right].index });
+      }
     }
   }
   return pairs;
 }
 
-export function detectMalformedProseTexts(texts: string[]): string[] {
-  const issues: string[] = [];
+export function countRepeatedIdeaPairs(texts: string[]): number {
+  return findRepeatedIdeaPairs(texts).length;
+}
+
+export function findMalformedProseTextIssues(texts: string[]): MalformedProseTextIssue[] {
+  const issues: MalformedProseTextIssue[] = [];
+  const seen = new Set<string>();
+  const addIssue = (
+    textIndex: number,
+    code: MalformedProseIssueCode,
+    message: string,
+    text: string,
+  ) => {
+    const key = `${textIndex}:${code}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    issues.push({ textIndex, code, message, text });
+  };
+
   texts.forEach((text, index) => {
     const trimmed = text.trim();
     const openParens = (trimmed.match(/\(/g) ?? []).length;
     const closeParens = (trimmed.match(/\)/g) ?? []).length;
     const straightQuotes = (trimmed.match(/"/g) ?? []).length;
-    if (openParens !== closeParens) issues.push(`text ${index + 1}: unmatched parentheses`);
-    if (straightQuotes % 2 !== 0) issues.push(`text ${index + 1}: unmatched quotation mark`);
+    if (openParens !== closeParens) {
+      addIssue(index, "unmatched-parentheses", "unmatched parentheses", trimmed);
+    }
+    if (straightQuotes % 2 !== 0) {
+      addIssue(index, "unmatched-quotation", "unmatched quotation mark", trimmed);
+    }
     if (/[.!?]\s*["”]\s+(?:instead|and|but|or|because)\b/i.test(trimmed)) {
-      issues.push(`text ${index + 1}: broken quoted fragment`);
+      addIssue(index, "broken-quoted-fragment", "broken quoted fragment", trimmed);
     }
     if (/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i.test(trimmed)) {
-      issues.push(`text ${index + 1}: incomplete sentence ending`);
+      addIssue(index, "incomplete-sentence-ending", "incomplete sentence ending", trimmed);
     }
     for (const pattern of CORRUPT_TEXT_PATTERNS) {
-      if (pattern.regex.test(trimmed)) issues.push(`text ${index + 1}: ${pattern.label}`);
+      if (pattern.regex.test(trimmed)) {
+        addIssue(index, pattern.code, pattern.label, trimmed);
+      }
     }
   });
-  return [...new Set(issues)];
+  return issues;
+}
+
+export function detectMalformedProseTexts(texts: string[]): string[] {
+  return findMalformedProseTextIssues(texts).map(
+    (issue) => `text ${issue.textIndex + 1}: ${issue.message}`,
+  );
 }
 
 function countRoboticPhrases(text: string): number {

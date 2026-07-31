@@ -1111,3 +1111,39 @@ describe("runConclusionStructuredShadow", () => {
 
 
 
+
+describe("professional translation structure gate", () => {
+  it("rejects a candidate that drops an inline emphasis node", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [{ id: "p1", type: "paragraph", content: [
+        { type: "text", text: "Hello " },
+        { type: "strong", text: "World" },
+      ] }],
+      componentId: "inline-shape-loss",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>你好世界</p><!-- /wp:paragraph -->",
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects a candidate that adds a new URL", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("Hello World")],
+      componentId: "new-url",
+      componentKind: "section",
+      translateProtectedHtml: async () => '<!-- wp:paragraph --><p><a href="https://invented.example">你好世界</a></p><!-- /wp:paragraph -->',
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects a materially incomplete translation", async () => {
+    const source = "This is a complete business paragraph with several important details about planning, customers, measurement, execution, and long-term improvement.";
+    const result = await translateEditorialBlocks({
+      blocks: [p(source)],
+      componentId: "incomplete",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>摘要。</p><!-- /wp:paragraph -->",
+    });
+    expect(result.passed).toBe(false);
+  });
+});
