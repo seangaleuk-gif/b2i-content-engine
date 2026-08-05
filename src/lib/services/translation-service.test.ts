@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderArticleDocument, type ArticleDocument, type EditorialBlock } from "@/lib/blog/article-document";
 import {
   checkCompleteness,
+  hasEnglishHeavyProseBlock,
   visibleChars,
   extractLinks,
   checkLinksPreserved,
@@ -220,7 +221,186 @@ describe("translateArticle — structured helper orchestration", () => {
     expect(result.failedComponents).toContain("section-0");
     expect(result.failedComponents.some((component) => component.startsWith("validation:"))).toBe(true);
   });
+
+  it("repair accepts a normalized candidate containing previously-fixable terminology", async () => {
+    // The mocked translator returns blocks whose text carries forbidden
+    // marketing terminology. After deterministic normalization that terminology
+    // becomes 創作者市場推廣, so repairChineseComponent must accept the
+    // candidate instead of rejecting it as untranslated.
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks =
+      async (opts) => ({
+        blocks: opts.blocks.map((block) => {
+          if (block.type === "list") return { ...block, items: block.items.map((item) => item.map((inline) => ({ ...inline, text: "網紅營銷嘅推廣策略好常見。" }))) };
+          if (block.type === "table") {
+            const convert = (group: typeof block.headers[number]) => group.map((inline) => ({ ...inline, text: "網紅營銷嘅推廣策略好常見。" }));
+            return { ...block, headers: block.headers.map(convert), rows: block.rows.map((row) => row.map(convert)) };
+          }
+          return { ...block, content: block.content.map((inline) => ({ ...inline, text: "網紅營銷嘅推廣策略好常見。" })) };
+        }),
+        translatedHtml: "",
+        passed: true,
+        metrics: { sourceChars: 10, translatedChars: 10, ratio: 1, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 },
+      });
+
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: mockHelper });
+
+    // The section is accepted (no editorial failure) and its blocks are stored
+    // with the canonical term, not the forbidden one.
+    expect(result.failedComponents).not.toContain("section-0-editorial");
+    const sectionText = result.doc.sections[0].blocks
+      .map((block) => JSON.stringify(block))
+      .join("");
+    expect(sectionText).toContain("創作者市場推廣");
+    expect(sectionText).not.toContain("網紅營銷");
+  });
+
+  it("a section whose only issue is formal register does not enter the AI repair path", async () => {
+    // The mocked translator returns blocks whose only deviation is a protected
+    // formal-register compound (與其). After deterministic normalization that
+    // compound is preserved but is no longer flagged, so the dedicated editorial
+    // repair pass must NOT be re-invoked for the section.
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks =
+      async (opts) => {
+        calls.push({ componentId: opts.componentId, componentKind: opts.componentKind });
+        const text = "品牌與其依賴大網紅，不如與創作者合作。";
+        return {
+          blocks: opts.blocks.map((block) => {
+            if (block.type === "list") {
+              return { ...block, items: block.items.map((item) => item.map((inline) => (inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text }))) };
+            }
+            if (block.type === "table") {
+              const convert = (group: typeof block.headers[number]) => group.map((inline) => (inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text }));
+              return { ...block, headers: block.headers.map(convert), rows: block.rows.map((row) => row.map(convert)) };
+            }
+            return { ...block, content: block.content.map((inline) => (inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text })) };
+          }),
+          translatedHtml: "",
+          passed: true,
+          metrics: { sourceChars: 10, translatedChars: 10, ratio: 1, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 },
+        };
+      };
+
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: mockHelper });
+
+    // The section is translated exactly once; the formal-register-only finding
+    // does not trigger the editorial repair pass or any failure.
+    const sectionCalls = calls.filter((c) => c.componentId === "zh-section-0");
+    expect(sectionCalls.length).toBe(1);
+    expect(result.failedComponents).not.toContain("section-0-editorial");
+    expect(result.failedComponents).not.toContain("zh-section-0-editorial");
+    expect(result.failedComponents.some((c) => c.includes("formal written Chinese"))).toBe(false);
+  });
+
+  it("a section whose only English content is a plain-text citation does not trigger the repair chain", async () => {
+    // The mocked translator returns blocks that are Chinese except for one
+    // plain-text English source-title citation. The whole citation block is
+    // exempt from English-leak counting, so the section is accepted at the
+    // component gate and the four-call repair/fallback chain must not run.
+    const calls: Array<{ componentId: string; componentKind: string }> = [];
+    const mockHelper: typeof import("./editorial-block-translation").translateEditorialBlocks =
+      async (opts) => {
+        calls.push({ componentId: opts.componentId, componentKind: opts.componentKind });
+        const text = "品牌與創作者市場推廣要成功，就唔可以忽視真實聲音。";
+        const citation = "來源：How to Find the Right Influencer Marketing Agency in Hong Kong。";
+        return {
+          blocks: opts.blocks.map((block) => {
+            if (block.type === "list") {
+              return { ...block, items: block.items.map((item) => item.map((inline) => (inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text }))) };
+            }
+            if (block.type === "table") {
+              const convert = (group: typeof block.headers[number]) => group.map((inline) => (inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text }));
+              return { ...block, headers: block.headers.map(convert), rows: block.rows.map((row) => row.map(convert)) };
+            }
+            const content = block.content.map((inline) => (inline.type === "link" ? { ...inline, text: "資料來源" } : { ...inline, text }));
+            return { ...block, content: content.map((n, i) => (i === content.length - 1 ? { ...n, text: citation } : n)) };
+          }),
+          translatedHtml: "",
+          passed: true,
+          metrics: { sourceChars: 10, translatedChars: 10, ratio: 1, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 1 },
+        };
+      };
+
+    const result = await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: mockHelper });
+
+    // Section translated exactly once; no editorial/strict/fallback repair.
+    const sectionCalls = calls.filter((c) => c.componentId === "zh-section-0");
+    expect(sectionCalls.length).toBe(1);
+    expect(result.failedComponents).not.toContain("section-0-editorial");
+    expect(result.failedComponents).not.toContain("zh-section-0-editorial");
+    expect(result.failedComponents.some((c) => c.includes("excessive English") || c.includes("insufficient Chinese"))).toBe(false);
+  });
 });
+
+describe("formal register is advisory in validateTranslatedDocument", () => {
+  it("protected 與其/與否/參與 and standalone-與 normalized text are not rejected", () => {
+    const enDoc: ArticleDocument = {
+      metadata: { title: "Creator Marketing Guide", slug: "guide", metaDescription: "A guide", excerpt: "", targetWordCount: 0, focusKeyphrase: "" },
+      languageSwitcher: null,
+      introduction: { id: "intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "Brands prefer creators." }] }] },
+      sections: [{ id: "s1", heading: "How to Choose", headingLevel: 2, sectionType: "main", status: "generated", blocks: [{ id: "s1p", type: "paragraph", content: [{ type: "text", text: "Section body." }] }] }],
+      visibleFaq: [],
+      conclusion: { id: "conc", status: "generated", blocks: [] },
+      cta: null, faqSchema: null, insertedLinks: [],
+    };
+    const zhDoc: ArticleDocument = {
+      ...enDoc,
+      metadata: { ...enDoc.metadata, slug: "guide-zh", title: "與其追求大網紅，不如用創作者", metaDescription: "香港市場推廣。", focusKeyphrase: "" },
+      introduction: { id: "zh-intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "品牌與創作者合作。" }] }] },
+      sections: [{ id: "zh-section-0", heading: "與否都應該參與？", headingLevel: 2, sectionType: "main", status: "generated", blocks: [{ id: "s1p", type: "paragraph", content: [{ type: "text", text: "品牌與其依賴大網紅，不如與創作者合作。參與度好重要。" }] }] }],
+    };
+
+    // The previous production HTTP 400 (validation:section-N: formal written
+    // Chinese; use "同") must no longer be produced.
+    const errors = validateTranslatedDocument(enDoc, zhDoc, []);
+    expect(errors.some((error) => error.includes("formal written Chinese"))).toBe(false);
+    expect(errors.some((error) => /use \\"同\\"/.test(error))).toBe(false);
+  });
+
+  it("hard number and structure failures still reject", () => {
+    const enDoc: ArticleDocument = {
+      metadata: { title: "Creator Marketing Guide", slug: "guide", metaDescription: "A guide", excerpt: "", targetWordCount: 0, focusKeyphrase: "" },
+      languageSwitcher: null,
+      introduction: { id: "intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "Brands reach 65% of SMEs within 6 months." }] }] },
+      sections: [], visibleFaq: [],
+      conclusion: { id: "conc", status: "generated", blocks: [] },
+      cta: null, faqSchema: null, insertedLinks: [],
+    };
+    const zhDoc: ArticleDocument = {
+      ...enDoc,
+      metadata: { ...enDoc.metadata, slug: "guide-zh", title: "香港創作者市場推廣指南", metaDescription: "香港市場推廣指南。", focusKeyphrase: "" },
+      introduction: { id: "zh-intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "品牌喺 6 個月內接觸 30% 嘅中小企。" }] }] },
+    };
+
+    const errors = validateTranslatedDocument(enDoc, zhDoc, []);
+    expect(errors.some((error) => /numbers changed/.test(error))).toBe(true);
+  });
+});
+
+describe("production all-English section still fails", () => {
+  it("rejects a fully untranslated English section", () => {
+    const enDoc: ArticleDocument = {
+      metadata: { title: "Creator Marketing Guide", slug: "guide", metaDescription: "A guide", excerpt: "", targetWordCount: 0, focusKeyphrase: "" },
+      languageSwitcher: null,
+      introduction: { id: "intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "Brands value authentic voices." }] }] },
+      sections: [{ id: "s1", heading: "Why It Matters", headingLevel: 2, sectionType: "main", status: "generated", blocks: [{ id: "s1p", type: "paragraph", content: [{ type: "text", text: "Section body." }] }] }],
+      visibleFaq: [],
+      conclusion: { id: "conc", status: "generated", blocks: [] },
+      cta: null, faqSchema: null, insertedLinks: [],
+    };
+    const zhDoc: ArticleDocument = {
+      ...enDoc,
+      metadata: { ...enDoc.metadata, slug: "guide-zh", title: "香港創作者市場推廣指南", metaDescription: "香港市場推廣指南。", focusKeyphrase: "" },
+      introduction: { id: "zh-intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "香港品牌重視真實聲音。" }] }] },
+      sections: [{ id: "zh-section-0", heading: "Why It Matters", headingLevel: 2, sectionType: "main", status: "generated", blocks: [{ id: "s1p", type: "paragraph", content: [{ type: "text", text: "Hong Kong brands increasingly value authentic voices because consumers are tired of hard-sell marketing content." }] }] }],
+    };
+
+    const errors = validateTranslatedDocument(enDoc, zhDoc, []);
+    expect(errors.some((error) => error.includes("section-0") && error.includes("excessive English prose"))).toBe(true);
+    expect(errors.some((error) => error.includes("section-0") && error.includes("insufficient Chinese"))).toBe(true);
+  });
+});
+
 
 describe("FAQ and CTA do not use structured helper", () => {
   it("FAQ translation does not invoke the helper", async () => {
@@ -442,6 +622,35 @@ describe("checkCompleteness", () => {
   it("fails when entire translated content is English with no Chinese", () => {
     const r = checkCompleteness("<p>Some English text here</p>", "<p>Completely untranslated English content here that should fail the check</p>", "test");
     expect(r.passed).toBe(false);
+  });
+  it("fails when one prose block is entirely English even if the component is mostly Chinese", () => {
+    // The whole-component English share is far below 10%, but block 2 is an
+    // untranslated English block. The final Chinese editorial gate rejects
+    // English-heavy blocks per prose block, so the component gate must too.
+    const r = checkCompleteness(
+      "<p>This is the English source paragraph that must be translated completely into Chinese for the article.</p>",
+      "<p>呢段係已經翻譯成繁體中文嘅內容，講述香港品牌點樣運用社交平台推廣。</p><p>Completely untranslated English block that was left behind by the translation model.</p>",
+      "test",
+    );
+    expect(r.passed).toBe(false);
+  });
+  it("passes when all prose blocks are Chinese despite English brand names", () => {
+    const r = checkCompleteness(
+      "<p>Use Threads for Instagram marketing with Meta platforms</p>",
+      "<p>用 Threads 做 Instagram 營銷配合 Meta 平台</p><p>另一個段落全部係中文內容，只有品牌名稱係英文。</p>",
+      "test",
+    );
+    expect(r.passed).toBe(true);
+  });
+  it("hasEnglishHeavyProseBlock detects a single untranslated block", () => {
+    expect(
+      hasEnglishHeavyProseBlock(
+        "<p>呢段係中文。</p><p>This English paragraph was never translated and is long enough to be detected.</p>",
+      ),
+    ).toBe(true);
+    expect(
+      hasEnglishHeavyProseBlock("<p>呢段係中文內容，完全唔包含英文句子。</p>"),
+    ).toBe(false);
   });
 });
 
@@ -1129,6 +1338,36 @@ describe("translation metadata and fail-closed parity", () => {
     expect(fallback).toContain("Threads");
     expect(fallback).toContain("2026");
     expect(fallback).toMatch(/[\u3400-\u9fff]/u);
+  });
+
+  it("does not misclassify ordinary capitalised research-title words as protected entities", () => {
+    const enDoc: ArticleDocument = {
+      metadata: { title: "Practical Guide", slug: "guide", metaDescription: "Useful guidance.", excerpt: "", targetWordCount: 500, focusKeyphrase: "香港指南" },
+      languageSwitcher: null,
+      introduction: { id: "intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "What Audience Need Which Marketers understand." }] }] },
+      sections: [{
+        id: "section-0", heading: "How to Understand Your Audience", headingLevel: 2, sectionType: "main", status: "generated",
+        blocks: [{ id: "s1-p1", type: "paragraph", content: [{ type: "text", text: "Which marketers need this audience insight?" }] }],
+      }], visibleFaq: [],
+      conclusion: { id: "conc", status: "generated", blocks: [] },
+      cta: null, faqSchema: null, insertedLinks: [],
+    };
+    const zhDoc: ArticleDocument = {
+      ...enDoc,
+      metadata: { ...enDoc.metadata, slug: "guide-zh", title: "香港指南實用方法", metaDescription: "提供香港市場實用建議。", focusKeyphrase: "香港指南" },
+      introduction: { id: "zh-intro", status: "generated", blocks: [{ id: "p1", type: "paragraph", content: [{ type: "text", text: "了解受眾需要，市場推廣人員便能制定合適方法。" }] }] },
+      sections: [{
+        id: "zh-section-0", heading: "如何了解你的受眾", headingLevel: 2, sectionType: "main", status: "generated",
+        blocks: [{ id: "s1-p1", type: "paragraph", content: [{ type: "text", text: "哪些市場推廣人員需要這項受眾洞察？" }] }],
+      }],
+    };
+    const errors = validateTranslatedDocument(enDoc, zhDoc, [{
+      url: "https://example.com/article",
+      title: "What Audience Need Which Marketers Should Know",
+    }]);
+
+    expect(errors.some((error) => /named entities changed:.*(?:Audience|Need|Which|Marketers)/.test(error))).toBe(false);
+    expect(errors.some((error) => /section 0 heading (?:contains|named entities changed)/.test(error))).toBe(false);
   });
 
   it("rejects English fallback content and a title missing the Chinese keyphrase", () => {

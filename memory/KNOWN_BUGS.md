@@ -1,3 +1,5 @@
+<!-- HISTORICAL: superseded by NEW_CHAT_HANDOFF.md (2026-08-01). Verify any claim against current code before acting. -->
+
 # Known Bugs
 
 ## Active

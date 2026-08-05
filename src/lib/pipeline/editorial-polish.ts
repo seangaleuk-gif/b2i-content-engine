@@ -26,6 +26,10 @@ import {
   editableTextsFromDocument,
   findMalformedProseTextIssues,
   findRepeatedIdeaPairs,
+  keyphraseExclusionSet,
+  normalizedWordSet,
+  paragraphOverlap,
+  REPEATED_IDEA_OVERLAP_THRESHOLD,
   type MalformedProseIssueCode,
 } from "@/lib/blog/publication-quality";
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
@@ -66,6 +70,8 @@ export interface PolishRequest {
   metaDescription: string;
   mode?: EditorialPolishMode;
   malformedIssuesByBlockId?: Record<string, string[]>;
+  /** Per-block preserve/replace context for the repetition-repair pass. */
+  repetitionTargets?: RepetitionPairTarget[];
 }
 
 export interface CandidateValidation {
@@ -85,6 +91,8 @@ export interface EditorialPolishOptions {
   mode?: EditorialPolishMode;
   /** Stable block-level malformed-prose reasons supplied to targeted repair. */
   malformedIssuesByBlockId?: Record<string, string[]>;
+  /** Per-block preserve/replace context for the repetition-repair pass. */
+  repetitionTargets?: RepetitionPairTarget[];
 }
 
 export type EditorialPolishMode =
@@ -268,8 +276,11 @@ export function buildSectionSummaries(doc: ArticleDocument): SectionSummary[] {
 }
 
 export function buildPolishPrompt(request: PolishRequest): ChatMessage[] {
+  const repetitionContext = request.mode === "repetition" && request.repetitionTargets
+    ? request.repetitionTargets
+    : [];
   const modeInstruction = request.mode === "repetition"
-    ? `\nThis is a targeted repetition-repair pass. Every supplied block is the deterministically selected weaker occurrence from a near-duplicate cluster; the strongest occurrence is intentionally not editable. Rewrite each supplied block as specific, non-factual practical guidance or a transition that adds genuinely new value.`
+    ? `\nThis is a targeted repetition-repair pass. Every supplied block is the deterministically selected later occurrence from a near-duplicate pair; the earlier paragraph is preserved and is NOT editable. The repetitionContext payload lists, for each supplied block, the preserved partner paragraph, the duplicated idea that must be removed from your block, and the required word-set overlap limit. Rewrite each supplied block so it shares fewer than half of its content words with its preserved partner: introduce a different purpose, example, action or transition — never merely synonyms of the preserved paragraph. If the preserved paragraph owns the focus keyphrase, do not repeat the exact keyphrase in your replacement.`
     : request.mode === "malformed"
       ? `\nThis is a targeted malformed-prose repair pass. Every supplied block has deterministic issue labels in malformedIssuesByBlockId. Repair every listed issue in its exact stable block ID. Do not return an empty edits array, and do not edit blocks that are not supplied.`
       : request.mode === "weakened"
@@ -317,6 +328,23 @@ If no block needs editing, return {"edits":[]}.`;
     editableBlocks: request.blocks,
     ...(request.mode === "malformed"
       ? { malformedIssuesByBlockId: request.malformedIssuesByBlockId ?? {} }
+      : {}),
+    ...(repetitionContext.length > 0
+      ? {
+          repetitionContext: Object.fromEntries(
+            repetitionContext.map((target) => [
+              target.blockId,
+              {
+                preservedParagraph: target.preserveText,
+                preservedBlockId: target.preserveBlockId,
+                duplicatedIdeaToRemove: target.duplicatedIdea,
+                currentOverlap: target.overlap,
+                requiredOverlapLimit: REPEATED_IDEA_OVERLAP_THRESHOLD,
+                rule: "Your replacement must share fewer content words with the preserved paragraph than the overlap limit above. Keep any number, percentage, date, href and named source exactly as they are in your block.",
+              },
+            ]),
+          ),
+        }
       : {}),
   };
 
@@ -428,6 +456,22 @@ function extractNumbers(text: string): string[] {
 export function extractNumericClaims(html: string): string[] {
   const text = html.replace(/<!--[\s\S]*?-->/g, " ").replace(/<[^>]+>/g, " ");
   return extractNumbers(text);
+}
+
+
+function canonicalNumericBlockSignature(doc: ArticleDocument): Array<{
+  componentId: string;
+  blockId: string;
+  blockIndex: number;
+  numbers: string[];
+}> {
+  const components: ArticleComponent[] = [doc.introduction, ...doc.sections, doc.conclusion];
+  return components.flatMap((component) => component.blocks.map((block, blockIndex) => ({
+    componentId: component.id,
+    blockId: block.id,
+    blockIndex,
+    numbers: extractNumbers(textFromBlock(block)),
+  })));
 }
 
 function extractAttributions(text: string): string[] {
@@ -765,8 +809,8 @@ function protectedSignature(doc: ArticleDocument): unknown {
   };
 }
 
-function repeatedIdeaPairs(doc: ArticleDocument): number {
-  return countRepeatedIdeaPairs(editableTextsFromDocument(doc));
+function repeatedIdeaPairs(doc: ArticleDocument, excludeWords?: ReadonlySet<string>): number {
+  return countRepeatedIdeaPairs(editableTextsFromDocument(doc), excludeWords);
 }
 
 function malformedTextsForBlock(block: EditorialBlock): string[] {
@@ -898,21 +942,185 @@ export function repairDeterministicMalformedProse(
   };
 }
 
-/** Stable paragraph block IDs participating in the canonical near-duplicate pairs. */
-function repetitionStrength(block: EditorialBlock, order: number): number {
-  const text = textFromBlock(block);
-  const linkCount = linksFromBlock(block).length;
-  const numericCount = extractNumbers(text).length;
-  const attributionCount = extractAttributions(text).length;
-  // Prefer the occurrence that is best evidenced and most complete. Earlier
-  // outline order is the final deterministic tie-breaker.
-  return (
-    linkCount * 1_000
-    + numericCount * 150
-    + attributionCount * 100
-    + Math.min(80, text.split(/\s+/).filter(Boolean).length)
-    - order / 10_000
-  );
+export interface RepetitionFallbackApplied {
+  blockId: string;
+  action: "sentences-kept" | "removed";
+  before: string;
+  after: string;
+}
+
+export interface RepetitionFallbackResult {
+  doc: ArticleDocument;
+  applied: RepetitionFallbackApplied[];
+  skipped: Array<{ blockId: string; reason: string }>;
+}
+
+function componentForTarget(
+  doc: ArticleDocument,
+  target: RepetitionPairTarget,
+): ArticleComponent | ArticleSection | undefined {
+  if (target.componentKind === "introduction") return doc.introduction;
+  if (target.componentKind === "conclusion") return doc.conclusion;
+  return doc.sections.find((section) => section.id === target.componentId);
+}
+
+/**
+ * Bounded deterministic repetition fallback, applied only after both AI
+ * repetition-repair attempts failed to reduce the same pair.
+ *
+ * For each targeted later paragraph:
+ * - sentences that carry protected content (numbers, attributions, quoted
+ *   evidence, the exact focus keyphrase, scanner-approved factual sentences)
+ *   are ALWAYS kept, so no numeric fact, link surface, quote or required
+ *   keyphrase placement is ever dropped;
+ * - sentences that repeat the preserved partner's idea (>= 4 shared content
+ *   words and >= 50% of the sentence's own word set) are removed;
+ * - if every sentence repeated the preserved idea AND the block carries no
+ *   protected content, the block itself is removed — provided the article
+ *   stays above its word minimum and the component keeps at least one block;
+ * - the resulting paragraph must fall below the canonical overlap threshold
+ *   against its preserved partner, otherwise the change is reverted;
+ * - the fallback never introduces filler and never touches headings, FAQ,
+ *   CTA, schema, language switcher, links or lists.
+ */
+export function applyDeterministicRepetitionFallback(
+  doc: ArticleDocument,
+  targets: RepetitionPairTarget[],
+  options: {
+    minimumWordCount: number;
+    keyphrase: string;
+    protectedSentencesByBlockId?: Record<string, string[]>;
+  },
+): RepetitionFallbackResult {
+  const clone = cloneDoc(doc);
+  const applied: RepetitionFallbackApplied[] = [];
+  const skipped: Array<{ blockId: string; reason: string }> = [];
+  if (targets.length === 0) return { doc: clone, applied, skipped };
+
+  const keyphrase = options.keyphrase.trim().toLowerCase();
+  const excludeWords = keyphraseExclusionSet(keyphrase);
+  const pairsBefore = countRepeatedIdeaPairs(editableTextsFromDocument(clone), excludeWords);
+  const protectedSentences = options.protectedSentencesByBlockId ?? {};
+
+  for (const target of targets) {
+    const component = componentForTarget(clone, target);
+    const block = component?.blocks[target.blockIndex];
+    if (!component || !block || block.id !== target.rawBlockId) {
+      skipped.push({ blockId: target.blockId, reason: "stable block target not found" });
+      continue;
+    }
+    if (block.type !== "paragraph" || !canRebuildAsPlainText(block)) {
+      skipped.push({ blockId: target.blockId, reason: "not a plain-text paragraph" });
+      continue;
+    }
+    if (linksFromBlock(block).length > 0) {
+      skipped.push({ blockId: target.blockId, reason: "contains links" });
+      continue;
+    }
+    const text = textFromBlock(block);
+    if ((protectedSentences[target.blockId]?.length ?? 0) > 0) {
+      skipped.push({ blockId: target.blockId, reason: "contains scanner-approved factual sentences" });
+      continue;
+    }
+
+    const preserveSet = normalizedWordSet(target.preserveText, excludeWords);
+    const protectedSentenceSet = new Set(
+      (protectedSentences[target.blockId] ?? []).map(normalizeProtectedSentence),
+    );
+    const kept: string[] = [];
+    for (const sentence of splitEditorialSentences(text)) {
+      const normalized = normalizeProtectedSentence(sentence);
+      if (!normalized) continue;
+      const carriesProtectedContent = extractNumbers(sentence).length > 0
+        || new RegExp(ATTRIBUTION_RE.source, "i").test(sentence)
+        || /["“”'‘’]/.test(sentence)
+        || keyphrase.length > 0 && normalized.toLowerCase().includes(keyphrase)
+        || protectedSentenceSet.has(normalized);
+      if (carriesProtectedContent) {
+        kept.push(normalized);
+        continue;
+      }
+      const shared = paragraphOverlap(preserveSet, normalizedWordSet(sentence, excludeWords));
+      if (shared.shared >= 4 && shared.ratio >= 0.5) {
+        // Repeats the preserved idea — drop deterministically.
+        continue;
+      }
+      kept.push(normalized);
+    }
+
+    if (kept.length === 0) {
+      // Whole-block removal is safe only when nothing protected was dropped
+      // (guaranteed: protected sentences are always kept) and the article
+      // stays above its word minimum with a non-empty component.
+      const removedWords = text.split(/\s+/).filter(Boolean).length;
+      const articleWords = countCanonicalVisibleWords(clone);
+      if (component.blocks.length <= 1) {
+        skipped.push({ blockId: target.blockId, reason: "would empty the component" });
+        continue;
+      }
+      if (articleWords - removedWords < options.minimumWordCount) {
+        skipped.push({ blockId: target.blockId, reason: "would fall below the word minimum" });
+        continue;
+      }
+      component.blocks.splice(target.blockIndex, 1);
+      component.status = "normalized";
+      applied.push({ blockId: target.blockId, action: "removed", before: text, after: "" });
+      continue;
+    }
+
+    const after = kept.join(" ");
+    const overlap = paragraphOverlap(preserveSet, normalizedWordSet(after, excludeWords));
+    if (overlap.ratio >= REPEATED_IDEA_OVERLAP_THRESHOLD) {
+      skipped.push({
+        blockId: target.blockId,
+        reason: `overlap still ${overlap.ratio.toFixed(2)} after sentence-level dedup`,
+      });
+      continue;
+    }
+    block.content = [{ type: "text", text: after }];
+    component.status = "normalized";
+    applied.push({ blockId: target.blockId, action: "sentences-kept", before: text, after });
+  }
+
+  // The fallback must never increase the global pair count or introduce
+  // malformed prose. If it does, the entire fallback is reverted.
+  const pairsAfter = countRepeatedIdeaPairs(editableTextsFromDocument(clone), excludeWords);
+  if (pairsAfter > pairsBefore || findMalformedEditableBlocks(clone).length > 0) {
+    return { doc: doc, applied: [], skipped };
+  }
+  return { doc: clone, applied, skipped };
+}
+
+export interface RepetitionPairSurfaceFlags {
+  keyphrase: boolean;
+  numbers: string[];
+  linkCount: number;
+  quoteCount: number;
+}
+
+/**
+ * Protected-surface flags for one repeated-pair paragraph: whether it owns the
+ * exact focus keyphrase, which numeric facts it carries, its link count and
+ * its quoted-evidence count. Used for diagnostics and fallback safety.
+ */
+export function repetitionPairSurfaceFlags(
+  doc: ArticleDocument,
+  target: Pick<RepetitionPairTarget, "componentKind" | "componentId" | "blockId" | "text">,
+  keyphrase: string,
+): RepetitionPairSurfaceFlags {
+  const component = target.componentKind === "introduction"
+    ? doc.introduction
+    : target.componentKind === "conclusion"
+      ? doc.conclusion
+      : doc.sections.find((section) => section.id === target.componentId);
+  const block = component?.blocks.find((candidate) => candidate.id === target.blockId);
+  const numbers = extractNumbers(target.text);
+  return {
+    keyphrase: countExactKeyphrase(target.text, keyphrase) > 0,
+    numbers,
+    linkCount: block ? linksFromBlock(block).length : 0,
+    quoteCount: (target.text.match(/["“”'‘’]/g) ?? []).length,
+  };
 }
 
 /**
@@ -921,15 +1129,51 @@ function repetitionStrength(block: EditorialBlock, order: number): number {
  * therefore deterministic and never asks the model to choose which copy wins.
  */
 export function findRepeatedEditableBlockIds(doc: ArticleDocument): string[] {
+  return findRepetitionPairTargets(doc).map((target) => target.blockId);
+}
+
+export interface RepetitionPairTarget {
+  /** Stable public block ID of the paragraph that may be rewritten (the later/weaker copy). */
+  blockId: string;
+  /** Raw block id (the block's own id field) used for component-block lookups. */
+  rawBlockId: string;
+  componentKind: EditableTarget["componentKind"];
+  componentId: string;
+  blockIndex: number;
+  text: string;
+  /** Stable public block ID of the preserved partner (the earlier/stronger copy). */
+  preserveBlockId: string;
+  preserveComponentKind: EditableTarget["componentKind"];
+  preserveComponentId: string;
+  preserveText: string;
+  /** Canonical word-set overlap between the two paragraphs. */
+  overlap: number;
+  /** Sentences of the replace paragraph that repeat the preserved idea. */
+  duplicatedIdea: string;
+}
+
+/**
+ * Deterministic repetition-pair targeting with stable block IDs.
+ *
+ * For every near-duplicate cluster the earlier/strongest paragraph is
+ * preserved and each later/weaker paragraph is exposed for repair, together
+ * with its preserved partner, the canonical overlap and the exact sentences
+ * that repeat the preserved idea. This is the single source of truth for the
+ * repetition-repair prompt, the per-target overlap validation and the bounded
+ * deterministic fallback.
+ */
+export function findRepetitionPairTargets(doc: ArticleDocument): RepetitionPairTarget[] {
   const targets = createEditableTargets(doc)
     .filter((target) => target.originalBlock.type === "paragraph")
     .map((target, order) => ({
-      id: target.publicBlock.blockId,
-      block: target.originalBlock,
+      target,
       text: textFromBlock(target.originalBlock),
       order,
     }));
-  const pairs = findRepeatedIdeaPairs(targets.map((target) => target.text));
+  if (targets.length === 0) return [];
+
+  const excludeWords = keyphraseExclusionSet(doc.metadata.focusKeyphrase);
+  const pairs = findRepeatedIdeaPairs(targets.map((entry) => entry.text), excludeWords);
   if (pairs.length === 0) return [];
 
   const adjacency = new Map<number, Set<number>>();
@@ -943,7 +1187,7 @@ export function findRepeatedEditableBlockIds(doc: ArticleDocument): string[] {
   }
 
   const visited = new Set<number>();
-  const weaker = new Set<string>();
+  const results: RepetitionPairTarget[] = [];
   for (const start of adjacency.keys()) {
     if (visited.has(start)) continue;
     const stack = [start];
@@ -955,16 +1199,38 @@ export function findRepeatedEditableBlockIds(doc: ArticleDocument): string[] {
       cluster.push(index);
       for (const neighbour of adjacency.get(index) ?? []) stack.push(neighbour);
     }
-    const strongest = [...cluster].sort((left, right) =>
-      repetitionStrength(targets[right].block, targets[right].order)
-      - repetitionStrength(targets[left].block, targets[left].order)
-      || targets[left].order - targets[right].order
-    )[0];
+    const preserveIndex = cluster.reduce((earliest, index) =>
+      targets[index].order < targets[earliest].order ? index : earliest,
+    cluster[0]);
+    const preserve = targets[preserveIndex];
+    const preserveSet = normalizedWordSet(preserve.text, excludeWords);
     for (const index of cluster) {
-      if (index !== strongest) weaker.add(targets[index].id);
+      if (index === preserveIndex) continue;
+      const entry = targets[index];
+      const overlap = paragraphOverlap(preserveSet, normalizedWordSet(entry.text, excludeWords));
+      const duplicatedSentences = splitEditorialSentences(entry.text).filter((sentence) => {
+        const set = normalizedWordSet(sentence, excludeWords);
+        if (set.size < 3) return false;
+        const shared = paragraphOverlap(preserveSet, set);
+        return shared.shared >= 4 && shared.ratio >= 0.5;
+      });
+      results.push({
+        blockId: entry.target.publicBlock.blockId,
+        rawBlockId: entry.target.originalBlock.id,
+        componentKind: entry.target.componentKind,
+        componentId: entry.target.componentId,
+        blockIndex: entry.target.blockIndex,
+        text: entry.text,
+        preserveBlockId: preserve.target.publicBlock.blockId,
+        preserveComponentKind: preserve.target.componentKind,
+        preserveComponentId: preserve.target.componentId,
+        preserveText: preserve.text,
+        overlap: overlap.ratio,
+        duplicatedIdea: duplicatedSentences.map((sentence) => sentence.trim()).filter(Boolean).join(" "),
+      });
     }
   }
-  return [...weaker];
+  return results;
 }
 
 /**
@@ -1064,11 +1330,17 @@ export function validateCandidate(
     reasons.push("keyphrase density exceeds 3%");
   }
 
-  const originalNumbers = extractNumericClaims(originalHtml);
-  const candidateNumbers = extractNumericClaims(candidateHtml);
-  if (!sameStrings(originalNumbers, candidateNumbers)) reasons.push("numeric facts changed");
+  // Compare numeric facts through the canonical ArticleDocument rather than
+  // rendered article HTML. Metadata/headings and protected FAQ/CTA/schema are
+  // already locked by structureSignature()/protectedSignature(). For editable
+  // prose, bind the exact numeric expressions to each stable component/block
+  // ID. This avoids false positives caused by unrelated rendered HTML order,
+  // while still rejecting a number that changes or moves to another paragraph.
+  if (JSON.stringify(canonicalNumericBlockSignature(original)) !== JSON.stringify(canonicalNumericBlockSignature(candidate))) {
+    reasons.push("numeric facts changed");
+  }
 
-  if (repeatedIdeaPairs(candidate) > repeatedIdeaPairs(original)) {
+  if (repeatedIdeaPairs(candidate, keyphraseExclusionSet(keyphrase)) > repeatedIdeaPairs(original, keyphraseExclusionSet(keyphrase))) {
     reasons.push("near-duplicate paragraph count increased");
   }
   const malformed = detectMalformedProse(candidate);
@@ -1148,6 +1420,7 @@ export async function runEditorialPolish(
     metaDescription: articleDoc.metadata.metaDescription,
     mode: options.mode,
     malformedIssuesByBlockId: options.malformedIssuesByBlockId,
+    repetitionTargets: options.repetitionTargets,
   };
   if (request.blocks.length === 0) {
     return resultForFailure(articleDoc, keyphrase, "No editable blocks matched the repair scope", 0, 0, 0);
@@ -1205,7 +1478,6 @@ export async function runEditorialPolish(
       }
       continue;
     }
-
     let candidate = cloneDoc(articleDoc);
     let spacingFixesApplied = repairEditableSpacing(candidate);
     try {
@@ -1230,6 +1502,51 @@ export async function runEditorialPolish(
         );
       }
       continue;
+    }
+
+    // Repetition-mode invariant: every targeted block must drop below the
+    // canonical word-set overlap threshold against its preserved partner.
+    // Without this, a synonym-level rewrite that keeps the near-duplicate
+    // would pass structural validation yet never reduce the pair count.
+    const repetitionContext = options.repetitionTargets ?? [];
+    if (request.mode === "repetition" && repetitionContext.length > 0) {
+      const overlapFailures: string[] = [];
+      for (const target of repetitionContext) {
+        const component = target.componentKind === "introduction"
+          ? candidate.introduction
+          : target.componentKind === "conclusion"
+            ? candidate.conclusion
+            : candidate.sections.find((section) => section.id === target.componentId);
+        const current = component?.blocks[target.blockIndex];
+        if (!component || !current || current.id !== target.rawBlockId) {
+          overlapFailures.push(`${target.blockId}: stable block target changed`);
+          continue;
+        }
+        const kpWords = keyphraseExclusionSet(keyphrase);
+        const overlap = paragraphOverlap(
+          normalizedWordSet(target.preserveText, kpWords),
+          normalizedWordSet(textFromBlock(current), kpWords),
+        );
+        if (overlap.ratio >= REPEATED_IDEA_OVERLAP_THRESHOLD) {
+          overlapFailures.push(
+            `${target.blockId} still overlaps preserved paragraph ${target.preserveBlockId} (${overlap.ratio.toFixed(2)} >= ${REPEATED_IDEA_OVERLAP_THRESHOLD})`,
+          );
+        }
+      }
+      if (overlapFailures.length > 0) {
+        rejectionReason = `Repetition overlap validation: ${overlapFailures.join("; ")}`;
+        if (attempt === maxAttempts) {
+          return resultForFailure(
+            articleDoc,
+            keyphrase,
+            `Validation failed: ${rejectionReason}`,
+            proposal.edits.length,
+            0,
+            attempt,
+          );
+        }
+        continue;
+      }
     }
 
     const validation = validateCandidate(

@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { translateEditorialBlocks, EditorialBlockTranslationError, runConclusionStructuredShadow } from "./editorial-block-translation";
+import { translateEditorialBlocks, runConclusionStructuredShadow } from "./editorial-block-translation";
 import { protectNumbersInEditorialBlocks } from "./editorial-block-protection";
 import { serializeTranslationPayload } from "./translation-dto";
+import { isSourceEcho, normalizeTranslationComparisonText } from "./translation-validator";
 import { renderEditorialBlocksToWordPress, type EditorialBlock } from "@/lib/blog/article-content";
 
 function p(text: string): EditorialBlock {
@@ -180,6 +181,238 @@ describe("translateEditorialBlocks", () => {
     expect(rendered).toContain('href="https://example.com"');
   });
 
+  it("uses the structured fallback when HTML translation echoes English", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("Hello World with 25% growth")],
+      componentId: "structured-recovery",
+      componentKind: "section",
+      translateProtectedHtml: identityTranslate,
+      repairProtectedHtml: identityTranslate,
+      translateProtectedPayload: async (payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        for (const block of payload.blocks) {
+          for (const node of block.nodes || []) {
+            node.text = node.text
+              .replace("Hello World with", "香港團隊錄得")
+              .replace("growth", "增長");
+          }
+        }
+        return JSON.stringify(payload);
+      },
+    });
+
+    expect(result.passed).toBe(true);
+    expect(renderEditorialBlocksToWordPress(result.blocks)).toContain("香港團隊錄得");
+    expect(renderEditorialBlocksToWordPress(result.blocks)).toContain("25%");
+    expect(result.validationParity?.diagnostics).toContain("structured-fallback-used");
+  });
+
+  it.each([
+    ["Threads reached 2.4M users in 2025", "Threads 達到", "2.4M"],
+    ["Sales increased from 36% to 66%", "銷售由", "增加至 66%"],
+  ])("rejects unchanged English %j and runs the structured fallback", async (source, zhFragment, numberFragment) => {
+    const result = await translateEditorialBlocks({
+      blocks: [p(source)],
+      componentId: "structured-echo-recovery",
+      componentKind: "section",
+      translateProtectedHtml: identityTranslate,
+      repairProtectedHtml: identityTranslate,
+      translateProtectedPayload: async (payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        for (const block of payload.blocks) {
+          for (const node of block.nodes || []) {
+            if (source.includes("Threads reached")) {
+              node.text = node.text
+                .replace("Threads reached", "Threads 達到")
+                .replace(" users in ", " 用戶，於 ");
+            } else {
+              node.text = node.text
+                .replace("Sales increased from", "銷售由")
+                .replace(" to ", " 增加至 ");
+            }
+          }
+        }
+        return JSON.stringify(payload);
+      },
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain(zhFragment);
+    expect(rendered).toContain(numberFragment);
+    expect(rendered).not.toContain(source);
+    expect(result.validationParity?.diagnostics).toContain("structured-fallback-used");
+  });
+
+  it("accepts a legitimate Chinese translation with numbers directly", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("Hello World with 25% growth")],
+      componentId: "valid-zh-1",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>Hello World 錄得 __NUM_0__ 增長</p><!-- /wp:paragraph -->",
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain("Hello World 錄得 25% 增長");
+    expect(result.validationParity?.diagnostics).not.toContain("structured-fallback-used");
+  });
+
+  it("accepts the required Chinese translation with mixed numbers and year", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("Threads reached 2.4M users in 2025")],
+      componentId: "valid-zh-2",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>Threads 在 2025 年達到 __NUM_0__ 用戶</p><!-- /wp:paragraph -->",
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain("Threads 在 2025 年達到 2.4M 用戶");
+    expect(result.validationParity?.diagnostics).not.toContain("structured-fallback-used");
+  });
+
+  it("accepts a Chinese translation that reorders protected placeholders", async () => {
+    // Chinese grammar may place the second percentage first ("66% 與 36% 之間").
+    // Placeholder reordering stays legal; number preservation is count-based.
+    const result = await translateEditorialBlocks({
+      blocks: [p("Between 36% and 66%")],
+      componentId: "valid-zh-reorder",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>__NUM_1__ 與 __NUM_0__ 之間</p><!-- /wp:paragraph -->",
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain("66% 與 36% 之間");
+    expect(result.validationParity?.diagnostics).not.toContain("structured-fallback-used");
+  });
+
+  it("accepts a Chinese percentage translation directly", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("Sales increased from 36% to 66%")],
+      componentId: "valid-zh-3",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>銷售由 __NUM_0__ 增加至 __NUM_1__</p><!-- /wp:paragraph -->",
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain("銷售由 36% 增加至 66%");
+    expect(result.validationParity?.diagnostics).not.toContain("structured-fallback-used");
+  });
+
+  it("accepts a mixed-language translation containing protected brand names", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("Meta, Threads and Instagram are essential for Hong Kong marketers.")],
+      componentId: "mixed-brands",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>Meta、Threads、Instagram 對香港營銷人員至關重要。</p><!-- /wp:paragraph -->",
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain("Meta、Threads、Instagram");
+    expect(rendered).toContain("營銷");
+    expect(result.validationParity?.diagnostics).not.toContain("structured-fallback-used");
+  });
+
+  it.each(["25%", "2025", "Meta", "Meta、Threads、Instagram"])(
+    "does not reject the short token-only block %j when unchanged",
+    async (token) => {
+      const result = await translateEditorialBlocks({
+        blocks: [p(token)],
+        componentId: "token-only",
+        componentKind: "section",
+        translateProtectedHtml: identityTranslate,
+      });
+
+      expect(result.passed).toBe(true);
+      expect(renderEditorialBlocksToWordPress(result.blocks)).toContain(token);
+    },
+  );
+
+  it("rejects unchanged bilingual prose and runs the structured fallback", async () => {
+    const source = "Use 「香港創作者」 when describing local creators.";
+    const result = await translateEditorialBlocks({
+      blocks: [p(source)],
+      componentId: "bilingual-echo",
+      componentKind: "section",
+      translateProtectedHtml: identityTranslate,
+      repairProtectedHtml: identityTranslate,
+      translateProtectedPayload: async (payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        for (const block of payload.blocks) {
+          for (const node of block.nodes || []) {
+            node.text = "描述本地創作者時，請使用「香港創作者」。";
+          }
+        }
+        return JSON.stringify(payload);
+      },
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain("描述本地創作者");
+    expect(rendered).not.toContain("when describing local creators");
+    expect(result.validationParity?.diagnostics).toContain("structured-fallback-used");
+  });
+
+  it("rejects a formatting-only echo and runs the structured fallback", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("Hello World with 25% growth")],
+      componentId: "formatting-echo",
+      componentKind: "section",
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>\n  HELLO&nbsp;WORLD with __NUM_0__ growth\n</p><!-- /wp:paragraph -->",
+      repairProtectedHtml: identityTranslate,
+      translateProtectedPayload: async (payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        for (const block of payload.blocks) {
+          for (const node of block.nodes || []) {
+            node.text = node.text
+              .replace("Hello World with", "香港團隊錄得")
+              .replace("growth", "增長");
+          }
+        }
+        return JSON.stringify(payload);
+      },
+    });
+
+    expect(result.passed).toBe(true);
+    const rendered = renderEditorialBlocksToWordPress(result.blocks);
+    expect(rendered).toContain("香港團隊錄得");
+    expect(rendered).toContain("25%");
+    expect(result.validationParity?.diagnostics).toContain("structured-fallback-used");
+  });
+
+  it("genuine content changes are not classified as source echoes", async () => {
+    // Changed numbers, percentages and URLs remain part of the equality
+    // comparison and never trigger the echo guard on their own.
+    expect(isSourceEcho("Sales increased from 36% to 66%", "Sales increased from 36% to 99%")).toBe(false);
+    expect(isSourceEcho("Hello World with 25% growth", "Hello World with 25% annual growth")).toBe(false);
+    expect(isSourceEcho("Use Meta Threads for growth", "Use Meta Threads for growth and reach")).toBe(false);
+  });
+
+  it("uses the structured fallback when the HTML provider throws", async () => {
+    const result = await translateEditorialBlocks({
+      blocks: [p("A practical English sentence with 40% growth")],
+      componentId: "structured-provider-recovery",
+      componentKind: "section",
+      translateProtectedHtml: async () => { throw new Error("provider unavailable"); },
+      translateProtectedPayload: async (payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        payload.blocks[0].nodes[0].text = payload.blocks[0].nodes[0].text
+          .replace("A practical English sentence with", "這是一句實用中文，錄得")
+          .replace("growth", "增長");
+        return JSON.stringify(payload);
+      },
+    });
+
+    expect(result.passed).toBe(true);
+    expect(renderEditorialBlocksToWordPress(result.blocks)).toContain("40%");
+    expect(result.validationParity?.diagnostics).toContain("structured-fallback-used");
+  });
+
   it("validation failure without repair falls back to source", async () => {
     const result = await translateEditorialBlocks({
       blocks: [
@@ -215,28 +448,29 @@ describe("translateEditorialBlocks", () => {
     expect(result.blocks.length).toBeGreaterThan(0);
   });
 
-  it("parser errors throw EditorialBlockTranslationError with component ID", async () => {
-    // H2 headings in editorial HTML trigger a parse error
-    await expect(
-      translateEditorialBlocks({
-        blocks: [p("Hello")],
-        componentId: "h2-reject",
-        componentKind: "introduction",
-        translateProtectedHtml: async () => {
-          return "<!-- wp:heading {\"level\":2} --><h2>Stray H2</h2><!-- /wp:heading -->";
-        },
-      }),
-    ).rejects.toThrow(EditorialBlockTranslationError);
-    await expect(
-      translateEditorialBlocks({
-        blocks: [p("Hello")],
-        componentId: "h2-reject",
-        componentKind: "introduction",
-        translateProtectedHtml: async () => {
-          return "<!-- wp:heading {\"level\":2} --><h2>Stray H2</h2><!-- /wp:heading -->";
-        },
-      }),
-    ).rejects.toThrow(/h2-reject/);
+  it("parser errors fail closed and never accept the malformed H2", async () => {
+    // H2 headings in editorial HTML trigger a parse error. Provider failures
+    // (including parse failures of AI output) are isolated so the orchestrator
+    // can continue translating the remaining article; the component must fail
+    // closed with a source-preserving fallback and surface the failure through
+    // the status channel the orchestrator uses to attribute the component ID.
+    let failureReported = false;
+    const result = await translateEditorialBlocks({
+      blocks: [p("Hello")],
+      componentId: "h2-reject",
+      componentKind: "introduction",
+      translateProtectedHtml: async () => {
+        return "<!-- wp:heading {\"level\":2} --><h2>Stray H2</h2><!-- /wp:heading -->";
+      },
+      onStatus: (status) => {
+        if (!status.passed) failureReported = true;
+      },
+    });
+    expect(result.passed).toBe(false);
+    // The fallback preserves the source blocks; the stray H2 is never accepted.
+    expect(result.blocks.length).toBeGreaterThan(0);
+    expect(result.blocks.every((block) => block.type !== "subheading" || (block as { level?: number }).level !== 2)).toBe(true);
+    expect(failureReported).toBe(true);
   });
 
   it("source blocks are not mutated", async () => {
@@ -507,16 +741,24 @@ describe("structured number/link validation is authoritative", () => {
   });
 
   it("parsed blocks validated before structured number/link checks", async () => {
-    await expect(
-      translateEditorialBlocks({
-        blocks: [p("Hello")],
-        componentId: "parse-first",
-        componentKind: "introduction",
-        translateProtectedHtml: async () => {
-          return "<!-- wp:heading {\"level\":2} --><h2>Stray H2</h2><!-- /wp:heading -->";
-        },
-      }),
-    ).rejects.toThrow(EditorialBlockTranslationError);
+    // A parse error (H2 heading) is detected before any number/link check can
+    // make the candidate acceptable: the component fails closed instead of
+    // passing with a malformed structure.
+    let failureReported = false;
+    const result = await translateEditorialBlocks({
+      blocks: [p("Hello")],
+      componentId: "parse-first",
+      componentKind: "introduction",
+      translateProtectedHtml: async () => {
+        return "<!-- wp:heading {\"level\":2} --><h2>Stray H2</h2><!-- /wp:heading -->";
+      },
+      onStatus: (status) => {
+        if (!status.passed) failureReported = true;
+      },
+    });
+    expect(result.passed).toBe(false);
+    expect(result.blocks.every((block) => block.type !== "subheading" || (block as { level?: number }).level !== 2)).toBe(true);
+    expect(failureReported).toBe(true);
   });
 
   it("source blocks are never mutated", async () => {
@@ -533,17 +775,24 @@ describe("structured number/link validation is authoritative", () => {
     expect(original).toEqual(copy);
   });
 
-  it("diagnostics include component ID in error messages", async () => {
-    await expect(
-      translateEditorialBlocks({
-        blocks: [p("Hello")],
-        componentId: "diag-id",
-        componentKind: "introduction",
-        translateProtectedHtml: async () => {
-          return "<!-- wp:heading {\"level\":2} --><h2>Stray H2</h2><!-- /wp:heading -->";
-        },
-      }),
-    ).rejects.toThrow(/diag-id/);
+  it("component failures are surfaced for orchestrator diagnostics", async () => {
+    // The orchestrator attributes failures to the stable component ID via the
+    // status channel (onStatus with passed=false), so a failing component is
+    // traceable even though provider failures are isolated instead of thrown.
+    let failureReported = false;
+    const result = await translateEditorialBlocks({
+      blocks: [p("Hello")],
+      componentId: "diag-id",
+      componentKind: "introduction",
+      translateProtectedHtml: async () => {
+        return "<!-- wp:heading {\"level\":2} --><h2>Stray H2</h2><!-- /wp:heading -->";
+      },
+      onStatus: (status) => {
+        if (!status.passed) failureReported = true;
+      },
+    });
+    expect(result.passed).toBe(false);
+    expect(failureReported).toBe(true);
   });
 });
 
@@ -626,16 +875,22 @@ describe("block-level number protection lifecycle", () => {
     expect(allText).not.toContain("__NUM_");
   });
 
-  it("source text without numbers passes through unchanged", async () => {
+  it("source text without numbers is translated cleanly", async () => {
+    // An empty source-number set must never be treated as a missing-number
+    // failure. The identity mock is intentionally NOT used here: an unchanged
+    // English response is correctly rejected by completeness and the
+    // source-echo guard, so the provider mock returns a real Chinese
+    // translation that contains no numbers.
     const result = await translateEditorialBlocks({
       blocks: [
         { id: "p1", type: "paragraph", content: [{ type: "text", text: "This is plain text without any digits" }] },
       ],
       componentId: "plain-safe",
       componentKind: "introduction",
-      translateProtectedHtml: async (html) => html,
+      translateProtectedHtml: async () => "<!-- wp:paragraph --><p>這是沒有數字的純文字內容</p><!-- /wp:paragraph -->",
     });
     expect(result.passed).toBe(true);
+    expect(renderEditorialBlocksToWordPress(result.blocks)).toContain("純文字");
   });
 });
 
@@ -1147,3 +1402,56 @@ describe("professional translation structure gate", () => {
     expect(result.passed).toBe(false);
   });
 });
+
+describe("source-echo validator", () => {
+  it("normalizes tags to spaces so adjacent paragraphs never merge words", () => {
+    expect(normalizeTranslationComparisonText("<p>Hello</p><p>World</p>")).toBe("hello world");
+  });
+
+  it("normalizes entities, Unicode, whitespace and case", () => {
+    expect(normalizeTranslationComparisonText("<p>\n  HELLO&nbsp;WORLD with 25% growth\n</p>")).toBe("hello world with 25% growth");
+    expect(normalizeTranslationComparisonText("He said &#39;hi&#39; &amp; left.")).toBe("he said 'hi' & left.");
+  });
+
+  it("classifies unchanged meaningful English prose as a source echo", () => {
+    expect(isSourceEcho("Hello World with 25% growth", "Hello World with 25% growth")).toBe(true);
+    expect(isSourceEcho("Threads reached 2.4M users in 2025", "Threads reached 2.4M users in 2025")).toBe(true);
+    expect(isSourceEcho("Sales increased from 36% to 66%", "Sales increased from 36% to 66%")).toBe(true);
+  });
+
+  it("classifies formatting-only differences as a source echo", () => {
+    expect(isSourceEcho(
+      "<p>Hello World with 25% growth</p>",
+      "<p>\n  HELLO&nbsp;WORLD with 25% growth\n</p>",
+    )).toBe(true);
+  });
+
+  it("classifies unchanged bilingual prose as a source echo despite CJK content", () => {
+    expect(isSourceEcho(
+      "Use 「香港創作者」 when describing local creators.",
+      "Use 「香港創作者」 when describing local creators.",
+    )).toBe(true);
+  });
+
+  it("never classifies short token-only blocks as source echoes", () => {
+    expect(isSourceEcho("25%", "25%")).toBe(false);
+    expect(isSourceEcho("2025", "2025")).toBe(false);
+    expect(isSourceEcho("Meta", "Meta")).toBe(false);
+    expect(isSourceEcho("Meta、Threads、Instagram", "Meta、Threads、Instagram")).toBe(false);
+  });
+
+  it("does not classify genuine Chinese translations as source echoes", () => {
+    expect(isSourceEcho("Hello World with 25% growth", "Hello World 錄得 25% 增長")).toBe(false);
+    expect(isSourceEcho("Threads reached 2.4M users in 2025", "Threads 在 2025 年達到 2.4M 用戶")).toBe(false);
+    expect(isSourceEcho("Sales increased from 36% to 66%", "銷售由 36% 增加至 66%")).toBe(false);
+    expect(isSourceEcho(
+      "Meta, Threads and Instagram are essential for Hong Kong marketers.",
+      "Meta、Threads、Instagram 對香港營銷人員至關重要。",
+    )).toBe(false);
+  });
+});
+
+
+
+
+

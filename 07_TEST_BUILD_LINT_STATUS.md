@@ -1,90 +1,69 @@
 # Test, TypeScript, Build, and Lint Status
 
-## DeepSeek targeted tests
+**Verified:** 1 August 2026 (evening, latest development totals)
 
-Reported after the explicit thinking/truncation implementation:
-
-- `src/lib/services/deepseek.test.ts`: **28/28 passed**
-
-Coverage includes:
-
-- routine stages explicitly disable thinking
-- reserved reasoning stages enable thinking
-- every request contains an explicit thinking object
-- `length` plus empty content retries
-- `length` plus partial content retries
-- partial content is never returned for parsing
-- normal `stop` content is unchanged
-- ordinary empty response retains retry behavior
-- reasoning content is never used as final content
-- escalation respects the 32,768 cap
+> These totals are current only as of the latest recorded run. **Do not present them as current after future code changes unless rerun.**
 
 ## Full suite
 
-Latest reported full-suite status:
+```text
+Tests       11 failed | 1630 passed (1641 total)
+```
 
-- 1,399 tests discovered/reported
-- 23 failing
+The 11 failures are the **unchanged pre-existing baseline** — zero new regressions from the coherent-chunk translation shadow, the bilingual editorial shadow, or the deterministic Cantonese repair work.
 
-The coder reported these 23 as pre-existing based on a stash comparison, mainly in untracked or previously modified test files such as:
+Failing files and counts:
 
-- `section-expander.test.ts`
-- `component-regenerator.test.ts`
-- `blog-versions.test.ts`
+- `src/lib/blog/final-seo-normalizer.test.ts` — 4 (pre-existing contract/empty-state tests)
+- `src/lib/pipeline/blog-generation-e2e.test.ts` — 1 (pre-existing language-switcher fixture href guard; production-safe)
+- `src/lib/services/component-regenerator.test.ts` — 2 (pre-existing)
+- `src/lib/services/section-expander.test.ts` — 2 (pre-existing; same file carries the 2 known TypeScript errors)
+- `src/lib/services/translation-service.test.ts` — 2 (pre-existing; includes real-DeepSeek timeouts)
 
-Do not state that these are definitively unrelated without preserving or reproducing the comparison evidence. They remain unresolved technical debt.
+## Shadow suites (all passing)
+
+- `translation-source-document.test.ts` — 20/20
+- `translation-chunk-planner.test.ts` — 23/23
+- `document-context-translation-shadow.test.ts` — 34/34
+- `document-context-translation-shadow.integration.test.ts` — 6/6
+- `translation-ai.test.ts` — 3/3
+- `document-context-shadow-preview.test.ts` — 23/23
+- **Total shadow suites: 110/110** (before the latest audit-only task)
+
+## Other targeted suites (all passing)
+
+- `src/lib/services/translation-editorial-normalization.test.ts` — 57/57
+- `src/lib/blog/final-seo-normalizer.test.ts` — 5/5 Chinese final editorial diagnostics (of 424 total in the file)
+- `src/lib/services/editorial-block-translation.test.ts` — 93/93
+- `src/lib/pipeline/blog-generation-pipeline.test.ts`, `blog-generation-service.test.ts`, `editorial-repetition-repair.test.ts`, `publication-quality.test.ts`, `editorial-polish.test.ts` — passing
 
 ## TypeScript
 
-Latest reported result:
+`npx tsc --noEmit`:
 
-- 2 errors
-- both in untracked `src/lib/services/section-expander.test.ts`
-- reported as pre-existing
+```text
+2 errors
+src/lib/services/section-expander.test.ts (29:24, 63:24)
+```
 
-Production build still passes.
+Both byte-identical to the previous baseline (pre-existing). No new TypeScript errors.
 
 ## Production build
 
 - `npm run build`: passes
 - Next.js/Turbopack compilation: passes
-- Production startup: passes
+- TypeScript in build graph: passes
+- No build warnings
 
 ## Lint baseline
 
-Latest lint report:
-
 ```text
-468 problems: 285 errors, 183 warnings
+467 problems: 284 errors, 183 warnings
 ```
 
-Top categories:
+Down one from the prior 468 baseline (one `as any` cast removed in `chatWithBudget`). No new lint issues from the shadow work.
 
-- 269 `@typescript-eslint/no-explicit-any` errors
-- 176 `@typescript-eslint/no-unused-vars` warnings
-- 7 `prefer-const` errors
-- 5 `no-require-imports` errors
-- React hook/compiler issues in dashboard UI
-- minor accessibility/image warnings
-
-The lint backlog does not explain the current final-validation failure.
-
-Do not run broad lint cleanup while repairing generation. In particular:
-
-- Do not refactor all `any` usage.
-- Do not modify ESLint configuration.
-- Do not suppress rules globally.
-- Do not mix dashboard React cleanup with pipeline repair.
-
-## Required verification after the current fix
-
-1. Targeted FAQ and malformed-repair tests
-2. Existing DeepSeek tests
-3. Full test suite with exact pass/fail delta
-4. TypeScript validation
-5. Production build
-6. One real English generation
-7. Manual article inspection
+## Reporting rule
 
 Reports must distinguish:
 

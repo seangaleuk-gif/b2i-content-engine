@@ -1,5 +1,7 @@
 # TODO
 
+> **HISTORICAL ARCHIVE.** Superseded by `NEW_CHAT_HANDOFF.md` (2026-08-01). The test totals below ("842 tests passing", "3 consecutive production translations passed versions 24-26") are stale; the current recorded full suite is 18 pre-existing failures / 1,473 passing, and the live-verified translation is project 19 version 6 (saved ID 202).
+
 ## Previous Sprints — Phases 1–7, Pipeline Bug Fixes, Chinese Translation Pipeline (Completed)
 (see CHANGELOG.md for full history)
 

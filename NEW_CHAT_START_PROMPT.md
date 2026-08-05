@@ -1,39 +1,31 @@
 # New Coding Chat — Start Message
 
-You are continuing work on the B2I Content Engine. Read every Markdown file in the handoff pack before inspecting or modifying code. Treat the handoff dated 31 July 2026 as authoritative where older project documentation conflicts with it.
+You are continuing work on the B2I Content Engine. Read `NEW_CHAT_HANDOFF.md` (the authoritative handoff) first, then inspect the actual code, tests, and logs before recommending or making any change. Treat `NEW_CHAT_HANDOFF.md` as authoritative where older documentation conflicts with it.
 
-The DeepSeek request-layer problem is already fixed and must not be changed:
+## Verified working state
 
-- every request explicitly sends `thinking: { type: "enabled" | "disabled" }`;
-- routine generation and translation use thinking disabled;
-- reserved high-level reasoning stages use thinking enabled;
-- every `finish_reason: "length"` response is rejected as truncated, including partial content;
-- token escalation remains a capped emergency fallback;
-- the latest real run showed zero reasoning tokens and first-attempt completion.
+- English generation is the production-verified baseline (Nuclear Fix v2). Auto-research and external-link generation are working. Do not alter it.
+- The active Traditional Chinese (zh-HK) pipeline is exactly **two substantive DeepSeek calls**: one full-document thinking-enabled translation (`max_tokens=65536`) + one bounded editorial review of deterministically selected at-risk units (`max_tokens=12000`).
+- Version 28 completed 105/105 coverage and saved successfully. A forensic audit found semantic/register/naturalness problems (e.g. 被見到／被相信, 精製廣告, 濫用創作者, 人肉廣告板, 大名人, 創作者或者KOL) that the deterministic gate cannot catch — this is why the bounded editorial-review call was added.
+- The real Cantonese corpus (Words.hk + HKCanCor via PyCantonese 5.0.0) is stored under `src/data/cantonese/` and used for deterministic validation + review-candidate selection only. Corpus examples are **not** injected into the AI translation prompt.
+- Simplified Chinese is out of scope.
 
-The current failure is downstream:
+## Protected, do not revisit without evidence
 
-```text
-Final validation failed: FAQ parity mismatch; malformed prose issues=1; editorial score=36 (minimum: 80); [SOFT] no H2 keyphrase
-```
+- English pipeline.
+- The one-call translation + bounded editorial review architecture (exactly two substantive calls).
+- `max_tokens=65536` for the translation call; thinking enabled for translation and review.
+- The real Cantonese corpus and its import pipeline; the authoritative B2I glossary over corpus suggestions.
+- Deterministic parity/quality validators and the no-partial-save gate.
+- No third call, no retries that generate alternative translations, no fallback pipeline, no SQL/migrations.
 
-Fix only the finalization consistency defects.
+## Next action
 
-Required work:
+The bounded editorial-review call is new and its live effect is **not yet verified**. The next action is to have the user run one production translation and inspect the review diagnostics (`result.review`: selected units, reasons, applied patches) to confirm it repairs the Version 28 problems. Then tune candidate selection based on the real output. Do not run a live translation yourself.
 
-1. Trace the FAQ from generation through factual scanning, claim ownership, editorial processing, recovery, schema generation, rendering, and final validation.
-2. Establish one current canonical FAQ source after all mutations.
-3. Generate both visible FAQ body and FAQPage schema from that same canonical source.
-4. Never restore a stale protected FAQ snapshot after factual text has been removed.
-5. Add concise parity diagnostics: canonical count, rendered count, schema count, and normalized mismatch index.
-6. Trace these malformed block IDs through every later mutation and restore:
-   - `section:section-2:section-2-wp-5`
-   - `section:section-5:section-5-wp-4`
-7. Apply repairs directly to the canonical `ArticleDocument` block by stable ID, revalidate immediately, and prove no later stage restores the old text.
-8. If local AI repair fails, regenerate only the individual paragraph with local section context.
-9. Run malformed and FAQ preflight checks immediately before final validation.
-10. Keep the editorial minimum at 80. After consistency defects are fixed, report the exact scoring deductions and repair only the responsible blocks if the score remains below 80.
+## Workflow rules
 
-Do not change DeepSeek logic, model, budgets, prompts, SEO/factual thresholds, stage order without proof, translation architecture, database code, concurrency, lint configuration, or unrelated files.
-
-Add regression tests for FAQ mutation/body/schema parity and malformed repair persistence. Run targeted tests, existing DeepSeek tests, the full suite, TypeScript validation, and production build. Report exact root causes, files changed, test/build results, remaining failures, and anything not verified. Do not claim end-to-end success until the user completes a real English generation.
+- The user manually runs all live generations and translations. Do not instruct the coder to run a live generation or translation unless the user explicitly requests it.
+- Never mix architecture diagnosis and implementation in one task.
+- Keep changes small, reversible and protected by regression tests.
+- Report exact root causes, files changed, targeted and full-suite results, TypeScript, build, remaining failures, and anything not verified.

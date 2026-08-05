@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 2,
+  "provenance": "live",
+  "generatedAt": "2026-08-04T05:53:22.407Z",
+  "deterministic": true,
+  "dataHash": "ebea768fa3ff516296e59878d232e13ef4c5d85b645d06dc863b04e7015a7b28",
+  "sources": [
+    {
+      "id": "wordshk-wordlist",
+      "url": "https://words.hk/faiman/analysis/wordslist.json",
+      "licence": "public-domain",
+      "attribution": "Words.hk (https://words.hk/)",
+      "retrievedAt": "2026-08-04T05:53:22.407Z",
+      "status": "downloaded",
+      "checksum": "7703caef2f40c324eaf27f423bd35ac6403fcdc1eac5804d07212ef45d98a50d"
+    },
+    {
+      "id": "wordshk-english-index",
+      "url": "https://words.hk/faiman/analysis/englishindex.json",
+      "licence": "public-domain",
+      "attribution": "Words.hk (https://words.hk/)",
+      "retrievedAt": "2026-08-04T05:53:22.407Z",
+      "status": "downloaded",
+      "checksum": "3e7e0e9b08c5fdb89918ac956738661534b909e0c9d863408df14376ae9f7e38"
+    },
+    {
+      "id": "hkcancor-pycantonese",
+      "url": "pycantonese:hkcancor()",
+      "licence": "CC-BY-4.0",
+      "attribution": "HKCanCor (Luke S. K. Wong), via PyCantonese — https://pycantonese.org/",
+      "retrievedAt": "2026-08-04T05:53:22.407Z",
+      "status": "downloaded",
+      "checksum": "f378e492e28347728bed547693848a232204f1a1595f2f039f3441acd0670ddc"
+    }
+  ],
+  "versions": {
+    "pycantonese": "5.0.0",
+    "wordslistSchema": "word:jyutping[]",
+    "englishIndexSchema": "term:[[word:jyutping,relevance]]",
+    "hkcancorFiles": 58
+  },
+  "counts": {
+    "lexicon": 61234,
+    "englishTerms": 40845,
+    "hkcancorOccurrences": 153656,
+    "examples": 10272,
+    "frequency": 7221,
+    "ngrams": 33503,
+    "variants": 17
+  },
+  "generatedFiles": [
+    "cantonese-examples.jsonl",
+    "cantonese-frequency.json",
+    "cantonese-lexicon.json",
+    "cantonese-ngrams.json",
+    "cantonese-variants.json",
+    "english-cantonese-index.json"
+  ]
+}

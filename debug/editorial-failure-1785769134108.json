@@ -1,0 +1,36 @@
+{
+  "createdAt": "2026-08-03T14:58:54.107Z",
+  "title": "Test Article Title",
+  "keyphrase": "test keyphrase",
+  "requestedWordCount": 500,
+  "preEditorialScore": 65,
+  "preEditorialBreakdown": {
+    "malformed": 0,
+    "repeatedPairs": 0,
+    "robotic": 0,
+    "conclusionRatio": 0.18110236220472442
+  },
+  "finalScore": 65,
+  "finalBreakdown": {
+    "malformed": 0,
+    "repeatedPairs": 0,
+    "robotic": 0,
+    "conclusionRatio": 0.18110236220472442
+  },
+  "finalReasons": [
+    "editorial score=70 (minimum: 80)"
+  ],
+  "repeatedPairs": [],
+  "rejectedCandidates": [
+    {
+      "stage": "repetition",
+      "accepted": false,
+      "reason": "editorial score did not improve: 70 → 70",
+      "score": 70
+    }
+  ],
+  "roboticMatches": [],
+  "malformedFindings": [],
+  "preEditorialHtml": "<!-- wp:html --><div class=\"b2i-language-switcher\" data-language=\"en\"><span>English</span> | <a href=\"/blog/test-post-zh\">繁體中文</a></div><!-- /wp:html -->\n\n<!-- wp:paragraph --><p>This is the introduction paragraph that explains the topic in detail. It has multiple sentences to provide context. This is the third sentence for good measure.</p><!-- /wp:paragraph -->\n\n<!-- wp:heading {\"level\":2} -->\n<h2>First Main Heading</h2>\n<!-- /wp:heading -->\n\n<!-- wp:paragraph --><p>First section content with several sentences. This covers the first main topic in detail. It has enough content to be useful for readers.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Additional paragraph in the first section. This provides more depth on the first topic. Readers will find this informative and well-structured.</p><!-- /wp:paragraph -->\n\n<!-- wp:heading {\"level\":2} -->\n<h2>Second Topic Explored</h2>\n<!-- /wp:heading -->\n\n<!-- wp:paragraph --><p>Second section body text with quality content. This section explores a different angle of the main topic. Readers benefit from the varied perspective provided here.</p><!-- /wp:paragraph -->\n\n<!-- b2i-conclusion-start -->\n\n<!-- wp:paragraph --><p>In conclusion, this approach provides significant value. Readers should take action on the key points discussed above. The benefits are clear and well-documented.</p><!-- /wp:paragraph -->\n\n<!-- b2i-conclusion-end -->\n\n<!-- b2i-faq-heading -->\n\n<!-- wp:heading {\"level\":2} -->\n<h2>Frequently Asked Questions</h2>\n<!-- /wp:heading -->\n\n<!-- wp:html -->\n<div class=\"faq-item\">\n  <h3>What is the main benefit?</h3>\n  <p>It helps you save time and money.</p>\n</div>\n<!-- /wp:html -->\n\n<!-- wp:html -->\n<div class=\"faq-item\">\n  <h3>How do I get started?</h3>\n  <p>Simply sign up and follow the setup.</p>\n</div>\n<!-- /wp:html -->\n\n<!-- wp:html -->\n<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"FAQPage\",\n  \"mainEntity\": [\n    {\n      \"@type\": \"Question\",\n      \"name\": \"What is the main benefit?\",\n      \"acceptedAnswer\": {\n        \"@type\": \"Answer\",\n        \"text\": \"It helps you save time and money.\"\n      }\n    },\n    {\n      \"@type\": \"Question\",\n      \"name\": \"How do I get started?\",\n      \"acceptedAnswer\": {\n        \"@type\": \"Answer\",\n        \"text\": \"Simply sign up and follow the setup.\"\n      }\n    }\n  ]\n}\n</script>\n<!-- /wp:html -->\n\n<!-- wp:html --><div class=\"cta-block\"><h2>Ready to Start?</h2><p><a href=\"https://app.b2ihub.com/signup\">Create Free Account</a></p></div><!-- /wp:html -->",
+  "postTargetedRepairsHtml": "<!-- wp:html --><div class=\"b2i-language-switcher\" data-language=\"en\"><span>English</span> | <a href=\"/blog/test-post-zh\">繁體中文</a></div><!-- /wp:html -->\n\n<!-- wp:paragraph --><p>This is the introduction paragraph that explains the topic in detail. It has multiple sentences to provide context. This is the third sentence for good measure.</p><!-- /wp:paragraph -->\n\n<!-- wp:heading {\"level\":2} -->\n<h2>First Main Heading</h2>\n<!-- /wp:heading -->\n\n<!-- wp:paragraph --><p>First section content with several sentences. This covers the first main topic in detail. It has enough content to be useful for readers.</p><!-- /wp:paragraph -->\n\n<!-- wp:paragraph --><p>Additional paragraph in the first section. This provides more depth on the first topic. Readers will find this informative and well-structured.</p><!-- /wp:paragraph -->\n\n<!-- wp:heading {\"level\":2} -->\n<h2>Second Topic Explored</h2>\n<!-- /wp:heading -->\n\n<!-- wp:paragraph --><p>Second section body text with quality content. This section explores a different angle of the main topic. Readers benefit from the varied perspective provided here.</p><!-- /wp:paragraph -->\n\n<!-- b2i-conclusion-start -->\n\n<!-- wp:paragraph --><p>In conclusion, this approach provides significant value. Readers should take action on the key points discussed above. The benefits are clear and well-documented.</p><!-- /wp:paragraph -->\n\n<!-- b2i-conclusion-end -->\n\n<!-- b2i-faq-heading -->\n\n<!-- wp:heading {\"level\":2} -->\n<h2>Frequently Asked Questions</h2>\n<!-- /wp:heading -->\n\n<!-- wp:html -->\n<div class=\"faq-item\">\n  <h3>What is the main benefit?</h3>\n  <p>It helps you save time and money.</p>\n</div>\n<!-- /wp:html -->\n\n<!-- wp:html -->\n<div class=\"faq-item\">\n  <h3>How do I get started?</h3>\n  <p>Simply sign up and follow the setup.</p>\n</div>\n<!-- /wp:html -->\n\n<!-- wp:html -->\n<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"FAQPage\",\n  \"mainEntity\": [\n    {\n      \"@type\": \"Question\",\n      \"name\": \"What is the main benefit?\",\n      \"acceptedAnswer\": {\n        \"@type\": \"Answer\",\n        \"text\": \"It helps you save time and money.\"\n      }\n    },\n    {\n      \"@type\": \"Question\",\n      \"name\": \"How do I get started?\",\n      \"acceptedAnswer\": {\n        \"@type\": \"Answer\",\n        \"text\": \"Simply sign up and follow the setup.\"\n      }\n    }\n  ]\n}\n</script>\n<!-- /wp:html -->\n\n<!-- wp:html --><div class=\"cta-block\"><h2>Ready to Start?</h2><p><a href=\"https://app.b2ihub.com/signup\">Create Free Account</a></p></div><!-- /wp:html -->"
+}

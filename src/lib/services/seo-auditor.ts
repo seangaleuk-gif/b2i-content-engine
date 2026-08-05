@@ -24,6 +24,7 @@ import {
   translationFaqCount,
 } from "@/lib/content-standards";
 import { closeVariant } from "@/lib/seo/seo-text-utils";
+import { findFormalRegisterIssues } from "./translation-glossary";
 
 export type AuditStatus = "pass" | "warning" | "fail" | "not_applicable";
 
@@ -774,6 +775,30 @@ export function runChineseAudit(input: ChineseAuditInput): AuditResult {
     checks.push(makeCheck("faq_schema", "FAQ Schema", 0, "fail", `Chinese FAQ issues: ${chineseFaqIssues.join("; ")}`, "FAQPage schema", chineseFaqIssues.join(". "), "Structure & Schema"));
   } else {
     checks.push(makeCheck("faq_schema", "FAQ Schema", 0, "fail", "No Chinese FAQPage JSON-LD found", "FAQPage schema", "No FAQPage schema found in the Chinese article.", "Structure & Schema"));
+  }
+
+  // ── Deterministic final editorial diagnostics (soft) ──
+  // Detect proven Cantonese defects. These are warnings only — they never block
+  // saving and must not create full-section AI repair loops.
+  const blogText = blog.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  if (/([\u3400-\u9fff])\s+([\u3400-\u9fff])/u.test(blogText)) {
+    checks.push(makeCheck("cjk_stray_whitespace", "CJK Stray Whitespace", 90, "warning", "Han-Han whitespace present", "No whitespace between CJK words", "Accidental whitespace detected between adjacent Chinese words.", "Content Quality"));
+  }
+  if (/或者\s*創作者\s*合作/.test(blogText)) {
+    checks.push(makeCheck("creator_duplicate", "Duplicated Creator Phrase", 90, "warning", "「或者…創作者…合作」", "No duplicated 創作者", "Redundant creator phrase detected.", "Content Quality"));
+  }
+  if (/揀啱你\s*創作者/.test(blogText)) {
+    checks.push(makeCheck("broken_possessive", "Broken Possessive Phrase", 90, "warning", "「揀啱你創作者…」", "Natural possessive 揀啱你嘅…", "Broken possessive construction detected.", "Content Quality"));
+  }
+  if (/感覺好人性化/.test(blogText)) {
+    checks.push(makeCheck("literal_human", "Literal Human Phrase", 90, "warning", "「感覺好人性化」", "Natural 有人情味 phrasing", "Literal 'humanized' phrasing detected.", "Content Quality"));
+  }
+  // Formal written-Chinese register markers remaining in the body are advisory
+  // only (never a hard failure and never a repair trigger). Protected compounds
+  // such as 與其/與否/參與 are excluded by the glossary validator itself.
+  const formalRegisterIssues = findFormalRegisterIssues(blogText);
+  if (formalRegisterIssues.length > 0) {
+    checks.push(makeCheck("formal_register", "Formal Register Markers", 90, "warning", `${formalRegisterIssues.length} markers`, "Conversational Cantonese", "Formal written-Chinese register markers remain; the deterministic normalizer should convert these.", "Content Quality"));
   }
 
   // ── Weighted scoring ──

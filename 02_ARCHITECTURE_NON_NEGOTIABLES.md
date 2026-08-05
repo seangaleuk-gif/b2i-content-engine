@@ -19,7 +19,7 @@ The AI does not own these components:
 - Visible FAQ structure
 - FAQPage JSON-LD schema
 
-The visible FAQ and schema must always be generated from the same current canonical FAQ entries. A stale protected FAQ snapshot must never overwrite a later factual or editorial mutation.
+The visible FAQ and schema must always be generated from the same current canonical FAQ entries. A stale protected FAQ snapshot must never overwrite a later factual or editorial mutation. `final-preflight` verifies canonical/rendered/schema parity immediately before final validation.
 
 ## Pipeline ownership
 
@@ -49,7 +49,7 @@ No stage may mutate an HTML string and silently leave `ArticleDocument` stale.
 
 ## Stable block identity
 
-Repairs must target stable block IDs, not array positions, labels such as “editable text 4,” or fuzzy paragraph matching.
+Repairs must target stable block IDs (`kind:componentId:blockId`), not array positions, labels such as "editable text 4," or fuzzy paragraph matching.
 
 For every repair:
 
@@ -57,6 +57,8 @@ For every repair:
 - Replace the canonical block content.
 - Re-run validation on that exact block immediately.
 - Confirm later stages do not restore the previous content.
+
+Targeted editorial repairs (malformed, weakened, repetition) persist to canonical state even when the score-gated general polish is rejected.
 
 ## Validation ownership
 
@@ -79,7 +81,7 @@ Examples include:
 - FAQ count or FAQ schema parity mismatch
 - CTA/signup mismatch
 - Internal-link maximum breach
-- Editorial score below the configured minimum
+- Editorial score below the configured minimum (80)
 
 ### Soft warnings
 
@@ -91,6 +93,21 @@ Examples include:
 - Slight word-count deviation when policy marks it soft
 
 Do not promote a soft warning into the root cause of an unrelated hard failure.
+
+## Editorial repetition repair
+
+- The earlier paragraph of a near-duplicate pair is always preserved; only the later paragraph is rewritten.
+- The repair prompt receives the preserved partner text and the duplicated idea.
+- A candidate is rejected when its target still overlaps the preserved paragraph at ≥ 0.55 word-set overlap.
+- After two failed AI attempts, a bounded deterministic fallback removes echoed sentences (keeping numbers, links, quotes, protected sentences, and exact keyphrase occurrences) or removes the block only when nothing protected is lost.
+- The overlap threshold (0.55) and the editorial minimum (80) are fixed; do not lower them.
+
+## Research and external links
+
+- Research dispatch is owned by `runBlogGeneration`: automatic by default when no approved `research_sources` rows exist; manual rows suppress automatic research; provider failures degrade with a clear warning and never fabricate sources.
+- The pipeline consumes `context.research` for prompts, factual scanning, claim ownership, and external-link injection.
+- External links are injected only from approved research sources (valid http(s), non-B2I domains), with candidates/inject/final diagnostics and an explicit warning when zero eligible sources exist.
+- External-link counting uses the canonical definition (`countEditorialExternalLinks` / `extractEditorialExternalLinkUrls`): FAQ schema script blocks, CTA signup, language switcher, internal B2I URLs, and relative URLs are excluded. The SEO audit reads the same canonical metric.
 
 ## AI provider ownership
 
@@ -113,6 +130,10 @@ Retain the existing single-owner architecture:
 - `errors.ts`: `AppError` and response conversion
 
 Do not expose internal provider errors, stack traces, filesystem paths, or database details in public responses.
+
+## Translation scope
+
+Traditional Chinese is the only translation target. Simplified Chinese is out of scope. Do not add Simplified Chinese code paths, prompts, or tests without explicit user instruction.
 
 ## No architectural reinterpretation
 

@@ -256,3 +256,69 @@ describe("2500-word post-assembly generation pipeline", () => {
     expect(result.stageOutputs.every((output) => output.accepted)).toBe(true);
   });
 });
+
+describe("external-link pipeline diagnostics", () => {
+  function runWithContext(context: { research: Array<{ url: string; title: string; snippet?: string; category?: string; position?: number }> }) {
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    const keyphrase = "threads marketing hong kong";
+    const { min: wordMin, max: wordMax } = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "links-test",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, wordMin, wordMax, keyphrase),
+      ctx: { research: context.research },
+      wordMin,
+      wordMax,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    return runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => {
+        throw new Error("Unexpected AI call in deterministic end-to-end test");
+      },
+      makeTrackedChatForStage: () => async () => {
+        throw new Error("Unexpected tracked AI call in deterministic end-to-end test");
+      },
+      telemetry: {},
+      context,
+    });
+  }
+
+  it("injects eligible research sources and keeps them in the final article", async () => {
+    const sources = [
+      { url: "https://example.com/local-teams", title: "Local Teams Share Useful Lessons", snippet: "Clear and honest words build trust with customers." },
+      { url: "https://example.com/weekly-plan", title: "A Small Weekly Plan Keeps Work Steady", snippet: "Simple examples help busy owners take a practical next step." },
+    ];
+    let result: Awaited<ReturnType<typeof runPostAssemblyPipeline>> | undefined;
+    try {
+      result = await runWithContext({ research: sources });
+    } catch {
+      // final validation may fail for unrelated editorial reasons; inspect state
+    }
+    const finalBlog = result ? result.blog : "";
+    const present = sources.filter((source) => finalBlog.includes(source.url));
+    expect(present.length).toBeGreaterThan(0);
+    if (result) {
+      expect(result.warnings.some((w: string) => w.includes("no research sources"))).toBe(false);
+    }
+  });
+
+  it("warns clearly when no research sources are available", async () => {
+    let result: Awaited<ReturnType<typeof runPostAssemblyPipeline>> | undefined;
+    try {
+      result = await runWithContext({ research: [] });
+    } catch {
+      // final validation may fail for unrelated editorial reasons; inspect state
+    }
+    expect(result).toBeDefined();
+    expect(result!.warnings.some((w: string) => w.includes("no research sources available"))).toBe(true);
+  });
+});

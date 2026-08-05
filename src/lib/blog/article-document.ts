@@ -50,6 +50,31 @@ export interface InsertedLink {
   sourceType: "editorial-external" | "internal" | "cta" | "language";
 }
 
+/**
+ * A single external source reference carried as structured data. The original
+ * English title, publisher and URL are immutable canonical values used for
+ * traceability and validation; the model may edit only the localized display
+ * fields. The visible Chinese citation block is rendered deterministically from
+ * these fields (the application never shows the English original beside the
+ * Chinese display title).
+ */
+export interface SourceReferenceUnit {
+  /** Stable reference ID, e.g. `source-ref-0`. */
+  sourceReferenceId: string;
+  /** The underlying translation source-unit ID (e.g. `section.2.block.3`). */
+  sourceUnitId: string;
+  /** Immutable original English source title (never displayed beside Chinese). */
+  originalTitle: string;
+  /** Immutable original publisher / brand identity derived from the URL. */
+  originalPublisher?: string;
+  /** Immutable original URL, preserved byte-for-byte. */
+  originalUrl?: string;
+  /** Localized Traditional Chinese display title (model-editable). */
+  localizedDisplayTitle?: string;
+  /** Approved localized publisher name (model-editable only when approved). */
+  localizedPublisher?: string;
+}
+
 // ── Compatibility helpers for legacy consumers ──
 // Render a single component to HTML without going through the full document renderer.
 export function renderComponentHtml(component: ArticleComponent): string {
@@ -74,6 +99,8 @@ export interface ArticleDocument {
   cta: ProtectedArticleBlock | null;
   faqSchema: ProtectedArticleBlock | null;
   insertedLinks: InsertedLink[];
+  /** Structured external source references (deterministically localized + validated). */
+  sourceReferences?: SourceReferenceUnit[];
 }
 
 function countVisibleTextWords(text: string): number {

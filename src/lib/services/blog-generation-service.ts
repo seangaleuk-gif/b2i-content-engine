@@ -11,6 +11,8 @@ import { getCompiledBundle } from "@/lib/services/prompt-compiler";
 import { AiService, type ChatMessage, type ChatOptions } from "@/lib/services/deepseek";
 import { AppError } from "@/lib/services/errors";
 import { countReadableWords, robustJsonParse, repairMetaDescription, containsExactPhrase } from "@/lib/services/text-utils";
+import { extractEditorialExternalLinkUrls } from "@/lib/seo/seo-text-utils";
+import { runBraveResearchWithRetry } from "@/lib/services/brave";
 import { WORD_ALLOCATION, GENERATION_WORD_BUFFER } from "@/lib/services/generation-constants";
 import { englishWordTolerance, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount, dynamicH2Range, dynamicFaqRange } from "@/lib/content-standards";
 import { runComponentRegeneration, regenerateIntroduction, regenerateSection, regenerateConclusion, type GenContext } from "@/lib/services/component-regenerator";
@@ -20,7 +22,7 @@ import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
-import { pairedSlugs, sanitizeSectionUrls } from "@/lib/services/article-postprocessors";
+import { pairedSlugs, sanitizeSectionUrls, isEligibleExternalSourceUrl } from "@/lib/services/article-postprocessors";
 import { rebalanceWpBlocks } from "@/lib/services/text-utils";
 import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks } from "@/lib/blog/article-content";
 import { buildClaimOwnershipLedger, formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
@@ -158,6 +160,64 @@ export interface GenerationOverrides {
   requestDeepSeek?: (stage: string, messages: ChatMessage[], options?: ChatOptions) => Promise<{ content: string }>;
 }
 
+export interface ResearchDispatchDecision {
+  mode: "manual" | "auto" | "auto-ineligible";
+  existingCount: number;
+  willRun: boolean;
+  reason: string;
+}
+
+/**
+ * Deterministic research-dispatch decision for a normal blog generation.
+ *
+ * Contract (supported by the UI generation step "Loading Research", the
+ * English pipeline doc's "research/evidence preparation" first step, and the
+ * generation prompts that assign approved evidence to body sections):
+ * research is automatic by default; manually generated sources are used as-is
+ * and suppress automatic research.
+ */
+export function resolveResearchDispatch(
+  existingCount: number,
+  topic: string,
+): ResearchDispatchDecision {
+  if (existingCount > 0) {
+    return {
+      mode: "manual",
+      existingCount,
+      willRun: false,
+      reason: `manual research already present (${existingCount} sources)`,
+    };
+  }
+  if (!topic || !topic.trim()) {
+    return {
+      mode: "auto-ineligible",
+      existingCount: 0,
+      willRun: false,
+      reason: "no keyword or topic to research",
+    };
+  }
+  return {
+    mode: "auto",
+    existingCount: 0,
+    willRun: true,
+    reason: "no approved research; automatic research eligible",
+  };
+}
+
+/** Deduplicate research items by normalized URL, preserving first occurrence. */
+export function deduplicateResearchItems<T extends { url?: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of items) {
+    if (!item.url) continue;
+    const normalized = item.url.replace(/\/+$/, "").toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(item);
+  }
+  return out;
+}
+
 export async function runBlogGeneration(
   userId: string,
   projectId: number,
@@ -179,6 +239,71 @@ export async function runBlogGeneration(
   const knowledge = await knowledgeRepository.findByUser(userId);
   await promptSectionRepository.seedDefaults(userId);
   const promptSections = await promptSectionRepository.findByUser(userId);
+
+  // ── Research dispatch ──
+  // Automatic by default: when no approved research rows exist, run the
+  // research provider for the project topic and persist the results so the
+  // article pipeline, factual scanner, claim ownership and external-link
+  // stages all receive the same approved sources. Manually generated rows
+  // suppress automatic research. Provider failures degrade to the previous
+  // no-research behavior with a clear warning — never fake sources.
+  const researchTopic = project.keyword || project.name || "";
+  const dispatch = resolveResearchDispatch(research.length, researchTopic);
+  console.log(
+    `[research-dispatch] requested=auto resolvedMode=${dispatch.mode}` +
+    ` autoEligible=${dispatch.willRun} manualSources=${research.length}` +
+    ` willRun=${dispatch.willRun} reason="${dispatch.reason}"`,
+  );
+  const researchWarnings: string[] = [];
+  if (dispatch.willRun) {
+    console.log(`[research:start] topic="${researchTopic}" mode=auto`);
+    try {
+      const rawResults = await runBraveResearchWithRetry(researchTopic);
+      const deduped = deduplicateResearchItems(rawResults);
+      console.log(
+        `[research:provider] calls=1 success=${deduped.length > 0 ? 1 : 0}` +
+        ` failed=${deduped.length > 0 ? 0 : 1}` +
+        ` raw=${rawResults.length} parsed=${deduped.length}`,
+      );
+      if (deduped.length === 0) {
+        console.log(`[research:results] raw=${rawResults.length} parsed=0 approved=0 rejected=${rawResults.length}`);
+        researchWarnings.push("Automatic research returned no sources; generation continues without research evidence.");
+      } else {
+        await researchRepository.createMany(
+          deduped.map((item) => ({
+            projectId: Number(projectId),
+            category: item.category,
+            title: item.title,
+            url: item.url,
+            snippet: item.snippet,
+            position: item.position,
+          })),
+        );
+        const persisted = await researchRepository.findByProject(Number(projectId));
+        research.splice(0, research.length, ...persisted);
+        const eligible = research.filter((item) => isEligibleExternalSourceUrl(item.url)).length;
+        console.log(
+          `[research:results] raw=${rawResults.length} parsed=${deduped.length}` +
+          ` approved=${research.length} rejected=${rawResults.length - deduped.length}`,
+        );
+        console.log(
+          `[research:handoff] claims=0 sources=${research.length} externalLinkCandidates=${eligible}`,
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[research:provider] failed=1 error="${message}"`);
+      console.log(`[research:results] raw=0 parsed=0 approved=0 rejected=0`);
+      researchWarnings.push(
+        `Automatic research failed (${message}); generation continues without research evidence.`,
+      );
+    }
+  } else {
+    const eligible = research.filter((item) => isEligibleExternalSourceUrl(item.url)).length;
+    console.log(
+      `[research:handoff] claims=0 sources=${research.length} externalLinkCandidates=${eligible}`,
+    );
+  }
 
   const context: BlogContext = {
     project: {
@@ -511,6 +636,9 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     telemetry,
     context,
   } satisfies PipelineDependencies);
+  if (researchWarnings.length > 0) {
+    pipelineState.warnings.push(...researchWarnings);
+  }
 
   const finalBlog = pipelineState.blog;
   const finalTitle = pipelineState.title;
@@ -519,7 +647,8 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   const generated = {
     title: finalTitle, slug: slugs.englishSlug, metaDescription: finalMeta,
     excerpt: outline.excerpt || "", blog: finalBlog, faq: pipelineState.faq || [],
-    internalLinks: [], externalLinks: [], categories: [], tags: [], readingTime: "", summary: "",
+    internalLinks: [], externalLinks: extractEditorialExternalLinkUrls(finalBlog),
+    categories: [], tags: [], readingTime: "", summary: "",
   };
 
   const qualityReport = buildGenerationReport(

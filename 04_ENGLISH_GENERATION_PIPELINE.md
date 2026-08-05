@@ -4,6 +4,7 @@
 
 ```text
 request validation
+→ research dispatch (automatic when no approved rows exist)
 → research/evidence preparation
 → outline
 → introduction and sections
@@ -15,10 +16,16 @@ request validation
 → claim ownership cleanup
 → malformed-prose repair
 → editorial repair/polish with guarded acceptance
-→ internal/external links
+→ internal links (link-injector)
+→ external links (approved research sources)
+→ external dedup
+→ link enforcement
+→ factual final confirmation
 → language switcher and CTA preservation
 → final trim
 → FAQ recovery/schema generation
+→ word-count check
+→ final preflight (malformed re-check, FAQ parity, external-link final count)
 → final validation
 → persistence/readback
 ```
@@ -52,7 +59,7 @@ Product targets for a typical approximately 2,500-word article:
 - Keyphrase density policy remains the centralized source of truth
 - Severe stuffing above the configured maximum remains a hard failure
 
-The latest run had the exact keyphrase missing from an H2, but policy reported it as `[SOFT]`; it did not block the article.
+A missing exact keyphrase in an H2 is `[SOFT]`; it does not block the article.
 
 ## Factual rules
 
@@ -64,25 +71,42 @@ The latest run had the exact keyphrase missing from an H2, but policy reported i
 - The conclusion must not introduce unsupported new numbers or factual claims.
 - Example questions and quoted post prompts must not be misclassified as testimonial or evidence claims.
 
+## Research and evidence preparation
+
+- Research runs automatically at generation start when no approved `research_sources` rows exist for the project (topic from project keyword/name). Manually generated research rows suppress automatic research.
+- Provider failures and zero-result responses degrade to the previous no-research behavior with a clear warning; no sources are fabricated.
+- Diagnostics: `[research-dispatch]`, `[research:start]`, `[research:provider]`, `[research:results]`, `[research:handoff]`.
+- Approved sources reach outline, section prompts, factual scanning, claim ownership, and external-link injection through `context.research`.
+
+## External links
+
+- The `external-links` stage injects `Source: <a href="...">title</a>.` citations from eligible approved sources (valid http(s), non-B2I domains) into relevant body sections.
+- A source attaches when the paragraph shares a quantity with it, contains a quotation with ≥6 shared tokens, or shares ≥6 lexical tokens (prose-only sources).
+- Diagnostics: `[external-links:candidates]`, `[external-links:inject]`, `[external-links:final]`.
+- When zero eligible sources exist, the pipeline logs and records an explicit warning instead of pretending links were added.
+- External-link counting uses the canonical definition (`countEditorialExternalLinks`): FAQ schema script blocks, CTA signup links, language-switcher links, internal B2I URLs, and relative URLs are excluded. The SEO audit reads the same canonical metric.
+
 ## Editorial rules
 
 - Editorial minimum remains **80**.
 - Do not lower the threshold to force an article through.
 - Editorial candidates are atomic: accept only when protected facts, structure, FAQ, CTA, links, word count, and quality all remain valid.
+- Targeted repairs (malformed, weakened, repetition) persist to canonical state even when the general polish is rejected.
+- Repetition repair preserves the earlier paragraph and rewrites only the later duplicate; overlap must drop below 0.55 or the candidate is rejected; a bounded deterministic fallback applies after two failed AI attempts.
 - Full-article fallback must not replace a stronger article with a weaker one.
-- Repair only the responsible paragraph or repetition pair when possible.
 - Stable block IDs must survive repair and later stages.
 
-## Current latest-run metrics
+## Current verified latest-run metrics
 
-Before final rejection:
+```text
+editorial score=94 | repeatedPairs=0 | malformed=0
+FAQ parity valid=true canonical=6 rendered=6 schema=6
+external links=6 | internal links=4 | keyphrase density=1.08%
+word count in range (2125-2875)
+final validation PASS
+```
 
-- Canonical word count: 2,807
-- Allowed range shown by the pipeline: 2,125–2,875
-- Final hard failures: FAQ parity mismatch, malformed prose issue, editorial score 36
-- Soft warning: no H2 keyphrase
-
-## Current generation acceptance test
+## Generation acceptance test
 
 A run is accepted only when:
 

@@ -1,95 +1,65 @@
-# Latest Changelog — 31 July 2026
+# Latest Changelog — 1 August 2026
 
-## DeepSeek empty-content diagnosis
+## Traditional Chinese translation — live verified (newest)
 
-Observed failures:
+- Full live translation saved: project 19, version 6, saved ID 202; 40 API calls, 0 retries, 26 deterministic editorial changes; `deepseek-v4-flash`, thinking disabled.
+- Structural translation works: full article saved, no duplicated article, FAQ/schema parity preserved, CTA preserved, links and protected content preserved.
+- Deterministic Cantonese editorial normalization added: source-label and paragraph punctuation, terminology/register normalization, literal-phrase repair, unsupported-claim softening, heading variants, and consistent FAQ/schema parity.
+- Natural Hong Kong code-switching allowed (`followers`, `post`, `唔 work`, `KPI`, `Reel`, platform/agency/company names); genuine untranslated English sentences still fail.
+- Next task: translation-pipeline architecture audit (see `NEW_CHAT_HANDOFF.md` section 2).
 
-```text
-DeepSeek response had no content in choices
-```
+## English generation — final verified run (31 July 2026)
 
-Isolated diagnostics established that `deepseek-v4-flash` was using thinking mode by default. Reasoning tokens count against `max_tokens`. When reasoning consumed the full budget, responses returned HTTP 200 with:
+- Fresh live English generation passed final validation: editorial score 94, repeated pairs 0, malformed 0, FAQ parity 6/6/6, external links 6, internal links 4, keyphrase density 1.08%.
+- Auto-research and external-link generation live verified.
+- Keyphrase exclusion consistent across editorial and final validation.
+- Repetition false-positive fixed (keyphrase excluded from overlap); malformed last-resort resolution; editorial candidate word-count trimming.
 
-- `finish_reason: "length"`
-- empty `message.content`
-- non-empty `reasoning_content`
+## Verified baseline
 
-The original wrapper reduced this to a generic empty-response error.
+- Full suite: 18 pre-existing failures, 1,473 passing (1491 total), zero new regressions.
+- Lint: 468 (285 errors / 183 warnings). Build passes. 2 pre-existing TypeScript errors in `section-expander.test.ts`.
 
-## Token-exhaustion observability and retry
+---
 
-Implemented in `deepseek.ts`:
+## Earlier changelog (31 July 2026)
 
-- `token_exhaustion` error classification
-- finish-reason and usage inspection
-- sanitized response metrics
-- retry budget escalation ×1.5 and ×2
-- global cap 32,768
+## DeepSeek request layer (protected, earlier in the day)
 
-Stage budgets were raised to accommodate reasoning-model output.
+- Explicit thinking-mode control: every request sends `thinking: { type: "enabled" | "disabled" }`; `thinking: false` is HTTP 400.
+- Routine stages (generation, repair, metadata, translation) use thinking disabled; reserved reasoning stages (`factual-risk`, `evidence-reconciliation`, `quality-diagnosis`) use thinking enabled.
+- Every `finish_reason === "length"` response rejected as truncated, including partial content; partial JSON never reaches parsers.
+- Token escalation: ×1.5 / ×2, global cap 32,768.
+- Verified effect: `reasoning_tokens=0`, first-attempt completion, no exhaustion loops.
 
-Focused tests were added and passed.
+## FAQ parity and malformed persistence (fixed, production verified)
 
-## Runaway reasoning evidence
+- FAQ visible-body/schema parity: HTML round-trips no longer double-encode FAQ `answerText`/`question`; schema and visible body stay in parity; `final-preflight` verifies canonical/rendered/schema counts immediately before final validation.
+- Malformed repair persistence: successful targeted repairs (malformed, weakened, repetition) are committed to canonical state even when the score-gated general polish is rejected (`targeted repairs persisted`), so a later restore can never resurrect a repaired fragment.
 
-A production attempt showed routine calls exhausting 6K, 8K, 12K, and 16K token budgets, including a small section-trimming prompt. Some calls returned partial truncated JSON with `finish_reason=length`. This proved that indefinitely raising token ceilings was not an acceptable production strategy.
+## Editorial repetition repair (fixed, production verified)
 
-## Explicit thinking-mode control
+- Root cause: the repetition pass was blind (no partner context) and its selection ranked by word count, which picked the longer later paragraph as "strongest".
+- Fix: order-based targeting preserves the earlier paragraph and rewrites only the later duplicate; the prompt supplies the preserved partner text and duplicated idea; per-target overlap must drop below 0.55 or the candidate is rejected; after two failed AI attempts a bounded deterministic fallback removes echoed sentences (keeping numbers, links, quotes, protected sentences, exact keyphrase) or removes the block only when nothing protected is lost.
+- Live result: `[editorial-repetition-repair] accepted score=30 → 94`, final editorial score 94, repeatedPairs 0.
 
-Live probing confirmed:
+## Robotic detector fix
 
-```ts
-thinking: { type: "disabled" }
-```
+- `remember` is only counted as a robotic phrase in imperative form (sentence-start), eliminating false positives such as "people will remember your brand".
 
-disables reasoning, while:
+## Research and external links (implemented and test verified; live verification pending)
 
-```ts
-thinking: false
-```
+- Automatic research dispatch in `runBlogGeneration`: runs `runBraveResearchWithRetry` when no approved `research_sources` rows exist; manual rows suppress auto; provider failure/empty degrades with a clear warning; no fabricated sources.
+- External links: injected from eligible approved sources; `[external-links:candidates]` / `[external-links:inject]` / `[external-links:final]` diagnostics; explicit warning when zero eligible sources; prose-overlap relevance fallback (≥6 shared tokens) so non-numeric sources can be linked; canonical `extractEditorialExternalLinkUrls`; `generated.externalLinks` metadata now reflects the real final article.
+- Status: covered by service and e2e tests; a live normal generation without manual research is the remaining verification.
 
-is rejected with HTTP 400.
+## Translation (implemented and test verified; live verification pending)
 
-Implemented:
+- Editorial-block translation suite: 93/93 passing, including source-echo rejection for unchanged English candidates ("Hello World with 25% growth" etc.), CJK-aware completeness metric, structured fallback, and fail-closed parse handling.
+- Live Traditional Chinese translation still awaiting verification against the verified English baseline.
 
-- `ThinkingMode` type
-- stage-to-mode mapping
-- explicit `thinking` object in every request
-- routine generation/translation thinking disabled
-- reserved reasoning stages thinking enabled
-- unmapped stage warning with disabled fallback
-- translation component name forwarded as stage
+## Verified baseline
 
-## Truncated response handling
-
-Implemented a `truncated` response path:
-
-- every `finish_reason === "length"` response is rejected
-- partial non-empty content is never accepted
-- truncated JSON never reaches parsing
-- controlled escalation remains available
-
-## Verified performance improvement
-
-The next production generation showed:
-
-- thinking disabled on routine stages
-- zero reasoning tokens
-- first-attempt completion across normal generation stages
-- restored generation speed
-- no reasoning-token-exhaustion loop
-
-## Current downstream failure
-
-The same run reached final validation and failed on:
-
-- FAQ parity mismatch
-- one malformed-prose issue
-- editorial score 36, minimum 80
-- soft warning: exact keyphrase missing from an H2
-
-DeepSeek request behavior is no longer the current blocker.
-
-## Current next repair
-
-Fix canonical FAQ synchronization and stable-block malformed-repair persistence. Do not alter the completed DeepSeek work.
+- Fresh live English generation passed: editorial score 94, repeatedPairs 0, malformed 0, FAQ parity valid, final validation PASS.
+- Full suite: 18 pre-existing failures, 1442 passed (1460 total), zero new regressions.
+- Lint: 468 (285 errors / 183 warnings). Build passes. 2 pre-existing TypeScript errors in `section-expander.test.ts`.

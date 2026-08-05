@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   analyzePublicationQuality,
+  countRepeatedIdeaPairs,
+  keyphraseExclusionSet,
   trimConclusionToBudget,
 } from "./publication-quality";
 import {
@@ -8,6 +10,7 @@ import {
   type ArticleDocument,
 } from "./article-document";
 import {
+  analyzeFinalArticle,
   buildPolicy,
   evaluatePolicy,
   type FinalArticleMetrics,
@@ -124,6 +127,34 @@ describe("publication-quality analysis", () => {
     expect(metrics.malformedProseCount).toBe(0);
     expect(metrics.conclusionNewNumericClaimCount).toBe(0);
   });
+
+  describe("robotic phrase detection", () => {
+    it("does not count non-imperative uses of the word remember", () => {
+      const metrics = analyzePublicationQuality(article([
+        "Customers who enjoy a post will remember your brand the next time they shop.",
+        "People will remember a helpful answer long after they read it.",
+      ]));
+      expect(metrics.roboticPhraseCount).toBe(0);
+    });
+
+    it("counts the imperative remember form used as a robotic phrase", () => {
+      const metrics = analyzePublicationQuality(article([
+        "Remember, consistency matters more than frequency for a growing account.",
+        "Plain guidance helps. Remember to reply within a day.",
+      ]));
+      expect(metrics.roboticPhraseCount).toBe(2);
+    });
+
+    it("does not penalize a clean article for legitimate remember usage", () => {
+      // Regression: a real article containing "people will remember" scored
+      // a false robotic deduction and lost editorial points.
+      const metrics = analyzePublicationQuality(article([
+        "The posts that show up with real personality, not just promotions, are the ones people will remember.",
+      ]));
+      expect(metrics.roboticPhraseCount).toBe(0);
+      expect(metrics.editorialScore).toBe(100);
+    });
+  });
 });
 
 describe("deterministic conclusion discipline", () => {
@@ -206,5 +237,60 @@ describe("publication-quality feature gate", () => {
     expect(policy.enforcePublicationQuality).toBe(true);
     expect(result.passed).toBe(false);
     expect(result.reasons.some((reason) => reason.includes("factual contradictions"))).toBe(true);
+  });
+});
+
+describe("keyphrase exclusion in repeated-idea detection", () => {
+  const KP = "hong kong influencer marketing";
+
+  it("counts zero pairs when paragraphs share only the focus keyphrase", () => {
+    const paragraphs = [
+      "Hong Kong influencer marketing helps brands build authentic connections with local audiences every day.",
+      "Effective influencer marketing helps Hong Kong brands reach local consumers authentically and build lasting customer loyalty through genuine recommendations.",
+      "Hong Kong influencer marketing is growing fast with more local brands choosing authentic voices over celebrity endorsements for better engagement.",
+      "The Hong Kong influencer marketing landscape rewards genuine content and authentic partnerships between brands and creators.",
+    ];
+    // Without exclusion these trigger false positives (short keyphrase-heavy
+    // paragraphs reach the 0.55 overlap threshold).
+    expect(countRepeatedIdeaPairs(paragraphs)).toBeGreaterThan(0);
+    expect(countRepeatedIdeaPairs(paragraphs, keyphraseExclusionSet(KP))).toBe(0);
+  });
+
+  it("still detects genuine near-duplicate paragraphs after keyphrase exclusion", () => {
+    const original = "Effective influencer marketing helps Hong Kong brands reach local consumers authentically and build lasting customer loyalty through genuine recommendations.";
+    const echo = "Effective influencer marketing helps Hong Kong brands reach local consumers authentically and build lasting customer loyalty through genuine recommendations. This is the same idea repeated with an extra sentence appended.";
+    const filler = "A local bakery can share behind-the-scenes work and answer useful customer questions every single day without fail.";
+    expect(countRepeatedIdeaPairs([original, echo, filler], keyphraseExclusionSet(KP))).toBe(1);
+  });
+
+  it("final article analysis does not count keyphrase-only overlap as repeated pairs", () => {
+    const html = [
+      "<!-- wp:paragraph --><p>Hong Kong influencer marketing helps brands build authentic connections with local audiences every day.</p><!-- /wp:paragraph -->",
+      "<!-- wp:paragraph --><p>Effective influencer marketing helps Hong Kong brands reach local consumers authentically and build lasting customer loyalty through genuine recommendations.</p><!-- /wp:paragraph -->",
+      "<!-- wp:paragraph --><p>The Hong Kong influencer marketing landscape rewards genuine content and authentic partnerships between brands and creators.</p><!-- /wp:paragraph -->",
+    ].join("\n");
+    const metrics = analyzeFinalArticle(html, KP, "Title", "Meta description", 500, 60);
+    expect(metrics.repeatedIdeaPairCount).toBe(0);
+  });
+
+  it("final article analysis still counts genuine duplicate ideas", () => {
+    const html = [
+      "<!-- wp:paragraph --><p>Effective influencer marketing helps Hong Kong brands reach local consumers authentically and build lasting customer loyalty through genuine recommendations.</p><!-- /wp:paragraph -->",
+      "<!-- wp:paragraph --><p>Effective influencer marketing helps Hong Kong brands reach local consumers authentically and build lasting customer loyalty through genuine recommendations. This repeats the identical sentence again for the test.</p><!-- /wp:paragraph -->",
+      "<!-- wp:paragraph --><p>A local bakery can share behind-the-scenes work and answer useful customer questions every single day without fail.</p><!-- /wp:paragraph -->",
+    ].join("\n");
+    const metrics = analyzeFinalArticle(html, KP, "Title", "Meta description", 500, 70);
+    expect(metrics.repeatedIdeaPairCount).toBe(1);
+  });
+
+  it("editorial score is not deflated by keyphrase-only overlap", () => {
+    const html = [
+      "<!-- wp:paragraph --><p>Hong Kong influencer marketing helps brands build authentic connections with local audiences every day.</p><!-- /wp:paragraph -->",
+      "<!-- wp:paragraph --><p>Effective influencer marketing helps Hong Kong brands reach local consumers authentically and build lasting customer loyalty through genuine recommendations.</p><!-- /wp:paragraph -->",
+      "<!-- wp:paragraph --><p>The Hong Kong influencer marketing landscape rewards genuine content and authentic partnerships between brands and creators.</p><!-- /wp:paragraph -->",
+      "<!-- wp:paragraph --><p>For Hong Kong influencer marketing success brands must focus on authentic storytelling rather than audience size.</p><!-- /wp:paragraph -->",
+    ].join("\n");
+    const metrics = analyzeFinalArticle(html, KP, "Title", "Meta description", 500, 80);
+    expect(metrics.editorialScore ?? 0).toBeGreaterThan(90);
   });
 });

@@ -410,4 +410,34 @@ describe("truncated partial-content handling", () => {
     expect(result.content).toBe("ok");
     expect(lastFetchBody().max_tokens).toBe(32768);
   });
+
+  it("emits reasoning_effort only when thinking is enabled", async () => {
+    mockFetchResponse(successBody('{"a":1}'));
+    await chat([{ role: "user", content: "hi" }], { thinkingMode: "enabled", reasoningEffort: "high" }, "editorial-polish");
+    expect(lastFetchBody().thinking).toEqual({ type: "enabled" });
+    expect(lastFetchBody().reasoning_effort).toBe("high");
+
+    mockFetchResponse(successBody('{"a":1}'));
+    await chat([{ role: "user", content: "hi" }], { thinkingMode: "disabled", reasoningEffort: "high" }, "translate-text");
+    expect(lastFetchBody().thinking).toEqual({ type: "disabled" });
+    expect(lastFetchBody().reasoning_effort).toBeUndefined();
+  });
+
+  it("classifies an 8000-token reasoning exhaustion with no content as token_exhaustion", async () => {
+    mockFetchResponse(exhaustionBody("reasoning consumed the whole budget", 8000));
+    await expect(
+      chat([{ role: "user", content: "hi" }], { thinkingMode: "enabled", reasoningEffort: "high", maxTokens: 8000 }, "editorial-polish"),
+    ).rejects.toMatchObject({ type: "token_exhaustion" });
+  });
+
+  it("accepts a response with reasoning plus complete final JSON (parses only message.content)", async () => {
+    mockFetchResponse(successBody('{"units":[]}'));
+    const result = await chat(
+      [{ role: "user", content: "hi" }],
+      { thinkingMode: "enabled", reasoningEffort: "high", maxTokens: 32768 },
+      "editorial-polish",
+    );
+    expect(result.content).toBe('{"units":[]}');
+    expect(result.finishReason).toBe("stop");
+  });
 });

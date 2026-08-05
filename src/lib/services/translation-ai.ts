@@ -1,4 +1,4 @@
-import { AiService, type ChatMessage } from "@/lib/services/deepseek";
+import { AiService, type ChatMessage, type ChatResult, type ChatOptions } from "@/lib/services/deepseek";
 import type { FaqEntry, ProtectedArticleBlock } from "@/lib/blog/article-document";
 import type { RetryBudget } from "./translation-types";
 import type { StructuredTranslationShadowOptions } from "./editorial-block-translation";
@@ -16,19 +16,22 @@ Rules:
 - Do NOT add, remove, or restructure any HTML elements
 - Return the COMPLETE HTML with only the text content translated
 - Hong Kong Traditional Chinese only
+- Keep the CTA concise. Never write redundant triple formulations such as 「無中介、無佣金、無中間人」 — state the value once.
 - Example: "Ready to grow your brand" → "準備好拓展你的品牌？"
 - Example: "Get started" → "立即開始" or "馬上開始"
 - Example: "Create your free profile" → "免費建立商業檔案"`;
 
-export const TRANSLATION_SYSTEM = `You are a senior bilingual editor translating an English business blog into professional Hong Kong Traditional Chinese (zh-HK).
+export const TRANSLATION_SYSTEM = `You are a senior bilingual editor translating an English business blog into natural Hong Kong Traditional Chinese (zh-HK) with a consistent conversational Cantonese register.
 
 QUALITY STANDARD:
 - Translate meaning, intent and emphasis faithfully; do not summarize, embellish or add facts.
 - Write natural professional Hong Kong Traditional Chinese, not literal English sentence order.
-- Keep the voice warm, direct and easy to read. Use spoken Cantonese particles only when they are genuinely natural for the brand voice; avoid slang-heavy copy.
+- Keep a consistent conversational Cantonese register throughout the whole article: use spoken particles such as 嘅、喺、係、咗、啲 naturally, and prefer Cantonese forms like 我哋、佢哋、點解、咩、點樣 over formal written forms like 我們、他們、為何、什麼、如何. Never let a section slip into formal written Chinese while the rest is conversational.
 - Use Traditional Chinese characters and full-width Chinese punctuation （，。「」！？）.
-- Follow the canonical terminology glossary supplied in the prompt consistently across the whole article.
+- Follow the canonical terminology glossary supplied in the prompt consistently across the whole article. The main marketing term is ALWAYS 「創作者市場推廣」; natural variations such as 「創作者合作」 are allowed where appropriate. NEVER use 「影響力行銷」, 「網紅營銷」 or 「KOL市場推廣」.
+- Source label paragraphs must read 「來源：」 followed by the source title, with no trailing full stop or question mark (e.g. 「來源：AnyMind Group」, not 「資料來源：……。」).
 - Preserve temporal meaning exactly: historical facts stay historical, current status stays current, and predictions stay predictions. Never turn an old forecast into present guidance or introduce relative wording such as 「今年稍後」、「即將」 or 「未來幾個月」 unless the English source contains the same valid, date-anchored meaning.
+- Do not invent or strengthen factual claims. Where the source makes a general or unsupported statement, keep it general; never upgrade it to a stronger, sourced-sounding claim.
 - Prefer idiomatic written zh-HK: combine short English clauses naturally, avoid repeated pronouns and literal subject-first sentence patterns, and keep each paragraph's original purpose and tone.
 
 IMMUTABLE CONTENT:
@@ -121,17 +124,37 @@ export async function chatWithBudget(
   options: Record<string, unknown>,
   component: string,
   budget?: RetryBudget,
-): Promise<{ content: string; finishReason?: string }> {
+): Promise<{
+  content: string;
+  finishReason?: string;
+  attemptsUsed?: number;
+  usage?: ChatResult["usage"];
+  model?: string;
+  truncated?: boolean;
+}> {
   const requestedRetries = (options as any).maxRetries ?? 2;
   const maxRetries = budget ? budget.capRetries(requestedRetries) : requestedRetries;
-  const requestOptions = { ...options, maxRetries };
+  const requestOptions = { ...options, maxRetries } as ChatOptions;
+  // Only forward the retry limit when the caller explicitly requested it.
+  // Existing callers that omit maxRetries retain the current default production
+  // behavior (deepseek's default of 2 retries, budget cap not applied).
+  const explicitRetries = options.maxRetries !== undefined;
 
   try {
-    const result = await ai.chatWithRetry(messages, requestOptions as any, component);
+    const result = explicitRetries
+      ? await ai.chatWithRetry(messages, requestOptions, component, maxRetries)
+      : await ai.chatWithRetry(messages, requestOptions, component);
     const actualRetries = result.attemptsUsed ?? 0;
     const budgetCutOff = maxRetries < requestedRetries;
     if (budget) budget.record(component, actualRetries, budgetCutOff);
-    return { content: result.content, finishReason: result.finishReason };
+    return {
+      content: result.content,
+      finishReason: result.finishReason,
+      attemptsUsed: result.attemptsUsed ?? 0,
+      usage: result.usage,
+      model: result.model,
+      truncated: result.finishReason === "length",
+    };
   } catch (error) {
     if (budget) budget.record(component, maxRetries, true);
     throw error;
@@ -223,6 +246,20 @@ function deterministicCtaFallback(html: string): string {
   return result;
 }
 
+/**
+ * Remove the redundant triple formulation 「無中介、無佣金、無中間人」 from
+ * CTA text. The source CTA states the value once; the triple adds no meaning
+ * and reads as translation padding.
+ */
+export function stripRedundantCtaTriple(html: string): string {
+  return html
+    .replace(/(?:——|，|、)?\s*無中介、無佣金、無中間人\s*[。！]?/gu, "")
+    .replace(/\s*——\s*/gu, "——")
+    .replace(/[，。][，。]+/gu, "$1")
+    .replace(/——[。，]/gu, "。")
+    .trim();
+}
+
 export async function translateCtaBlock(cta: ProtectedArticleBlock, budget?: RetryBudget): Promise<ProtectedArticleBlock> {
   const messages: ChatMessage[] = [
     { role: "system", content: CTA_TRANSLATION_SYSTEM },
@@ -238,9 +275,10 @@ export async function translateCtaBlock(cta: ProtectedArticleBlock, budget?: Ret
     validateProtectedHtmlTranslation(cta.html, translated, "CTA");
     if (!translated.includes("app.b2ihub.com/signup")) throw new Error("CTA signup URL changed");
     if (!/[\u3400-\u9fff]/u.test(translated.replace(/<[^>]+>/g, " "))) throw new Error("CTA contains insufficient Chinese");
+    translated = stripRedundantCtaTriple(translated);
     return { ...cta, html: translated, fingerprint: fingerprintHtml(translated) };
   } catch {
-    const translated = deterministicCtaFallback(cta.html);
+    const translated = stripRedundantCtaTriple(deterministicCtaFallback(cta.html));
     return { ...cta, html: translated, fingerprint: fingerprintHtml(translated) };
   }
 }
@@ -251,40 +289,63 @@ function fingerprintHtml(html: string): string {
   return hash.toString(16);
 }
 
-// ── Structured conclusion translation prompt builders ──
+// ── Structured editorial translation prompt builders ──
 
-export function buildStructuredConclusionTranslationPrompt(payloadJson: string): string {
+export function buildStructuredEditorialTranslationPrompt(
+  payloadJson: string,
+  componentKind: "introduction" | "section" | "conclusion",
+): string {
   return [
-    `Translate this structured editorial JSON to Traditional Chinese for Hong Kong.`,
-    `Only values inside fields named "text" may change.  All other fields must remain identical.`,
+    `Translate this ${componentKind} structured editorial JSON to Traditional Chinese for Hong Kong.`,
+    `Only values inside fields named "text" may change. All other fields must remain identical.`,
+    `Translate every English prose sentence completely. Do not echo or copy the English source except immutable brands, proper nouns and technical abbreviations.`,
+    `Preserve every __NUM_N__ placeholder exactly and do not create literal numbers.`,
     `\n${payloadJson}\n`,
     `Return ONLY the translated JSON object. No prose, no code fences, no markdown, no HTML.`,
   ].join("\n");
 }
 
+export function buildStructuredConclusionTranslationPrompt(payloadJson: string): string {
+  return buildStructuredEditorialTranslationPrompt(payloadJson, "conclusion");
+}
+
 const MAX_REPAIR_ERRORS = 5;
 const MAX_ERROR_LENGTH = 200;
+
+export function buildStructuredEditorialRepairPrompt(
+  sourcePayloadJson: string,
+  invalidResponse: string,
+  errors: string[],
+  componentKind: "introduction" | "section" | "conclusion",
+): string {
+  const boundedErrors = errors.slice(0, MAX_REPAIR_ERRORS).map((e) => e.substring(0, MAX_ERROR_LENGTH));
+  const hasNumberMismatch = errors.some((e) => e.includes("number mismatch"));
+  const numberFix = hasNumberMismatch
+    ? `\nNUMBER ERROR: Every number in the output must come from an existing __NUM_N__ placeholder. Do not write literal digits, years, percentages, currencies or numeric words. Preserve every placeholder exactly.`
+    : "";
+  return [
+    `The previous structured ${componentKind} translation response was invalid.`,
+    `\nValidation errors:\n${boundedErrors.map((e) => `- ${e}`).join("\n")}`,
+    numberFix,
+    `\nOriginal protected source DTO:\n${sourcePayloadJson}`,
+    `\nInvalid response received:\n${invalidResponse.substring(0, 2000)}`,
+    `\nCorrect the response and translate every remaining English prose sentence to Hong Kong Traditional Chinese.`,
+    `Return ONLY the corrected JSON object. Translate only "text" values. Preserve every other field, key and structural element exactly.`,
+    `No prose, no code fences, no markdown, no HTML.`,
+  ].join("\n");
+}
 
 export function buildStructuredConclusionRepairPrompt(
   sourcePayloadJson: string,
   invalidResponse: string,
   errors: string[],
 ): string {
-  const boundedErrors = errors.slice(0, MAX_REPAIR_ERRORS).map((e) => e.substring(0, MAX_ERROR_LENGTH));
-  const hasNumberMismatch = errors.some((e) => e.includes("number mismatch"));
-  const numberFix = hasNumberMismatch
-    ? `\nNUMBER ERROR: The translation introduced or removed a number that is not represented by a __NUM_N__ placeholder. Every number in the output must come from a __NUM_N__ placeholder. Do NOT write any literal digits, years, percentages, currencies, or numeric words that are not already marked by a __NUM_N__ token. Translate the surrounding text but leave every __NUM_N__ token exactly as-is.`
-    : "";
-  return [
-    `The previous structured editorial JSON response was invalid.`,
-    `\nValidation errors:\n${boundedErrors.map((e) => `- ${e}`).join("\n")}`,
-    numberFix,
-    `\nOriginal protected source DTO:\n${sourcePayloadJson}`,
-    `\nInvalid response received:\n${invalidResponse.substring(0, 2000)}`,
-    `\nCorrect the response. Return ONLY the corrected JSON object.`,
-    `Translate only "text" values. Preserve every other field, key, and structural element exactly.`,
-    `No prose, no code fences, no markdown, no HTML.`,
-  ].join("\n");
+  return buildStructuredEditorialRepairPrompt(
+    sourcePayloadJson,
+    invalidResponse,
+    errors,
+    "conclusion",
+  );
 }
 
 function validateFaqBoundary(
@@ -435,6 +496,60 @@ export async function translateFaqEntries(entries: FaqEntry[], budget?: RetryBud
     translated.push(await translateFaqEntry(entries[index], index, budget));
   }
   return translated;
+}
+
+// ── Shared production structured fallback ──
+
+export async function translateStructuredEditorialPayload(
+  payloadJson: string,
+  context: { componentKind: "introduction" | "section" | "conclusion"; componentId: string },
+  budget?: RetryBudget,
+): Promise<string> {
+  const messages: ChatMessage[] = [
+    { role: "system", content: `${STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM}\n\n${translationDateInstruction()}\n\n${buildTranslationGlossaryPrompt()}` },
+    { role: "user", content: buildStructuredEditorialTranslationPrompt(payloadJson, context.componentKind) },
+  ];
+  const result = await chatWithBudget(
+    messages,
+    { responseFormat: { type: "json_object" }, maxTokens: 8192, temperature: 0.2, maxRetries: 1 },
+    `translate-${context.componentId}-structured-fallback`,
+    budget,
+  );
+  if (result.finishReason === "length") throw new Error(`${context.componentId} structured fallback was truncated`);
+  return result.content.trim();
+}
+
+export async function repairStructuredEditorialPayload(
+  sourcePayloadJson: string,
+  invalidResponse: string,
+  errors: string[],
+  context: { componentKind: "introduction" | "section" | "conclusion"; componentId: string },
+  budget?: RetryBudget,
+): Promise<string | null> {
+  const messages: ChatMessage[] = [
+    { role: "system", content: `${STRUCTURED_EDITORIAL_TRANSLATION_SYSTEM}\n\n${translationDateInstruction()}\n\n${buildTranslationGlossaryPrompt()}` },
+    {
+      role: "user",
+      content: buildStructuredEditorialRepairPrompt(
+        sourcePayloadJson,
+        invalidResponse,
+        errors,
+        context.componentKind,
+      ),
+    },
+  ];
+  try {
+    const result = await chatWithBudget(
+      messages,
+      { responseFormat: { type: "json_object" }, maxTokens: 8192, temperature: 0.15, maxRetries: 1 },
+      `translate-${context.componentId}-structured-fallback-repair`,
+      budget,
+    );
+    if (result.finishReason === "length") return null;
+    return result.content.trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Shared production callback factory ──

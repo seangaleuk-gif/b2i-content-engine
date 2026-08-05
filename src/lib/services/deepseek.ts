@@ -101,6 +101,8 @@ export interface ChatOptions {
   maxTokens?: number;
   timeoutMs?: number;
   thinkingMode?: ThinkingMode;
+  /** DeepSeek reasoning effort (low/medium/high), applied when thinking is enabled. */
+  reasoningEffort?: "low" | "medium" | "high";
   topP?: number;
   frequencyPenalty?: number;
   presencePenalty?: number;
@@ -228,6 +230,8 @@ export async function chat(
     max_tokens: options.maxTokens ?? 32768,
     thinking: { type: thinkingMode },
   };
+
+  if (options.reasoningEffort && thinkingMode === "enabled") body.reasoning_effort = options.reasoningEffort;
 
   if (options.topP !== undefined) body.top_p = options.topP;
   if (options.frequencyPenalty !== undefined) body.frequency_penalty = options.frequencyPenalty;

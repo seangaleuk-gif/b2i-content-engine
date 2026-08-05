@@ -40,7 +40,10 @@ const STOP_WORDS = new Set([
 
 const ROBOTIC_PHRASES = [
   /\bthe key is\b/gi,
-  /\bremember,?\b/gi,
+  // Imperative "Remember, ..." / "Remember to ..." only. A bare
+  // \bremember\b also matches legitimate prose such as "people will
+  // remember your brand", which would deflate the editorial score.
+  /(?:^|[.!?;:]\s+)remember\b,?/gi,
   /\bthat(?:'|’)s why\b/gi,
   /\bthat(?:'|’)s the beauty of\b/gi,
   /\bthink of it as\b/gi,
@@ -98,8 +101,44 @@ function words(text: string): string[] {
     .filter((word) => word.length > 2 && !STOP_WORDS.has(word));
 }
 
-function normalizedWordSet(text: string): Set<string> {
-  return new Set(words(text));
+export function normalizedWordSet(text: string, excludeWords?: ReadonlySet<string>): Set<string> {
+  const all = words(text);
+  if (!excludeWords || excludeWords.size === 0) return new Set(all);
+  return new Set(all.filter((word) => !excludeWords.has(word)));
+}
+
+/**
+ * Focus-keyphrase tokens that must never count toward repeated-idea overlap.
+ * The keyphrase is intentionally repeated across the article for SEO, so two
+ * paragraphs that share only keyphrase words are not a duplicated idea.
+ */
+export function keyphraseExclusionSet(keyphrase: string): ReadonlySet<string> {
+  if (!keyphrase) return new Set<string>();
+  return new Set(words(keyphrase));
+}
+
+/** Pair-detection constants shared by the detector and the repetition repair. */
+export const REPEATED_IDEA_MIN_PARAGRAPH_WORDS = 12;
+export const REPEATED_IDEA_MIN_SHARED_WORDS = 5;
+export const REPEATED_IDEA_OVERLAP_THRESHOLD = 0.55;
+
+/** Canonical overlap between two normalized word sets. */
+export function paragraphOverlap(
+  left: Set<string>,
+  right: Set<string>,
+  excludeWords?: ReadonlySet<string>,
+): { shared: number; smaller: number; ratio: number } {
+  let leftF = left;
+  let rightF = right;
+  if (excludeWords && excludeWords.size > 0) {
+    leftF = new Set([...left].filter((w) => !excludeWords.has(w)));
+    rightF = new Set([...right].filter((w) => !excludeWords.has(w)));
+  }
+  const smaller = Math.min(leftF.size, rightF.size);
+  if (smaller === 0) return { shared: 0, smaller: 0, ratio: 0 };
+  let shared = 0;
+  for (const word of leftF) if (rightF.has(word)) shared++;
+  return { shared, smaller, ratio: shared / smaller };
 }
 
 export interface RepeatedIdeaPair {
@@ -108,19 +147,22 @@ export interface RepeatedIdeaPair {
 }
 
 /** Returns original text indexes for the canonical near-duplicate rule. */
-export function findRepeatedIdeaPairs(texts: string[]): RepeatedIdeaPair[] {
+export function findRepeatedIdeaPairs(texts: string[], excludeWords?: ReadonlySet<string>): RepeatedIdeaPair[] {
   const eligible = texts
     .map((text, index) => ({ text, index }))
-    .filter(({ text }) => text.trim().split(/\s+/).length >= 12);
-  const sets = eligible.map(({ text }) => normalizedWordSet(text));
+    .filter(({ text }) => text.trim().split(/\s+/).length >= REPEATED_IDEA_MIN_PARAGRAPH_WORDS);
+  const sets = eligible.map(({ text }) => normalizedWordSet(text, excludeWords));
   const pairs: RepeatedIdeaPair[] = [];
   for (let left = 0; left < sets.length; left++) {
     for (let right = left + 1; right < sets.length; right++) {
       const smaller = Math.min(sets[left].size, sets[right].size);
-      if (smaller < 6) continue;
+      if (smaller < REPEATED_IDEA_MIN_SHARED_WORDS) continue;
       let intersection = 0;
       for (const word of sets[left]) if (sets[right].has(word)) intersection++;
-      if (intersection >= 5 && intersection / smaller >= 0.55) {
+      if (
+        intersection >= REPEATED_IDEA_MIN_SHARED_WORDS
+        && intersection / smaller >= REPEATED_IDEA_OVERLAP_THRESHOLD
+      ) {
         pairs.push({ leftIndex: eligible[left].index, rightIndex: eligible[right].index });
       }
     }
@@ -128,8 +170,8 @@ export function findRepeatedIdeaPairs(texts: string[]): RepeatedIdeaPair[] {
   return pairs;
 }
 
-export function countRepeatedIdeaPairs(texts: string[]): number {
-  return findRepeatedIdeaPairs(texts).length;
+export function countRepeatedIdeaPairs(texts: string[], excludeWords?: ReadonlySet<string>): number {
+  return findRepeatedIdeaPairs(texts, excludeWords).length;
 }
 
 export function findMalformedProseTextIssues(texts: string[]): MalformedProseTextIssue[] {
@@ -183,6 +225,16 @@ function countRoboticPhrases(text: string): number {
   return ROBOTIC_PHRASES.reduce((total, regex) => total + (text.match(regex)?.length ?? 0), 0);
 }
 
+/** Exact robotic-phrase matches for diagnostics. Never includes credentials. */
+export function extractRoboticPhraseMatches(text: string): string[] {
+  const matches: string[] = [];
+  for (const regex of ROBOTIC_PHRASES) {
+    const found = text.match(regex);
+    if (found) matches.push(...found);
+  }
+  return matches;
+}
+
 function numberClaims(text: string): string[] {
   const regex = createNumberExpressionRegex("gi");
   return [...text.matchAll(regex)].map((match) =>
@@ -199,7 +251,7 @@ function conclusionTextFromHtml(html: string): string {
   );
 }
 
-export function analyzePublicationQuality(html: string): PublicationQualityMetrics {
+export function analyzePublicationQuality(html: string, excludeWords?: ReadonlySet<string>): PublicationQualityMetrics {
   const paragraphTexts = extractParagraphTexts(html);
   const readableText = extractReadableText(html);
   const claimConflicts = detectClaimConflicts(
@@ -207,7 +259,7 @@ export function analyzePublicationQuality(html: string): PublicationQualityMetri
     { claims: [] },
   );
   const malformed = detectMalformedProseTexts(paragraphTexts);
-  const repeatedIdeaPairCount = countRepeatedIdeaPairs(paragraphTexts);
+  const repeatedIdeaPairCount = countRepeatedIdeaPairs(paragraphTexts, excludeWords);
   const roboticPhraseCount = countRoboticPhrases(readableText);
   const conclusionText = conclusionTextFromHtml(html);
   const conclusionWordCount = conclusionText
@@ -296,7 +348,7 @@ export function trimConclusionToBudget(
     componentText(doc.introduction),
     ...doc.sections.map(componentText),
   ];
-  const bodySets = bodyTexts.map(normalizedWordSet);
+  const bodySets = bodyTexts.map((t) => normalizedWordSet(t));
   const candidates = doc.conclusion.blocks
     .map((block, index) => {
       const set = normalizedWordSet(blockText(block));

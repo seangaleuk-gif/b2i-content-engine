@@ -1,12 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { normalizeOutlineHeadings, runBlogGeneration } from "@/lib/services/blog-generation-service";
-import { projectRepository } from "@/lib/repositories";
+import { resolveResearchDispatch } from "@/lib/services/blog-generation-service";
+import { runPostAssemblyPipeline, createPipelineState } from "@/lib/pipeline/blog-generation-pipeline";
+import { runBraveResearchWithRetry } from "@/lib/services/brave";
+import { projectRepository, researchRepository } from "@/lib/repositories";
 
 vi.mock("@/lib/repositories", () => ({
-  projectRepository: { findById: vi.fn() },
-  researchRepository: { findByProject: vi.fn().mockResolvedValue([]) },
-  knowledgeRepository: { findByUser: vi.fn().mockResolvedValue([]) },
-  promptSectionRepository: { seedDefaults: vi.fn().mockResolvedValue(undefined), findByUser: vi.fn().mockResolvedValue([]) },
+projectRepository: { findById: vi.fn() },
+researchRepository: { findByProject: vi.fn().mockResolvedValue([]), createMany: vi.fn().mockResolvedValue([]) },
+knowledgeRepository: { findByUser: vi.fn().mockResolvedValue([]) },
+promptSectionRepository: { seedDefaults: vi.fn().mockResolvedValue(undefined), findByUser: vi.fn().mockResolvedValue([]) },
+}));
+
+vi.mock("@/lib/services/brave", () => ({
+runBraveResearchWithRetry: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/lib/services/prompt-compiler", () => ({
@@ -39,6 +46,14 @@ vi.mock("@/lib/pipeline/blog-generation-pipeline", () => ({
 vi.mock("@/lib/services/article-postprocessors", () => ({
   sanitizeSectionUrls: vi.fn((h: string) => h),
   pairedSlugs: vi.fn((slug: string) => ({ englishSlug: slug.replace(/-zh$/, ""), chineseSlug: `${slug.replace(/-zh$/, "")}-zh` })),
+  isEligibleExternalSourceUrl: vi.fn((url: string) => {
+    try {
+      const host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+      return !["b2ihub.com", "app.b2ihub.com"].some((d) => host === d || host.endsWith(`.${d}`));
+    } catch {
+      return false;
+    }
+  }),
 }));
 
 // ── Test setup ──
@@ -241,5 +256,112 @@ describe("runBlogGeneration — successful flow", () => {
   it("completes without errors", async () => {
     const mock = buildRequestMock([]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
+  });
+});
+
+// ── Research dispatch ──
+
+describe("resolveResearchDispatch", () => {
+  it("runs automatic research when no sources exist and a topic is present", () => {
+    const decision = resolveResearchDispatch(0, "hong kong influencer marketing");
+    expect(decision.mode).toBe("auto");
+    expect(decision.willRun).toBe(true);
+  });
+
+  it("uses manual research as-is when sources already exist", () => {
+    const decision = resolveResearchDispatch(4, "hong kong influencer marketing");
+    expect(decision.mode).toBe("manual");
+    expect(decision.willRun).toBe(false);
+  });
+
+  it("never auto-runs without a topic", () => {
+    const decision = resolveResearchDispatch(0, "  ");
+    expect(decision.willRun).toBe(false);
+    expect(decision.reason).toContain("no keyword or topic");
+  });
+});
+
+describe("runBlogGeneration — automatic research dispatch", () => {
+  beforeEach(() => {
+    vi.mocked(projectRepository.findById).mockReset();
+    vi.mocked(projectRepository.findById).mockResolvedValue({
+      id: 1, name: "T", keyword: "hong kong influencer marketing", audience: "t", country: "HK",
+      wordCount: 2500, content: "", status: "draft",
+    } as unknown as Awaited<ReturnType<typeof projectRepository.findById>>);
+    vi.mocked(researchRepository.findByProject).mockReset();
+    vi.mocked(researchRepository.findByProject).mockResolvedValue([]);
+    vi.mocked(researchRepository.createMany).mockReset();
+    vi.mocked(researchRepository.createMany).mockResolvedValue([]);
+    vi.mocked(runBraveResearchWithRetry).mockReset();
+    vi.mocked(runPostAssemblyPipeline).mockClear();
+    vi.mocked(createPipelineState).mockClear();
+  });
+
+  it("calls the research provider and hands the approved sources to the pipeline when no manual research exists", async () => {
+    const source = {
+      title: "Influencer Marketing Report", url: "https://example.com/report",
+      snippet: "Hong Kong brands trust micro creators.", category: "google" as const, position: 0,
+    };
+    vi.mocked(runBraveResearchWithRetry).mockResolvedValue([source]);
+    vi.mocked(researchRepository.findByProject)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 1, projectId: 1, ...source, createdAt: new Date() }]);
+
+    const mock = buildRequestMock([]);
+    await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+    expect(runBraveResearchWithRetry).toHaveBeenCalledWith("hong kong influencer marketing");
+    expect(researchRepository.createMany).toHaveBeenCalledWith([expect.objectContaining({ url: "https://example.com/report" })]);
+    const context = vi.mocked(runPostAssemblyPipeline).mock.calls[0][1].context as { research: Array<{ url: string; title: string }> };
+    expect(context.research.length).toBe(1);
+    expect(context.research[0].url).toBe("https://example.com/report");
+  });
+
+  it("skips automatic research and preserves manually selected sources", async () => {
+    const manual = { id: 7, projectId: 1, title: "Manual Source", url: "https://manual.example.com/a", snippet: "s", category: "google" as const, position: 0, createdAt: "2026-01-01T00:00:00Z" };
+    vi.mocked(researchRepository.findByProject).mockResolvedValue([manual as unknown as Awaited<ReturnType<typeof researchRepository.findByProject>>[number]]);
+
+    const mock = buildRequestMock([]);
+    await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+    expect(runBraveResearchWithRetry).not.toHaveBeenCalled();
+    expect(researchRepository.createMany).not.toHaveBeenCalled();
+    const context = vi.mocked(runPostAssemblyPipeline).mock.calls[0][1].context as unknown as { research: Array<{ url: string; title: string }> };
+    expect(context.research).toHaveLength(1);
+    expect(context.research[0].url).toBe("https://manual.example.com/a");
+  });
+
+  it("does not fabricate sources when the research provider fails", async () => {
+    vi.mocked(runBraveResearchWithRetry).mockRejectedValue(new Error("Brave Search API authentication failed (401)"));
+
+    const mock = buildRequestMock([]);
+    await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+    expect(researchRepository.createMany).not.toHaveBeenCalled();
+    const context = vi.mocked(runPostAssemblyPipeline).mock.calls[0][1].context as unknown as { research: Array<{ url: string; title: string }> };
+    expect(context.research).toEqual([]);
+    const warnings = vi.mocked(createPipelineState).mock.results[0]?.value?.warnings ?? [];
+    expect(warnings.some((w: string) => w.includes("Automatic research failed"))).toBe(true);
+  });
+
+  it("does not fabricate sources when the provider returns zero results", async () => {
+    vi.mocked(runBraveResearchWithRetry).mockResolvedValue([]);
+
+    const mock = buildRequestMock([]);
+    await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+    expect(researchRepository.createMany).not.toHaveBeenCalled();
+    const warnings = vi.mocked(createPipelineState).mock.results[0]?.value?.warnings ?? [];
+    expect(warnings.some((w: string) => w.includes("returned no sources"))).toBe(true);
+  });
+
+  it("reports the real external-link count in the saved metadata", async () => {
+    const htmlWithLink = `<!-- wp:paragraph --><p>See <a href="https://example.com/report">the report</a> for details.</p><!-- /wp:paragraph -->`;
+    vi.mocked(createPipelineState).mockReturnValue({
+      blog: htmlWithLink, faq: [], retryCount: 0, componentRegenerations: 0, warnings: [],
+    } as unknown as Awaited<ReturnType<typeof createPipelineState>>);
+    const mock = buildRequestMock([]);
+    const result = await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+    expect(result.generated.externalLinks).toEqual(["https://example.com/report"]);
   });
 });

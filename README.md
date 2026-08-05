@@ -72,7 +72,14 @@ tokens, or access-token files to the repository.
 - `assertValidStageInput()` validates pre-stage HTML before every mutation
 - Protected blocks (wp:html, scripts, links, buttons, images, media) tokenized during SEO normalization
 
-- Build: 1,294 tests passing, 0 failing
+### Current verification status
+- Full suite: 1,460 tests — 1,442 passed, 18 pre-existing failures (unchanged baseline, no new regressions)
+- Lint: 468 findings (285 errors / 183 warnings) — unchanged baseline
+- Build: passes
+- TypeScript: 2 pre-existing errors in `section-expander.test.ts`
+- English generation: production verified (fresh live run, editorial score 94, FAQ parity valid, final validation PASS)
+- Traditional Chinese translation: live verified (project 19, version 6, saved ID 202; 40 API calls, 0 retries, 26 deterministic editorial changes)
+- Automatic research and external links: live verified (external links injected, retained, saved and counted)
 
 ### Editorial polish safety
 
@@ -162,7 +169,7 @@ The rendered article must appear in this order:
 | Internal links below minimum | Soft | 0 minimum means no lower bound |
 | Unsupported precise claims | Prohibited | Removed or generalized deterministically |
 | Fabricated testimonials | Prohibited | Detected by factual-risk scanner and removed |
-| External research links | Preserved | Retained when they support surviving claims; 0 is acceptable |
+| External research links | Injected from approved research | Automatic research runs when no approved sources exist; external links are inserted from eligible approved sources with diagnostics; 0 is acceptable per policy when no eligible source exists |
 
 ### Fixes applied across all sessions
 

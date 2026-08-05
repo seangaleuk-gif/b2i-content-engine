@@ -51,7 +51,7 @@ export async function POST(
     const existingDoc = createExistingDocument(latest, project.keyword || "", slugs.englishSlug);
 
     const research = await researchRepository.findByProject(projectId);
-    const result = await translateArticle(latest.blog, existingDoc, research);
+    const result = await translateArticle(latest.blog, existingDoc, research, { projectId });
 
     if (result.failedComponents.length > 0) {
       console.error("[translate] Rejected translation candidate:", result.failedComponents);
@@ -150,7 +150,7 @@ export async function POST(
         tags,
         readingTime: `${result.estimatedReadingMinutes} min`,
         wordCount: result.zhCharCount,
-        summary: buildTranslationVersionSummary(Number(latest.id), zhKeyword),
+        summary: buildTranslationVersionSummary(Number(latest.id), zhKeyword, result.review),
         model: "deepseek-v4-flash",
         promptVersion: "translation-v6-freshness-hk-editorial",
         generationTimeMs: 0,

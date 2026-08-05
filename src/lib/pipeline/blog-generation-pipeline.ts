@@ -6,8 +6,10 @@
 // state.blog is ONLY assigned by syncBlogFromDocument() — never directly.
 // No stage treats raw HTML as independently canonical.
 
-import type { ArticleDocument } from "@/lib/blog/article-document";
-import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, parseWordPressEditorialBlocks, countCanonicalVisibleWords, extractVisibleFaqFromArticle, validateFaqParity } from "@/lib/blog/article-document";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
+import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, countCanonicalVisibleWords, extractVisibleFaqFromArticle, validateFaqParity } from "@/lib/blog/article-document";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import { type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { normalizeFinalSeo } from "@/lib/blog/final-seo-normalizer";
@@ -19,7 +21,7 @@ import {
 } from "@/lib/blog/article-integrity";
 import type { FinalArticlePolicy, FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
-import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags, countReadableWords, containsExactPhrase } from "@/lib/seo/seo-text-utils";
+import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags, countReadableWords, containsExactPhrase, countEditorialExternalLinks, extractEditorialExternalLinkUrls } from "@/lib/seo/seo-text-utils";
 import { FLESCH_MAX, FLESCH_MIN, GENERATION_WORD_BUFFER, MAX_SENTENCES_PER_PARAGRAPH, WORD_ALLOCATION } from "@/lib/services/generation-constants";
 import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
@@ -29,7 +31,9 @@ import {
   extractEditableBlocks,
   findMalformedEditableBlocks,
   findProseOnlyEditableBlockIds,
-  findRepeatedEditableBlockIds,
+  findRepetitionPairTargets,
+  applyDeterministicRepetitionFallback,
+  repetitionPairSurfaceFlags,
   findWeakenedEditableBlockIds,
   repairDeterministicMalformedProse,
   type EditorialPolishMode,
@@ -37,7 +41,8 @@ import {
 import { runComponentRegeneration, regenerateConclusion, regenerateSection } from "@/lib/services/component-regenerator";
 import { scanFactualRisks, removeUnsupportedSentences, formatClaimLog } from "@/lib/blog/factual-risk-scanner";
 import { enforceInternalLinkLimit } from "@/lib/blog/final-article-policy";
-import { trimConclusionToBudget } from "@/lib/blog/publication-quality";
+import { trimConclusionToBudget, extractRoboticPhraseMatches } from "@/lib/blog/publication-quality";
+import { isEligibleExternalSourceUrl } from "@/lib/services/article-postprocessors";
 import {
   enforceClaimOwnership,
   formatOwnedEvidencePacket,
@@ -323,6 +328,124 @@ function replaceComponentHtml(
   const parsed = parseWordPressEditorialBlocks(html, component.id);
   component.blocks = parsed.blocks;
   if (status) component.status = status;
+}
+
+function paragraphPlainText(block: EditorialBlock): string | null {
+  if (block.type !== "paragraph") return null;
+  if (block.content.some((node) => node.type !== "text")) return null;
+  return block.content.map((node) => node.text).join("").trim();
+}
+
+function safeTrimParagraph(
+  block: EditorialBlock,
+  keyphrase: string,
+  research: Array<{ title?: string; snippet?: string; url?: string }>,
+): { wordCount: number; plainText: string | null } | null {
+  if (block.type !== "paragraph") return null;
+  const html = renderEditorialBlocksToWordPress([block]);
+  const wordCount = countReadableWords(html);
+  if (wordCount < 6) return null;
+  const claims = scanFactualRisks(html, keyphrase, research).claims;
+  if (
+    /<a\b/i.test(html)
+    || claims.length > 0
+    || (keyphrase.trim() && containsExactPhrase(html, keyphrase))
+    || /(?:HK\$|US\$|[$£€¥]|\b(?:19|20)\d{2}\b|\d)/i.test(html)
+    || /according to|research (?:from|by)|data (?:from|shows)|study (?:from|by)/i.test(html)
+  ) return null;
+  return { wordCount, plainText: paragraphPlainText(block) };
+}
+
+export interface FinalTrimFallbackResult {
+  removedWords: number;
+  shortenedSentences: number;
+  removedParagraphs: number;
+  finalWordCount: number;
+}
+
+/**
+ * Close a residual word-count overrun without slicing prose. This fallback may
+ * remove only a complete trailing sentence from a fact-free plain paragraph or
+ * one complete fact-free paragraph from an editable H2 section.
+ */
+export function trimResidualSafeProseToMaximum(
+  doc: ArticleDocument,
+  wordMax: number,
+  wordMin: number,
+  keyphrase: string,
+  research: Array<{ title?: string; snippet?: string; url?: string }>,
+): FinalTrimFallbackResult {
+  let removedWords = 0;
+  let shortenedSentences = 0;
+  let removedParagraphs = 0;
+  const sections = () => doc.sections.filter(
+    (section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading",
+  );
+
+  for (let guard = 0; guard < 20 && countCanonicalVisibleWords(doc) > wordMax; guard++) {
+    const excess = countCanonicalVisibleWords(doc) - wordMax;
+    const candidates: Array<{
+      section: ArticleDocument["sections"][number];
+      block: Extract<EditorialBlock, { type: "paragraph" }>;
+      remainder: string;
+      sentenceWords: number;
+      distanceFromEnd: number;
+    }> = [];
+    for (const section of sections()) {
+      for (let blockIndex = section.blocks.length - 1; blockIndex >= 0; blockIndex--) {
+        const block = section.blocks[blockIndex];
+        const safe = safeTrimParagraph(block, keyphrase, research);
+        if (!safe?.plainText || block.type !== "paragraph") continue;
+        const sentences = safe.plainText.match(/[^.!?]+(?:[.!?]+["”’)]*|$)/g)?.map((v) => v.trim()).filter(Boolean) ?? [];
+        if (sentences.length < 2) continue;
+        const trailing = sentences[sentences.length - 1];
+        const sentenceWords = countReadableWords(trailing);
+        const remainder = safe.plainText.slice(0, safe.plainText.lastIndexOf(trailing)).trim();
+        if (sentenceWords < 4 || countReadableWords(remainder) < 12) continue;
+        if (countCanonicalVisibleWords(doc) - sentenceWords < wordMin) continue;
+        candidates.push({ section, block, remainder, sentenceWords, distanceFromEnd: section.blocks.length - 1 - blockIndex });
+      }
+    }
+    if (candidates.length === 0) break;
+    candidates.sort((a, b) => {
+      const ac = a.sentenceWords >= excess ? 0 : 1;
+      const bc = b.sentenceWords >= excess ? 0 : 1;
+      return ac - bc || (ac === 0 ? a.sentenceWords - b.sentenceWords : b.sentenceWords - a.sentenceWords) || a.distanceFromEnd - b.distanceFromEnd;
+    });
+    const selected = candidates[0];
+    selected.block.content = [{ type: "text", text: selected.remainder }];
+    selected.section.status = "trimmed";
+    removedWords += selected.sentenceWords;
+    shortenedSentences++;
+  }
+
+  for (let guard = 0; guard < 20 && countCanonicalVisibleWords(doc) > wordMax; guard++) {
+    const excess = countCanonicalVisibleWords(doc) - wordMax;
+    const candidates: Array<{ section: ArticleDocument["sections"][number]; blockIndex: number; wordCount: number; distanceFromEnd: number }> = [];
+    for (const section of sections()) {
+      if (section.blocks.filter((block) => block.type === "paragraph").length <= 1) continue;
+      const sectionWords = countReadableWords(renderComponentHtml(section));
+      for (let blockIndex = section.blocks.length - 1; blockIndex >= 0; blockIndex--) {
+        const safe = safeTrimParagraph(section.blocks[blockIndex], keyphrase, research);
+        if (!safe || sectionWords - safe.wordCount < 50) continue;
+        if (countCanonicalVisibleWords(doc) - safe.wordCount < wordMin) continue;
+        candidates.push({ section, blockIndex, wordCount: safe.wordCount, distanceFromEnd: section.blocks.length - 1 - blockIndex });
+      }
+    }
+    if (candidates.length === 0) break;
+    candidates.sort((a, b) => {
+      const ac = a.wordCount >= excess ? 0 : 1;
+      const bc = b.wordCount >= excess ? 0 : 1;
+      return ac - bc || (ac === 0 ? a.wordCount - b.wordCount : b.wordCount - a.wordCount) || a.distanceFromEnd - b.distanceFromEnd;
+    });
+    const selected = candidates[0];
+    selected.section.blocks.splice(selected.blockIndex, 1);
+    selected.section.status = "trimmed";
+    removedWords += selected.wordCount;
+    removedParagraphs++;
+  }
+
+  return { removedWords, shortenedSentences, removedParagraphs, finalWordCount: countCanonicalVisibleWords(doc) };
 }
 
 /** Derive section input from the canonical ArticleDocument. */
@@ -964,6 +1087,41 @@ export async function runPostAssemblyPipeline(
   // application-owned link insertion so exact factual sentences remain safely
   // removable during the deterministic evidence stages.
   // validation decides whether the cloned candidate is committed atomically.
+  const preEditorialHtml = state.blog;
+  const preEditorialMetrics = analyzeFinalArticle(
+    preEditorialHtml,
+    state.keyphrase,
+    state.title,
+    state.metaDescription,
+    state.requestedWordCount,
+    countCanonicalVisibleWords(state.articleDoc),
+  );
+  const rejectedEditorialCandidates: Array<{
+    stage: string;
+    accepted: boolean;
+    reason: string;
+    score: number;
+  }> = [];
+  const recordEditorialCandidate = (
+    stage: string,
+    result: Awaited<ReturnType<typeof runEditorialPolish>> | null,
+  ): void => {
+    if (!result) return;
+    const score = analyzeFinalArticle(
+      renderArticleDocument(result.doc),
+      state.keyphrase,
+      state.title,
+      state.metaDescription,
+      state.requestedWordCount,
+      countCanonicalVisibleWords(result.doc),
+    ).editorialScore ?? 100;
+    rejectedEditorialCandidates.push({
+      stage,
+      accepted: result.result.accepted,
+      reason: result.result.reason,
+      score,
+    });
+  };
   if (isEditorialPolishEnabled()) {
     const inputFingerprint = fp(state.blog);
     const editorCtx = { chatWithRetry: deps.chatWithRetry };
@@ -1008,9 +1166,45 @@ export async function runPostAssemblyPipeline(
         const evaluated = evaluateEditorialStageCandidate(metrics, state.policy);
         // Editorial score and repetition are comparative acceptance criteria at
         // this stage. The strict thresholds remain owned by final validation.
-        const hardReasons = evaluated.reasons.filter(
+        let hardReasons = evaluated.reasons.filter(
           (reason) => !reason.startsWith("repeated idea pairs=") && !reason.startsWith("editorial score="),
         );
+        // Word-count overrun is the one hard rejection that can be fixed
+        // deterministically without altering editorial quality.  If it is the
+        // ONLY hard reason, run the bounded safe-trim logic on the candidate
+        // before giving up.
+        if (hardReasons.length === 1 && hardReasons[0].startsWith("word count=")) {
+          const excess = metrics.readableWordCount - state.policy.wordCountMax;
+          if (excess > 0) {
+            const trimmedDoc = structuredClone(candidate);
+            const residual = trimResidualSafeProseToMaximum(
+              trimmedDoc, state.policy.wordCountMax, state.policy.wordCountMin,
+              state.keyphrase, deps.context?.research || [],
+            );
+            if (residual.removedWords > 0) {
+              const trimmedMetrics = analyzeFinalArticle(
+                renderArticleDocument(trimmedDoc),
+                state.keyphrase, state.title, state.metaDescription,
+                state.requestedWordCount, countCanonicalVisibleWords(trimmedDoc),
+              );
+              const trimmedEval = evaluateEditorialStageCandidate(trimmedMetrics, state.policy);
+              const trimmedHard = trimmedEval.reasons.filter(
+                (r) => !r.startsWith("repeated idea pairs=") && !r.startsWith("editorial score="),
+              );
+              if (trimmedHard.length === 0) {
+                // Use the trimmed candidate for all downstream checks
+                metrics.readableWordCount = trimmedMetrics.readableWordCount;
+                metrics.repeatedIdeaPairCount = trimmedMetrics.repeatedIdeaPairCount;
+                metrics.editorialScore = trimmedMetrics.editorialScore;
+                hardReasons = [];
+                console.log(
+                  `[editorial-wc-trim] trimmed candidate ${residual.removedWords} words → ` +
+                  `${trimmedMetrics.readableWordCount} (max ${state.policy.wordCountMax})`,
+                );
+              }
+            }
+          }
+        }
         const comparativeReasons: string[] = [];
         const baselineRepeats = baselineMetrics.repeatedIdeaPairCount ?? 0;
         const candidateRepeats = metrics.repeatedIdeaPairCount ?? 0;
@@ -1168,22 +1362,106 @@ export async function runPostAssemblyPipeline(
       }
     }
 
+    // Last-resort malformed resolution: one unresolved fragment (common after
+    // factual-scan sentence removal) must not permanently block repetition
+    // repair.  Run the deterministic repair again with block removal enabled
+    // on the exact remaining blocks, then re-scan.  Fail closed only if the
+    // block cannot be safely repaired or removed.
+    const lingeringMalformed = findMalformedEditableBlocks(workingDoc)
+      .filter((block) => !protectedBlockIds.includes(block.blockId));
+    if (lingeringMalformed.length > 0) {
+      console.log(
+        `[editorial-malformed-last-resort] unresolved=${lingeringMalformed.length}` +
+        ` blocks=${lingeringMalformed.map((b) => b.blockId).join(",")}`,
+      );
+      const docClone = structuredClone(workingDoc);
+      const lastResort = repairDeterministicMalformedProse(
+        docClone, state.wordMin, protectedSentencesByBlockId, true,
+      );
+      const resolved = lastResort.repairedBlockIds.length + lastResort.removedBlockIds.length;
+      if (resolved > 0 && lastResort.unresolved.length === 0) {
+        const lrValidation = buildComparativeValidator(workingDoc, "malformed")(docClone);
+        if (lrValidation.passed) {
+          workingDoc = docClone;
+          targetedRepairsDoc = workingDoc;
+          console.log(
+            `[editorial-malformed-last-resort] resolved repaired=${lastResort.repairedBlockIds.length}` +
+            ` removed=${lastResort.removedBlockIds.length}`,
+          );
+        } else {
+          console.log(
+            `[editorial-malformed-last-resort] rejected: ${lrValidation.reasons.join("; ")}`,
+          );
+        }
+      } else {
+        console.log(
+          `[editorial-malformed-last-resort] still-unresolved=${lastResort.unresolved.length}` +
+          ` repaired=${lastResort.repairedBlockIds.length} removed=${lastResort.removedBlockIds.length}`,
+        );
+      }
+    }
+
     // Repetition repair runs only after malformed prose is clean. Otherwise its
     // candidate would be rejected for an unrelated pre-existing fragment.
     const unresolvedMalformed = findMalformedEditableBlocks(workingDoc);
-    const repeatedBlockIds = unresolvedMalformed.length === 0
-      ? findRepeatedEditableBlockIds(workingDoc)
-          .filter((blockId) => !protectedBlockIds.includes(blockId))
+    const repetitionTargets = unresolvedMalformed.length === 0
+      ? findRepetitionPairTargets(workingDoc)
+          .filter((target) => !protectedBlockIds.includes(target.blockId))
       : [];
-    if (repeatedBlockIds.length > 0) {
+    if (repetitionTargets.length > 0) {
+      // Exact repetition diagnostics: stable IDs, overlap, protected-surface
+      // flags and the first 180 characters of each paragraph.
+      for (const target of repetitionTargets) {
+        const aFlags = repetitionPairSurfaceFlags(
+          workingDoc,
+          {
+            componentKind: target.preserveComponentKind,
+            componentId: target.preserveComponentId,
+            blockId: target.preserveBlockId,
+            text: target.preserveText,
+          },
+          state.keyphrase,
+        );
+        const bFlags = repetitionPairSurfaceFlags(
+          workingDoc,
+          {
+            componentKind: target.componentKind,
+            componentId: target.componentId,
+            blockId: target.blockId,
+            text: target.text,
+          },
+          state.keyphrase,
+        );
+        console.log(
+          `[editorial-repetition-pair] pair=1` +
+          ` a=${target.preserveComponentKind}:${target.preserveComponentId}:${target.preserveBlockId}` +
+          ` b=${target.componentKind}:${target.componentId}:${target.blockId}` +
+          ` overlap=${target.overlap.toFixed(2)}` +
+          ` aKeyphrase=${aFlags.keyphrase} bKeyphrase=${bFlags.keyphrase}` +
+          ` aNumbers=${aFlags.numbers.join(",")} bNumbers=${bFlags.numbers.join(",")}` +
+          ` aLinks=${aFlags.linkCount} bLinks=${bFlags.linkCount}` +
+          ` aQuotes=${aFlags.quoteCount} bQuotes=${bFlags.quoteCount}` +
+          ` aText="${target.preserveText.slice(0, 180)}"` +
+          ` bText="${target.text.slice(0, 180)}"`,
+        );
+      }
+      const repetitionScoreBefore = analyzeFinalArticle(
+        renderArticleDocument(workingDoc),
+        state.keyphrase,
+        state.title,
+        state.metaDescription,
+        state.requestedWordCount,
+        countCanonicalVisibleWords(workingDoc),
+      ).editorialScore ?? 100;
       repetitionResult = await runEditorialPolish(
         workingDoc,
         state.keyphrase,
         async (messages, options) => editorCtx.chatWithRetry(messages, options, "editorial-repetition-repair"),
         {
           protectedBlockIds,
-          editableBlockIds: repeatedBlockIds,
+          editableBlockIds: repetitionTargets.map((target) => target.blockId),
           protectedSentencesByBlockId,
+          repetitionTargets,
           mode: "repetition",
           validateProductionCandidate: buildComparativeValidator(workingDoc, "repetition"),
         },
@@ -1191,6 +1469,46 @@ export async function runPostAssemblyPipeline(
       if (repetitionResult.result.accepted) {
         workingDoc = repetitionResult.doc;
         targetedRepairsDoc = workingDoc;
+        console.log(
+          `[editorial-repetition-repair] accepted score=${repetitionScoreBefore} → ` +
+          `${(analyzeFinalArticle(renderArticleDocument(workingDoc), state.keyphrase, state.title, state.metaDescription, state.requestedWordCount, countCanonicalVisibleWords(workingDoc)).editorialScore ?? 100)}`,
+        );
+      } else {
+        // Bounded deterministic fallback: both AI attempts failed to reduce the
+        // same pairs. Sentence-level dedup against each preserved partner keeps
+        // every number, link, quote, attribution, protected sentence and exact
+        // keyphrase occurrence, and removes only provably duplicated plain
+        // prose. It never invents filler.
+        const fallback = applyDeterministicRepetitionFallback(workingDoc, repetitionTargets, {
+          minimumWordCount: state.wordMin,
+          keyphrase: state.keyphrase,
+          protectedSentencesByBlockId,
+        });
+        for (const item of fallback.applied) {
+          console.log(
+            `[editorial-repetition-fallback] ${item.action} ${item.blockId}` +
+            ` before="${item.before.slice(0, 120)}" after="${item.after.slice(0, 120)}"`,
+          );
+        }
+        for (const item of fallback.skipped) {
+          console.log(`[editorial-repetition-fallback] skipped ${item.blockId}: ${item.reason}`);
+        }
+        if (fallback.applied.length > 0) {
+          const fallbackValidation = buildComparativeValidator(workingDoc, "repetition")(fallback.doc);
+          if (fallbackValidation.passed) {
+            workingDoc = fallback.doc;
+            targetedRepairsDoc = workingDoc;
+            console.log(
+              `[editorial-repetition-fallback] committed applied=${fallback.applied.length}` +
+              ` score=${repetitionScoreBefore} → ` +
+              `${(analyzeFinalArticle(renderArticleDocument(workingDoc), state.keyphrase, state.title, state.metaDescription, state.requestedWordCount, countCanonicalVisibleWords(workingDoc)).editorialScore ?? 100)}`,
+            );
+          } else {
+            console.log(
+              `[editorial-repetition-fallback] rejected: ${fallbackValidation.reasons.join("; ")}`,
+            );
+          }
+        }
       }
     }
 
@@ -1257,6 +1575,22 @@ export async function runPostAssemblyPipeline(
       countCanonicalVisibleWords(workingDoc),
     );
     const finalEditorialScore = finalEditorialMetrics.editorialScore ?? 100;
+    recordEditorialCandidate("malformed", malformedResult);
+    recordEditorialCandidate("weakened", weakenedResult);
+    recordEditorialCandidate("repetition", repetitionResult);
+    recordEditorialCandidate("general", generalResult);
+    recordEditorialCandidate("prose-only", proseOnlyResult);
+    const editorialScoreBreakdown = {
+      malformedProseCount: finalEditorialMetrics.malformedProseCount ?? 0,
+      repeatedIdeaPairCount: finalEditorialMetrics.repeatedIdeaPairCount ?? 0,
+      roboticPhraseCount: finalEditorialMetrics.roboticPhraseCount ?? 0,
+      conclusionWordRatio: finalEditorialMetrics.conclusionWordRatio ?? 0,
+      conclusionPenalty: (finalEditorialMetrics.conclusionWordRatio ?? 0) > 0.18
+        ? 35
+        : (finalEditorialMetrics.conclusionWordRatio ?? 0) > 0.15
+          ? 15
+          : 0,
+    };
     // The general polish transaction is atomic: incremental general/prose-only
     // edits are not committed when the article still misses the production
     // threshold. Successfully repaired stable block IDs (malformed, weakened,
@@ -1278,7 +1612,9 @@ export async function runPostAssemblyPipeline(
         ` proseOnly=${proseOnlyResult?.result.accepted === true}` +
         ` score=${finalEditorialScore}` +
         ` malformedRemaining=${findMalformedEditableBlocks(state.articleDoc).length}` +
-        ` repeats=${findRepeatedEditableBlockIds(state.articleDoc).length}`,
+        ` repeatedPairs=${editorialScoreBreakdown.repeatedIdeaPairCount}` +
+        ` robotic=${editorialScoreBreakdown.roboticPhraseCount}` +
+        ` conclusionPenalty=${editorialScoreBreakdown.conclusionPenalty}`,
       );
     } else {
       console.log(
@@ -1292,7 +1628,12 @@ export async function runPostAssemblyPipeline(
             `malformedRemaining=${findMalformedEditableBlocks(state.articleDoc).length}`
           : anyEditorialCandidateAccepted
             ? `; editorial score remains below minimum: ${finalEditorialScore} < ${state.policy.minimumEditorialScore}`
-            : ""),
+            : "") +
+        `; score breakdown malformed=${editorialScoreBreakdown.malformedProseCount}` +
+        ` repeatedPairs=${editorialScoreBreakdown.repeatedIdeaPairCount}` +
+        ` robotic=${editorialScoreBreakdown.roboticPhraseCount}` +
+        ` conclusionRatio=${editorialScoreBreakdown.conclusionWordRatio.toFixed(3)}` +
+        ` conclusionPenalty=${editorialScoreBreakdown.conclusionPenalty}`,
       );
     }
     recordStage(
@@ -1310,11 +1651,12 @@ export async function runPostAssemblyPipeline(
         weakened: weakenedResult?.result ?? null,
         weakenedBlockCount: weakenedBlockIds.length,
         repetition: repetitionResult?.result ?? null,
-        repetitionBlockCount: repeatedBlockIds.length,
+        repetitionBlockCount: repetitionTargets.length,
         general: generalResult.result,
         proseOnly: proseOnlyResult?.result ?? null,
         proseOnlyBlockCount: proseOnlyBlockIds.length,
         finalEditorialScore,
+        editorialScoreBreakdown,
         minimumEditorialScore: state.policy.minimumEditorialScore,
         targetedRepairsPersisted,
       },
@@ -1366,8 +1708,32 @@ export async function runPostAssemblyPipeline(
 
   state = runTrackedHtmlStage(state, "external-links", (html) => {
     const researchItems = deps.context?.research || [];
-    if (researchItems.length === 0) return html;
-    return insertExternalResearchLinks(html, researchItems, 6).html;
+    const eligible = researchItems.filter(
+      (item: { url?: string }) => typeof item?.url === "string" && isEligibleExternalSourceUrl(item.url),
+    );
+    const rejected = researchItems.length - eligible.length;
+    console.log(
+      `[external-links:candidates] researchSources=${researchItems.length}` +
+      ` eligible=${eligible.length} rejected=${rejected}`,
+    );
+    if (eligible.length === 0) {
+      const message = researchItems.length === 0
+        ? "no research sources available — 0 external links injected"
+        : "no eligible external sources (all B2I-owned or invalid URLs) — 0 external links injected";
+      console.log(`[external-links] WARNING: ${message}`);
+      state.warnings.push(`External links: ${message}`);
+      return html;
+    }
+    const requested = Math.min(6, eligible.length);
+    const before = countEditorialExternalLinks(html);
+    const result = insertExternalResearchLinks(html, eligible, 6);
+    const after = countEditorialExternalLinks(html);
+    console.log(
+      `[external-links:inject] requested=${requested} inserted=${result.linksInserted}` +
+      ` skipped=${Math.max(0, requested - result.linksInserted)}` +
+      ` externalBefore=${before} externalAfter=${after}`,
+    );
+    return result.html;
   });
 
   state = runTrackedHtmlStage(state, "external-dedup", (html) =>
@@ -1525,7 +1891,26 @@ export async function runPostAssemblyPipeline(
       syncBlogFromDocument(state);
     }
 
-    const finalWordCount = countCanonicalVisibleWords(state.articleDoc);
+    let finalWordCount = countCanonicalVisibleWords(state.articleDoc);
+    if (finalWordCount > state.wordMax) {
+      const residual = trimResidualSafeProseToMaximum(
+        state.articleDoc,
+        state.wordMax,
+        state.wordMin,
+        state.keyphrase,
+        deps.context?.research || [],
+      );
+      if (residual.removedWords > 0) {
+        totalRemoved += residual.removedWords;
+        finalWordCount = residual.finalWordCount;
+        syncBlogFromDocument(state);
+        console.log(
+          `[final-trim] residual fallback removed=${residual.removedWords}` +
+          ` shortenedSentences=${residual.shortenedSentences}` +
+          ` removedParagraphs=${residual.removedParagraphs}`,
+        );
+      }
+    }
     if (totalRemoved > 0) {
       console.log(
         `[final-trim] total removed=${totalRemoved} final wc=${finalWordCount} target=${state.wordMax}`,
@@ -1606,6 +1991,11 @@ export async function runPostAssemblyPipeline(
       schemaHtml,
     );
     const renderedCount = (state.blog.match(/"@type": "Question"/g) ?? []).length;
+    const finalExternalLinks = countEditorialExternalLinks(state.blog);
+    console.log(
+      `[external-links:final] saved=${finalExternalLinks}` +
+      ` urls=[${extractEditorialExternalLinkUrls(state.blog).join(", ")}]`,
+    );
     console.log(
       `[final-preflight] FAQ parity valid=${parity.valid}` +
       ` canonical=${state.articleDoc.visibleFaq.length}` +
@@ -1626,7 +2016,20 @@ export async function runPostAssemblyPipeline(
   // Final validation
   state = runTrackedHtmlStage(state, "final-validation", (html) => {
     const result = runFinalValidation(state);
-    if (!result.passed) throw new Error(`Final validation failed: ${result.reasons.join("; ")}`);
+    if (!result.passed) {
+      if (
+        process.env.DEBUG_EDITORIAL === "true"
+        && result.reasons.some((reason) => reason.includes("editorial score"))
+      ) {
+        writeEditorialFailureArtifact(state, {
+          preEditorialHtml,
+          preEditorialMetrics,
+          rejectedEditorialCandidates,
+          finalReasons: result.reasons,
+        });
+      }
+      throw new Error(`Final validation failed: ${result.reasons.join("; ")}`);
+    }
     return html;
   });
 
@@ -1890,4 +2293,105 @@ export function runFinalValidation(state: PipelineState): { passed: boolean; rea
   );
   const policy = buildPolicy(state.requestedWordCount, state.wordMin, state.wordMax, state.keyphrase);
   return evaluatePolicy(metrics, policy);
+}
+
+/**
+ * Development-only diagnostic artifact for articles that fail final validation
+ * solely on editorial quality. Enabled only by DEBUG_EDITORIAL=true; never
+ * writes to Supabase and never persists as a blog version. The failed article
+ * would otherwise be discarded, making the exact repeated pairs impossible to
+ * inspect. Credentials and research payloads are never included.
+ */
+export function writeEditorialFailureArtifact(
+  state: PipelineState,
+  context: {
+    preEditorialHtml: string;
+    preEditorialMetrics: FinalArticleMetrics;
+    rejectedEditorialCandidates: Array<{ stage: string; accepted: boolean; reason: string; score: number }>;
+    finalReasons: string[];
+  },
+): void {
+  try {
+    const finalMetrics = analyzeFinalArticle(
+      state.blog,
+      state.keyphrase,
+      state.title,
+      state.metaDescription,
+      state.requestedWordCount,
+      countCanonicalVisibleWords(state.articleDoc),
+    );
+    const pairs = findRepetitionPairTargets(state.articleDoc).map((target) => {
+      const aFlags = repetitionPairSurfaceFlags(
+        state.articleDoc,
+        {
+          componentKind: target.preserveComponentKind,
+          componentId: target.preserveComponentId,
+          blockId: target.preserveBlockId,
+          text: target.preserveText,
+        },
+        state.keyphrase,
+      );
+      const bFlags = repetitionPairSurfaceFlags(
+        state.articleDoc,
+        {
+          componentKind: target.componentKind,
+          componentId: target.componentId,
+          blockId: target.blockId,
+          text: target.text,
+        },
+        state.keyphrase,
+      );
+      return {
+        a: `${target.preserveComponentKind}:${target.preserveComponentId}:${target.preserveBlockId}`,
+        b: `${target.componentKind}:${target.componentId}:${target.blockId}`,
+        overlap: target.overlap,
+        duplicatedIdea: target.duplicatedIdea,
+        aKeyphrase: aFlags.keyphrase,
+        bKeyphrase: bFlags.keyphrase,
+        aNumbers: aFlags.numbers,
+        bNumbers: bFlags.numbers,
+        aText: target.preserveText.slice(0, 180),
+        bText: target.text.slice(0, 180),
+      };
+    });
+    const artifact = {
+      createdAt: new Date().toISOString(),
+      title: state.title,
+      keyphrase: state.keyphrase,
+      requestedWordCount: state.requestedWordCount,
+      preEditorialScore: context.preEditorialMetrics.editorialScore ?? 100,
+      preEditorialBreakdown: {
+        malformed: context.preEditorialMetrics.malformedProseCount ?? 0,
+        repeatedPairs: context.preEditorialMetrics.repeatedIdeaPairCount ?? 0,
+        robotic: context.preEditorialMetrics.roboticPhraseCount ?? 0,
+        conclusionRatio: context.preEditorialMetrics.conclusionWordRatio ?? 0,
+      },
+      finalScore: finalMetrics.editorialScore ?? 100,
+      finalBreakdown: {
+        malformed: finalMetrics.malformedProseCount ?? 0,
+        repeatedPairs: finalMetrics.repeatedIdeaPairCount ?? 0,
+        robotic: finalMetrics.roboticPhraseCount ?? 0,
+        conclusionRatio: finalMetrics.conclusionWordRatio ?? 0,
+      },
+      finalReasons: context.finalReasons,
+      repeatedPairs: pairs,
+      rejectedCandidates: context.rejectedEditorialCandidates,
+      roboticMatches: extractRoboticPhraseMatches(state.blog),
+      malformedFindings: findMalformedEditableBlocks(state.articleDoc).map((block) => ({
+        blockId: block.blockId,
+        issues: block.issues,
+      })),
+      preEditorialHtml: context.preEditorialHtml,
+      postTargetedRepairsHtml: state.blog,
+    };
+    const dir = path.join(process.cwd(), "debug");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `editorial-failure-${Date.now()}.json`);
+    fs.writeFileSync(file, JSON.stringify(artifact, null, 2), "utf8");
+    console.log(`[editorial-failure-artifact] written to ${file}`);
+  } catch (error) {
+    console.warn(
+      `[editorial-failure-artifact] could not write artifact: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }

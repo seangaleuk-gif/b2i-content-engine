@@ -52,6 +52,20 @@ export function pairedSlugs(baseSlug: string): { englishSlug: string; chineseSlu
   };
 }
 
+/** A research source URL is eligible for external links when it is a valid
+ *  http(s) URL and not B2I-owned. Shared by the research dispatch, the
+ *  external-link stage and link diagnostics. */
+export function isEligibleExternalSourceUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    return !B2I_DOMAINS.some((domain) => host === domain || host.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
 /** Insert external authoritative research links into article body.
  *  Uses only project research URLs, never invents links.
  *  Inserts at top-level WordPress block boundaries — never inside a block.
@@ -201,7 +215,12 @@ function evidenceRelevanceScore(blockText: string, sourceText: string): number {
   // contains no number. Require substantial lexical agreement to avoid
   // attaching a merely topical source.
   const hasQuotation = /["“”]/.test(blockText);
-  return hasQuotation && overlap >= 6 ? 80 + overlap : 0;
+  if (hasQuotation && overlap >= 6) return 80 + overlap;
+  // Prose-only sources: substantial lexical agreement (the same token
+  // threshold as quoted evidence) is enough to attach a relevant source
+  // link. Without this, sources carrying no numbers or quotations could
+  // never be linked even when they match the paragraph.
+  return overlap >= 6 ? overlap : 0;
 }
 
 function escapeHtmlAttribute(text: string): string {

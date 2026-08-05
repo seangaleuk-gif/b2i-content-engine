@@ -18,7 +18,7 @@ thinking: { type: "enabled" }
 
 ## Current implementation
 
-### Files changed
+### Files changed (protected)
 
 - `src/lib/services/deepseek.ts`
 - `src/lib/services/blog-generation-service.ts`
@@ -155,7 +155,7 @@ Never log API keys, prompts, article content, translations, or full model respon
 
 ## Verified production effect
 
-After explicit thinking was disabled, the latest generation showed:
+After explicit thinking was disabled, real generations show:
 
 - `reasoning_tokens=0`
 - `reasoning_chars=n/a`
@@ -163,4 +163,4 @@ After explicit thinking was disabled, the latest generation showed:
 - no reasoning-token-exhaustion loop
 - normal generation speed restored
 
-Do not modify this subsystem while fixing the current FAQ/malformed-prose finalization defect.
+This subsystem is complete and protected. Do not modify it unless a defect is proven with evidence.

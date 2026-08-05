@@ -123,17 +123,175 @@ export function visibleChars(html: string): number {
 
 export function checkCompleteness(source: string, translated: string, component: string): { passed: boolean; sourceChars: number; translatedChars: number; ratio: number } {
   const sourceChars = visibleChars(source);
-  const translatedChars = visibleChars(translated);
+  const rawTranslatedChars = visibleChars(translated);
+  // CJK characters carry meaning far more densely than Latin script, so a
+  // legitimate Chinese translation of short content is naturally compact
+  // (e.g. "Click here" → "按此": 10 Latin chars → 2 CJK chars). Weight CJK
+  // characters when measuring the effective translated length so valid
+  // translations are not discarded as "incomplete". The completeness
+  // threshold itself is unchanged; this only corrects the metric for the
+  // target language.
+  const cjkChars = countCjkChars(translated);
+  const translatedChars = rawTranslatedChars + cjkChars;
   const ratio = sourceChars > 0 ? translatedChars / sourceChars : 1;
-  const passed = ratio >= COMPLETENESS_RATIO && !hasExcessiveEnglish(translated);
+  const passed = ratio >= COMPLETENESS_RATIO
+    && !hasExcessiveEnglish(translated)
+    && !hasEnglishHeavyProseBlock(translated);
   return { passed, sourceChars, translatedChars, ratio };
 }
 
 export function hasExcessiveEnglish(text: string): boolean {
-  const cleaned = text.replace(/<!--[\s\S]*?-->/g, "").replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const cleaned = stripCitationSourceTitles(text)
+    .replace(/<!--[\s\S]*?-->/g, "").replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   const engRuns = cleaned.match(/\b([A-Za-z]{2,}\s+){4,}[A-Za-z]{2,}\b/g) || [];
   if (engRuns.length === 0) return false;
   return engRuns.join(" ").length > cleaned.length * 0.10;
+}
+
+// ── Citation-label exemption ──
+// A citation paragraph such as 「來源：<a href="...">English research title</a>」
+// or 「來源：English research title」 legitimately carries an English source title
+// (an external evidence title that is preserved as a proper noun). The whole
+// citation-label block is a source-title line and must not count toward
+// English-leakage detection — whether the title is linked or plain text. Only
+// blocks that start with a citation label are exempted — ordinary English
+// paragraphs, headings and untranslated prose are still detected.
+
+const CITATION_LABEL_RE = /^\s*(?:來源|資料來源|Source)\s*[：:]/iu;
+
+function isCitationLabelBlock(blockHtml: string): boolean {
+  const visible = blockHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return CITATION_LABEL_RE.test(visible);
+}
+
+/** Remove the complete source-title content inside citation-label blocks (linked or plain-text). */
+export function stripCitationSourceTitles(html: string): string {
+  return html.replace(/<(p|li|h3|td|th)\b[^>]*>[\s\S]*?<\/\1>/gi, (block: string) => {
+    if (!isCitationLabelBlock(block)) return block;
+    // Exclude the entire citation-label block: the label marks a source-title
+    // line, so any English after it is a preserved source title, not leakage.
+    return "";
+  });
+}
+
+/**
+ * English-leakage check at the prose-block granularity used by the final
+ * Chinese editorial gate. A component whose overall text is mostly Chinese can
+ * hide a single untranslated English block (the whole-component
+ * `hasExcessiveEnglish` check measures the English run against the entire
+ * component, so one English block in a large component can fall below 10%).
+ * Every component-level gate must reject the same English-heavy blocks the
+ * final validation rejects, or a repair can be accepted at the component gate
+ * and then rejected by the final gate. Citation-label blocks are exempted from
+ * the English run because their source titles (linked or plain-text) are
+ * preserved evidence, not untranslated prose.
+ */
+export function hasEnglishHeavyProseBlock(html: string): boolean {
+  const proseBlocks = [...html.matchAll(/<(?:p|li|h3|td|th)\b[^>]*>([\s\S]*?)<\/(?:p|li|h3|td|th)>/gi)]
+    .map((match) => ({ blockHtml: match[0], inner: match[1] }));
+  return proseBlocks.some(({ blockHtml, inner }) => {
+    if (isCitationLabelBlock(blockHtml)) {
+      // Citation-label blocks are source-title lines (linked or plain-text
+      // English title); exclude them entirely from English-leak counting.
+      return false;
+    }
+    const cleaned = inner.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    return cleaned.length > 0 && hasExcessiveEnglish(cleaned);
+  });
+}
+
+// ── Source-echo guard ──
+// Deterministic protection against unchanged English responses being accepted
+// as translations. The consecutive-English-word detector above misses echoes
+// whose word runs are interrupted by numbers, percentages or dates (e.g.
+// "Hello World with 25% growth"), so candidates whose meaningful text is
+// effectively unchanged from the source are rejected before acceptance and
+// continue into the repair/retry and structured-fallback flow.
+
+/** Minimum whitespace-delimited Latin tokens the source must contain before an
+ *  unchanged response may be classified as a meaningful-English echo. */
+export const MIN_ECHO_LATIN_WORDS = 3;
+/** Minimum Latin letters inside lowercase-bearing pure-alpha tokens before an
+ *  unchanged response may be classified as a meaningful-English echo. */
+export const MIN_ECHO_LATIN_LETTERS = 12;
+
+function decodeHtmlEntitiesForComparison(text: string): string {
+  return text
+    .replace(/&nbsp;/gi, "\u00A0")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_match, code: string) => String.fromCodePoint(parseInt(code, 16)))
+    // Decoded last so "&amp;nbsp;" stays the literal text "&nbsp;".
+    .replace(/&amp;/gi, "&");
+}
+
+/** Deterministic normalization of HTML for source-echo comparison.
+ *  Decodes HTML entities, removes comments and complete script/style blocks,
+ *  replaces tags with spaces (so `<p>Hello</p><p>World</p>` becomes
+ *  "hello world", never "helloworld"), applies NFKC Unicode normalization,
+ *  collapses whitespace, trims, and folds case. Numbers, percentages,
+ *  punctuation, brand names, protected placeholders and meaningful text
+ *  tokens are all preserved. */
+export function normalizeTranslationComparisonText(html: string): string {
+  return decodeHtmlEntitiesForComparison(html)
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * True when the translated candidate is effectively unchanged from the
+ * English source AND the source contains enough meaningful Latin-script
+ * prose to justify translation.
+ *
+ * Short token-only blocks ("25%", "2025", "Meta", "Meta、Threads、Instagram")
+ * are never echoes because countLatinWords counts whitespace-delimited tokens
+ * (a CJK-punctuation-joined brand list is one token), and the letter count
+ * only considers pure-alpha tokens containing a lowercase letter (an
+ * ALL-CAPS brand list contributes nothing).
+ *
+ * A bilingual sentence containing meaningful untranslated English prose
+ * ("Use 「香港創作者」 when describing local creators.") IS an echo; the
+ * presence of Chinese characters does not exempt it.
+ */
+export function isSourceEcho(source: string, translated: string): boolean {
+  const normalizedSource = normalizeTranslationComparisonText(source);
+  const normalizedTranslated = normalizeTranslationComparisonText(translated);
+
+  if (!normalizedSource || !normalizedTranslated) return false;
+  if (normalizedSource !== normalizedTranslated) return false;
+
+  // Meaningful-Latin-prose word count: whitespace-delimited tokens that
+  // contain letters but NO digits. Number-bearing constructs ("hk$500",
+  // "2.4m", "2025") never count as prose words, so short token blocks such
+  // as "HK$500 and 50% off" (2 prose words) are not echoes while "Hello
+  // World with 25% growth" (4 prose words) is. CJK-punctuation-joined brand
+  // lists ("Meta、Threads、Instagram") are a single token, never three.
+  const latinWords = normalizedSource
+    .split(/\s+/)
+    .filter((token) => /[a-zA-Z]/.test(token) && !/\d/.test(token))
+    .length;
+
+  // Letter count considers only pure-alpha tokens containing a lowercase
+  // letter, so an ALL-CAPS brand list contributes nothing while prose
+  // (even joined without spaces) still does.
+  const latinLetterCount = normalizedSource
+    .split(/\s+/)
+    .filter((token) => /^[A-Za-z]+$/.test(token) && /[a-z]/.test(token))
+    .join("")
+    .match(/[A-Za-z]/g)?.length ?? 0;
+
+  return latinWords >= MIN_ECHO_LATIN_WORDS || latinLetterCount >= MIN_ECHO_LATIN_LETTERS;
 }
 
 // ── Link checks ──

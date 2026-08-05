@@ -503,6 +503,56 @@ ${"<!-- wp:paragraph --><p>為了填滿目標字數而添加的額外內容段�
 
 // ── Deterministic keyphrase insertion tests ──
 
+describe("Chinese final editorial diagnostics", () => {
+  const baseInput = {
+    title: "香港創作者市場推廣指南",
+    metaDescription: "香港創作者市場推廣完整指南。",
+    keyword: "香港創作者市場推廣",
+    faq: [],
+    englishWordCount: 2500,
+  };
+
+  it("detects stray whitespace between CJK words", () => {
+    const blog = "<p>品牌制定強勁嘅 創作者 市場推廣策略。</p>";
+    const audit = runChineseAudit({ ...baseInput, blog });
+    const check = audit.checks.find((c) => c.id === "cjk_stray_whitespace");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("warning");
+  });
+
+  it("detects the duplicated creator phrase", () => {
+    const blog = "<p>透過同啱嘅香港創作者或者 創作者 合作。</p>";
+    const audit = runChineseAudit({ ...baseInput, blog });
+    const check = audit.checks.find((c) => c.id === "creator_duplicate");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("warning");
+  });
+
+  it("detects the broken possessive phrase", () => {
+    const blog = "<p>最終，喺香港揀啱你創作者市場推廣嘅代理商。</p>";
+    const audit = runChineseAudit({ ...baseInput, blog });
+    const check = audit.checks.find((c) => c.id === "broken_possessive");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("warning");
+  });
+
+  it("detects the literal 'human' phrase", () => {
+    const blog = "<p>個訊息嘅感染力係完全唔同嘅。感覺好人性化。</p>";
+    const audit = runChineseAudit({ ...baseInput, blog });
+    const check = audit.checks.find((c) => c.id === "literal_human");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("warning");
+  });
+
+  it("does not raise false-positive editorial diagnostics on clean content", () => {
+    const blog = "<p>香港創作者市場推廣正悄悄轉型。品牌開始意識到，一個有 10,000 位忠實粉絲嘅創作者，可以更快推動產品銷售。</p>";
+    const audit = runChineseAudit({ ...baseInput, blog });
+    for (const id of ["cjk_stray_whitespace", "creator_duplicate", "broken_possessive", "literal_human"]) {
+      expect(audit.checks.some((c) => c.id === id)).toBe(false);
+    }
+  });
+});
+
 describe("ensureKeyphraseInTitle", () => {
   it("exact keyphrase already present → title unchanged", () => {
     const title = "香港本地化測試完整指南";

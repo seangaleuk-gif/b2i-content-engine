@@ -6,6 +6,8 @@ This version has breaking changes — APIs, conventions, and file structure may 
 
 # B2I Content Engine — Architecture
 
+> **New-chat entry point:** read `NEW_CHAT_HANDOFF.md` (1 August 2026) first. It is the authoritative handoff; where older files conflict, it wins.
+
 ## Canonical article state
 
 `ArticleDocument` (in `src/lib/blog/article-document.ts`) is the single canonical mutable article representation. No other model, string, or array independently represents article content.
@@ -107,7 +109,7 @@ Non-`AppError` throws are mapped to a generic 500 response with `{ error: "Inter
 
 ## Build and tests
 
-Current build passes with **842 tests passing and 0 failing** (10 test files).
+Current build passes. Full suite: **1,442 passed / 18 pre-existing failures (1,460 total)**; lint 468 findings (285 errors / 183 warnings); `tsc --noEmit` has 2 pre-existing errors in `section-expander.test.ts`. Verified 31 July 2026 evening.
 
 ## Contributor rules
 
@@ -181,7 +183,35 @@ If a numeric mismatch, English leakage, or FAQ-count variation can be prevented 
 
 ## Handoff
 
-Current state (2026-07-27):
+Current state (2026-07-31 evening update). The authoritative detailed handoff is `B2I-MASTER-HANDOFF-2026-07-31.md`; the older `2026-07-27` section below is retained as historical context.
+
+### Verified now (production verified)
+- **English generation is the protected working baseline.** A fresh live English generation passed final validation: editorial score **94**, repeatedPairs **0**, malformed **0**, FAQ parity valid (5/5/5), word count 2767 (2125–2875), final validation **PASS**.
+- DeepSeek routine stages use thinking disabled (`reasoning_tokens=0`, first-attempt completion).
+- FAQ parity and malformed-repair persistence are fixed (`final-preflight` verifies canonical/rendered/schema parity; targeted repairs persist even when the general polish is rejected).
+- Editorial minimum remains **80**. Repetition overlap threshold remains **0.55**.
+- Repetition repair preserves the earlier paragraph, rewrites only the later duplicate, validates per-target overlap, and applies a bounded deterministic fallback after two failed AI attempts.
+- Robotic `remember` detection is imperative-only (false-positive fix).
+
+### Translation
+- **Traditional Chinese is the only translation target. Simplified Chinese is out of scope.**
+- Editorial-block translation tests: **93/93 passing** (source-echo rejection, CJK-aware completeness, structured fallback, fail-closed parsing).
+- Live Traditional Chinese translation is **verified** (project 19, version 6, saved ID 202; 40 API calls, 0 retries, 26 deterministic editorial changes; `deepseek-v4-flash`, thinking disabled). Structural translation, source-label and paragraph punctuation, FAQ/schema parity, CTA preservation and natural HK code-switching all work.
+
+### Research and external links (live verified)
+- Automatic research dispatch in `runBlogGeneration` (auto when no approved `research_sources` rows; manual rows suppress auto; provider failure/empty degrades with a clear warning; no fabricated sources).
+- External links injected from eligible approved sources with `[external-links:candidates/inject/final]` diagnostics and a zero-eligible warning.
+- `externalLinks` metadata reflects the real final article.
+- Live verified: external links injected, retained, saved and counted (6 in the latest verified English run).
+
+### Tests / lint / build (last recorded full-suite result)
+- Full suite: **18 failed | 1473 passed (1491 total)** — unchanged pre-existing baseline, zero new regressions.
+- Lint: **468 findings** (285 errors / 183 warnings) — unchanged baseline.
+- Build: passes. `tsc --noEmit`: 2 pre-existing errors in `section-expander.test.ts`.
+
+---
+
+## Historical context (2026-07-27, superseded where it conflicts with the handoff above)
 
 ### Translation Pipeline Refactor
 - **Module split**: `translation-service.ts` (orchestration only), `translation-ai.ts` (AI calls, prompts, retry budget), `translation-validator.ts` (number protection, English leakage, completeness), `translation-assembler.ts` (FAQ schema, source localisation, internal-link localisation), `translation-types.ts` (shared types).
@@ -208,7 +238,7 @@ Current state (2026-07-27):
 - Integrated into English pipeline (prompt-builder, final-article-policy, final-seo-normalizer, component-regenerator, section-expander, quality-scorer, seo-auditor runAudit). Not yet integrated into Chinese SEO.
 
 ### English Pipeline
-- Pipeline order: expansion → trim → paragraphs → regeneration → external-links → internal-links → seo-normalization → factual-scan → link-enforce → final-trim → faq-recovery → paragraphs-final → cta-preserve → wc-check → final-validation
+- Pipeline order (current): expansion → trim → paragraphs → regeneration → seo-normalization → factual-scan → claim-ownership → temporal-freshness → malformed-prose-repair → editorial-polish → claim-ownership-final → language-switcher → internal-links → external-links → external-dedup → link-enforce → factual-final → cta-preserve → final-trim → faq-recovery → wc-check → final-preflight → final-validation
 - `cta-preserve` always re-injects canonical CTA when damaged (not just when `articleDoc.cta` is null), then rebuilds FAQ schema from current visible FAQ.
 - `wc-check`: post-CTA word count trim that also rebuilds FAQ schema.
 - `runTrackedHtmlStage` flattens nested `<p>` before stage validation using `detectNestedParagraphs` + iterative unwrap.
@@ -244,9 +274,8 @@ Current state (2026-07-27):
 **Soft warnings (never block):** Keyphrase density <0.5%, keyphrase not in H2, keyphrase not in first 100 words, title/meta near misses, reading level outside target.
 
 ### Tests
-- **842 tests passing, 0 failing** (10 files: 7 existing + content-standards.test.ts + verify-word-count-tiers.test.ts + regression-issues.test.ts)
+- **1,442 tests passing, 18 pre-existing failures** (1,460 total, verified 31 July 2026 evening). The historical "842 tests passing" claim is stale.
 - All 6 word-count tiers verified (500, 1000, 1500, 2500, 3500, 5000 words) across content-standards, policy builder, boundary tests, SEO audit, Chinese SEO audit, and version filtering.
-- 3 consecutive production translations confirmed passing (versions 24-26).
 
 ### Known Issues
 - DeepSeek v4 `empty_response` on prompts under ~500 input tokens (mitigated by padding).

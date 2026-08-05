@@ -35,6 +35,21 @@ export interface TranslationResult {
   sourceDecisions: SourceDecision[];
   internalLinkDecisions: SourceDecision[];
   structuredShadowResult?: StructuredTranslationShadowResult;
+  /** Editorial-review diagnostics (selected units, reasons, decisions, field edits). */
+  review?: {
+    selectedUnitIds: string[];
+    selectedReasons: Array<{ sourceUnitId: string; reasons: string[]; mandatory: boolean }>;
+    decisions: Array<{
+      sourceUnitId: string;
+      decision: "replace" | "retain";
+      reasonCodes: string[];
+      edits?: Array<{ fieldId: string; replacementText: string }>;
+    }>;
+    appliedEditCount: number;
+    retainedCount: number;
+    status: "not-run" | "run" | "failed";
+    failure: string | null;
+  };
 }
 
 export interface ResearchItem {

@@ -1,35 +1,35 @@
 # B2I Content Engine — Read First
 
-**Authoritative handoff date:** 31 July 2026, 16:55 Singapore/Hong Kong time
+**Authoritative handoff date:** 1 August 2026
 
-This folder is the current handoff for the next coding-assistant chat. Read every file before proposing or making changes.
+The authoritative handoff is `NEW_CHAT_HANDOFF.md`. Read it and the other files in this pack before inspecting or modifying code. Older statements in project Markdown files that conflict with the handoff are stale. `B2I-MASTER-HANDOFF-2026-07-31.md` is superseded by `NEW_CHAT_HANDOFF.md`.
 
-## Authority and stale documentation warning
+## Current verified state (summary)
 
-This handoff supersedes old status statements in existing project Markdown files where they conflict with this pack. In particular, old claims such as “842 tests passing,” “1,189 tests passing,” or “Nuclear Fix v2 is the current working baseline” are stale and must not be treated as the present status.
+- **English generation is the production-verified working baseline.** Latest verified live result: editorial score **94**, repeated pairs **0**, malformed **0**, FAQ parity **6/6/6**, external links **6**, internal links **4**, keyphrase density **1.08%**, final validation **PASS**.
+- Auto-research and external-link generation are working (live verified).
+- Keyphrase exclusion is consistent across editorial and final validation.
+- Editorial minimum remains **80**; repetition overlap threshold remains **0.55**.
+- **Traditional Chinese translation is live verified** (project 19, version 6, saved ID 202; 40 API calls, 0 retries, 26 deterministic editorial changes; `deepseek-v4-flash`, thinking disabled). Structural translation works; source-label and paragraph punctuation fixed; FAQ/schema parity and CTA preserved; natural HK code-switching allowed.
+- Simplified Chinese is out of scope.
+- Test baseline: **18 pre-existing failures, 1,473 passing** in the last recorded full-suite result.
+- Lint baseline: **468 findings** (285 errors, 183 warnings). Build passes.
+- Two pre-existing TypeScript errors remain in `section-expander.test.ts`.
 
-The current project compiles and starts, and DeepSeek request latency has been repaired. However, **English generation still fails final validation**, so there is no currently confirmed production-ready generation baseline.
+## Next task
 
-## Current immediate task
-
-Fix only the latest final-validation consistency defects:
-
-1. FAQ visible-body/schema parity after factual and editorial mutations.
-2. Malformed paragraph repair persistence by stable block ID.
-3. Re-run the existing editorial scorer after those defects are fixed.
-4. Keep the editorial minimum at 80.
-
-Do not change DeepSeek thinking-mode handling, model name, generation prompts, SEO thresholds, factual rules, translation architecture, database code, concurrency, or token budgets while fixing this task.
+A professional architecture audit of the translation pipeline (see `NEW_CHAT_HANDOFF.md` section 2). Audit-only; no code changes until the user manually switches thinking off.
 
 ## Read order
 
-1. `01_PROJECT_STATUS.md`
-2. `02_ARCHITECTURE_NON_NEGOTIABLES.md`
-3. `03_DEEPSEEK_REQUEST_POLICY.md`
-4. `04_ENGLISH_GENERATION_PIPELINE.md`
-5. `05_TRANSLATION_PIPELINE.md`
-6. `06_CURRENT_BLOCKERS_AND_NEXT_FIX.md`
-7. `07_TEST_BUILD_LINT_STATUS.md`
-8. `08_CHANGELOG_LATEST.md`
-9. `09_CODER_WORKING_RULES.md`
-10. `NEW_CHAT_START_PROMPT.md`
+1. `NEW_CHAT_HANDOFF.md`
+2. `01_PROJECT_STATUS.md`
+3. `02_ARCHITECTURE_NON_NEGOTIABLES.md`
+4. `03_DEEPSEEK_REQUEST_POLICY.md`
+5. `04_ENGLISH_GENERATION_PIPELINE.md`
+6. `05_TRANSLATION_PIPELINE.md`
+7. `06_CURRENT_BLOCKERS_AND_NEXT_FIX.md`
+8. `07_TEST_BUILD_LINT_STATUS.md`
+9. `08_CHANGELOG_LATEST.md`
+10. `09_CODER_WORKING_RULES.md`
+11. `NEW_CHAT_START_PROMPT.md`

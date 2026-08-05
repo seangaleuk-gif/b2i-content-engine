@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import * as nodeFs from "node:fs";
+import * as nodePath from "node:path";
 import {
   type ArticleDocument,
   type ArticleSection,
@@ -32,9 +34,11 @@ import {
   evaluateEditorialStageCandidate,
   guardStageOutput,
   sanitizeFaqFactualClaims,
+  trimResidualSafeProseToMaximum,
   shouldAcceptSeoNormalization,
   validatePipelineOrder,
   validateTemporalCandidate,
+  writeEditorialFailureArtifact,
 } from "@/lib/pipeline/blog-generation-pipeline";
 import { findMalformedEditableBlocks } from "@/lib/pipeline/editorial-polish";
 import { enforceInternalLinkLimit, analyzeFinalArticle, evaluatePolicy, buildPolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
@@ -1015,6 +1019,42 @@ describe("FAQ generation guarantees", () => {
     expect(result.html).not.toContain(`<a href="/blog/article-5"`);
   });
 
+  it("residual final-trim closes a small overrun at a complete sentence boundary", () => {
+    const doc = makeArticleDoc({
+      sections: [sectionFromHtml(
+        "section-safe-trim",
+        "Safe Trim Section",
+        `<!-- wp:paragraph --><p>This paragraph introduces a practical workflow for local teams and gives readers useful context before they act. This final sentence is optional supporting prose that can be removed safely when the article is slightly too long.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>Another substantial paragraph keeps the section useful after trimming. It explains how teams can review their approach, learn from customer feedback, and improve the next piece of content without changing any factual claim.</p><!-- /wp:paragraph -->`,
+      )],
+    });
+    const before = countCanonicalVisibleWords(doc);
+    const ctaBefore = doc.cta?.html;
+    const result = trimResidualSafeProseToMaximum(doc, before - 18, before - 100, "safe trim", []);
+
+    expect(result.finalWordCount).toBeLessThanOrEqual(before - 18);
+    expect(result.shortenedSentences + result.removedParagraphs).toBeGreaterThan(0);
+    expect(doc.cta?.html).toBe(ctaBefore);
+    expect(renderArticleDocument(doc)).not.toContain("This final sentence is optional supporting prose");
+  });
+
+  it("residual final-trim never removes a paragraph containing the focus keyphrase", () => {
+    const doc = makeArticleDoc({
+      sections: [sectionFromHtml(
+        "section-keyphrase-trim",
+        "Protected Keyphrase Section",
+        `<!-- wp:paragraph --><p>This safe trim keyphrase paragraph contains the exact focus phrase and must remain untouched. It includes a trailing optional sentence that must also remain.</p><!-- /wp:paragraph -->
+<!-- wp:paragraph --><p>This separate paragraph gives practical context for teams. Its final optional sentence can be removed safely to close a small overrun without affecting SEO.</p><!-- /wp:paragraph -->`,
+      )],
+    });
+    const before = countCanonicalVisibleWords(doc);
+    trimResidualSafeProseToMaximum(doc, before - 5, before - 100, "safe trim keyphrase", []);
+    const rendered = renderArticleDocument(doc);
+
+    expect(rendered).toContain("safe trim keyphrase paragraph");
+    expect(rendered).toContain("trailing optional sentence that must also remain");
+  });
+
   it("final-trim removes last paragraph without breaking WP blocks", () => {
     // Create a section with multiple paragraphs
     const sectionHtml = `<!-- wp:paragraph --><p>First paragraph with important content about the topic. This provides genuine value to the reader about key concepts covered here.</p><!-- /wp:paragraph -->
@@ -1496,5 +1536,63 @@ describe("editorial malformed-repair persistence by stable block ID", () => {
     const commit = chooseEditorialCommitDoc({ workingDoc: doc, targetedRepairsDoc: null, accepted: false });
     expect(commit.targetedRepairsPersisted).toBe(false);
     expect(commit.doc).toBe(doc);
+  });
+});
+
+describe("editorial failure artifact (dev-only)", () => {
+  it("writes an artifact only when DEBUG_EDITORIAL is enabled", () => {
+    const doc = makeArticleDoc();
+    const state = createPipelineState({
+      userId: "test",
+      projectId: "1",
+      keyphrase: "test keyphrase",
+      requestedWordCount: 500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((section) => section.heading),
+      intro: renderComponentHtml(doc.introduction),
+      conclusion: renderComponentHtml(doc.conclusion),
+      wordsPerSection: 100,
+      exactKeyphraseTarget: 2,
+      policy: buildPolicy(500, 450, 550, "test keyphrase"),
+      ctx: {},
+      wordMin: 450,
+      wordMax: 550,
+      systemPrompt: "",
+      userMessage: "",
+    });
+    const context = {
+      preEditorialHtml: state.blog,
+      preEditorialMetrics: analyzeFinalArticle(
+        state.blog, state.keyphrase, state.title, state.metaDescription,
+        state.requestedWordCount, countCanonicalVisibleWords(state.articleDoc),
+      ),
+      rejectedEditorialCandidates: [
+        { stage: "repetition", accepted: false, reason: "editorial score did not improve: 70 → 70", score: 70 },
+      ],
+      finalReasons: ["editorial score=70 (minimum: 80)"],
+    };
+
+    // Production mode: no artifact, no crash.
+    delete process.env.DEBUG_EDITORIAL;
+    writeEditorialFailureArtifact(state, context);
+    const before = nodeFs.readdirSync("debug").filter((f) => f.startsWith("editorial-failure-")).length;
+
+    // Dev mode: artifact is written with the score breakdown and rejected candidates.
+    process.env.DEBUG_EDITORIAL = "true";
+    writeEditorialFailureArtifact(state, context);
+    const after = nodeFs.readdirSync("debug").filter((f) => f.startsWith("editorial-failure-"));
+    expect(after.length).toBe(before + 1);
+
+    const newest = after.sort().pop()!;
+    const file = nodePath.join("debug", newest);
+    const parsed = JSON.parse(nodeFs.readFileSync(file, "utf8"));
+    expect(parsed.finalReasons).toContain("editorial score=70 (minimum: 80)");
+    expect(parsed.rejectedCandidates[0].stage).toBe("repetition");
+    expect(parsed.preEditorialHtml.length).toBeGreaterThan(0);
+    expect(parsed.postTargetedRepairsHtml.length).toBeGreaterThan(0);
+    expect(parsed.repeatedPairs).toBeDefined();
+    expect(parsed.roboticMatches).toBeDefined();
+    nodeFs.unlinkSync(file);
+    delete process.env.DEBUG_EDITORIAL;
   });
 });

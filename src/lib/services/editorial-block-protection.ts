@@ -148,6 +148,40 @@ export function checkBlockLinksPreserved(
   return srcLinks.filter((l) => !tgtLinks.includes(l) && !l.startsWith("#"));
 }
 
+// ── Placeholder integrity for number protection ──
+
+/**
+ * Count `__NUM_n__` placeholder occurrences across a block's inline text and
+ * report which expected placeholders are missing and which are duplicated or
+ * unknown. Used by the shadow path as the authoritative number-parity gate so
+ * formatting variants (10,000 vs 10000) can never produce false positives.
+ */
+export function analyzeBlockPlaceholderIntegrity(
+  blocks: EditorialBlock[],
+  placeholders: string[],
+): { lost: string[]; extra: string[] } {
+  const counts = new Map<string, number>();
+  forEachInlineText(blocks, (text) => {
+    const re = /__NUM_(\d+)__/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const key = `__NUM_${m[1]}__`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  });
+  const lost = placeholders.filter((p) => (counts.get(p) || 0) === 0);
+  const extras: string[] = [];
+  for (const p of placeholders) {
+    const c = counts.get(p) || 0;
+    if (c > 1) extras.push(p);
+  }
+  const known = new Set(placeholders);
+  for (const key of counts.keys()) {
+    if (!known.has(key)) extras.push(key);
+  }
+  return { lost, extra: extras };
+}
+
 // ── Internal traversal helpers ──
 
 function forEachInlineNode(

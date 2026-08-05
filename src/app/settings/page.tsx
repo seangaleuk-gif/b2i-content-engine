@@ -143,10 +143,26 @@ function PromptTabContent({
     }
   };
 
-  const handleRestoreDefaults = () => {
+  const handleRestoreDefaults = async () => {
+    // Restoring the default is an explicit user action that SAVES the canonical
+    // default value, so a refresh or a future generation uses it (not just the editor).
     setContent(defaultContent);
     setSaved(false);
     setSaveError(null);
+    setSaving(true);
+    try {
+      await api.post("/api/prompt-sections", {
+        sectionKey,
+        content: defaultContent,
+      });
+      setSaved(true);
+      refetchPrompts();
+      setTimeout(() => setSaved(false), 3000);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "Failed to restore default");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleRefresh = () => {

@@ -9,7 +9,7 @@ import {
   dynamicFaqRange,
   externalLinkRange,
 } from "@/lib/content-standards";
-import { analyzePublicationQuality } from "@/lib/blog/publication-quality";
+import { analyzePublicationQuality, keyphraseExclusionSet } from "@/lib/blog/publication-quality";
 
 // ── Types ──
 
@@ -293,7 +293,7 @@ export function scoreArticle(
   const total = seoScore + readabilityScore + structureScore + formattingScore + contentScore;
   const maxTotal = 30 + 20 + 20 + 15 + 15; // 100
   const baseScore = Math.round((total / maxTotal) * 100);
-  const publication = analyzePublicationQuality(blog);
+  const publication = analyzePublicationQuality(blog, keyphraseExclusionSet(keyword));
   const factualDetails: ScoreDetail[] = [
     {
       label: "Factual consistency",

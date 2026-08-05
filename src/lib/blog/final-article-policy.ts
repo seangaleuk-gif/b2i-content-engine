@@ -37,7 +37,7 @@ import {
   englishWordTolerance,
   englishTitleRange,
 } from "@/lib/content-standards";
-import { analyzePublicationQuality } from "@/lib/blog/publication-quality";
+import { analyzePublicationQuality, keyphraseExclusionSet } from "@/lib/blog/publication-quality";
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import { scanTemporalFreshness } from "@/lib/blog/temporal-freshness";
@@ -492,7 +492,7 @@ export function analyzeFinalArticle(
       .trim();
     hasConclusionContent = conclusionContent.length >= 3; // at least a short readable word
   }
-  const publication = analyzePublicationQuality(html);
+  const publication = analyzePublicationQuality(html, keyphraseExclusionSet(keyphrase));
   const unsupportedFactualClaimCount = validationContext
     ? countUnsupportedFactualClaims(
         validationContext.articleDoc,

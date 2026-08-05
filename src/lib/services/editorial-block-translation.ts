@@ -1,5 +1,5 @@
 import { type EditorialBlock, type InlineContent, parseWordPressEditorialBlocks, renderEditorialBlocksToWordPress, validateEditorialBlocks } from "@/lib/blog/article-content";
-import { checkCompleteness, checkLinksPreserved, checkNumbersPreserved } from "./translation-validator";
+import { checkCompleteness, checkLinksPreserved, checkNumbersPreserved, isSourceEcho } from "./translation-validator";
 import { protectNumbersInEditorialBlocks, restoreNumbersInEditorialBlocks, checkBlockNumbersPreserved, checkBlockLinksPreserved, extractNumbersFromEditorialBlocks, extractLinksFromEditorialBlocks, type NumberProtectionState } from "./editorial-block-protection";
 import { serializeTranslationPayload, extractTranslationJson, normalizeTranslationPayload, reconstructEditorialBlocks, validateConclusionPolicy, type TranslationComponentPayload, type TranslationLinkMap } from "./translation-dto";
 
@@ -16,6 +16,22 @@ export interface TranslateEditorialBlocksOptions {
   context?: Record<string, unknown>;
   translateProtectedHtml: (protectedHtml: string) => Promise<string>;
   repairProtectedHtml?: (protectedHtml: string, error: string) => Promise<string | null>;
+  /**
+   * Structure-first fallback used only after both WordPress-HTML candidates
+   * fail. The AI sees text-bearing JSON nodes, never URLs or application-owned
+   * markup, which prevents source-English HTML echoes from becoming the final
+   * translation candidate.
+   */
+  translateProtectedPayload?: (
+    payloadJson: string,
+    context: { componentKind: "introduction" | "section" | "conclusion"; componentId: string },
+  ) => Promise<string>;
+  repairProtectedPayload?: (
+    sourcePayloadJson: string,
+    invalidResponse: string,
+    errors: string[],
+    context: { componentKind: "introduction" | "section" | "conclusion"; componentId: string },
+  ) => Promise<string | null>;
   onStatus?: (status: { passed: boolean; metrics: { sourceChars: number; translatedChars: number; ratio: number; sourceNumbers: number; translatedNumbers: number; numbersMatch: number } }) => void;
 }
 
@@ -217,6 +233,18 @@ function evaluateCandidate(
   const translatedHtml = renderEditorialBlocksToWordPress(translatedBlocks);
   const completeness = checkCompleteness(sourceHtml, translatedHtml, componentId);
 
+  // Source-echo guard: an unchanged meaningful-English candidate is never a
+  // valid translation, even when the consecutive-English-word detector misses
+  // it (numbers, percentages and dates interrupt word runs). The restored
+  // source (real numbers, no __NUM_N__ placeholders) is compared against the
+  // restored candidate so values such as "25%" match correctly. Rejected
+  // candidates continue into the existing repair/retry and structured-fallback
+  // flow.
+  const sourceEcho = isSourceEcho(
+    renderEditorialBlocksToWordPress(sourceBlocks),
+    translatedHtml,
+  );
+
   // 6. HTML shadow validation (diagnostic only, on restored content)
   const shadow = runHtmlShadow(sourceBlocks, translatedBlocks);
 
@@ -230,6 +258,9 @@ function evaluateCandidate(
   }
   if (!completeness.passed) {
     failParts.push(`translation incomplete or contains excessive English (ratio=${completeness.ratio.toFixed(2)})`);
+  }
+  if (sourceEcho) {
+    failParts.push("source echo: translation is effectively unchanged from the English source");
   }
   if (!numbersMatch) {
     const details: string[] = [];
@@ -352,6 +383,168 @@ function fallbackResult(
   };
 }
 
+interface StructuredFallbackEvaluation {
+  passed: boolean;
+  blocks: EditorialBlock[];
+  translatedHtml: string;
+  errors: string[];
+}
+
+function evaluateStructuredFallbackCandidate(
+  raw: string,
+  sourcePayload: TranslationComponentPayload,
+  sourceBlocks: EditorialBlock[],
+  protectedBlocks: EditorialBlock[],
+  linkMap: TranslationLinkMap,
+  protectionState: NumberProtectionState,
+  componentId: string,
+): StructuredFallbackEvaluation {
+  const failed = (errors: string[]): StructuredFallbackEvaluation => ({
+    passed: false,
+    blocks: sourceBlocks,
+    translatedHtml: renderEditorialBlocksToWordPress(sourceBlocks),
+    errors,
+  });
+
+  const normalized = normalizeTranslationPayload(raw, sourcePayload);
+  if (!normalized.payload) return failed(normalized.errors);
+
+  const reconstructed = reconstructEditorialBlocks(normalized.payload, protectedBlocks, linkMap);
+  if (reconstructed.errors.length > 0) return failed(reconstructed.errors);
+
+  const placeholderIntegrity = checkPlaceholderIntegrity(reconstructed.blocks, protectionState);
+  if (!placeholderIntegrity.ok) {
+    return failed([`placeholder integrity: ${placeholderIntegrity.errors.join("; ")}`]);
+  }
+
+  const restored = restoreNumbersInEditorialBlocks(reconstructed.blocks, protectionState);
+  const remaining = checkNoPlaceholdersRemain(restored);
+  if (remaining.length > 0) return failed([`placeholders remain: ${remaining.join(", ")}`]);
+
+  const errors = validateEditorialBlocks(restored);
+  if (!sameStringSequence(editorialStructureSignature(sourceBlocks), editorialStructureSignature(restored))) {
+    errors.push("editorial block or inline structure changed");
+  }
+
+  if (sourcePayload.componentKind === "conclusion") {
+    validateConclusionPolicy(normalized.payload.blocks, errors);
+  }
+
+  const numbers = checkBlockNumbersPreserved(sourceBlocks, restored);
+  if (numbers.lost.length > 0 || numbers.extras.length > 0) {
+    const details = [
+      numbers.lost.length > 0 ? `lost: ${numbers.lost.join(", ")}` : "",
+      numbers.extras.length > 0 ? `extra: ${numbers.extras.join(", ")}` : "",
+    ].filter(Boolean).join("; ");
+    errors.push(`number mismatch (${details})`);
+  }
+
+  const sourceLinks = extractLinksFromEditorialBlocks(sourceBlocks);
+  const translatedLinks = extractLinksFromEditorialBlocks(restored);
+  if (!sameStringSequence(sourceLinks, translatedLinks)) {
+    errors.push("URL sequence changed");
+  }
+
+  const sourceHtml = renderEditorialBlocksToWordPress(sourceBlocks);
+  const translatedHtml = renderEditorialBlocksToWordPress(restored);
+  const completeness = checkCompleteness(sourceHtml, translatedHtml, componentId);
+  if (!completeness.passed) {
+    errors.push(`translation incomplete or contains excessive English (ratio=${completeness.ratio.toFixed(2)})`);
+  }
+  // The structured fallback candidate is held to the same source-echo rule:
+  // an unchanged English payload must not pass simply because the HTML
+  // candidate was already rejected.
+  if (isSourceEcho(sourceHtml, translatedHtml)) {
+    errors.push("source echo: translation is effectively unchanged from the English source");
+  }
+
+  return {
+    passed: errors.length === 0,
+    blocks: restored,
+    translatedHtml,
+    errors,
+  };
+}
+
+async function tryStructuredFallback(
+  options: TranslateEditorialBlocksOptions,
+  sourceBlocks: EditorialBlock[],
+  protectedBlocks: EditorialBlock[],
+  protectionState: NumberProtectionState,
+  sourceNumCount: number,
+): Promise<TranslateEditorialBlocksResult | null> {
+  if (!options.translateProtectedPayload) return null;
+
+  const { payload, linkMap } = serializeTranslationPayload(protectedBlocks, options.componentKind);
+  const payloadJson = JSON.stringify(payload);
+  const context = { componentKind: options.componentKind, componentId: options.componentId };
+
+  let response = "";
+  try {
+    response = await options.translateProtectedPayload(payloadJson, context);
+  } catch {
+    return null;
+  }
+
+  let evaluation = evaluateStructuredFallbackCandidate(
+    response,
+    payload,
+    sourceBlocks,
+    protectedBlocks,
+    linkMap,
+    protectionState,
+    options.componentId,
+  );
+
+  if (!evaluation.passed && options.repairProtectedPayload) {
+    try {
+      const repaired = await options.repairProtectedPayload(
+        payloadJson,
+        response,
+        evaluation.errors,
+        context,
+      );
+      if (repaired) {
+        evaluation = evaluateStructuredFallbackCandidate(
+          repaired,
+          payload,
+          sourceBlocks,
+          protectedBlocks,
+          linkMap,
+          protectionState,
+          options.componentId,
+        );
+      }
+    } catch {
+      // Fall through to the source-preserving failure result.
+    }
+  }
+
+  if (!evaluation.passed) return null;
+
+  const sourceHtml = renderEditorialBlocksToWordPress(sourceBlocks);
+  const metrics = {
+    sourceChars: sourceHtml.length,
+    translatedChars: evaluation.translatedHtml.length,
+    ratio: sourceHtml.length > 0 ? evaluation.translatedHtml.length / sourceHtml.length : 0,
+    sourceNumbers: sourceNumCount,
+    translatedNumbers: extractNumbersFromEditorialBlocks(evaluation.blocks).length,
+    numbersMatch: 1,
+  };
+  options.onStatus?.({ passed: true, metrics });
+  return {
+    blocks: evaluation.blocks,
+    translatedHtml: evaluation.translatedHtml,
+    passed: true,
+    metrics,
+    validationParity: {
+      numbersMatch: true,
+      linksMatch: true,
+      diagnostics: ["structured-fallback-used"],
+    },
+  };
+}
+
 const EMPTY_METRICS = { sourceChars: 0, translatedChars: 0, ratio: 0, sourceNumbers: 0, translatedNumbers: 0, numbersMatch: 0 };
 
 export async function translateEditorialBlocks(
@@ -377,6 +570,14 @@ export async function translateEditorialBlocks(
   try {
     translatedProtectedHtml = await translateProtectedHtml(protectedHtml);
   } catch {
+    const structuredFallback = await tryStructuredFallback(
+      options,
+      blocks,
+      protectedBlocks,
+      protectionState,
+      sourceNumCount,
+    );
+    if (structuredFallback) return structuredFallback;
     const fallback = fallbackResult(blocks, componentId, sourceNumCount);
     if (onStatus) onStatus({ passed: false, metrics: fallback.metrics });
     return fallback;
@@ -390,6 +591,14 @@ export async function translateEditorialBlocks(
       blocks, translatedProtectedHtml, componentId, protectionState, protectedHtml, sourceNumCount, onStatus,
     );
   } catch {
+    const structuredFallback = await tryStructuredFallback(
+      options,
+      blocks,
+      protectedBlocks,
+      protectionState,
+      sourceNumCount,
+    );
+    if (structuredFallback) return structuredFallback;
     const fallback = fallbackResult(blocks, componentId, sourceNumCount);
     if (onStatus) onStatus({ passed: false, metrics: fallback.metrics });
     return fallback;
@@ -413,7 +622,17 @@ export async function translateEditorialBlocks(
       }
     }
 
-    // Repair failed or not available — fallback to source
+    // HTML translation and strict HTML repair both failed. Use the
+    // structure-first JSON fallback before failing closed to the English source.
+    const structuredFallback = await tryStructuredFallback(
+      options,
+      blocks,
+      protectedBlocks,
+      protectionState,
+      sourceNumCount,
+    );
+    if (structuredFallback) return structuredFallback;
+
     const fallback = fallbackResult(blocks, componentId, sourceNumCount);
     if (onStatus) onStatus({ passed: false, metrics: fallback.metrics });
     return fallback;

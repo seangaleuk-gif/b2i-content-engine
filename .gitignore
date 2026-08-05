@@ -44,3 +44,6 @@ next-env.d.ts
 
 tmp/structured-translation-evaluation/
 tmp/structured-translation-production-evidence/
+
+# dev-only shadow preview exports
+/.tmp/

@@ -659,6 +659,23 @@ describe("candidate validation", () => {
     expect(validateCandidate(original, candidate, KEY_PHRASE).passed).toBe(false);
   });
 
+  it("keeps numeric facts bound to their stable paragraph IDs", () => {
+    const original = makeDocument();
+    original.sections[0].blocks.push(
+      paragraph("numeric-a", "The first approved result was 25%."),
+      paragraph("numeric-b", "The second approved result was 30%."),
+    );
+    const candidate = structuredClone(original);
+    const first = candidate.sections[0].blocks.find((block) => block.id === "numeric-a");
+    const second = candidate.sections[0].blocks.find((block) => block.id === "numeric-b");
+    if (first?.type === "paragraph") first.content[0].text = "The first approved result was 30%.";
+    if (second?.type === "paragraph") second.content[0].text = "The second approved result was 25%.";
+
+    const result = validateCandidate(original, candidate, KEY_PHRASE);
+    expect(result.passed).toBe(false);
+    expect(result.reasons).toContain("numeric facts changed");
+  });
+
   it("rejects candidates outside the ten-percent word tolerance", () => {
     const original = makeDocument();
     const candidate = structuredClone(original);

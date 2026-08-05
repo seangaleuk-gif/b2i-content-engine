@@ -207,11 +207,13 @@ export function hasLanguageSwitcher(html: string): boolean {
   return /b2i-language-switcher/i.test(html);
 }
 
-/** Count editorial outbound links, excluding internal B2I links, CTA signup,
- *  language switcher links, same-domain links, and relative URLs. */
-/** Count editorial external links in article HTML.
- *  Excludes: internal links, CTA signup, script/JSON-LD blocks, language-switcher links. */
-export function countEditorialExternalLinks(html: string, internalDomains: string[] = ["b2ihub.com", "app.b2ihub.com"]): number {
+/** Canonical editorial external-link URL extraction.
+ *  Excludes: internal links, CTA signup, script/JSON-LD blocks,
+ *  language-switcher links, and relative URLs. */
+export function extractEditorialExternalLinkUrls(
+  html: string,
+  internalDomains: string[] = ["b2ihub.com", "app.b2ihub.com"],
+): string[] {
   // Strip script blocks (containing JSON-LD/FAQ schema URLs) before counting
   const stripped = html.replace(/<script[\s\S]*?<\/script>/gi, "");
   const hrefRe = /<a\b[^>]*href="([^"]*)"[^>]*>/gi;
@@ -224,5 +226,13 @@ export function countEditorialExternalLinks(html: string, internalDomains: strin
     if (!href.startsWith("http")) continue;
     seen.add(href.replace(/\/$/, ""));
   }
-  return seen.size;
+  return [...seen];
+}
+
+/** Count editorial external links in article HTML. */
+export function countEditorialExternalLinks(
+  html: string,
+  internalDomains: string[] = ["b2ihub.com", "app.b2ihub.com"],
+): number {
+  return extractEditorialExternalLinkUrls(html, internalDomains).length;
 }
