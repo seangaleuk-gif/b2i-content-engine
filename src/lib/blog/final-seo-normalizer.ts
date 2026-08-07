@@ -15,7 +15,10 @@ import {
 import { computeKeyphraseTargets, computeKeyphraseDensity, englishKeyphraseDensity, getKeyphraseContentWordCount } from "@/lib/content-standards";
 import { rebalanceWpBlocks } from "@/lib/services/text-utils";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
+import { parseWordPressEditorialBlocks } from "@/lib/blog/article-document";
 import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, computeWordCountTolerance, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
+import { scanSentenceQualityText } from "@/lib/blog/sentence-quality";
+import { findMalformedProseTextIssues } from "@/lib/blog/publication-quality";
 
 // ── Types ──
 
@@ -72,24 +75,6 @@ export interface NormalizerChatFn {
 
 const MAX_READABILITY_REWRITES = 3;
 const MAX_EXPANSION_ATTEMPTS = 4;
-
-const KEYPHRASE_SYNONYMS = [
-  "these marketing shifts",
-  "these developments",
-  "the changing Hong Kong market",
-  "the city's evolving marketing landscape",
-  "these 2026 trends",
-  "this shift",
-  "these strategies",
-  "these market changes",
-  "such developments",
-  "this evolution",
-  "Hong Kong's changing market dynamics",
-  "these emerging patterns",
-  "the region's evolving landscape",
-  "this transformation",
-  "these forces",
-];
 
 const UNSUPPORTED_STATS_PATTERNS = [
   /\d{1,3}%\s*(?:of|increase|decrease|growth|drop|rise|fall|more|less)/i,
@@ -467,6 +452,13 @@ function extractTopic(heading: string): string {
 }
 
 // ── Fix 2: Reduce excessive keyphrase occurrences ──
+// Structure- and sentence-aware: an exact keyphrase occurrence is reduced ONLY
+// by removing the complete sentence that carries it (never by substituting a
+// generic phrase into the middle of a sentence). Every candidate is validated
+// before commit (clone-and-commit): the resulting paragraph must parse, keep
+// its links and claims, and pass the deterministic sentence-quality and
+// malformed-prose checks. When no safe removal exists, the occurrence is kept
+// — density is verified against the stuffing maximum by the caller.
 
 function fixExcessiveKeyphrase(html: string, keyphrase: string, targetCount: number, changes: SeoNormalizationChange[]): string {
   const readableText = extractReadableText(html);
@@ -475,100 +467,196 @@ function fixExcessiveKeyphrase(html: string, keyphrase: string, targetCount: num
 
   const excessToRemove = currentCount - targetCount;
   const kpLower = keyphrase.toLowerCase().trim();
-  const kpRegex = new RegExp(kpLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-  const kpRegexSingle = new RegExp(kpLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
 
   // Identify first 100 words to protect
   const first100Words = readableText.split(/\s+/).slice(0, 100).join(" ").toLowerCase();
 
-  // Step 1: Paragraph-level reduction (preserves first 100 words and H2 matches)
-  let resultHtml = reduceInBlocks(html, "paragraph", keyphrase, kpRegex, kpRegexSingle, excessToRemove, first100Words, changes);
+  let resultHtml = reduceInBlocks(html, "paragraph", keyphrase, kpLower, excessToRemove, first100Words, changes);
 
-  // Step 2: If still above target, do a global HTML reduction (handles headings, lists, etc.)
-  const afterParaCount = countExactPhrase(extractReadableText(resultHtml), keyphrase);
-  if (afterParaCount > targetCount) {
-    resultHtml = reduceGlobally(resultHtml, keyphrase, kpRegex, kpRegexSingle, afterParaCount - targetCount, changes);
-  }
-
-  console.log(`[SEO-NORMALIZER] total keyphrase removals across all methods`);
+  console.log(`[SEO-NORMALIZER] keyphrase removals=${currentCount - countExactPhrase(extractReadableText(resultHtml), keyphrase)} from paragraphs`);
   return resultHtml;
 }
 
-function reduceInBlocks(html: string, blockType: string, keyphrase: string, kpRegex: RegExp, kpRegexSingle: RegExp, excessToRemove: number, first100Words: string, changes: SeoNormalizationChange[]): string {
+interface RemovalCandidate {
+  block: WpParagraphBlock;
+  sentence: string;
+  removalSafe: boolean;
+}
+
+/**
+ * Reduce keyphrase occurrences by removing complete sentences. A sentence is
+ * removable only when the paragraph keeps at least one other complete
+ * sentence, the sentence carries no links, no numbers and no statistical
+ * claim language, and no adjacent sentence depends on it. The candidate
+ * paragraph must pass sentence-quality and malformed-prose validation or the
+ * removal is rejected and the paragraph is left untouched.
+ */
+function reduceInBlocks(
+  html: string,
+  blockType: string,
+  keyphrase: string,
+  kpLower: string,
+  excessToRemove: number,
+  first100Words: string,
+  changes: SeoNormalizationChange[],
+): string {
   const blocks = extractWpParagraphBlocks(html);
-  const kpParas = blocks.filter((b) => b.visibleText.toLowerCase().includes(keyphrase.toLowerCase())).reverse();
   const first100Lower = first100Words.toLowerCase();
   let removed = 0;
-  let synonymIdx = 0;
   let outHtml = html;
 
-  for (const block of kpParas) {
-    if (removed >= excessToRemove) break;
+  const candidates: RemovalCandidate[] = [];
+  for (const block of blocks) {
     if (block.visibleText.toLowerCase().substring(0, Math.min(60, block.visibleText.length)) === first100Lower.substring(0, Math.min(60, first100Lower.length))) continue;
-
-    const matches = block.visibleText.match(kpRegex);
-    if (!matches || matches.length === 0) continue;
-
-    const toReplace = Math.min(matches.length, excessToRemove - removed);
-    let newText = block.visibleText;
-    let localReplaced = 0;
-
-    for (let r = 0; r < toReplace; r++) {
-      const synonym = KEYPHRASE_SYNONYMS[(synonymIdx + localReplaced) % KEYPHRASE_SYNONYMS.length];
-      if (!kpRegexSingle.test(newText)) break;
-      newText = newText.replace(kpRegexSingle, synonym);
-      localReplaced++;
-    }
-
-    if (newText !== block.visibleText && localReplaced > 0) {
-      outHtml = replaceWpParagraphBlock(outHtml, block, newText);
-      removed += localReplaced;
-      synonymIdx += localReplaced;
-      changes.push({
-        type: "keyphrase_removed",
-        description: `Removed ${localReplaced} keyphrase occurrence(s) from ${blockType}`,
-        before: block.visibleText.substring(0, 60),
-        after: newText.substring(0, 60),
+    if (!block.visibleText.toLowerCase().includes(kpLower)) continue;
+    const sentences = splitParagraphSentences(block.visibleText);
+    for (const sentence of sentences) {
+      if (!sentence.toLowerCase().includes(kpLower)) continue;
+      candidates.push({
+        block,
+        sentence,
+        removalSafe: sentenceRemovalIsSafe(block, sentences, sentence, kpLower),
       });
     }
   }
 
-  console.log(`[SEO-NORMALIZER] keyphrase removals=${removed} from ${blockType}s`);
-  return outHtml;
-}
+  // Prefer later candidates (paragraphs/sentences deeper in the article) and
+  // safe removals over unsafe ones.
+  candidates.sort((a, b) => {
+    if (a.removalSafe !== b.removalSafe) return a.removalSafe ? -1 : 1;
+    return b.block.start - a.block.start;
+  });
 
-function reduceGlobally(html: string, keyphrase: string, kpRegex: RegExp, kpRegexSingle: RegExp, excessToRemove: number, changes: SeoNormalizationChange[]): string {
-  let outHtml = html;
-  let removed = 0;
-  let synonymIdx = 0;
-  let safety = 0;
+  const rejected = new Set<string>();
+  for (const candidate of candidates) {
+    if (removed >= excessToRemove) break;
+    const blockKey = `${candidate.block.start}`;
+    if (rejected.has(blockKey)) continue;
+    if (!candidate.removalSafe) continue;
 
-  while (removed < excessToRemove && safety < 50) {
-    safety++;
-    const match = kpRegexSingle.exec(outHtml);
-    if (!match) break;
+    const sentenceIndex = splitParagraphSentences(candidate.block.visibleText).findIndex(
+      (sentence) => sentence === candidate.sentence,
+    );
+    if (sentenceIndex < 0) continue;
 
-    const before = outHtml.substring(Math.max(0, match.index - 2), Math.min(outHtml.length, match.index + keyphrase.length + 2));
-    // Skip if inside a tag (href, src, alt, etc.) or inside wp:heading for a protected H2
-    if (/=["']/.test(before) || /<!--\s*wp:heading/.test(before)) {
+    const remainingSentences = splitParagraphSentences(candidate.block.visibleText)
+      .filter((sentence, index) => index !== sentenceIndex);
+    const newText = remainingSentences.join(" ");
+
+    // Clone-and-commit validation: the candidate paragraph must remain
+    // grammatical, complete and structurally identical in meaning.
+    const validated = validateRemovalCandidate(candidate.block, candidate.sentence, newText);
+    if (!validated.ok) {
+      rejected.add(blockKey);
       continue;
     }
 
-    const synonym = KEYPHRASE_SYNONYMS[(synonymIdx + removed) % KEYPHRASE_SYNONYMS.length];
-    outHtml = outHtml.substring(0, match.index) + synonym + outHtml.substring(match.index + match[0].length);
+    outHtml = replaceWpParagraphBlock(outHtml, candidate.block, newText);
     removed++;
-    kpRegexSingle.lastIndex = match.index + synonym.length;
-  }
-
-  if (removed > 0) {
     changes.push({
       type: "keyphrase_removed",
-      description: `Removed ${removed} keyphrase occurrence(s) via global reduction`,
+      description: `Removed the complete sentence carrying the keyphrase from ${blockType}`,
+      before: candidate.sentence.substring(0, 80),
+      after: "",
     });
   }
 
-  console.log(`[SEO-NORMALIZER] global keyphrase removals=${removed}`);
   return outHtml;
+}
+
+function splitParagraphSentences(text: string): string[] {
+  const sentences: string[] = [];
+  let start = 0;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (char !== "." && char !== "!" && char !== "?") continue;
+    if (char === "." && /\d/.test(text[index - 1] ?? "") && /\d/.test(text[index + 1] ?? "")) continue;
+    let end = index + 1;
+    while (/[.!?]/.test(text[end] ?? "")) end++;
+    while (/["”’)]/.test(text[end] ?? "")) end++;
+    const sentence = text.slice(start, end).trim();
+    if (sentence) sentences.push(sentence);
+    start = end;
+    index = end - 1;
+  }
+  if (start < text.length) {
+    const trailing = text.slice(start).trim();
+    if (trailing) sentences.push(trailing);
+  }
+  return sentences;
+}
+
+/** A sentence must not be removed when doing so would lose facts, links or
+ *  leave a dangling reference. Digits that are part of the keyphrase itself
+ *  (e.g. a topic year) do not count as factual numbers. */
+function sentenceRemovalIsSafe(
+  block: WpParagraphBlock,
+  sentences: string[],
+  sentence: string,
+  kpLower: string,
+): boolean {
+  if (sentences.length < 2) return false;
+  const index = sentences.indexOf(sentence);
+  if (index < 0) return false;
+  // Links never travel with a removed sentence.
+  if (/<a\b/i.test(sentence)) return false;
+  // Numbers outside the keyphrase are factual content and never removed.
+  const withoutKeyphrase = sentence.replace(
+    new RegExp(kpLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
+    "",
+  );
+  if (/\d/.test(withoutKeyphrase)) return false;
+  if (/according to|research (?:from|by)|data (?:from|shows)|study (?:from|by)/i.test(sentence)) return false;
+  // The following sentence must not refer back to the removed sentence.
+  const next = sentences[index + 1];
+  if (next && /^\s*(?:that'?s|this is|these are|it'?s|this|that|these|those|it|they|the point|the result)\b/i.test(next)) {
+    return false;
+  }
+  // The preceding sentence must not be a setup ("Here's the number:", "For example:").
+  const previous = sentences[index - 1];
+  if (previous && /[:—-]$/.test(previous)) return false;
+  return true;
+}
+
+/** Deterministic post-candidate validation (requirement 2): the complete
+ *  resulting sentence/paragraph must have no duplicated determiners, no
+ *  repeated adjacent words, no lowercase sentence starts, no broken
+ *  punctuation, no malformed noun phrases and no fragments. */
+function validateRemovalCandidate(
+  block: WpParagraphBlock,
+  removedSentence: string,
+  newText: string,
+): { ok: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (!newText.trim()) {
+    reasons.push("paragraph would become empty");
+    return { ok: false, reasons };
+  }
+  const qualityIssues = scanSentenceQualityText(newText);
+  for (const issue of qualityIssues) {
+    reasons.push(`${issue.code}: ${issue.sentence.slice(0, 80)}`);
+  }
+  const malformed = findMalformedProseTextIssues([newText]);
+  for (const issue of malformed) {
+    reasons.push(`malformed: ${issue.message}`);
+  }
+  // A non-terminal trailing fragment must not remain (e.g. a colon or dash
+  // sentence end created by the removal).
+  const trimmedEnd = newText.trim().replace(/["”’)\]]+$/, "");
+  if (!/[.!?]$/.test(trimmedEnd)) {
+    reasons.push("paragraph does not end with terminal punctuation");
+  }
+  // Meaning guard: the removed sentence must be the only sentence containing
+  // the keyphrase in this paragraph, and the remaining text must still be
+  // parseable as a paragraph.
+  const parsed = parseWordPressEditorialBlocks(
+    `<!-- wp:paragraph --><p>${newText}</p><!-- /wp:paragraph -->`,
+    "keyphrase-removal-candidate",
+  );
+  if (parsed.errors.length > 0 || parsed.blocks.length !== 1) {
+    reasons.push("candidate does not parse as a paragraph");
+  }
+  return { ok: reasons.length === 0, reasons };
 }
 
 // ── Fix 3: Add missing keyphrase occurrences ──

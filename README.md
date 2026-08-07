@@ -34,6 +34,28 @@ Enable the optional editorial transaction in the runtime environment:
 ENABLE_EDITORIAL_POLISH=true
 ```
 
+Enterprise complete-document quality control is separately rollable in shadow
+and enforce modes:
+
+```bash
+# English: diagnose the assembled ArticleDocument, patch selected safe blocks,
+# then independently accept/reject each patch.
+ENABLE_FULL_DOCUMENT_EDITORIAL=true
+FULL_DOCUMENT_EDITORIAL_MODE=shadow # change to enforce after shadow evaluation
+
+# Traditional Chinese: review every aligned source/target unit in the existing
+# second substantive translation call and require document-level acceptance.
+ENABLE_FULL_DOCUMENT_ZH_REVIEW=true
+```
+
+When English enforce mode is active, unresolved high/critical findings,
+selection overflow, unvalidated patches, or missing stored acceptance block the
+save and publication gates. The Traditional Chinese flag similarly requires a
+natural, faithful complete-document decision and zero unresolved unit IDs.
+Publishing always reconstructs and freshly validates one explicitly paired
+English/Chinese snapshot, stages both WordPress posts as drafts, verifies raw
+readback, and only then changes both statuses to `publish`.
+
 When the flag is absent or not exactly `true`, the stage is skipped and the
 existing generation path is unchanged. Never commit API keys, Supabase session
 tokens, or access-token files to the repository.

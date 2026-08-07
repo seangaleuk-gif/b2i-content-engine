@@ -177,7 +177,7 @@ describe("shadow preview export (development-only)", () => {
   it("persists safe malformed-JSON diagnostics (message, position, snippet, recovered) in the preview JSON", () => {
     const dir = makeOutputDir();
     const result = {
-      ...makeResult("none", null as unknown as ArticleDocument, "none"),
+      ...makeResult("pre-editorial", null as unknown as ArticleDocument, "pre-editorial"),
       chunkResults: [{
         chunkId: "chunk.0",
         jsonDiagnostics: {

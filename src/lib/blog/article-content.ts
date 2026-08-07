@@ -52,6 +52,7 @@ export type EditorialBlock =
 export type AiEditorialBlock =
   | { type: "paragraph"; text: string }
   | { type: "subheading"; text: string }
+  | { type: "heading"; text: string; level?: number }
   | { type: "list"; ordered: boolean; items: string[] }
   | { type: "quote"; text: string }
   | { type: "table"; headers: string[]; rows: string[][] };
@@ -70,6 +71,7 @@ export interface NormalizationOptions {
 const ALLOWED_BLOCK_TYPES = new Set([
   "paragraph",
   "subheading",
+  "heading",
   "list",
   "quote",
   "table",
@@ -188,6 +190,29 @@ export function normalizeAiEditorialPayload(
           continue;
         }
         checkForDisallowedContent(text, errors, `Block ${i} subheading`, opts);
+        blocks.push({ id, type: "subheading", level: 3, content: textToInlineContent(text) });
+        break;
+      }
+      case "heading": {
+        // Generic "heading" is a recoverable alias for the canonical H3
+        // subheading. Normalize it only when unambiguous and safe: an H3
+        // level (explicit or implicit) becomes a subheading; an explicit H2
+        // or any other unsupported level is rejected so the bounded
+        // schema-correction retry can request the exact allowed block types.
+        const text = typeof rb.text === "string" ? normalizeWhitespace(rb.text) : "";
+        if (!text) {
+          errors.push(`Block ${i}: heading has empty text`);
+          continue;
+        }
+        if (rb.level === 2 || rb.level === "2") {
+          errors.push(`Block ${i}: heading requests disallowed level 2`);
+          continue;
+        }
+        if (rb.level !== undefined && rb.level !== null && rb.level !== 3 && rb.level !== "3") {
+          errors.push(`Block ${i}: heading requests unsupported level ${String(rb.level)}`);
+          continue;
+        }
+        checkForDisallowedContent(text, errors, `Block ${i} heading`, opts);
         blocks.push({ id, type: "subheading", level: 3, content: textToInlineContent(text) });
         break;
       }

@@ -24,7 +24,7 @@ import type { TranslationResult } from "./translation-types";
 import type { ShadowProviderResponse } from "./shadow-number-protection";
 import { runDocumentContextTranslationShadow, type DocumentContextTranslationShadowResult } from "./document-context-translation-shadow";
 import { analyzeDocQuality, emptyQualityReport } from "./shadow-cantonese-quality";
-import { runEditorialReview } from "./document-context-editorial-review";
+import { runEditorialReview, isFullDocumentZhReviewEnabled } from "./document-context-editorial-review";
 import { buildTranslationSourceDocument } from "./translation-source-document";
 import { buildZhHkStyleContract } from "./zh-hk-style-contract";
 import { analyzeZhHkLanguageQuality } from "./zh-hk-language-quality";
@@ -96,6 +96,13 @@ export function validatePrimaryDocumentContextResult(result: DocumentContextTran
   // means the new translation is NOT saved — no silent fallback to the unreviewed doc.
   if (result.review?.status === "failed") {
     return { stage: "review", diagnostics: result.review.failure ? [result.review.failure] : result.review.diagnostics };
+  }
+  if (isFullDocumentZhReviewEnabled() && (
+    result.review?.status !== "run"
+    || result.review.documentAccepted !== true
+    || (result.review.unresolvedUnitIds?.length ?? 0) > 0
+  )) {
+    return { stage: "review", diagnostics: ["complete-document semantic acceptance is missing"] };
   }
 
   const html = renderArticleDocument(doc);
@@ -173,6 +180,8 @@ export async function runPrimaryDocumentContextTranslation(
       failure: outcome.failure,
       diagnostics: outcome.diagnostics,
       truncated: outcome.truncated,
+      documentAccepted: outcome.documentAccepted,
+      unresolvedUnitIds: outcome.unresolvedUnitIds,
     };
     if (outcome.status === "run") {
       result.preview.retainedDoc = outcome.doc;
@@ -211,6 +220,8 @@ export async function runPrimaryDocumentContextTranslation(
       retainedCount: result.review.retainedCount,
       status: result.review.status,
       failure: result.review.failure,
+      documentAccepted: result.review.documentAccepted,
+      unresolvedUnitIds: result.review.unresolvedUnitIds,
     } : undefined,
     ...lengthMetrics,
   };

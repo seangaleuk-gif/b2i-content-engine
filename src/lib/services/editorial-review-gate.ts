@@ -25,6 +25,10 @@ const UNNATURAL_PHRASE_MARKERS: Array<[RegExp, string]> = [
   [/有就最好/gu, "nice-to-have (literal, unnatural calque)"],
   [/有就好/gu, "nice-to-have (literal, unnatural calque)"],
   [/算係最好/gu, "nice-to-have (literal, unnatural calque)"],
+  [/活動廣告板/gu, "walking billboard (literal, unnatural calque)"],
+  [/人肉廣告板/gu, "walking billboard (overly literal and unprofessional)"],
+  [/令(?:所有人|各方|雙方)老實啲/gu, "keeps everyone honest (literal, meaning should express accountability)"],
+  [/保持誠實/gu, "keeps everyone honest (literal, meaning should express accountability)"],
 ];
 
 /** Detect unnatural calque phrases in a document; return matched markers per unit. */

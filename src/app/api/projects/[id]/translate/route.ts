@@ -3,7 +3,7 @@ import { getCurrentUserId } from "@/lib/services/auth";
 import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { blogVersionRepository, researchRepository } from "@/lib/repositories";
-import { translateArticle } from "@/lib/services/translation-service";
+import { translateArticle, validateTranslatedDocument } from "@/lib/services/translation-service";
 import { runChineseAudit } from "@/lib/services/seo-auditor";
 import {
   type ArticleDocument,
@@ -17,6 +17,8 @@ import { pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-post
 import { buildTranslationVersionSummary } from "@/lib/services/translation-version-metadata";
 import type { BlogVersion } from "@/db/schema/blog-versions";
 import { scanTemporalFreshness } from "@/lib/blog/temporal-freshness";
+import { analyzeZhHkLanguageQuality } from "@/lib/services/zh-hk-language-quality";
+import { checkCtaParity, findUnnaturalCalques, unresolvedMandatoryFindings } from "@/lib/services/editorial-review-gate";
 
 export async function POST(
   _request: Request,
@@ -177,6 +179,42 @@ export async function POST(
         savedEnglish.blog !== enBlog
       ) {
         throw new Error("Bilingual post-save readback did not match the canonical documents");
+      }
+
+      const parsedSavedChinese = parseArticleDocumentFromHtml(savedChinese.blog || "", result.doc);
+      if (!parsedSavedChinese.doc || parsedSavedChinese.errors.length > 0) {
+        throw new Error(`Saved Chinese ArticleDocument could not be reconstructed: ${parsedSavedChinese.errors.join("; ")}`);
+      }
+      const savedZhDoc = parsedSavedChinese.doc;
+      const parityErrors = validateTranslatedDocument(parsedEnglishDoc, savedZhDoc, research);
+      const savedQuality = analyzeZhHkLanguageQuality(savedZhDoc, parsedEnglishDoc);
+      const blockingQuality = unresolvedMandatoryFindings(savedQuality);
+      const unnatural = findUnnaturalCalques(savedZhDoc);
+      const ctaParity = checkCtaParity(savedZhDoc);
+      const savedZhAudit = runChineseAudit({
+        title: savedChinese.title || "",
+        metaDescription: savedChinese.metaDescription || "",
+        keyword: zhKeyword,
+        blog: savedChinese.blog || "",
+        faq: savedZhDoc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
+        englishWordCount: latest.wordCount || 2500,
+        pairedEnglishFaqCount: pairedEnFaqCount,
+      });
+      const savedSeoFailures = savedZhAudit.checks.filter((check) => check.status === "fail");
+      if (
+        parityErrors.length > 0
+        || blockingQuality.length > 0
+        || unnatural.length > 0
+        || !ctaParity.ok
+        || savedSeoFailures.length > 0
+      ) {
+        throw new Error([
+          ...parityErrors,
+          ...blockingQuality.map((finding) => `${finding.sourceUnitId}:${finding.messageCode}`),
+          ...unnatural.map((finding) => `${finding.sourceUnitId}:${finding.reason}`),
+          ...ctaParity.missingClaims.map((claim) => `CTA missing ${claim}`),
+          ...savedSeoFailures.map((check) => `SEO ${check.label}`),
+        ].join("; "));
       }
     } catch (persistenceError) {
       const rollbackErrors: string[] = [];

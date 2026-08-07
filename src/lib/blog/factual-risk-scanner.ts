@@ -11,6 +11,7 @@ import {
   renderEditorialBlocksToWordPress,
   type EditorialBlock,
 } from "@/lib/blog/article-document";
+import { isSourceBoilerplate, stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 
 // ── Types ──
 
@@ -56,7 +57,8 @@ export type ClaimCategory =
   | "publishing_cadence"
   | "testimonial_quote"
   | "unattributed_source"
-  | "business_result";
+  | "business_result"
+  | "market_wide_claim";
 
 export interface EvidenceLedgerEntry {
   evidenceId: string;
@@ -162,6 +164,35 @@ const CLAIM_PATTERNS: Array<{
   { category: "testimonial_quote", regex: /(?:a|one)\s+(?:local|small|Hong Kong)\s+(?:business|brand|company|shop|store|cafe|bakery|studio)\s+(?:told us|shared|reported|said|noted|found|experienced|saw)/gi },
   // "X more" claims
   { category: "business_result", regex: /\d+\s*(?:times|x)\s+more\s+(?:sales|revenue|traffic|leads|engagement|visits?|conversions?)/gi },
+  // Unsupported market-wide assertions, superlatives and absolute language.
+  // These must be supported by matching evidence, softened into clearly
+  // non-factual advice, or removed.
+  { category: "market_wide_claim", regex: /\bhit rock bottom\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\beveryone (?:is|has|can|will|sees?|wants?|expects?)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bbrands across (?:the )?(?:city|market|industry|region)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bthe most effective (?:way|strategy|approach|tool|method|channel|platform)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bno longer guarantees?\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\b(?:nobody|no one) (?:can|will|ever|wants?|trusts?|clicks?)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\ball (?:businesses|brands|marketers|companies|teams)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bevery (?:business|brand|marketer|company|team|campaign|customer)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bguaranteed? (?:results?|success|growth|engagement|reach)\b[^.!?]*/gi },
+  // Absolute format-ineffectiveness: a claim that a whole advertising format
+  // "simply doesn't work anymore" requires equally strong evidence — a source
+  // on ad fatigue alone never supports it.
+  { category: "market_wide_claim", regex: /\b(?:ads?|promotions?|banner ads?|interruptive (?:ads?|promotions?)|(?:all|most|traditional) ads?)\b[^.!?]{0,80}\b(?:simply |just |basically )?don['\u2019]?t work anymore\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\b(?:ads?|promotions?|banner ads?)\b[^.!?]{0,80}\bno longer work\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bno (?:brand|business|company|team) can (?:succeed|survive|grow|win|thrive)\b[^.!?]*/gi },
+  // Universal performance conclusions: an approach "won't work anymore",
+  // "will not work", "cannot work", "never works", or guarantees an outcome.
+  { category: "market_wide_claim", regex: /\b(?:it|that|this|they|the (?:old|traditional|conventional) (?:playbook|approach|strategy|method|way|model)|(?:ads?|promotions?|banner ads?|interruptive (?:ads?|promotions?)|loud|frequent) (?:messaging|advertising|promotions?))\b[^.!?]{0,80}\b(?:simply |just |basically )?(?:won['\u2019]?t|will not|doesn['\u2019]?t|do not|cannot|can['\u2019]?t|never) work(?: anymore)?\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\b(?:never works|no longer works)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\b(?:this|that|it|such an?|the (?:old|traditional) (?:approach|strategy|method|way|playbook|model)) (?:always|consistently|invariably|never|no longer) leads? to\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\b(?:does|do|can|could) (?:far )?more than\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bleads? to fewer (?:returns|results|sales|conversions|engagements?)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bguarantees? (?:results?|success|growth|engagement|reach|sales|conversions?)\b[^.!?]*/gi },
+  // Quantitative market claims: message/ad volume asserted as a market fact.
+  { category: "market_wide_claim", regex: /\b(?:consumers?|people|users?|audiences?|customers?)\b[^.!?]{0,60}\b(?:bombarded|flooded|inundated|overwhelmed)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\b(?:thousands?|hundreds?|millions?) of (?:messages|ads?|promotions?|notifications?)\b[^.!?]*/gi },
 ];
 
 // ── Research-source text extraction ──
@@ -171,7 +202,10 @@ export function buildEvidenceLedger(
 ): EvidenceLedgerEntry[] {
   return (research ?? []).flatMap((item, sourceIndex) => {
     const title = decodeHtmlEntities(item.title ?? "");
-    const snippet = decodeHtmlEntities(item.snippet ?? "");
+    // Publisher boilerplate (legal disclaimers, opinion notices, privacy/cookie
+    // text, navigation text) must never become evidence or usable quotations.
+    if (isSourceBoilerplate(title)) return [];
+    const snippet = stripSourceBoilerplate(decodeHtmlEntities(item.snippet ?? ""));
     const sourceSentences = splitEvidenceSentences(snippet);
     if (sourceSentences.length === 0 && title.trim()) sourceSentences.push(title.trim());
     return sourceSentences.map((sentence, claimIndex) => {
@@ -421,6 +455,29 @@ function findSupportingEvidence(
       continue;
     }
 
+    // Market-wide assertions and superlatives are only supported when the
+    // research itself makes the same market-wide claim. A general trend in
+    // research never supports "everyone", "rock bottom" or "the most effective".
+    if (category === "market_wide_claim") {
+      if (!entry.concepts.includes("market-wide-claim")) {
+        closestReason = "research does not make the same market-wide assertion";
+        continue;
+      }
+      // Evidence strength must match claim strength: a source on ad fatigue
+      // never supports "banner ads simply don't work anymore"; a general trend
+      // never supports "every customer expects" or "thousands of messages".
+      const claimStrength = claimConcepts.filter((concept) =>
+        (MARKET_WIDE_STRENGTH_CONCEPTS as readonly string[]).includes(concept),
+      );
+      if (
+        claimStrength.length > 0
+        && !claimStrength.some((concept) => entry.concepts.includes(concept))
+      ) {
+        closestReason = "research does not assert the same market-wide claim strength";
+        continue;
+      }
+    }
+
     const evidenceTokens = contentTokens(entry.approvedText);
     const overlap = claimTokens.filter((token) => evidenceTokens.includes(token));
     const requiredOverlap = category === "date_claim"
@@ -459,9 +516,37 @@ function findConceptConflict(claimConcepts: string[], evidenceConcepts: string[]
   return null;
 }
 
+const MARKET_WIDE_CLAIM_RE =
+  /\b(?:hit rock bottom|everyone (?:is|has|can|will|sees?|wants?|expects?)|brands across (?:the )?(?:city|market|industry|region)|the most effective (?:way|strategy|approach|tool|method|channel|platform)|no longer guarantees?|nobody|no one (?:can|will|ever|wants?|trusts?|clicks?)|all (?:businesses|brands|marketers|companies|teams)|every (?:business|brand|marketer|company|team|campaign|customer)|guaranteed? (?:results?|success|growth|engagement|reach)|don['\u2019]?t work anymore|won['\u2019]?t work|will not work|doesn['\u2019]?t work|do not work|cannot work|can['\u2019]?t work|never works|no longer work|no (?:brand|business|company|team) can (?:succeed|survive|grow|win|thrive)|always leads? to|never leads? to|no longer leads? to|does (?:far )?more than|leads? to fewer|bombarded|flooded|inundated|overwhelmed|thousands? of (?:messages|ads?|promotions?|notifications?)|hundreds? of (?:messages|ads?|promotions?|notifications?)|millions? of (?:messages|ads?|promotions?|notifications?))\b/i;
+
+/** Claim-strength concepts: a market-wide claim is only supported when the
+ *  research asserts the SAME strength. Ad-fatigue evidence never supports
+ *  "format X never works"; a general trend never supports "every customer". */
+const MARKET_WIDE_STRENGTH_CONCEPTS = [
+  "format-ineffectiveness",
+  "message-volume",
+  "every-customer",
+  "no-brand-can",
+  "rock-bottom",
+  "absolute-outcome",
+] as const;
+
 function extractClaimConcepts(text: string): string[] {
   const normalized = decodeHtmlEntities(text).toLowerCase().replace(/\s+/g, " ");
   const concepts = new Set<string>();
+  if (MARKET_WIDE_CLAIM_RE.test(normalized)) concepts.add("market-wide-claim");
+  if (
+    /\b(?:won['\u2019]?t work|will not work|doesn['\u2019]?t work|don['\u2019]?t work|do not work|cannot work|can['\u2019]?t work|never works?|no longer work)\b|work(?:s)? anymore\b/.test(normalized)
+  ) {
+    concepts.add("format-ineffectiveness");
+  }
+  if (/\b(?:always|never|no longer|invariably|consistently) leads? to\b|\bdoes (?:far )?more than\b|\bleads? to fewer\b|\bguarantees?\b/.test(normalized)) {
+    concepts.add("absolute-outcome");
+  }
+  if (/\b(?:bombarded|flooded|inundated|overwhelmed)\b|\b(?:thousands?|hundreds?|millions?) of (?:messages|ads?|promotions?|notifications?)\b/.test(normalized)) concepts.add("message-volume");
+  if (/\bevery customer\b/.test(normalized)) concepts.add("every-customer");
+  if (/\bno (?:brand|business|company|team) can\b/.test(normalized)) concepts.add("no-brand-can");
+  if (/\bhit rock bottom\b/.test(normalized)) concepts.add("rock-bottom");
   if (/\b(?:survey|surveyed|respondents?|participants?|sample)\b/.test(normalized)) concepts.add("survey-sample");
   if (/\b(?:hong kong|hk)?\s*(?:threads\s+)?users?\b/.test(normalized)) concepts.add("general-users");
   if (/\bmonthly active users?\b|\bmau\b/.test(normalized)) concepts.add("monthly-active-users");
@@ -510,23 +595,61 @@ function containingSentence(text: string, position: number): string {
 
 // ── Claim removal from section body ──
 
+export interface RemoveSentencesOptions {
+  /**
+   * Normalized complete-sentence texts that must never be removed, even when
+   * they match a claim fragment. Ownership enforcement uses this to preserve
+   * the canonical owned occurrence when a duplicate shares the same block.
+   */
+  preserveSentenceTexts?: string[];
+}
+
+/**
+ * Dependency references that dangle once their antecedent sentence (a claim,
+ * statistic or number) has been removed: "That's a striking number",
+ * "this result", "these findings", "the point is", "this shows", "it makes
+ * sense", "that figure", "such numbers", ...
+ */
+const DEPENDENT_REFERENCE_PATTERNS: RegExp[] = [
+  /^\s*(?:that['\u2019]?s|that is|this is|these are|those are|it['\u2019]?s|it is)\s+(?:a\s+)?(?:striking|remarkable|significant|telling|huge|big|small|key|clear|strong|interesting|useful|powerful|real)?\s*(?:number|figure|result|finding|statistic|percentage|share|rate|trend|pattern|growth|decline|jump|surge|drop|rise|shift|change|development|evidence|point)\b/i,
+  /^\s*(?:this|that|these|those|the point|the result|the figure|the number|the data|the evidence|the survey|the study)\s+(?:result|findings?|numbers?|figures?|statistics?|percentage|share|rate|trends?|patterns?|growth|decline|jumps?|surges?|drops?|rises?|shifts?|changes?|developments?|evidence|point|data)\b/i,
+  /^\s*(?:this|that)\s+shows?\b/i,
+  /^\s*the point is\b/i,
+];
+
+function isDependentReference(sentence: string): boolean {
+  return DEPENDENT_REFERENCE_PATTERNS.some((pattern) => pattern.test(sentence));
+}
+
+function isSourceCitationParagraph(text: string): boolean {
+  return /^\s*sources?:/i.test(text);
+}
+
 export function removeUnsupportedSentences(
   sectionHtml: string,
   unsupportedClaims: ScannedClaim[],
+  options?: RemoveSentencesOptions,
 ): { html: string; sentencesRemoved: number; orphanedTransitionsRemoved: number } {
   if (unsupportedClaims.length === 0) {
     return { html: sectionHtml, sentencesRemoved: 0, orphanedTransitionsRemoved: 0 };
   }
-
-  let modified = sectionHtml;
-  let removed = 0;
+  const preservedSentences = new Set(
+    (options?.preserveSentenceTexts ?? []).map((sentence) => normalizeForMatch(sentence)),
+  );
 
   const paragraphRe =
     /<!--\s*wp:paragraph\s*-->\s*\n?<p\b[^>]*>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi;
   const paragraphs = [...sectionHtml.matchAll(paragraphRe)];
 
-  // Work backwards so replacements never invalidate later source positions.
-  for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex--) {
+  // Per-paragraph removal plans. Ranges are offsets into the ORIGINAL text.
+  const plans: Array<{
+    paragraphIndex: number;
+    ranges: TextRange[];
+    // True when the whole paragraph becomes empty and should be removed.
+    removeWhole: boolean;
+  }> = [];
+
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
     const match = paragraphs[paragraphIndex];
     const paragraphHtml = match[0];
     const parsed = parseWordPressEditorialBlocks(
@@ -550,6 +673,7 @@ export function removeUnsupportedSentences(
 
     const ranges = sentenceRanges(text).filter((range) => {
       const sentence = normalizeForMatch(text.slice(range.start, range.end));
+      if (preservedSentences.has(sentence)) return false;
       return relevantClaims.some((claim) => sentence.includes(normalizeForMatch(claim.text)));
     });
     if (ranges.length === 0) continue;
@@ -562,14 +686,130 @@ export function removeUnsupportedSentences(
     );
     if (safeRanges.length === 0) continue;
 
-    const repaired = removeTextRanges(paragraph, safeRanges);
+    const removalRanges = [...safeRanges].sort((a, b) => a.start - b.start);
+
+    // Same-paragraph dependency handling: a sentence immediately following the
+    // removed claim that refers back to it ("That's a striking number", "this
+    // result", "the point is") must go too, otherwise it dangles. If it cannot
+    // be removed safely, abort this paragraph's removal entirely.
+    const lastRemoved = removalRanges[removalRanges.length - 1];
+    const followingText = text.slice(lastRemoved.end).trim();
+    const followingSentence = followingText.split(/(?<=[.!?])\s+/)[0] ?? "";
+    if (followingSentence && isDependentReference(followingSentence)) {
+      const dependentStart = text.indexOf(followingSentence, lastRemoved.end);
+      const dependentRange = dependentStart >= 0
+        ? { start: dependentStart, end: dependentStart + followingSentence.length }
+        : null;
+      const dependentLinked = dependentRange
+        && linkedRanges.some((link) => rangesOverlap(link, dependentRange));
+      if (dependentRange && !dependentLinked) {
+        removalRanges.push(dependentRange);
+      } else {
+        // The dependent sentence carries a link or cannot be located — never
+        // remove the claim and leave the reference dangling.
+        continue;
+      }
+    }
+
+    // Preceding setup: a sentence before the claim that introduces it ("The
+    // point is:", "Here's the number:") dangles when the claim goes.
+    const firstRemoved = removalRanges[0];
+    const precedingText = text.slice(0, firstRemoved.start).trim();
+    if (/:$/.test(precedingText) && precedingText.length > 0) {
+      const setupStart = text.slice(0, firstRemoved.start).lastIndexOf(precedingText);
+      const setupRange = { start: setupStart, end: setupStart + precedingText.length };
+      const setupLinked = linkedRanges.some((link) => rangesOverlap(link, setupRange));
+      if (!setupLinked) {
+        removalRanges.unshift(setupRange);
+      } else {
+        continue;
+      }
+    }
+
+    // Merge overlapping ranges (dependent sentence may touch the claim range).
+    removalRanges.sort((a, b) => a.start - b.start);
+    const merged: TextRange[] = [];
+    for (const range of removalRanges) {
+      const last = merged[merged.length - 1];
+      if (last && range.start <= last.end) {
+        last.end = Math.max(last.end, range.end);
+      } else {
+        merged.push({ ...range });
+      }
+    }
+
+    plans.push({ paragraphIndex, ranges: merged, removeWhole: false });
+  }
+
+  // Cross-paragraph dependency handling: when a paragraph loses claim
+  // sentences, the next non-source paragraph must not open with a reference to
+  // the removed antecedent ("That's a striking number..."). The dependent
+  // first sentence is removed when safe; otherwise the claim removal is
+  // aborted so no dangling reference is ever left behind.
+  for (const plan of [...plans]) {
+    if (plan.ranges.length === 0) continue;
+    for (let nextIndex = plan.paragraphIndex + 1; nextIndex < paragraphs.length; nextIndex++) {
+      const nextMatch = paragraphs[nextIndex];
+      const nextParsed = parseWordPressEditorialBlocks(nextMatch[0], `factual-next-${nextIndex}`);
+      const nextBlock = nextParsed.blocks[0];
+      if (nextParsed.errors.length > 0 || nextBlock?.type !== "paragraph") continue;
+      const nextText = nextBlock.content.map((node) => node.text).join("");
+      if (isSourceCitationParagraph(nextText)) continue;
+      const nextFirstSentence = nextText.split(/(?<=[.!?])\s+/)[0] ?? nextText;
+      if (!isDependentReference(nextFirstSentence)) break;
+      const nextLinked = inlineLinkRanges(nextBlock);
+      const nextRanges = sentenceRanges(nextText);
+      const firstRange = nextRanges[0];
+      const dependentLinked = firstRange
+        && nextLinked.some((link) => rangesOverlap(link, firstRange));
+      const nextKeepsSentence = nextRanges.length > 1;
+      const nextHasOwnClaims = unsupportedClaims.some((claim) =>
+        normalizeForMatch(nextText).includes(normalizeForMatch(claim.text)),
+      );
+      // A single-sentence dependent paragraph is still removable when it is
+      // pure reference prose (no links, no numbers, no claims of its own).
+      const wholeParagraphDependent = !nextKeepsSentence
+        && !dependentLinked
+        && !nextHasOwnClaims
+        && !/\d/.test(nextText)
+        && (nextText.split(/\s+/).filter(Boolean).length <= 30);
+      if (dependentLinked || nextHasOwnClaims || (!nextKeepsSentence && !wholeParagraphDependent)) {
+        // The dependent sentence cannot be removed safely — abort the claim
+        // removal so the reference is never left dangling.
+        plan.ranges = [];
+        break;
+      }
+      plans.push({
+        paragraphIndex: nextIndex,
+        ranges: wholeParagraphDependent ? nextRanges : [firstRange],
+        removeWhole: wholeParagraphDependent,
+      });
+      break;
+    }
+  }
+
+  let modified = sectionHtml;
+  let removed = 0;
+  // Apply from the last paragraph to the first so earlier replacements never
+  // invalidate the original source positions of later ones.
+  const applyOrder = plans
+    .map((plan, order) => ({ plan, order }))
+    .filter(({ plan }) => plan.ranges.length > 0)
+    .sort((a, b) => b.plan.paragraphIndex - a.plan.paragraphIndex || a.order - b.order);
+  for (const { plan } of applyOrder) {
+    const match = paragraphs[plan.paragraphIndex];
+    const paragraphHtml = match[0];
+    const parsed = parseWordPressEditorialBlocks(paragraphHtml, `factual-apply-${plan.paragraphIndex}`);
+    const paragraph = parsed.blocks[0];
+    if (parsed.errors.length > 0 || paragraph?.type !== "paragraph") continue;
+    const repaired = removeTextRanges(paragraph, plan.ranges);
     const repairedText = repaired.content.map((node) => node.text).join("").trim();
     const replacement = repairedText
       ? renderEditorialBlocksToWordPress([repaired])
       : "";
     const start = match.index ?? 0;
     modified = modified.slice(0, start) + replacement + modified.slice(start + paragraphHtml.length);
-    removed += safeRanges.length;
+    removed += plan.ranges.length;
   }
 
   const nonParagraphCleanup = removeUnsupportedNonParagraphBlocks(

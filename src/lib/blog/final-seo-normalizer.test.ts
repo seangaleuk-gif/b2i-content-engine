@@ -1232,7 +1232,8 @@ describe("normalizer acceptance logic", () => {
       result.safety.linkDestinationsUnchanged === true &&
       result.safety.wordpressBlocksValid === true &&
       result.safety.faqSchemaPreserved === true &&
-      result.safety.languageSwitcherPreserved === true
+      result.safety.languageSwitcherPreserved === true &&
+      result.safety.ctaPreserved === true
     );
   }
 
@@ -4874,11 +4875,13 @@ describe("pipeline stage order and fallback", () => {
       { stage: "external-dedup", inputFingerprint: "b4", outputFingerprint: "b5", accepted: true },
       { stage: "link-enforce", inputFingerprint: "b5", outputFingerprint: "b6", accepted: true },
       { stage: "factual-final", inputFingerprint: "b6", outputFingerprint: "b7", accepted: true },
+      { stage: "post-ownership-seo-reconcile", inputFingerprint: "b7", outputFingerprint: "b7", accepted: true },
       { stage: "cta-preserve", inputFingerprint: "b7", outputFingerprint: "b8", accepted: true },
       { stage: "final-trim", inputFingerprint: "b8", outputFingerprint: "b9", accepted: true },
       { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
       { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
       { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
+      { stage: "final-qc-scan", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
       { stage: "final-validation", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
@@ -4944,8 +4947,8 @@ describe("pipeline stage 2 integration", () => {
       "seo-normalization", "title-repair", "factual-scan", "claim-ownership", "temporal-freshness",
       "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
       "language-switcher", "internal-links", "external-links", "external-dedup",
-      "link-enforce", "factual-final", "cta-preserve", "final-trim",
-      "faq-recovery", "wc-check", "final-preflight", "final-validation",
+      "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve", "final-trim",
+      "faq-recovery", "wc-check", "final-preflight", "final-qc-scan", "final-validation",
     ];
     // All required stages present
     state.stageOutputs = required.map((s, i) => ({
@@ -5050,15 +5053,15 @@ describe("pipeline stage 2 integration", () => {
     expect(state.blog).toBe("final-validated-html");
   });
 
-  it("internal-links before seo-normalization order is enforced", () => {
+  it("seo-normalization before internal-links order is enforced", () => {
     const state = makeEmptyState();
     state.stageOutputs = [
-      { stage: "seo-normalization", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
-      { stage: "internal-links", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
+      { stage: "internal-links", inputFingerprint: "a", outputFingerprint: "b", accepted: true },
+      { stage: "seo-normalization", inputFingerprint: "b", outputFingerprint: "c", accepted: true },
       { stage: "final-validation", inputFingerprint: "c", outputFingerprint: "d", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
-    expect(issues.some((i) => i.code === "STAGE_ORDER" && i.stage === "internal-links")).toBe(true);
+    expect(issues.some((i) => i.code === "STAGE_ORDER" && i.stage === "seo-normalization")).toBe(true);
   });
 });
 
@@ -5283,11 +5286,13 @@ describe("pipeline stage skip recording and rollback", () => {
       { stage: "external-dedup", inputFingerprint: "b4", outputFingerprint: "b5", accepted: true },
       { stage: "link-enforce", inputFingerprint: "b5", outputFingerprint: "b6", accepted: true },
       { stage: "factual-final", inputFingerprint: "b6", outputFingerprint: "b7", accepted: true },
+      { stage: "post-ownership-seo-reconcile", inputFingerprint: "b7", outputFingerprint: "b7", accepted: true },
       { stage: "cta-preserve", inputFingerprint: "b7", outputFingerprint: "b8", accepted: true },
       { stage: "final-trim", inputFingerprint: "b8", outputFingerprint: "b9", accepted: true },
       { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
       { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
       { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
+      { stage: "final-qc-scan", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
       { stage: "final-validation", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
     ];
     const issues = validatePipelineOrder(state);

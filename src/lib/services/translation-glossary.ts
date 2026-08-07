@@ -195,7 +195,9 @@ export const CANTONESE_EDITORIAL_REPAIRS: Array<[RegExp, string]> = [
   [/衡量成功：從推廣活動到長期增長/gu, "點樣衡量成效：由推廣活動到長期增長"],
   [/關於香港創作者市場推廣的常見問題/gu, "香港創作者市場推廣常見問題"],
   // literal-phrase repairs
-  [/活動廣告板/gu, "人肉廣告板"],
+  // Context-sensitive metaphor: never replace 「活動廣告板」 blindly. The
+  // bilingual reviewer chooses wording such as 「流動宣傳工具」 or
+  // 「將創作者當成廣告位」 from the English sentence's actual meaning.
   [/創作者市場推廣嘅貨幣/gu, "創作者市場推廣最重要嘅基礎"],
   // tolerate the optional 都 in 可以令所有人(都)保持誠實
   [/可以令所有人(?:都)?保持誠實/gu, "可以令雙方更清楚成效"],

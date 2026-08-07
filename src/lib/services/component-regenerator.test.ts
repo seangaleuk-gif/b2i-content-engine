@@ -39,11 +39,9 @@ describe("component regeneration boundaries", () => {
       CONCLUSION_END_MARKER,
       faq,
     ].join("\n\n");
-    const replacement = paragraph(
-      "Use a short plan. Test one idea. Improve it with feedback.",
-    );
+    const replacementText = "Use a short plan. Test one idea. Improve it with feedback.";
     const chatWithRetry = vi.fn(async () => ({
-      content: JSON.stringify({ body: replacement }),
+      content: JSON.stringify({ blocks: [{ type: "paragraph", text: replacementText }] }),
       usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
       model: "test",
       attemptsUsed: 0,
@@ -79,7 +77,7 @@ describe("component regeneration boundaries", () => {
     );
 
     expect(chatWithRetry).toHaveBeenCalled();
-    expect(result.blog).toContain(replacement);
+    expect(result.blog).toContain(replacementText);
     expect(result.blog).toContain(CONCLUSION_START_MARKER);
     expect(result.blog).toContain(conclusion);
     expect(result.blog).toContain(CONCLUSION_END_MARKER);
@@ -87,19 +85,18 @@ describe("component regeneration boundaries", () => {
     expect(result.blog).toContain("Protected answer.");
   });
 
-  it("strips regenerated links that are not present in research", async () => {
+  it("rejects raw HTML links returned outside the structured block contract", async () => {
     const chatWithRetry = vi.fn(async () => ({
-      content: JSON.stringify({
-        body: paragraph(
-          'Use <a href="https://invented.example">this advice</a> and review https://another-invented.example before acting.',
-        ),
-      }),
+      content: JSON.stringify({ blocks: [{
+        type: "paragraph",
+        text: 'Use <a href="https://invented.example">this advice</a> before acting.',
+      }] }),
       usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
       model: "test",
       attemptsUsed: 0,
     }));
 
-    const body = await regenerateSection(
+    await expect(regenerateSection(
       {
         chatWithRetry,
         promptContext: {
@@ -124,10 +121,6 @@ describe("component regeneration boundaries", () => {
       300,
       8,
       "content quality",
-    );
-
-    expect(body).toContain("this advice");
-    expect(body).not.toContain("<a ");
-    expect(body).not.toContain("invented.example");
+    )).rejects.toThrow(/contains raw HTML tags/);
   });
 });

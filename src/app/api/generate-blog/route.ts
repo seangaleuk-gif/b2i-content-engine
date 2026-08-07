@@ -10,6 +10,7 @@ import {
 import { runBlogGeneration, type GenerationResult } from "@/lib/services/blog-generation-service";
 import { countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import { analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
+import { runFinalValidation } from "@/lib/pipeline/blog-generation-pipeline";
 
 export async function POST(request: Request) {
   const startTime = Date.now();
@@ -32,6 +33,15 @@ export async function POST(request: Request) {
     const finalWordCount = countCanonicalVisibleWords(result.pipelineState.articleDoc);
     const generationTimeMs = Date.now() - startTime;
 
+    // Defence in depth: never begin persistence unless the exact canonical
+    // pipeline result still passes the sole final acceptance policy.
+    const preSaveValidation = runFinalValidation(result.pipelineState);
+    if (!preSaveValidation.passed) {
+      throw AppError.unprocessable(
+        `Final validation failed before save: ${preSaveValidation.reasons.join("; ")}`,
+      );
+    }
+
     const nextVersion = await blogVersionRepository.getNextVersionNumber(Number(projectId));
     const previousProjectContent = project.content ?? "";
     let savedVersionId: number | null = null;
@@ -53,7 +63,30 @@ export async function POST(request: Request) {
         summary: result.generated.summary || "",
         model: "section-by-section",
         generationTimeMs,
-        tokenUsage: { totalTokens: 0 },
+        tokenUsage: {
+          totalTokens: 0,
+          qualityAcceptance: result.pipelineState.fullDocumentEditorial
+            ? {
+                runId: result.pipelineState.fullDocumentEditorial.runId,
+                mode: result.pipelineState.fullDocumentEditorial.mode,
+                status: result.pipelineState.fullDocumentEditorial.status,
+                accepted: result.pipelineState.fullDocumentEditorial.accepted,
+                selectedUnitIds: result.pipelineState.fullDocumentEditorial.selectedUnitIds,
+                unresolvedFindingIds: result.pipelineState.fullDocumentEditorial.unresolvedFindingIds,
+                mandatoryOverflow: result.pipelineState.fullDocumentEditorial.mandatoryOverflow,
+                acceptedPatchCount: result.pipelineState.fullDocumentEditorial.patches.filter((patch) => patch.accepted).length,
+                findings: result.pipelineState.fullDocumentEditorial.findings.map((finding) => ({
+                  findingId: finding.findingId,
+                  category: finding.category,
+                  severity: finding.severity,
+                  blockIds: finding.blockIds,
+                  source: finding.source,
+                })),
+                patches: result.pipelineState.fullDocumentEditorial.patches,
+                diagnostics: result.pipelineState.fullDocumentEditorial.diagnostics,
+              }
+            : null,
+        },
         status: "draft",
       });
       savedVersionId = Number((created as any).id);
@@ -94,6 +127,7 @@ export async function POST(request: Request) {
           articleDoc: result.pipelineState.articleDoc,
           research: result.pipelineState.ctx?.research || [],
           claimOwnership: result.pipelineState.ctx?.claimOwnership,
+          fullDocumentEditorial: result.pipelineState.fullDocumentEditorial,
         },
       );
       const postSavePolicy = result.pipelineState.policy;

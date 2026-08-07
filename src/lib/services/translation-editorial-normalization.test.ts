@@ -382,7 +382,9 @@ describe("final Cantonese editorial-polish repairs", () => {
   });
 
   it("repairs literal phrases into natural Cantonese", () => {
-    expect(normalizeChineseEditorialText("佢哋唔想做活動廣告板")).toContain("人肉廣告板");
+    // Source-aware review owns metaphor repair. Deterministic cleanup must not
+    // replace one literal calque with another without the English context.
+    expect(normalizeChineseEditorialText("佢哋唔想做活動廣告板")).toContain("活動廣告板");
     expect(normalizeChineseEditorialText("信任就係創作者市場推廣嘅貨幣")).toContain("創作者市場推廣最重要嘅基礎");
     expect(normalizeChineseEditorialText("可以令所有人保持誠實")).toContain("可以令雙方更清楚成效");
     expect(normalizeChineseEditorialText("佢會感覺好人性化")).toContain("成個訊息會自然同有人情味好多");

@@ -15,6 +15,7 @@ import {
   runEditorialReview,
   documentStructureSignature,
   REVIEW_SELECTION_CAP,
+  findSourceAwareLiteralTranslations,
   type ReviewDecision,
   type ReviewUnit,
 } from "./document-context-editorial-review";
@@ -174,6 +175,15 @@ describe("editorial review: immutable text-leaf field generation", () => {
     expect(linkField.currentText).toBe("YKONE");
     expect(linkField.currentText).not.toBe("https://ykone.com/x");
   });
+
+  it("protects FAQ answers that contain links or inline markup", () => {
+    const markedZh = makeZhDoc();
+    markedZh.visibleFaq[0].answerHtml = '<p>請參閱<a href="https://b2ihub.com/blog/guide">完整指南</a>。</p>';
+    markedZh.visibleFaq[0].answerText = "請參閱完整指南。";
+    const index = buildEditableFieldIndex(markedZh, makeEnDoc());
+    expect(index.byUnit.has("faq.0.answer")).toBe(false);
+    expect(markedZh.visibleFaq[0].answerHtml).toContain('href="https://b2ihub.com/blog/guide"');
+  });
 });
 
 describe("editorial review: deterministic candidate selection", () => {
@@ -223,6 +233,25 @@ describe("editorial review: deterministic candidate selection", () => {
     const u = selected.find((s) => s.sourceUnitId === "conclusion.block.5");
     expect(u).toBeDefined();
     expect(u!.reasons).toContain("unnatural-passive");
+  });
+});
+
+describe("editorial review: source-aware unnatural literal translations", () => {
+  it.each([
+    ["nice-to-have", "呢個方案有就最好。", "literal-nice-to-have"],
+    ["walking billboard", "創作者唔應該變成活動廣告板。", "literal-walking-billboard"],
+    ["out of touch", "個品牌顯得失焦。", "literal-out-of-touch"],
+    ["keeps everyone honest", "透明報告令所有人老實啲。", "literal-keeps-honest"],
+  ])("rejects %s when rendered as a contextually wrong calque", (source, target, reason) => {
+    expect(findSourceAwareLiteralTranslations([alignedUnit("u.0", source, target)])).toEqual([
+      { sourceUnitId: "u.0", reason },
+    ]);
+  });
+
+  it("does not reject the Chinese token without the matching English concept", () => {
+    expect(findSourceAwareLiteralTranslations([
+      alignedUnit("u.0", "The campaign lost focus on its audience.", "個推廣活動失焦。"),
+    ])).toEqual([]);
   });
 });
 
@@ -882,6 +911,61 @@ describe("editorial review: exactly two substantive calls and routing", () => {
     // (asserted in document-context-primary.test.ts).
     expect(outcome.callCount).toBe(1);
     expect(labels).toContain("document-context-editorial-review");
+  });
+});
+
+describe("editorial review: complete-document acceptance mode", () => {
+  it("uses the existing single review call and requires a document decision", async () => {
+    process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW = "true";
+    try {
+      const enDoc = makeEnDoc();
+      const zhDoc = makeZhDoc();
+      zhDoc.sections[1].blocks[0] = pblock("s1-0", [t("呢個策略對大部分團隊嚟講係個加分位。")]);
+      const callProvider = async (messages: ChatMessage[]): Promise<ShadowProviderResponse> => {
+        const ids = [...messages[1].content.matchAll(/^### ([^\n]+)$/gm)].map((match) => match[1]);
+        return {
+          content: JSON.stringify({
+            decisions: ids.map((sourceUnitId) => ({ sourceUnitId, decision: "retain", edits: [], reasonCodes: [] })),
+            documentAcceptance: { decision: "accept", unresolvedUnitIds: [], reasonCodes: [] },
+          }),
+          finishReason: "stop",
+        };
+      };
+      const outcome = await runEditorialReview({
+        enDoc,
+        sourceDoc: buildTranslationSourceDocument(enDoc),
+        zhDoc,
+        qualityReport: emptyQualityReport(),
+        styleContract: buildZhHkStyleContract(""),
+        callProvider,
+      });
+      expect(outcome.callCount).toBe(1);
+      expect(outcome.status).toBe("run");
+      expect(outcome.documentAccepted).toBe(true);
+      expect(outcome.unresolvedUnitIds).toEqual([]);
+    } finally {
+      delete process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW;
+    }
+  });
+
+  it("fails closed when the complete-document decision is omitted", async () => {
+    process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW = "true";
+    try {
+      const enDoc = makeEnDoc();
+      const zhDoc = makeZhDoc();
+      const outcome = await runEditorialReview({
+        enDoc,
+        sourceDoc: buildTranslationSourceDocument(enDoc),
+        zhDoc,
+        qualityReport: emptyQualityReport(),
+        styleContract: buildZhHkStyleContract(""),
+        callProvider: async () => ({ content: '{"decisions":[]}', finishReason: "stop" }),
+      });
+      expect(outcome.status).toBe("failed");
+      expect(outcome.failure).toContain("omitted documentAcceptance");
+    } finally {
+      delete process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW;
+    }
   });
 });
 

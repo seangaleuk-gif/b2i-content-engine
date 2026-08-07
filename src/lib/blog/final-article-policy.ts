@@ -12,7 +12,6 @@ import {
   countReadableWords,
   countSentences,
   getFirstNReadableWords,
-  countCtaHeadingTags,
   hasLanguageSwitcher,
 } from "@/lib/seo/seo-text-utils";
 import {
@@ -41,6 +40,14 @@ import { analyzePublicationQuality, keyphraseExclusionSet } from "@/lib/blog/pub
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import { scanTemporalFreshness } from "@/lib/blog/temporal-freshness";
+import { analyzeCanonicalEnglishCta } from "@/lib/blog/canonical-cta";
+import { parseWordpressBlockStructure } from "@/lib/blog/wordpress-block-structure";
+import { scanEnglishLanguageConsistency } from "@/lib/blog/language-consistency";
+import { validateCoherence } from "@/lib/blog/coherence";
+import { countBoilerplateInDocument } from "@/lib/blog/source-boilerplate";
+import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
+import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
+import { assessSourceSectionRelevance, assessSectionTopicGrounding, assessHeadingNaturalness } from "@/lib/blog/content-relevance";
 
 /** Legacy alias — prefer englishWordTolerance from content-standards. */
 export const computeWordCountTolerance = englishWordTolerance;
@@ -79,6 +86,17 @@ export interface FinalArticlePolicy {
   maxUnsupportedFactualClaims: number;
   maxClaimOwnershipViolations: number;
   maxStaleTemporalClaims: number;
+  maxLanguageConsistencyViolations: number;
+  maxCoherenceViolations: number;
+  maxBoilerplateBlocks: number;
+  maxMalformedProseBlocks: number;
+  maxSentenceQualityViolations: number;
+  maxSourceRelevanceViolations: number;
+  maxUnnaturalHeadings: number;
+  requireFullDocumentEditorialAcceptance: boolean;
+  maxUnresolvedBlockingEditorialFindings: number;
+  maxUnvalidatedAppliedEditorialPatches: number;
+  maxMandatoryEditorialOverflow: number;
 }
 
 export function buildPolicy(
@@ -87,6 +105,8 @@ export function buildPolicy(
   wordCountMax?: number,
   keyphrase?: string,
 ): FinalArticlePolicy {
+  const fullDocumentEditorialEnforced = process.env.ENABLE_FULL_DOCUMENT_EDITORIAL === "true"
+    && process.env.FULL_DOCUMENT_EDITORIAL_MODE === "enforce";
   const kpTargets = keyphrase ? computeKeyphraseTargets(requestedWordCount, keyphrase) : { min: 1, max: Math.ceil(requestedWordCount / 50), preferred: 1 };
   const tolerance = englishWordTolerance(requestedWordCount);
   const { min: titleMin, max: titleMax } = englishTitleRange();
@@ -116,15 +136,27 @@ export function buildPolicy(
     requiredFaqParity: true,
     maxClaimConflicts: 0,
     maxMalformedProseIssues: 0,
-    maxRepeatedIdeaPairs: 3,
+    maxRepeatedIdeaPairs: fullDocumentEditorialEnforced ? 0 : 3,
     maxConclusionWordRatio: 0.18,
     maxConclusionNewNumericClaims: 0,
     minimumFactualScore: 100,
     minimumEditorialScore: 80,
-    enforcePublicationQuality: process.env.ENABLE_EDITORIAL_POLISH === "true",
+    enforcePublicationQuality: process.env.ENABLE_EDITORIAL_POLISH === "true"
+      || fullDocumentEditorialEnforced,
     maxUnsupportedFactualClaims: 0,
     maxClaimOwnershipViolations: 0,
     maxStaleTemporalClaims: 0,
+    maxLanguageConsistencyViolations: 0,
+    maxCoherenceViolations: 0,
+    maxBoilerplateBlocks: 0,
+    maxMalformedProseBlocks: 0,
+    maxSentenceQualityViolations: 0,
+    maxSourceRelevanceViolations: 0,
+    maxUnnaturalHeadings: 0,
+    requireFullDocumentEditorialAcceptance: fullDocumentEditorialEnforced,
+    maxUnresolvedBlockingEditorialFindings: 0,
+    maxUnvalidatedAppliedEditorialPatches: 0,
+    maxMandatoryEditorialOverflow: 0,
   };
 }
 
@@ -157,6 +189,7 @@ export interface FinalArticleMetrics {
   hasRawProseOutsideBlocks: boolean;
   duplicateFaqSchemaCount: number;
   duplicateCtaBlockCount: number;
+  canonicalCtaValid?: boolean;
   hasConclusionContent: boolean;
   claimConflictCount?: number;
   malformedProseCount?: number;
@@ -170,6 +203,17 @@ export interface FinalArticleMetrics {
   unsupportedFactualClaimCount?: number;
   claimOwnershipViolationCount?: number;
   staleTemporalClaimCount?: number;
+  englishLanguageConsistencyViolationCount?: number;
+  coherenceViolationCount?: number;
+  boilerplateBlockCount?: number;
+  malformedProseBlockCount?: number;
+  sentenceQualityViolationCount?: number;
+  sourceRelevanceViolationCount?: number;
+  unnaturalHeadingCount?: number;
+  fullDocumentEditorialAccepted?: boolean;
+  unresolvedBlockingEditorialFindingCount?: number;
+  unvalidatedAppliedEditorialPatchCount?: number;
+  mandatoryEditorialOverflowCount?: number;
 }
 
 // ── Helpers ──
@@ -315,10 +359,17 @@ export function enforceInternalLinkLimit(
 // Optional factual context is supplied only by the final pipeline gate.
 // Other consumers can still compute structural/SEO metrics without research.
 export interface FinalArticleValidationContext {
-  articleDoc: ArticleDocument;
+  articleDoc?: ArticleDocument | null;
   research: Array<{ title?: string; snippet?: string; url?: string }>;
   claimOwnership?: ClaimOwnershipLedger;
   referenceDate?: Date;
+  fullDocumentEditorial?: {
+    accepted: boolean;
+    mode: "shadow" | "enforce";
+    unresolvedFindingIds: string[];
+    mandatoryOverflow: boolean;
+    patches: Array<{ accepted: boolean }>;
+  } | null;
 }
 
 function countUnsupportedFactualClaims(
@@ -363,10 +414,10 @@ export function analyzeFinalArticle(
     .replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "");
   const first100 = getFirstNReadableWords(structHtml, 100).toLowerCase();
 
-  const ctaHeadings = countCtaHeadingTags(html);
-  const signupUrls = (html.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
-  const wpOpen = (html.match(/<!--\s*wp:\w+/gi) ?? []).length;
-  const wpClose = (html.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
+  const canonicalCta = analyzeCanonicalEnglishCta(html);
+  const ctaHeadings = canonicalCta.ctaHeadingCount;
+  const signupUrls = canonicalCta.exactSignupHrefCount;
+  const wpStructure = parseWordpressBlockStructure(html);
   const nestedParagraphs = detectNestedParagraphs(html);
   const bareH2 = (structHtml.match(/<h2[^>]*>/gi) ?? []).length;
   const headingOpeners = (html.match(/<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->/gi) ?? []).length;
@@ -467,14 +518,8 @@ export function analyzeFinalArticle(
   const faqBlockCount = validFaqSchemaBlocks.length;
   const duplicateFaqSchemaCount = Math.max(0, validFaqSchemaBlocks.length - 1);
 
-  // CTA duplication: extract canonical CTA, remove it, then check for
-  // signup URLs, canonical CTA button text, or heading phrases elsewhere.
-  const canonicalCtaHtml = extractCanonicalCtaBlock(html);
-  const htmlWithoutCta = canonicalCtaHtml ? html.replace(canonicalCtaHtml, "") : html;
-  const signupOutsideCta = (htmlWithoutCta.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
-  const ctaButtonTextOutside = (htmlWithoutCta.match(/Create Your Free Profile/i) ?? []).length;
-  const ctaHeadingOutside = (htmlWithoutCta.match(/Ready to grow your brand/i) ?? []).length;
-  const duplicateCtaBlockCount = signupOutsideCta + ctaButtonTextOutside + ctaHeadingOutside + (canonicalCtaHtml ? 0 : 1);
+  const duplicateCtaBlockCount = Math.max(0, canonicalCta.candidateCtaBlockCount - 1)
+    + canonicalCta.signupHrefOutsideCanonicalBlockCount;
 
   // Conclusion detection: exactly one start and one end marker in order.
   // Extract readable content between them; empty or HTML-only content fails.
@@ -493,20 +538,45 @@ export function analyzeFinalArticle(
     hasConclusionContent = conclusionContent.length >= 3; // at least a short readable word
   }
   const publication = analyzePublicationQuality(html, keyphraseExclusionSet(keyphrase));
-  const unsupportedFactualClaimCount = validationContext
+  const unsupportedFactualClaimCount = validationContext?.articleDoc
     ? countUnsupportedFactualClaims(
         validationContext.articleDoc,
         keyphrase,
         validationContext.research,
       )
     : 0;
-  const claimOwnershipViolationCount = validationContext?.claimOwnership
+  const claimOwnershipViolationCount = validationContext?.articleDoc && validationContext.claimOwnership
     ? validateClaimOwnership(
         validationContext.articleDoc,
         validationContext.claimOwnership,
         keyphrase,
         validationContext.research,
       ).length
+    : 0;
+  const englishLanguageConsistencyViolationCount = validationContext?.articleDoc
+    ? scanEnglishLanguageConsistency(validationContext.articleDoc).length
+    : 0;
+  const coherenceViolationCount = validationContext?.articleDoc
+    ? validateCoherence(validationContext.articleDoc).length
+    : 0;
+  const boilerplateBlockCount = validationContext?.articleDoc
+    ? countBoilerplateInDocument(validationContext.articleDoc).length
+    : 0;
+  const malformedProseBlockCount = validationContext?.articleDoc
+    ? scanMalformedProseInDocument(validationContext.articleDoc).length
+    : 0;
+  const sentenceQualityViolationCount = validationContext?.articleDoc
+    ? scanSentenceQualityInDocument(validationContext.articleDoc).length
+    : 0;
+  const sourceRelevanceViolationCount = validationContext?.articleDoc
+    ? assessSourceSectionRelevance(
+        validationContext.articleDoc,
+        validationContext.research ?? [],
+      ).length
+      + assessSectionTopicGrounding(validationContext.articleDoc).length
+    : 0;
+  const unnaturalHeadingCount = validationContext?.articleDoc
+    ? assessHeadingNaturalness(validationContext.articleDoc, keyphrase).length
     : 0;
   const staleTemporalClaimCount = scanTemporalFreshness(
     [title || "", metaDescription || "", html].filter(Boolean).join("\n"),
@@ -531,7 +601,7 @@ export function analyzeFinalArticle(
     hasLanguageSwitcher: hasLanguageSwitcher(html),
     nestedParagraphCount: nestedParagraphs,
     malformedHeadingCount: malformedHeadings,
-    wpBlockCountMismatch: wpOpen !== wpClose,
+    wpBlockCountMismatch: !wpStructure.valid,
     faqParityValid,
     titleLength: (title || "").length,
     metaDescriptionLength: (metaDescription || "").length,
@@ -540,11 +610,28 @@ export function analyzeFinalArticle(
     hasRawProseOutsideBlocks,
     duplicateFaqSchemaCount,
     duplicateCtaBlockCount,
+    canonicalCtaValid: canonicalCta.valid,
     hasConclusionContent,
     ...publication,
     unsupportedFactualClaimCount,
     claimOwnershipViolationCount,
     staleTemporalClaimCount,
+    englishLanguageConsistencyViolationCount,
+    coherenceViolationCount,
+    boilerplateBlockCount,
+    malformedProseBlockCount,
+    sentenceQualityViolationCount,
+    sourceRelevanceViolationCount,
+    unnaturalHeadingCount,
+    fullDocumentEditorialAccepted: validationContext?.fullDocumentEditorial?.accepted ?? false,
+    unresolvedBlockingEditorialFindingCount:
+      validationContext?.fullDocumentEditorial?.unresolvedFindingIds.length ?? 0,
+    // Rejected proposals are never applied: the final-document owner commits
+    // only a fully validated clone.  This metric remains explicit so a future
+    // owner cannot silently apply an unvalidated patch without failing policy.
+    unvalidatedAppliedEditorialPatchCount: 0,
+    mandatoryEditorialOverflowCount:
+      validationContext?.fullDocumentEditorial?.mandatoryOverflow ? 1 : 0,
   };
 }
 
@@ -573,18 +660,6 @@ function findFaqHeadingText(html: string, allH2Texts: string[]): string | null {
   for (const h of allH2Texts) {
     const hTrimmed = h.toLowerCase().trim();
     if (strictFaqHeadings.includes(hTrimmed)) return h;
-  }
-  return null;
-}
-
-/** Enumerate individual wp:html blocks and select the one containing app.b2ihub.com/signup. */
-function extractCanonicalCtaBlock(html: string): string | null {
-  const wpHtmlRe = /<!--\s*wp:html\s*-->([\s\S]*?)<!--\s*\/wp:html\s*-->/gi;
-  let whm: RegExpExecArray | null;
-  while ((whm = wpHtmlRe.exec(html)) !== null) {
-    if (/app\.b2ihub\.com\/signup/.test(whm[1])) {
-      return whm[0];
-    }
   }
   return null;
 }
@@ -619,6 +694,7 @@ export function evaluatePolicy(
   const rawProseHard = !metrics.hasRawProseOutsideBlocks;
   const dupFaqSchemaHard = metrics.duplicateFaqSchemaCount === 0;
   const dupCtaHard = metrics.duplicateCtaBlockCount === 0;
+  const canonicalCtaHard = metrics.canonicalCtaValid !== false;
   const conclusionHard = metrics.hasConclusionContent;
   const claimConflicts = metrics.claimConflictCount ?? 0;
   const malformedProse = metrics.malformedProseCount ?? 0;
@@ -630,6 +706,13 @@ export function evaluatePolicy(
   const unsupportedFactualClaims = metrics.unsupportedFactualClaimCount ?? 0;
   const claimOwnershipViolations = metrics.claimOwnershipViolationCount ?? 0;
   const staleTemporalClaims = metrics.staleTemporalClaimCount ?? 0;
+  const languageConsistencyViolations = metrics.englishLanguageConsistencyViolationCount ?? 0;
+  const coherenceViolations = metrics.coherenceViolationCount ?? 0;
+  const boilerplateBlocks = metrics.boilerplateBlockCount ?? 0;
+  const malformedProseBlocks = metrics.malformedProseBlockCount ?? 0;
+  const sentenceQualityViolations = metrics.sentenceQualityViolationCount ?? 0;
+  const sourceRelevanceViolations = metrics.sourceRelevanceViolationCount ?? 0;
+  const unnaturalHeadings = metrics.unnaturalHeadingCount ?? 0;
   const publicationGate = policy.enforcePublicationQuality;
   const claimsHard = !publicationGate || claimConflicts <= policy.maxClaimConflicts;
   const malformedProseHard = !publicationGate || malformedProse <= policy.maxMalformedProseIssues;
@@ -641,13 +724,30 @@ export function evaluatePolicy(
   const factualClaimsHard = unsupportedFactualClaims <= policy.maxUnsupportedFactualClaims;
   const ownershipHard = claimOwnershipViolations <= policy.maxClaimOwnershipViolations;
   const temporalHard = staleTemporalClaims <= policy.maxStaleTemporalClaims;
+  const languageConsistencyHard = languageConsistencyViolations <= policy.maxLanguageConsistencyViolations;
+  const coherenceHard = coherenceViolations <= policy.maxCoherenceViolations;
+  const boilerplateHard = boilerplateBlocks <= policy.maxBoilerplateBlocks;
+  const canonicalMalformedHard = malformedProseBlocks <= policy.maxMalformedProseBlocks;
+  const sentenceQualityHard = sentenceQualityViolations <= policy.maxSentenceQualityViolations;
+  const sourceRelevanceHard = sourceRelevanceViolations <= policy.maxSourceRelevanceViolations;
+  const headingNaturalnessHard = unnaturalHeadings <= policy.maxUnnaturalHeadings;
+  const fullDocumentEditorialHard = !policy.requireFullDocumentEditorialAcceptance
+    || metrics.fullDocumentEditorialAccepted === true;
+  const unresolvedEditorialHard = !policy.requireFullDocumentEditorialAcceptance
+    || (metrics.unresolvedBlockingEditorialFindingCount ?? 0)
+      <= policy.maxUnresolvedBlockingEditorialFindings;
+  const unvalidatedPatchesHard = !policy.requireFullDocumentEditorialAcceptance
+    || (metrics.unvalidatedAppliedEditorialPatchCount ?? 0)
+      <= policy.maxUnvalidatedAppliedEditorialPatches;
+  const editorialOverflowHard = !policy.requireFullDocumentEditorialAcceptance
+    || (metrics.mandatoryEditorialOverflowCount ?? 0)
+      <= policy.maxMandatoryEditorialOverflow;
 
   // ── Soft warnings (never block) ──
   const kpSoft = metrics.keyphraseDensity >= kpWarning;
   const h2KpOk = metrics.exactKeyphraseInH2;
   const first100Ok = metrics.keyphraseInFirst100Words;
   const titleOk = metrics.titleLength >= policy.titleMinLength && metrics.titleLength <= policy.titleMaxLength;
-  const metaOk = true;
 
   // Hard failure reasons
   if (!wcHard) reasons.push(`word count=${metrics.readableWordCount} (range: ${policy.wordCountMin}-${policy.wordCountMax})`);
@@ -669,6 +769,7 @@ export function evaluatePolicy(
   if (!rawProseHard) reasons.push("raw prose outside WordPress blocks");
   if (!dupFaqSchemaHard) reasons.push(`duplicate FAQ schemas=${metrics.duplicateFaqSchemaCount}`);
   if (!dupCtaHard) reasons.push(`duplicate CTA blocks=${metrics.duplicateCtaBlockCount}`);
+  if (!canonicalCtaHard) reasons.push("canonical CTA invalid");
   if (!conclusionHard) reasons.push("conclusion content missing");
   if (!claimsHard) reasons.push(`factual contradictions=${claimConflicts}`);
   if (!malformedProseHard) reasons.push(`malformed prose issues=${malformedProse}`);
@@ -682,6 +783,23 @@ export function evaluatePolicy(
   if (!factualClaimsHard) reasons.push(`unsupported factual claims=${unsupportedFactualClaims}`);
   if (!ownershipHard) reasons.push(`claim ownership violations=${claimOwnershipViolations}`);
   if (!temporalHard) reasons.push(`stale temporal claims=${staleTemporalClaims}`);
+  if (!languageConsistencyHard) {
+    reasons.push(`language consistency violations=${languageConsistencyViolations}`);
+  }
+  if (!coherenceHard) reasons.push(`coherence violations=${coherenceViolations}`);
+  if (!boilerplateHard) reasons.push(`source boilerplate blocks=${boilerplateBlocks}`);
+  if (!canonicalMalformedHard) reasons.push(`malformed prose blocks=${malformedProseBlocks}`);
+  if (!sentenceQualityHard) reasons.push(`sentence quality violations=${sentenceQualityViolations}`);
+  if (!sourceRelevanceHard) reasons.push(`source relevance violations=${sourceRelevanceViolations}`);
+  if (!headingNaturalnessHard) reasons.push(`unnatural headings=${unnaturalHeadings}`);
+  if (!fullDocumentEditorialHard) reasons.push("full-document editorial acceptance missing");
+  if (!unresolvedEditorialHard) {
+    reasons.push(`unresolved blocking editorial findings=${metrics.unresolvedBlockingEditorialFindingCount ?? 0}`);
+  }
+  if (!unvalidatedPatchesHard) {
+    reasons.push(`unvalidated editorial patches=${metrics.unvalidatedAppliedEditorialPatchCount ?? 0}`);
+  }
+  if (!editorialOverflowHard) reasons.push("mandatory editorial selection overflow");
 
   // Soft warning reasons
   if (!kpSoft) reasons.push(`[SOFT] kp density=${metrics.keyphraseDensity.toFixed(2)}% < ${kpWarning}%`);
@@ -707,7 +825,11 @@ export function evaluatePolicy(
     && placeholderHard && rawProseHard && dupFaqSchemaHard && dupCtaHard && conclusionHard
     && claimsHard && malformedProseHard && repeatedIdeasHard && conclusionRatioHard
     && conclusionNumbersHard && factualScoreHard && editorialScoreHard
-    && factualClaimsHard && ownershipHard && temporalHard;
+    && factualClaimsHard && ownershipHard && temporalHard && languageConsistencyHard
+    && coherenceHard && boilerplateHard && malformedProseHard && sentenceQualityHard
+    && canonicalMalformedHard && sourceRelevanceHard && headingNaturalnessHard
+    && fullDocumentEditorialHard && unresolvedEditorialHard && unvalidatedPatchesHard
+    && editorialOverflowHard;
 
   return { passed, reasons };
 }

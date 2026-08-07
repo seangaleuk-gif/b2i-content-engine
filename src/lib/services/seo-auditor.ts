@@ -135,6 +135,17 @@ export function runAudit(input: AuditInput): AuditResult {
   const canonicalWordCount = parsed.doc
     ? countCanonicalVisibleWords(parsed.doc)
     : undefined;
+  // Editorial H2s for the keyphrase-h2 check: the FAQ heading and the CTA
+  // heading (protected blocks) never count as the editorial-H2 placement.
+  const editorialH2Texts = parsed.doc
+    ? parsed.doc.sections
+        .filter(
+          (section) =>
+            section.sectionType !== "faq-heading"
+            && section.sectionType !== "conclusion-heading",
+        )
+        .map((section) => section.heading)
+    : h2Texts;
   const m = analyzeFinalArticle(
     blog,
     keyword,
@@ -228,19 +239,19 @@ export function runAudit(input: AuditInput): AuditResult {
     checks.push(makeCheck("keyphrase_first100", "Keyphrase in First 100 Words", null, "not_applicable", "No keyphrase", "First 100 words", "", "Content & Keyphrase"));
   }
 
-  // 8. Keyphrase in H2
+  // 8. Keyphrase in a normal editorial H2 (FAQ and CTA headings never count)
   if (keywordLower) {
-    const exactInH2 = h2Texts.some((h) => h.toLowerCase().includes(keywordLower));
-    const closeInH2 = !exactInH2 && h2Texts.some((h) => closeVariant(keyword, h));
-    const matchedHeading = h2Texts.find((h) => h.toLowerCase().includes(keywordLower)) ?? h2Texts.find((h) => closeVariant(keyword, h));
+    const exactInH2 = editorialH2Texts.some((h) => h.toLowerCase().includes(keywordLower));
+    const closeInH2 = !exactInH2 && editorialH2Texts.some((h) => closeVariant(keyword, h));
+    const matchedHeading = editorialH2Texts.find((h) => h.toLowerCase().includes(keywordLower)) ?? editorialH2Texts.find((h) => closeVariant(keyword, h));
     if (exactInH2) {
-      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 100, "pass", `"${matchedHeading}"`, "Exact phrase in H2", "The exact keyphrase appears in an H2 heading.", "Content & Keyphrase"));
+      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 100, "pass", `"${matchedHeading}"`, "Exact phrase in H2", "The exact keyphrase appears in a normal editorial H2 heading.", "Content & Keyphrase"));
     } else if (closeInH2) {
-      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", `Close match: "${matchedHeading}"`, "Exact phrase in H2", "A close variant of the keyphrase was found in an H2, but not the exact phrase.", "Content & Keyphrase"));
-    } else if (h2Texts.length > 0) {
-      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", "Not found", "Exact phrase in H2", "The keyphrase is missing from all H2 headings (quality target).", "Content & Keyphrase"));
+      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", `Close match: "${matchedHeading}"`, "Exact phrase in H2", "A close variant of the keyphrase was found in an editorial H2, but not the exact phrase.", "Content & Keyphrase"));
+    } else if (editorialH2Texts.length > 0) {
+      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", "Not found", "Exact phrase in H2", "The keyphrase is missing from all editorial H2 headings (quality target).", "Content & Keyphrase"));
     } else {
-      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", "No H2 headings", "Exact phrase in H2", "No H2 headings found.", "Content & Keyphrase"));
+      checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", 60, "warning", "No H2 headings", "Exact phrase in H2", "No editorial H2 headings found.", "Content & Keyphrase"));
     }
   } else {
     checks.push(makeCheck("keyphrase_h2", "Exact Keyphrase in H2", null, "not_applicable", "No keyphrase", "Exact phrase in H2", "", "Content & Keyphrase"));

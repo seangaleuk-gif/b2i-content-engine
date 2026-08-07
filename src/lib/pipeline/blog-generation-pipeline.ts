@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
-import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, countCanonicalVisibleWords, extractVisibleFaqFromArticle, validateFaqParity } from "@/lib/blog/article-document";
+import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, countCanonicalVisibleWords, extractVisibleFaqFromArticle, extractPlainTextFromEditorialBlocks, validateFaqParity } from "@/lib/blog/article-document";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import { type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { normalizeFinalSeo } from "@/lib/blog/final-seo-normalizer";
@@ -21,8 +21,9 @@ import {
 } from "@/lib/blog/article-integrity";
 import type { FinalArticlePolicy, FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
-import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countCtaHeadingTags, countReadableWords, containsExactPhrase, countEditorialExternalLinks, extractEditorialExternalLinkUrls } from "@/lib/seo/seo-text-utils";
+import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countReadableWords, containsExactPhrase, countEditorialExternalLinks, extractEditorialExternalLinkUrls } from "@/lib/seo/seo-text-utils";
 import { FLESCH_MAX, FLESCH_MIN, GENERATION_WORD_BUFFER, MAX_SENTENCES_PER_PARAGRAPH, WORD_ALLOCATION } from "@/lib/services/generation-constants";
+import { normalizeEnglishTitleCasing } from "@/lib/services/text-utils";
 import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
 import {
@@ -44,19 +45,42 @@ import { enforceInternalLinkLimit } from "@/lib/blog/final-article-policy";
 import { trimConclusionToBudget, extractRoboticPhraseMatches } from "@/lib/blog/publication-quality";
 import { isEligibleExternalSourceUrl } from "@/lib/services/article-postprocessors";
 import {
-  enforceClaimOwnership,
+  enforceOwnershipAndVerify,
   formatOwnedEvidencePacket,
+  formatOwnershipViolationDetails,
+  isTopicContextYearClaim,
   validateClaimOwnership,
 } from "@/lib/blog/claim-ownership";
+import { reconcilePostOwnershipKeyphrase } from "@/lib/blog/post-ownership-seo-reconcile";
+import { scanEnglishLanguageConsistency, formatLanguageConsistencyViolations } from "@/lib/blog/language-consistency";
+import {
+  compressDocumentStructureAware,
+  validateCoherence,
+  coherenceViolationSummary,
+  MIN_SECTION_WORDS,
+} from "@/lib/blog/coherence";
+import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
+import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
+import { countBoilerplateInDocument } from "@/lib/blog/source-boilerplate";
+import {
+  assessSourceSectionRelevance,
+  assessSectionTopicGrounding,
+  assessHeadingNaturalness,
+  removeOffTopicSourceCitations,
+  formatRelevanceViolations,
+} from "@/lib/blog/content-relevance";
 import { repairTemporalFreshnessDocument, findTemporalFreshnessIssues } from "@/lib/blog/temporal-freshness";
-
-const CANONICAL_CTA_HTML = `<!-- wp:html -->
-<div style="background: #1E3A8A; color: #fff; padding: 32px 28px; border-radius: 12px; margin: 40px 0; text-align: center;">
-  <h2 style="color: #fff; margin-top: 0; font-size: 22px;">Ready to grow your brand with Hong Kong creators?</h2>
-  <p style="font-size: 16px; line-height: 1.6; margin-bottom: 24px;">B2I Hub connects businesses directly with verified creators — no agencies, no commissions, no middlemen. Create your free profile and start collaborating today.</p>
-  <a href="https://app.b2ihub.com/signup" style="display: inline-block; background: #F97316; color: #fff; padding: 14px 36px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px;" target="_blank" rel="noopener">Create Your Free Profile →</a>
-</div>
-<!-- /wp:html -->`;
+import {
+  runFullDocumentEditorial,
+  isFullDocumentEditorialEnabled,
+  type FullDocumentEditorialOutcome,
+} from "@/lib/pipeline/full-document-editorial";
+import {
+  analyzeCanonicalEnglishCta,
+  CANONICAL_ENGLISH_CTA_FINGERPRINT,
+  CANONICAL_ENGLISH_CTA_HTML,
+} from "@/lib/blog/canonical-cta";
+import { dynamicFaqRange } from "@/lib/content-standards";
 
 // ── Types ──
 
@@ -111,6 +135,7 @@ export interface PipelineState {
   currentWordCount: number;
   expansionAttempts: number;
   trimAttempts: number;
+  fullDocumentEditorial?: FullDocumentEditorialOutcome | null;
 }
 
 // ── Pipeline dependencies ──
@@ -276,6 +301,7 @@ export function sanitizeFaqFactualClaims(
   entries: ArticleDocument["visibleFaq"],
   keyphrase: string,
   research: Array<{ title?: string; snippet?: string; url?: string }>,
+  topicContext?: { keyphrase: string; title?: string; metaDescription?: string; headings?: string[] },
 ): {
   entries: ArticleDocument["visibleFaq"];
   unsupportedSentencesRemoved: number;
@@ -283,19 +309,23 @@ export function sanitizeFaqFactualClaims(
 } {
   let unsupportedSentencesRemoved = 0;
   const citationsAdded = 0;
+  const effectiveContext = topicContext ?? { keyphrase };
 
   const sanitized = entries.map((entry, index) => {
     const paragraphHtml =
       `<!-- wp:paragraph --><p>${escapeHtmlText(entry.answerText)}</p><!-- /wp:paragraph -->`;
     const initialRisk = scanFactualRisks(paragraphHtml, keyphrase, research);
-    const cleanup = removeUnsupportedSentences(paragraphHtml, initialRisk.claims);
+    const claimsToRemove = initialRisk.claims.filter(
+      (claim) => !isTopicContextYearClaim(claim, effectiveContext),
+    );
+    const cleanup = removeUnsupportedSentences(paragraphHtml, claimsToRemove);
     unsupportedSentencesRemoved += cleanup.sentencesRemoved;
 
     const remainingClaims = scanFactualRisks(
       cleanup.html,
       keyphrase,
       research,
-    ).claims;
+    ).claims.filter((claim) => !isTopicContextYearClaim(claim, effectiveContext));
     if (remainingClaims.length > 0) {
       throw new Error(
         `Precise factual claim could not be removed safely from synthesis-only FAQ ${index + 1}: ` +
@@ -485,8 +515,7 @@ function runStageValidation(html: string, baseline: ArticleIntegrityBaseline, st
   const unclosedTags = unclosed.length > 0 ? [unclosed[0]] : [];
   const wpPairResult = validateWordpressBlockPairs(html);
   const wpBlocksValid = wpPairResult.valid;
-  const issues: string[] = [...result.errors];
-  for (const wpIssue of wpPairResult.issues) issues.push(wpIssue);
+  const issues = [...new Set([...result.errors, ...wpPairResult.issues])];
   return { valid: result.valid && wpBlocksValid, nestedParagraphs: result.metrics.nestedParagraphCount,
     malformedHeadings: result.metrics.malformedHeadingCount, wpBlocksValid, unclosedTags, issues };
 }
@@ -566,6 +595,83 @@ export function guardStageOutput(
 export function recordStage(state: PipelineState, stageName: string, inputFp: string, outputFp: string, accepted: boolean, fallbackSource?: string, metadata?: Record<string, unknown>): void {
   state.stageOutputs.push({ stage: stageName, inputFingerprint: inputFp, outputFingerprint: outputFp, accepted, fallbackSource, metadata });
 }
+
+/**
+ * Final-document editorial boundary precondition. Before the model may diagnose the
+ * complete document, the canonical render must be structurally sound: balanced and
+ * type-correct WordPress blocks, canonical/render cache equality, protected-content
+ * integrity, FAQ/schema parity and exactly one canonical CTA. This ensures the
+ * final-document diagnosis never receives structurally invalid HTML.
+ */
+export function assertFinalEditorialBoundary(state: PipelineState): void {
+  const html = state.blog;
+  const canonicalRender = renderArticleDocument(state.articleDoc);
+  if (canonicalRender !== html) {
+    throw new Error(
+      `Final-document editorial boundary: canonical/render cache mismatch (canonical render ${fingerprintHtml(canonicalRender)} vs cache ${fp(html)})`,
+    );
+  }
+
+  const baseline = createArticleIntegrityBaseline(html);
+  const integrity = validateFinalArticleIntegrity(html, baseline);
+  const wpPair = validateWordpressBlockPairs(html);
+  if (!integrity.valid || !wpPair.valid) {
+    const issues = [...integrity.errors, ...wpPair.issues];
+    throw new Error(`Final-document editorial boundary: invalid canonical render. ${issues.join("; ")}`);
+  }
+
+  const cta = analyzeCanonicalEnglishCta(html);
+  if (
+    !cta.valid
+    || state.articleDoc.cta?.html.replace(/\s+/g, " ").trim()
+      !== CANONICAL_ENGLISH_CTA_HTML.replace(/\s+/g, " ").trim()
+    || state.articleDoc.cta?.fingerprint !== CANONICAL_ENGLISH_CTA_FINGERPRINT
+  ) {
+    throw new Error(`Final-document editorial boundary: CTA integrity failed. ${cta.issues.join("; ")}`);
+  }
+
+  const slugs = pairedSlugs(state.articleDoc.metadata.slug || "blog-post");
+  const canonicalSwitcher = renderLanguageSwitcher({
+    currentLanguage: "en",
+    englishSlug: slugs.englishSlug,
+    chineseSlug: slugs.chineseSlug,
+  });
+  if (
+    state.articleDoc.languageSwitcher?.html !== canonicalSwitcher
+    || state.articleDoc.languageSwitcher?.fingerprint !== fingerprintHtml(canonicalSwitcher)
+  ) {
+    throw new Error("Final-document editorial boundary: English language switcher is not canonical");
+  }
+
+  // FAQ / schema parity from the canonical FAQ array.
+  const faqRange = dynamicFaqRange(state.articleDoc.metadata.targetWordCount || state.requestedWordCount);
+  if (
+    state.articleDoc.visibleFaq.length < faqRange.min
+    || state.articleDoc.visibleFaq.length > faqRange.max
+  ) {
+    throw new Error(
+      `Final-document editorial boundary: canonical visible FAQ count=${state.articleDoc.visibleFaq.length}`
+      + ` outside ${faqRange.min}-${faqRange.max}`,
+    );
+  }
+  const renderedFaq = extractVisibleFaqFromArticle(html, state.articleDoc);
+  const schemaHtml = extractFaqBlock(html);
+  const parity = validateFaqParity(state.articleDoc.visibleFaq, schemaHtml);
+  const renderedMatchesCanonical = renderedFaq.length === state.articleDoc.visibleFaq.length
+    && renderedFaq.every((entry, index) => {
+      const canonical = state.articleDoc.visibleFaq[index];
+      return canonical
+        && entry.question.replace(/\s+/g, " ").trim() === canonical.question.replace(/\s+/g, " ").trim()
+        && entry.answerText.replace(/\s+/g, " ").trim() === canonical.answerText.replace(/\s+/g, " ").trim();
+    });
+  if (!schemaHtml || !parity.valid || !renderedMatchesCanonical) {
+    throw new Error(
+      `Final-document editorial boundary: FAQ/schema parity mismatch`+
+      ` (canonical=${state.articleDoc.visibleFaq.length} rendered=${renderedFaq.length})`,
+    );
+  }
+}
+
 
 // ── State snapshot (articleDoc is the canonical source) ──
 
@@ -682,6 +788,7 @@ export function createPipelineState(params: {
     wordMin: params.wordMin, wordMax: params.wordMax,
     estimatedTokens: 0, systemPrompt: params.systemPrompt, userMessage: params.userMessage,
     currentWordCount: 0, expansionAttempts: 0, trimAttempts: 0,
+    fullDocumentEditorial: null,
   };
 }
 
@@ -693,11 +800,15 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
     "seo-normalization", "title-repair", "factual-scan", "claim-ownership", "temporal-freshness",
     "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
     "language-switcher", "internal-links", "external-links", "external-dedup",
-    "link-enforce", "factual-final", "cta-preserve", "final-trim",
-    "faq-recovery", "wc-check", "final-preflight", "final-validation",
+    "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve", "final-trim",
+    "faq-recovery", "wc-check", "final-preflight", "final-qc-scan", "final-document-editorial", "final-validation",
   ];
   if (isEditorialPolishEnabled()) {
     required.push("conclusion-discipline", "editorial-polish");
+  }
+  if (!isFullDocumentEditorialEnabled()) {
+    const index = required.indexOf("final-document-editorial");
+    if (index >= 0) required.splice(index, 1);
   }
   for (const req of required) {
     if (!stages.includes(req)) issues.push({ code: "MISSING_STAGE", message: `Required stage "${req}" not found`, stage: req });
@@ -710,8 +821,10 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
     "paragraphs-final", "malformed-prose-repair",
     ...(isEditorialPolishEnabled() ? ["editorial-polish"] : []),
     "claim-ownership-final", "language-switcher", "internal-links", "external-links",
-    "external-dedup", "link-enforce", "factual-final", "cta-preserve",
-    "final-trim", "faq-recovery", "wc-check", "final-preflight", "final-validation",
+    "external-dedup",     "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve",
+    "final-trim", "faq-recovery", "wc-check", "final-preflight", "final-qc-scan",
+    ...(isFullDocumentEditorialEnabled() ? ["final-document-editorial"] : []),
+    "final-validation",
   ];
   for (let left = 0; left < expectedOrder.length; left++) {
     for (let right = left + 1; right < expectedOrder.length; right++) {
@@ -883,13 +996,17 @@ export async function runPostAssemblyPipeline(
   // Title repair: non-HTML mutation (title only)
   // Uses one AI retry maximum, then deterministic fallback.
   // Titles 40–49 characters are accepted with a soft warning (not a 500 error).
+  // Deterministic proper-noun casing is always applied so configured proper
+  // nouns ("Hong Kong", "HSBC", "AI") and keyphrase casing stay exact — a model
+  // or keyphrase prepend can never produce "Hong kong marketing trends 2026".
   state = runTrackedHtmlStage(state, "title-repair", (html) => {
+    state.title = normalizeEnglishTitleCasing(state.title, state.keyphrase);
     const titleOk = state.title.length >= 40 && state.title.length <= 70 && containsExactPhrase(state.title, state.keyphrase);
     if (titleOk) return html;
 
     // One deterministic attempt: prepend keyphrase if missing and within length
     if (!containsExactPhrase(state.title, state.keyphrase)) {
-      const titlePhrase = state.keyphrase.charAt(0).toUpperCase() + state.keyphrase.slice(1);
+      const titlePhrase = normalizeEnglishTitleCasing(state.keyphrase, state.keyphrase);
       const candidate = `${titlePhrase}: ${state.title}`;
       if (candidate.length >= 40 && candidate.length <= 70) {
         state.title = candidate;
@@ -978,6 +1095,12 @@ export async function runPostAssemblyPipeline(
       state.articleDoc.visibleFaq,
       state.keyphrase,
       research,
+      {
+        keyphrase: state.keyphrase,
+        title: state.articleDoc.metadata.title,
+        metaDescription: state.articleDoc.metadata.metaDescription,
+        headings: state.articleDoc.sections.map((section) => section.heading),
+      },
     );
     state.articleDoc.visibleFaq = faqCleanup.entries;
     if (faqCleanup.unsupportedSentencesRemoved > 0 || faqCleanup.citationsAdded > 0) {
@@ -994,29 +1117,48 @@ export async function runPostAssemblyPipeline(
   // deterministic stage removes every supported occurrence outside its owner
   // and keeps only the strongest occurrence inside the owner. It runs before
   // links so sentence removal is never blocked by a newly injected anchor.
+  //
+  // Enforcement and the final gate share one authoritative scanner, one text
+  // normalisation and one location model over the canonical ArticleDocument.
+  // Immediately after enforcement the stage re-renders from the canonical
+  // document, rescans the rendered canonical state and performs one bounded
+  // targeted second pass. Unresolved violations are never converted into
+  // warnings: the stage fails, which blocks saving and publishing.
   state = runTrackedHtmlStage(state, "claim-ownership", () => {
     const research = deps.context?.research || [];
     const ledger = deps.context?.claimOwnership;
     if (!ledger || ledger.entries.length === 0) return state.blog;
-    const repair = enforceClaimOwnership(state.articleDoc, ledger, state.keyphrase, research);
-    for (const componentId of repair.changedComponentIds) weakenedComponentIds.add(componentId);
-    if (repair.unresolved.length > 0) {
-      const first = repair.unresolved[0];
-      state.warnings.push(
-        `Claim ownership repair could not safely remove ${first.evidenceId} from ${first.componentId}`,
+    const verified = enforceOwnershipAndVerify(
+      state.articleDoc,
+      ledger,
+      state.keyphrase,
+      research,
+    );
+    for (const componentId of verified.repair.changedComponentIds) weakenedComponentIds.add(componentId);
+    if (verified.secondPassRepair) {
+      for (const componentId of verified.secondPassRepair.changedComponentIds) {
+        weakenedComponentIds.add(componentId);
+      }
+    }
+    if (verified.violations.length > 0) {
+      console.error(
+        `[claim-ownership] ${verified.violations.length} unresolved violation(s) after enforcement:\n` +
+        formatOwnershipViolationDetails(verified.violations, ledger).join("\n"),
+      );
+      throw new Error(
+        `Claim ownership violations remain after enforcement: ${verified.violations.length}` +
+        ` (first=${verified.violations[0].evidenceId} in ${verified.violations[0].componentId} reason=${verified.violations[0].reason})`,
       );
     }
+    state.articleDoc = verified.doc;
     syncBlogFromDocument(state);
-    const violations = validateClaimOwnership(state.articleDoc, ledger, state.keyphrase, research);
-    if (violations.length > 0) {
-      const first = violations[0];
-      state.warnings.push(
-        `Claim ownership violation remains: ${first.evidenceId} in ${first.componentId} (${first.reason})`,
-      );
-    }
     console.log(
-      `[claim-ownership] removed=${repair.removedSentences} outside-owner=${repair.removedOutOfOwnerOccurrences}` +
-      ` duplicate-owned=${repair.removedDuplicateOccurrences}`,
+      `[claim-ownership] removed=${verified.repair.removedSentences}` +
+      ` outside-owner=${verified.repair.removedOutOfOwnerOccurrences}` +
+      ` duplicate-owned=${verified.repair.removedDuplicateOccurrences}` +
+      ` faq-removed=${verified.repair.removedFaqSentences}` +
+      ` verified=${verified.violations.length}` +
+      (verified.secondPassRepair ? ` second-pass=${verified.secondPassRepair.removedSentences}` : ""),
     );
     return state.blog;
   });
@@ -1278,6 +1420,7 @@ export async function runPostAssemblyPipeline(
     let malformedFallbackApplied = false;
     let weakenedResult: Awaited<ReturnType<typeof runEditorialPolish>> | null = null;
     let repetitionResult: Awaited<ReturnType<typeof runEditorialPolish>> | null = null;
+    let generalResult: Awaited<ReturnType<typeof runEditorialPolish>> | null = null;
     let proseOnlyResult: Awaited<ReturnType<typeof runEditorialPolish>> | null = null;
     // Successful targeted repairs (malformed, weakened, repetition) are
     // correctness fixes applied to specific stable block IDs. They must persist
@@ -1512,17 +1655,23 @@ export async function runPostAssemblyPipeline(
       }
     }
 
-    const generalResult = await runEditorialPolish(
-      workingDoc,
-      state.keyphrase,
-      async (messages, options) => editorCtx.chatWithRetry(messages, options, "editorial-polish"),
-      {
-        protectedBlockIds,
-        protectedSentencesByBlockId,
-        validateProductionCandidate: buildComparativeValidator(workingDoc, "general"),
-      },
-    );
-    if (generalResult.result.accepted) workingDoc = generalResult.doc;
+    // The broad/general editor has exactly one owner.  When the complete-
+    // document layer is enabled it owns broad rewriting later, after links and
+    // protected application blocks exist.  Earlier targeted correctness
+    // repairs remain active here.
+    if (!isFullDocumentEditorialEnabled()) {
+      generalResult = await runEditorialPolish(
+        workingDoc,
+        state.keyphrase,
+        async (messages, options) => editorCtx.chatWithRetry(messages, options, "editorial-polish"),
+        {
+          protectedBlockIds,
+          protectedSentencesByBlockId,
+          validateProductionCandidate: buildComparativeValidator(workingDoc, "general"),
+        },
+      );
+      if (generalResult.result.accepted) workingDoc = generalResult.doc;
+    }
 
     // If the broad editor is rejected for touching a protected number or if an
     // accepted broad candidate still remains below the editorial threshold,
@@ -1536,7 +1685,8 @@ export async function runPostAssemblyPipeline(
       countCanonicalVisibleWords(workingDoc),
     );
     const postGeneralEditorialScore = postGeneralMetrics.editorialScore ?? 100;
-    const proseOnlyBlockIds = postGeneralEditorialScore < state.policy.minimumEditorialScore
+    const proseOnlyBlockIds = !isFullDocumentEditorialEnabled()
+      && postGeneralEditorialScore < state.policy.minimumEditorialScore
       ? findProseOnlyEditableBlockIds(
           workingDoc,
           state.keyphrase,
@@ -1564,7 +1714,7 @@ export async function runPostAssemblyPipeline(
       || malformedFallbackApplied
       || weakenedResult?.result.accepted === true
       || repetitionResult?.result.accepted === true
-      || generalResult.result.accepted
+      || generalResult?.result.accepted === true
       || proseOnlyResult?.result.accepted === true;
     const finalEditorialMetrics = analyzeFinalArticle(
       renderArticleDocument(workingDoc),
@@ -1608,7 +1758,7 @@ export async function runPostAssemblyPipeline(
         ` malformedFallback=${malformedFallbackApplied}` +
         ` weakened=${weakenedResult?.result.accepted === true}` +
         ` repetition=${repetitionResult?.result.accepted === true}` +
-        ` general=${generalResult.result.accepted}` +
+        ` general=${generalResult?.result.accepted === true}` +
         ` proseOnly=${proseOnlyResult?.result.accepted === true}` +
         ` score=${finalEditorialScore}` +
         ` malformedRemaining=${findMalformedEditableBlocks(state.articleDoc).length}` +
@@ -1618,7 +1768,7 @@ export async function runPostAssemblyPipeline(
       );
     } else {
       console.log(
-        `[editorial-polish] rejected: ${generalResult.result.reason}` +
+        `[editorial-polish] rejected: ${generalResult?.result.reason ?? "general editor deferred to final-document owner"}` +
         (malformedResult ? `; malformed=${malformedResult.result.reason}` : "") +
         (weakenedResult ? `; weakened=${weakenedResult.result.reason}` : "") +
         (repetitionResult ? `; repetition=${repetitionResult.result.reason}` : "") +
@@ -1652,7 +1802,7 @@ export async function runPostAssemblyPipeline(
         weakenedBlockCount: weakenedBlockIds.length,
         repetition: repetitionResult?.result ?? null,
         repetitionBlockCount: repetitionTargets.length,
-        general: generalResult.result,
+        general: generalResult?.result ?? null,
         proseOnly: proseOnlyResult?.result ?? null,
         proseOnlyBlockCount: proseOnlyBlockIds.length,
         finalEditorialScore,
@@ -1664,7 +1814,8 @@ export async function runPostAssemblyPipeline(
   }
 
   // The editor is never allowed to change ownership. This is a confirmation
-  // gate only; it does not silently repair a rejected editorial candidate.
+  // gate that fails the generation if the editor re-introduced a violation;
+  // it never silently converts an unresolved violation into a warning.
   state = runTrackedHtmlStage(state, "claim-ownership-final", (html) => {
     const ledger = deps.context?.claimOwnership;
     if (!ledger) return html;
@@ -1675,10 +1826,13 @@ export async function runPostAssemblyPipeline(
       deps.context?.research || [],
     );
     if (violations.length > 0) {
-      const first = violations[0];
-      state.warnings.push(
-        `Editorial claim ownership confirmation found ${violations.length} violation(s); ` +
-        `first=${first.evidenceId} in ${first.componentId} (${first.reason})`,
+      console.error(
+        `[claim-ownership-final] ${violations.length} violation(s) after editorial polish:\n` +
+        formatOwnershipViolationDetails(violations, ledger).join("\n"),
+      );
+      throw new Error(
+        `Claim ownership violations after editorial polish: ${violations.length}` +
+        ` (first=${violations[0].evidenceId} in ${violations[0].componentId} reason=${violations[0].reason})`,
       );
     }
     return html;
@@ -1773,13 +1927,41 @@ export async function runPostAssemblyPipeline(
       ? validateClaimOwnership(state.articleDoc, ledger, state.keyphrase, research)
       : [];
     if (ownershipViolations.length > 0) {
-      const first = ownershipViolations[0];
-      state.warnings.push(
-        `Final claim ownership confirmation found ${ownershipViolations.length} violation(s); ` +
-        `first=${first.evidenceId} (${first.reason})`,
+      console.error(
+        `[factual-final] ${ownershipViolations.length} claim ownership violation(s) at the final factual gate:\n` +
+        formatOwnershipViolationDetails(ownershipViolations, ledger).join("\n"),
+      );
+      throw new Error(
+        `Final claim ownership violations: ${ownershipViolations.length}` +
+        ` (first=${ownershipViolations[0].evidenceId} in ${ownershipViolations[0].componentId} reason=${ownershipViolations[0].reason})`,
       );
     }
     return html;
+  });
+
+  // Factual and ownership removal run after SEO normalisation and can remove
+  // the exact keyphrase from its H2 and opening placements. This deterministic
+  // stage restores the keyphrase in one suitable editorial H2 and naturally in
+  // the first 100 readable words, keeping density inside 0.5%–3% and never
+  // introducing unsupported claims, ownership violations, repetition or
+  // protected-content changes.
+  state = runTrackedHtmlStage(state, "post-ownership-seo-reconcile", (html) => {
+    const research = deps.context?.research || [];
+    const result = reconcilePostOwnershipKeyphrase(
+      state.articleDoc,
+      state.keyphrase,
+      research,
+      deps.context?.claimOwnership,
+    );
+    syncBlogFromDocument(state);
+    if (result.h2KeyphraseRestored || result.first100KeyphraseRestored) {
+      console.log(
+        `[post-ownership-seo-reconcile] h2=${result.h2KeyphraseRestored}` +
+        ` first100=${result.first100KeyphraseRestored}` +
+        ` density=${result.densityBefore.toFixed(2)}% → ${result.densityAfter.toFixed(2)}%`,
+      );
+    }
+    return state.blog;
   });
 
 
@@ -1789,12 +1971,13 @@ export async function runPostAssemblyPipeline(
   // If the CTA is missing or damaged, sets it on the canonical ArticleDocument
   // and re-renders — avoiding fragile HTML string surgery that can break WP blocks.
   state = runTrackedHtmlStage(state, "cta-preserve", (html) => {
-    const signupCount = (html.match(/app\.b2ihub\.com\/signup/gi) ?? []).length;
-    const headingCount = countCtaHeadingTags(html);
-    const ctaOk = signupCount === 1 && headingCount >= 1;
-    if (ctaOk) return html;
+    const cta = analyzeCanonicalEnglishCta(html);
+    const canonicalDocCta = state.articleDoc.cta?.html.replace(/\s+/g, " ").trim()
+      === CANONICAL_ENGLISH_CTA_HTML.replace(/\s+/g, " ").trim()
+      && state.articleDoc.cta?.fingerprint === CANONICAL_ENGLISH_CTA_FINGERPRINT;
+    if (cta.valid && canonicalDocCta) return html;
 
-    console.log(`[cta-preserve] CTA check failed: signup=${signupCount} headings=${headingCount} — re-injecting`);
+    console.log(`[cta-preserve] canonical CTA check failed: ${cta.issues.join("; ")} — re-injecting`);
 
     // Set CTA on the canonical ArticleDocument and re-render.
     // renderArticleDocument() places CTA at the correct position
@@ -1802,124 +1985,19 @@ export async function runPostAssemblyPipeline(
     state.articleDoc.cta = {
       id: "cta",
       type: "cta",
-      html: CANONICAL_CTA_HTML,
-      fingerprint: fingerprintHtml(CANONICAL_CTA_HTML),
+      html: CANONICAL_ENGLISH_CTA_HTML,
+      fingerprint: CANONICAL_ENGLISH_CTA_FINGERPRINT,
     };
     syncBlogFromDocument(state);
     return state.blog;
   });
 
-  // Deterministic final trim. This can only remove complete, unlinked paragraph
-  // blocks from editable H2 sections; it never slices prose or touches protected
-  // blocks. All article-level measurements use the canonical document counter.
-  state = runTrackedHtmlStage(state, "final-trim", (html) => {
-    const initialWordCount = countCanonicalVisibleWords(state.articleDoc);
-    if (initialWordCount <= state.wordMax) {
-      console.log(`[final-trim] skipped (wc=${initialWordCount} <= ${state.wordMax})`);
-      return html;
-    }
-
-    const excess = initialWordCount - state.wordMax;
-    let totalRemoved = 0;
-    const maxPasses = Math.min(8, Math.ceil(excess / 100) + 1);
-
-    for (let pass = 0; pass < maxPasses; pass++) {
-      const currentWordCount = countCanonicalVisibleWords(state.articleDoc);
-      if (currentWordCount <= state.wordMax) break;
-
-      const stillExcess = currentWordCount - state.wordMax;
-      const editableSections = state.articleDoc.sections.filter(
-        (section) => section.sectionType !== "faq-heading"
-          && section.sectionType !== "conclusion-heading",
-      );
-      const targetPerPass = Math.max(
-        30,
-        Math.ceil(stillExcess / Math.max(1, editableSections.length)),
-      );
-      let passRemoved = 0;
-
-      for (let index = 0; index < state.articleDoc.sections.length; index++) {
-        if (passRemoved >= targetPerPass * 1.5) break;
-
-        const section = state.articleDoc.sections[index];
-        if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") {
-          continue;
-        }
-
-        const sectionHtml = componentHtml(section);
-        if (sectionHtml.length < 100) continue;
-        const sectionWordCount = countReadableWords(sectionHtml);
-        if (sectionWordCount < 80) continue;
-
-        const paragraphBlocks = sectionHtml.match(
-          /<!--\s*wp:paragraph\s*-->\s*\n?<p>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi,
-        );
-        if (!paragraphBlocks || paragraphBlocks.length <= 1) continue;
-
-        const lastParagraph = paragraphBlocks[paragraphBlocks.length - 1];
-        const lastParagraphWordCount = countReadableWords(lastParagraph);
-        if (lastParagraphWordCount < 10) continue;
-        const paragraphClaims = scanFactualRisks(
-          lastParagraph,
-          state.keyphrase,
-          deps.context?.research || [],
-        ).claims;
-        if (
-          /<a\b/i.test(lastParagraph)
-          || paragraphClaims.length > 0
-          || /(?:HK\$|US\$|[$£€¥]|\b(?:19|20)\d{2}\b|\d)/i.test(lastParagraph)
-          || /according to|research (?:from|by)|data (?:from|shows)|study (?:from|by)/i.test(lastParagraph)
-        ) {
-          continue;
-        }
-
-        const lastIndex = sectionHtml.lastIndexOf(lastParagraph);
-        if (lastIndex < 0) continue;
-        const trimmedHtml = (
-          sectionHtml.substring(0, lastIndex).trim()
-          + sectionHtml.substring(lastIndex + lastParagraph.length)
-        ).trim();
-        replaceComponentHtml(section, trimmedHtml, "trimmed");
-        totalRemoved += lastParagraphWordCount;
-        passRemoved += lastParagraphWordCount;
-        console.log(
-          `[final-trim] pass=${pass} section=${index} removed ${lastParagraphWordCount} words`,
-        );
-      }
-
-      if (passRemoved === 0) break;
-      syncBlogFromDocument(state);
-    }
-
-    let finalWordCount = countCanonicalVisibleWords(state.articleDoc);
-    if (finalWordCount > state.wordMax) {
-      const residual = trimResidualSafeProseToMaximum(
-        state.articleDoc,
-        state.wordMax,
-        state.wordMin,
-        state.keyphrase,
-        deps.context?.research || [],
-      );
-      if (residual.removedWords > 0) {
-        totalRemoved += residual.removedWords;
-        finalWordCount = residual.finalWordCount;
-        syncBlogFromDocument(state);
-        console.log(
-          `[final-trim] residual fallback removed=${residual.removedWords}` +
-          ` shortenedSentences=${residual.shortenedSentences}` +
-          ` removedParagraphs=${residual.removedParagraphs}`,
-        );
-      }
-    }
-    if (totalRemoved > 0) {
-      console.log(
-        `[final-trim] total removed=${totalRemoved} final wc=${finalWordCount} target=${state.wordMax}`,
-      );
-    } else {
-      console.log(`[final-trim] no safe paragraphs removed — excess=${excess}`);
-    }
-    return state.blog;
-  });
+  // Deterministic final trim, then one bounded targeted section-compaction
+  // call when needed, then a coherence gate. Trimming is structure-aware:
+  // repetition and low-value detail are removed first, complete arguments,
+  // examples, transitions, evidence and heading relationships are preserved,
+  // and unresolved coherence damage blocks saving.
+  state = await runFinalTrimStage(state, deps);
 
   // FAQ schema is application-owned. Always regenerate it from canonical,
   // protected visible FAQ entries after every content-changing stage.
@@ -2012,6 +2090,160 @@ export async function runPostAssemblyPipeline(
     }
     return state.blog;
   });
+
+  // Authoritative final canonical quality scan. Runs once after every
+  // mutating stage (SEO, factual, ownership, links, CTA, trim, FAQ recovery)
+  // and immediately before full-document diagnosis: unresolved coherence,
+  // malformed-prose, sentence-quality, source-boilerplate, claim-strength
+  // inflation, source-to-section relevance and heading-naturalness violations
+  // are hard failures here and again in the pre-save gate. Shadow editorial
+  // diagnosis can never repair deterministic corruption — it is diagnosis-only.
+  state = runTrackedHtmlStage(state, "final-qc-scan", () => {
+    const research = deps.context?.research || [];
+    const coherence = validateCoherence(state.articleDoc);
+    const malformed = scanMalformedProseInDocument(state.articleDoc);
+    const sentenceQuality = scanSentenceQualityInDocument(state.articleDoc);
+    const boilerplate = countBoilerplateInDocument(state.articleDoc);
+    // Off-topic source citations are first repaired deterministically: a pure
+    // `Source: <a>…</a>.` citation paragraph that does not support its H2 is
+    // removed. Only violations that survive the removal (citations embedded in
+    // prose, or ungrounded sections) are hard failures.
+    let relevance = assessSourceSectionRelevance(state.articleDoc, research);
+    if (relevance.length > 0) {
+      const removed = removeOffTopicSourceCitations(state.articleDoc, relevance);
+      if (removed > 0) {
+        syncBlogFromDocument(state);
+        relevance = assessSourceSectionRelevance(state.articleDoc, research);
+        console.log(`[final-qc-scan] removed ${removed} off-topic source citation(s)`);
+      }
+    }
+    const ungrounded = assessSectionTopicGrounding(state.articleDoc);
+    const headings = assessHeadingNaturalness(state.articleDoc, state.keyphrase);
+    const unsupportedClaims = scanFactualRisks(
+      state.blog,
+      state.keyphrase,
+      research,
+    ).claims.filter((claim) => !claim.supported);
+    const unresolved = coherence.length
+      + malformed.length
+      + sentenceQuality.length
+      + boilerplate.length
+      + relevance.length
+      + ungrounded.length
+      + headings.length
+      + unsupportedClaims.length;
+    if (unresolved > 0) {
+      console.error(
+        `[final-qc-scan] ${unresolved} unresolved deterministic quality violation(s):\n` +
+        [
+          ...coherenceViolationSummary(coherence),
+          ...malformed.map((block) =>
+            `type=malformed-prose component=${block.componentId} block=${block.blockId} issues=${block.issues.map((issue) => issue.message).join("; ")}`,
+          ),
+          ...sentenceQuality.flatMap((block) =>
+            block.issues.map((issue) =>
+              `type=${issue.code} component=${block.componentId} block=${block.blockId} sentence="${issue.sentence.slice(0, 120)}"`,
+            ),
+          ),
+          ...boilerplate.map((block) =>
+            `type=boilerplate component=${block.componentId} block=${block.blockId} blockType=${block.blockType} snippet="${block.snippet}"`,
+          ),
+          ...formatRelevanceViolations(relevance).map((line) => `type=off-topic-source ${line}`),
+          ...ungrounded.map((section) => `type=ungrounded-section ${section}`),
+          ...headings.map((violation) =>
+            `type=heading-${violation.code} section=${violation.sectionId} heading="${violation.heading.slice(0, 120)}"`,
+          ),
+          ...unsupportedClaims.map((claim) =>
+            `type=unsupported-claim category=${claim.category} text="${claim.text.slice(0, 120)}"`,
+          ),
+        ].join("\n"),
+      );
+      throw new Error(
+        `Unresolved deterministic quality violations before final validation: ${unresolved}` +
+        ` (coherence=${coherence.length} malformed=${malformed.length} sentenceQuality=${sentenceQuality.length}` +
+        ` boilerplate=${boilerplate.length} relevance=${relevance.length + ungrounded.length}` +
+        ` headings=${headings.length} unsupportedClaims=${unsupportedClaims.length})`,
+      );
+    }
+    console.log(
+      `[final-qc-scan] clean coherence=0 malformed=0 sentenceQuality=0 boilerplate=0 relevance=0 headings=0 unsupported=0`,
+    );
+    return state.blog;
+  });
+
+  // Enterprise-style final-document editorial transaction. This is deliberately
+  // the last content-changing owner: it sees the fully trimmed, linked article
+  // with final CTA, FAQ, schema and WordPress markup already present. The only
+  // following stage is the canonical validation-only gate.
+  if (isFullDocumentEditorialEnabled()) {
+    const inputFingerprint = fp(state.blog);
+    // Boundary precondition: only structurally valid canonical HTML may reach the
+    // final-document diagnosis. Do not send invalid HTML to the model.
+    assertFinalEditorialBoundary(state);
+    const outcome = await runFullDocumentEditorial({
+      doc: state.articleDoc,
+      keyphrase: state.keyphrase,
+      research: deps.context?.research || [],
+      protectedSentencesByBlockId,
+      validateProductionCandidate: (candidate) => {
+        const wordCount = countCanonicalVisibleWords(candidate);
+        return {
+          passed: wordCount >= state.wordMin && wordCount <= state.wordMax,
+          reasons: wordCount >= state.wordMin && wordCount <= state.wordMax
+            ? []
+            : [`canonical word count ${wordCount} outside ${state.wordMin}-${state.wordMax}`],
+        };
+      },
+      aiCall: async (messages, options, label) =>
+        deps.chatWithRetry(messages, options, label || "final-document-editorial"),
+    });
+    state.fullDocumentEditorial = outcome;
+    state.articleDoc = outcome.doc;
+    syncBlogFromDocument(state);
+    recordStage(
+      state,
+      "final-document-editorial",
+      inputFingerprint,
+      fp(state.blog),
+      outcome.accepted,
+      outcome.accepted ? undefined : "pre-stage-restore",
+      {
+        qualityRunId: outcome.runId,
+        mode: outcome.mode,
+        status: outcome.status,
+        callCount: outcome.callCount,
+        findings: outcome.findings.map((finding) => ({
+          findingId: finding.findingId,
+          category: finding.category,
+          severity: finding.severity,
+          blockIds: finding.blockIds,
+          evidenceIds: finding.evidenceIds,
+          brandRuleIds: finding.brandRuleIds,
+          source: finding.source,
+        })),
+        selectedUnitIds: outcome.selectedUnitIds,
+        patches: outcome.patches,
+        unresolvedFindingIds: outcome.unresolvedFindingIds,
+        mandatoryOverflow: outcome.mandatoryOverflow,
+        diagnostics: outcome.diagnostics,
+      },
+    );
+    console.log(
+      `[final-document-editorial] run=${outcome.runId} mode=${outcome.mode}` +
+      ` findings=${outcome.findings.length} selected=${outcome.selectedUnitIds.length}` +
+      ` acceptedPatches=${outcome.patches.filter((patch) => patch.accepted).length}` +
+      ` rejectedPatches=${outcome.patches.filter((patch) => !patch.accepted).length}` +
+      ` unresolved=${outcome.unresolvedFindingIds.length} status=${outcome.status}`,
+    );
+    if (!outcome.accepted) {
+      throw new Error(
+        `Final-document editorial acceptance failed: ${[
+          ...outcome.diagnostics,
+          ...outcome.unresolvedFindingIds.map((id) => `unresolved ${id}`),
+        ].join("; ")}`,
+      );
+    }
+  }
 
   // Final validation
   state = runTrackedHtmlStage(state, "final-validation", (html) => {
@@ -2230,6 +2462,478 @@ async function runRegeneration(state: PipelineState, deps: PipelineDependencies)
   return runTrackedHtmlStage(state, "regeneration", (html) => regeneratedBlog, snap);
 }
 
+/** Parse a model compaction `{"blocks":[...]}` payload into WordPress blocks.
+ *  Only paragraph, list and quote blocks are accepted; anything else rejects
+ *  the candidate so protected markup can never be introduced. */
+function parseCompactionBlocksJson(raw: string): Array<{ type: "paragraph"; text: string } | { type: "list"; items: string[] } | { type: "quote"; text: string }> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { blocks?: unknown }).blocks)) return null;
+  const blocks: Array<{ type: "paragraph"; text: string } | { type: "list"; items: string[] } | { type: "quote"; text: string }> = [];
+  for (const block of (parsed as { blocks: unknown[] }).blocks) {
+    if (!block || typeof block !== "object") return null;
+    const item = block as Record<string, unknown>;
+    if (item.type === "paragraph" && typeof item.text === "string" && item.text.trim()) {
+      blocks.push({ type: "paragraph", text: item.text.trim() });
+    } else if (item.type === "list" && Array.isArray(item.items) && item.items.length > 0) {
+      const items = item.items.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+      if (items.length === 0) return null;
+      blocks.push({ type: "list", items });
+    } else if (item.type === "quote" && typeof item.text === "string" && item.text.trim()) {
+      blocks.push({ type: "quote", text: item.text.trim() });
+    } else {
+      return null;
+    }
+  }
+  return blocks.length > 0 ? blocks : null;
+}
+
+function compactionBlocksToHtml(blocks: NonNullable<ReturnType<typeof parseCompactionBlocksJson>>): string {
+  return blocks
+    .map((block) => {
+      if (block.type === "paragraph") {
+        return `<!-- wp:paragraph --><p>${escapeCompactionText(block.text)}</p><!-- /wp:paragraph -->`;
+      }
+      if (block.type === "list") {
+        const items = block.items.map((item) => `<li>${escapeCompactionText(item)}</li>`).join("");
+        return `<!-- wp:list --><ul>${items}</ul><!-- /wp:list -->`;
+      }
+      return `<!-- wp:quote --><blockquote><p>${escapeCompactionText(block.text)}</p></blockquote><!-- /wp:quote -->`;
+    })
+    .join("\n\n");
+}
+
+/** Escape compaction prose except for strictly-formed anchor tags, so a model
+ *  can keep a source citation (link) in the compacted section. The anchor is
+ *  later parsed into a real editorial link node; all other markup is escaped
+ *  and can never introduce protected content. */
+function escapeCompactionText(text: string): string {
+  const anchors: string[] = [];
+  const protectedText = text.replace(
+    /<a\s+href="https?:\/\/[^"\s]+"[^>]*>[\s\S]*?<\/a>/gi,
+    (anchor) => {
+      anchors.push(anchor);
+      return `\u0000${anchors.length - 1}\u0000`;
+    },
+  );
+  const escaped = protectedText
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+  return escaped.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => anchors[Number(index)] ?? "");
+}
+
+function extractLinkHrefsFromHtml(html: string): string[] {
+  const hrefs: string[] = [];
+  const re = /<a\b[^>]*\bhref="([^"]+)"/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) hrefs.push(m[1]);
+  return hrefs;
+}
+
+function extractQuoteTextsFromHtml(html: string): string[] {
+  const quotes: string[] = [];
+  const re =
+    /<!--\s*wp:quote\s*-->[\s\S]*?<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>[\s\S]*?<!--\s*\/wp:quote\s*-->/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    quotes.push(m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim());
+  }
+  return quotes;
+}
+
+function supportedClaimSentences(
+  html: string,
+  keyphrase: string,
+  research: Array<{ title?: string; snippet?: string; url?: string }>,
+): string[] {
+  return scanFactualRisks(html, keyphrase, research).claims
+    .filter((claim) => claim.supported && claim.sentenceText)
+    .map((claim) => claim.sentenceText!.replace(/\s+/g, " ").trim().toLowerCase());
+}
+
+/** A block whose prose is the corruption being repaired (incomplete sentence
+ *  or orphan-transition opening) is not required evidence. */
+function isCorruptBlockText(text: string): boolean {
+  const trimmed = text.replace(/["”’)\]]+$/, "");
+  if (!/[.!?]$/.test(trimmed)) return true;
+  if (
+    /^\s*(?:instead|however|therefore|meanwhile|moreover|furthermore|nevertheless|nonetheless|consequently|additionally|likewise|similarly|hence|thus|yet|so|but|and)\s*[,:]|^\s*(?:as a result|on the other hand|that said|in addition|for example|for instance)\s*[,:]/i.test(text)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Supported claims from the coherent blocks of a section only. Used when
+ *  compacting an AFFECTED section: the corrupted paragraph being repaired is
+ *  not required evidence, so its incidental claims do not need preservation. */
+function supportedClaimsInCoherentBlocks(
+  html: string,
+  keyphrase: string,
+  research: Array<{ title?: string; snippet?: string; url?: string }>,
+): string[] {
+  const claims: string[] = [];
+  const blockRe =
+    /<!--\s*wp:(paragraph|quote)(?:\s[\s\S]*?)?\s*-->([\s\S]*?)<!--\s*\/wp:\1\s*-->/gi;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(html)) !== null) {
+    const blockHtml = m[0];
+    const text = blockHtml
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (isCorruptBlockText(text)) continue;
+    for (const claim of scanFactualRisks(blockHtml, keyphrase, research).claims) {
+      if (claim.supported && claim.sentenceText) {
+        claims.push(claim.sentenceText.replace(/\s+/g, " ").trim().toLowerCase());
+      }
+    }
+  }
+  return claims;
+}
+
+/** Last paragraph of the previous editorial section and first paragraph of the
+ *  next editorial section, so a compacted section keeps its transitions
+ *  coherent across section boundaries. */
+function buildCompactionNeighbourContext(doc: ArticleDocument, sectionIndex: number): string {
+  const parts: string[] = [];
+  const prev = doc.sections[sectionIndex - 1];
+  if (prev && prev.sectionType !== "faq-heading" && prev.sectionType !== "conclusion-heading") {
+    const lastParagraph = [...prev.blocks].reverse().find((block) => block.type === "paragraph");
+    if (lastParagraph) {
+      parts.push(`Previous section ("${prev.heading}") ends with: "${extractPlainTextFromEditorialBlocks([lastParagraph]).slice(0, 300)}"`);
+    }
+  }
+  const next = doc.sections[sectionIndex + 1];
+  if (next && next.sectionType !== "faq-heading" && next.sectionType !== "conclusion-heading") {
+    const firstParagraph = next.blocks.find((block) => block.type === "paragraph");
+    if (firstParagraph) {
+      parts.push(`Next section ("${next.heading}") starts with: "${extractPlainTextFromEditorialBlocks([firstParagraph]).slice(0, 300)}"`);
+    }
+  }
+  return parts.join("\n");
+}
+
+/**
+ * One bounded targeted section-compaction call. When deterministic compression
+ * cannot safely reach the maximum — or reaches it but damages coherence — the
+ * affected section is compacted by the model with the complete section
+ * context: the heading, the full section body (including its links and source
+ * citations), the neighbouring paragraphs, and the section's owned evidence.
+ *
+ * The candidate is rejected — restoring the complete prior canonical snapshot
+ * — unless it is strictly shorter, coherent, factually equivalent (same
+ * supported claims and links, no new unsupported claims), ownership-clean,
+ * topic-relevant, quotation-complete (verbatim or removed as a whole), within
+ * the canonical word-count range and structurally valid.
+ */
+async function runBoundedSectionCompaction(
+  state: PipelineState,
+  deps: PipelineDependencies,
+  options?: { targetSectionIds?: string[] },
+): Promise<{ removedWords: number; sectionId: string | null; accepted: boolean }> {
+  const research = deps.context?.research || [];
+  const editorialSections = state.articleDoc.sections.filter(
+    (section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading",
+  );
+  let target = editorialSections[0];
+  if (options?.targetSectionIds && options.targetSectionIds.length > 0) {
+    target = editorialSections.find((section) => options.targetSectionIds!.includes(section.id)) ?? target;
+  } else {
+    target = editorialSections
+      .map((section) => ({ section, words: countReadableWords(componentHtml(section)) }))
+      .filter((entry) => entry.words > MIN_SECTION_WORDS + 80)
+      .sort((a, b) => b.words - a.words)[0]?.section ?? target;
+  }
+  if (!target) return { removedWords: 0, sectionId: null, accepted: false };
+
+  const snap = snapshotState(state);
+  const ledger = deps.context?.claimOwnership;
+  const evidencePrompt = ledger
+    ? formatOwnedEvidencePacket(ledger, target.id)
+    : "";
+  const originalHtml = componentHtml(target);
+  const originalWords = countReadableWords(originalHtml);
+  const originalLinks = extractLinkHrefsFromHtml(originalHtml);
+  // When repairing an AFFECTED section, supported claims inside the corrupted
+  // paragraph being repaired are not required evidence; otherwise every
+  // supported claim of the original section must be preserved.
+  const originalClaims = options?.targetSectionIds && options.targetSectionIds.length > 0
+    ? supportedClaimsInCoherentBlocks(originalHtml, state.keyphrase, research)
+    : supportedClaimSentences(originalHtml, state.keyphrase, research);
+  const originalQuotes = extractQuoteTextsFromHtml(originalHtml);
+  const sectionIndex = state.articleDoc.sections.findIndex((section) => section.id === target.id);
+  const neighbourContext = sectionIndex >= 0
+    ? buildCompactionNeighbourContext(state.articleDoc, sectionIndex)
+    : "";
+
+  const prompt = [
+    `Rewrite the section below more concisely so the article can meet its maximum word count.`,
+    `Keep EVERY fact, statistic, link, source citation, example and claim from the original section.`,
+    `Quotations and their attributions must be preserved COMPLETELY and VERBATIM, or the whole quotation must be removed — never shorten, truncate or rephrase a quotation.`,
+    `Never keep a paragraph that begins with a contrast transition ("Instead", "However", "Therefore", "Meanwhile", "For example") unless the paragraph before it establishes the contrast — preserve the antecedent or rewrite the dependent paragraph safely.`,
+    `Keep the meaning and structure identical. Do not add new facts, claims, numbers or opinions.`,
+    `Remove only repetition and low-value detail.`,
+    `Keep all sentences complete. Never leave an example, setup, quotation or comparison unfinished.`,
+    `Return JSON only: {"blocks": [{"type": "paragraph", "text": "..."}]}.`,
+    `Section heading: ${target.heading}`,
+    ...(neighbourContext ? [`Neighbouring context:\n${neighbourContext}`] : []),
+    ...(evidencePrompt ? [`Evidence owned by this section: ${evidencePrompt}`] : []),
+    `Original section body:\n${originalHtml}`,
+  ].join("\n\n");
+
+  let content = "";
+  try {
+    const response = await deps.chatWithRetry(
+      [
+        {
+          role: "system",
+          content: "You are a careful editor who compresses marketing articles without losing facts, links, quotations, examples or meaning.",
+        },
+        { role: "user", content: prompt },
+      ],
+      { responseFormat: { type: "json_object" }, temperature: 0.2 },
+      "final-trim-compaction",
+      1,
+    );
+    content = response.content;
+  } catch (error) {
+    console.error(`[final-trim:compaction] AI call failed: ${error instanceof Error ? error.message : String(error)} — restoring snapshot`);
+    restoreSnapshot(state, snap);
+    return { removedWords: 0, sectionId: target.id, accepted: false };
+  }
+
+  const parsedBlocks = parseCompactionBlocksJson(content);
+  if (!parsedBlocks) {
+    console.error("[final-trim:compaction] candidate JSON rejected — restoring snapshot");
+    restoreSnapshot(state, snap);
+    return { removedWords: 0, sectionId: target.id, accepted: false };
+  }
+  const candidateHtml = compactionBlocksToHtml(parsedBlocks);
+  const parsed = parseWordPressEditorialBlocks(candidateHtml, `${target.id}-compaction`);
+  if (parsed.errors.length > 0 || parsed.blocks.length === 0) {
+    console.error(`[final-trim:compaction] candidate blocks invalid (${parsed.errors.join("; ")}) — restoring snapshot`);
+    restoreSnapshot(state, snap);
+    return { removedWords: 0, sectionId: target.id, accepted: false };
+  }
+
+  const candidateWords = countReadableWords(candidateHtml);
+  const candidateLinks = extractLinkHrefsFromHtml(candidateHtml);
+  // The candidate uses the same per-block claim extraction as the original
+  // side, so date claims inside source-citation paragraphs compare equally.
+  const candidateClaims = supportedClaimsInCoherentBlocks(candidateHtml, state.keyphrase, research);
+  const candidateUnsupported = scanFactualRisks(candidateHtml, state.keyphrase, research).claims
+    .filter((claim) => !claim.supported);
+
+  const candidate = structuredClone(state.articleDoc);
+  const targetIndex = candidate.sections.findIndex((section) => section.id === target.id);
+  if (targetIndex < 0) {
+    restoreSnapshot(state, snap);
+    return { removedWords: 0, sectionId: target.id, accepted: false };
+  }
+  candidate.sections[targetIndex] = {
+    ...candidate.sections[targetIndex],
+    blocks: parsed.blocks,
+    status: "trimmed",
+  };
+
+  const sectionCoherence = validateCoherence(candidate).filter(
+    (violation) => violation.componentId === target.id,
+  );
+  const linkEquivalence = originalLinks.every((href) => candidateLinks.includes(href))
+    && candidateLinks.every((href) => originalLinks.includes(href));
+  const claimEquivalence = originalClaims.every((sentence) =>
+    candidateClaims.some((candidateSentence) => candidateSentence.includes(sentence) || sentence.includes(candidateSentence)),
+  );
+  // Quotations: preserved verbatim or removed as a whole — never truncated.
+  const candidateQuotes = extractQuoteTextsFromHtml(candidateHtml);
+  const quoteIntegrity = originalQuotes.every((quote) => {
+    const head = quote.slice(0, 30);
+    if (candidateQuotes.some((candidateQuote) => candidateQuote === quote)) return true;
+    if (!candidateQuotes.some((candidateQuote) => candidateQuote.startsWith(head))) return true;
+    return false;
+  });
+  const candidateSectionText = candidateHtml.replace(/<[^>]+>/g, " ");
+  const unmatchedQuotes = (candidateSectionText.match(/[“"]/g) ?? []).length
+    !== (candidateSectionText.match(/[”"]/g) ?? []).length;
+  const ownershipViolations = ledger
+    ? validateClaimOwnership(candidate, ledger, state.keyphrase, research)
+      .filter((violation) => violation.componentId === target.id)
+    : [];
+  const relevanceViolations = assessSourceSectionRelevance(candidate, research)
+    .filter((violation) => violation.sectionId === target.id);
+  const canonicalCount = countCanonicalVisibleWords(candidate);
+  const withinWordRange = canonicalCount >= state.wordMin && canonicalCount <= state.wordMax;
+  const wpStructureValid = validateWordpressBlockPairs(renderArticleDocument(candidate)).valid;
+  const shorter = candidateWords < originalWords;
+  const withinFloor = candidateWords >= MIN_SECTION_WORDS;
+  const structurallyValid = parsed.errors.length === 0;
+
+  const accepted = shorter
+    && withinFloor
+    && linkEquivalence
+    && claimEquivalence
+    && quoteIntegrity
+    && !unmatchedQuotes
+    && ownershipViolations.length === 0
+    && candidateUnsupported.length === 0
+    && sectionCoherence.length === 0
+    && relevanceViolations.length === 0
+    && withinWordRange
+    && wpStructureValid
+    && structurallyValid;
+
+  if (!accepted) {
+    console.error(
+      `[final-trim:compaction] candidate rejected — restoring snapshot` +
+      ` (shorter=${shorter} floor=${withinFloor} links=${linkEquivalence} claims=${claimEquivalence}` +
+      ` quotes=${quoteIntegrity} unmatchedQuotes=${unmatchedQuotes} ownership=${ownershipViolations.length}` +
+      ` unsupported=${candidateUnsupported.length} coherence=${sectionCoherence.length}` +
+      ` relevance=${relevanceViolations.length} wc=${canonicalCount} range=${state.wordMin}-${state.wordMax}` +
+      ` wp=${wpStructureValid})`,
+    );
+    restoreSnapshot(state, snap);
+    return { removedWords: 0, sectionId: target.id, accepted: false };
+  }
+
+  state.articleDoc = candidate;
+  console.log(
+    `[final-trim:compaction] accepted section=${target.id} words ${originalWords} → ${candidateWords} canonical=${canonicalCount}`,
+  );
+  return { removedWords: originalWords - candidateWords, sectionId: target.id, accepted: true };
+}
+
+/**
+ * Structure-aware final trim with a bounded targeted section-compaction
+ * fallback.
+ *
+ * 1. Deterministic compression runs first. If it reaches the target but
+ *    created coherence damage, the result is REJECTED and the complete
+ *    pre-trim PipelineSnapshot is restored.
+ * 2. The bounded section-compaction fallback is then invoked ONLY for the
+ *    affected sections (the ones with coherence violations), or for the
+ *    largest section when the maximum is still exceeded. Each candidate is
+ *    accepted only when it is shorter, coherent, factually equivalent,
+ *    ownership-clean, topic-relevant, quotation-complete, within the canonical
+ *    word-count range and structurally valid; otherwise the snapshot is
+ *    restored and the candidate discarded.
+ * 3. Unresolved coherence damage or an out-of-range word count after the
+ *    bounded fallback remains a hard failure: it throws and blocks saving
+ *    with zero database writes. Coherence failures are never converted into
+ *    warnings.
+ */
+async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
+  const snap = snapshotState(state);
+  const preHtml = state.blog;
+  const inputFp = fp(preHtml);
+  const stageBaseline = createArticleIntegrityBaseline(preHtml);
+  const initialWordCount = countCanonicalVisibleWords(state.articleDoc);
+  if (initialWordCount <= state.wordMax) {
+    console.log(`[final-trim] skipped (wc=${initialWordCount} <= ${state.wordMax})`);
+    recordStage(state, "final-trim", inputFp, inputFp, true, undefined, { skipped: true, reason: "within-max" });
+    return state;
+  }
+
+  const research = deps.context?.research || [];
+  let totalRemoved = 0;
+
+  // 1. Structure-aware deterministic compression.
+  const compression = compressDocumentStructureAware(
+    state.articleDoc,
+    state.wordMax,
+    state.wordMin,
+    state.keyphrase,
+    research,
+  );
+  totalRemoved += compression.removedWords;
+  syncBlogFromDocument(state);
+  console.log(
+    `[final-trim] structure-aware removed=${compression.removedWords}` +
+    ` paragraphs=${compression.removedParagraphs}` +
+    ` shortened=${compression.shortenedSentences}` +
+    ` remainingExcess=${compression.remainingExcess}`,
+  );
+
+  let coherence = validateCoherence(state.articleDoc);
+  let finalWordCount = countCanonicalVisibleWords(state.articleDoc);
+
+  if (coherence.length > 0) {
+    // 2a. The deterministic trim reached the target but damaged coherence.
+    //     Reject it, restore the complete pre-trim snapshot, and compact ONLY
+    //     the affected sections.
+    const affectedSectionIds = [...new Set(coherence.map((violation) => violation.componentId))];
+    restoreSnapshot(state, snap);
+    syncBlogFromDocument(state);
+    console.log(
+      `[final-trim] deterministic trim rejected (${coherence.length} coherence violation(s): ${coherence[0].type} in ${coherence[0].componentId})` +
+      ` — restoring pre-trim snapshot and compacting affected sections: ${affectedSectionIds.join(", ")}`,
+    );
+    for (const sectionId of affectedSectionIds.slice(0, 3)) {
+      const compaction = await runBoundedSectionCompaction(state, deps, { targetSectionIds: [sectionId] });
+      if (compaction.accepted) totalRemoved += compaction.removedWords;
+    }
+    syncBlogFromDocument(state);
+    finalWordCount = countCanonicalVisibleWords(state.articleDoc);
+    coherence = validateCoherence(state.articleDoc);
+  } else if (finalWordCount > state.wordMax) {
+    // 2b. Still over the maximum with a clean deterministic result: one
+    //     bounded compaction of the largest section.
+    const compaction = await runBoundedSectionCompaction(state, deps);
+    if (compaction.accepted) totalRemoved += compaction.removedWords;
+    finalWordCount = countCanonicalVisibleWords(state.articleDoc);
+    syncBlogFromDocument(state);
+    coherence = validateCoherence(state.articleDoc);
+  }
+
+  // 3. Post-trim gate: unresolved coherence damage or an out-of-range word
+  //    count after the bounded fallback blocks saving.
+  if (coherence.length > 0) {
+    console.error(
+      `[final-trim] ${coherence.length} coherence violation(s) after trimming and bounded compaction:\n` +
+      coherenceViolationSummary(coherence).join("\n"),
+    );
+    throw new Error(
+      `Coherence violations after final trim: ${coherence.length}` +
+      ` (first=${coherence[0].type} in ${coherence[0].componentId})`,
+    );
+  }
+  if (finalWordCount > state.wordMax || finalWordCount < state.wordMin) {
+    console.error(
+      `[final-trim] word count ${finalWordCount} outside ${state.wordMin}-${state.wordMax} after trimming and bounded compaction`,
+    );
+    throw new Error(
+      `Final trim could not reach the word-count range: ${finalWordCount} (target ${state.wordMin}-${state.wordMax})`,
+    );
+  }
+
+  if (totalRemoved > 0) {
+    console.log(
+      `[final-trim] total removed=${totalRemoved} final wc=${finalWordCount} target=${state.wordMax}`,
+    );
+  } else {
+    console.log(`[final-trim] no safe content removed — excess=${initialWordCount - state.wordMax}`);
+  }
+
+  // Record the stage with the true pre-trim fingerprint; restore the snapshot
+  // if the integrity guard rejects the trimmed output.
+  const guard = guardStageOutput(state.blog, preHtml, stageBaseline, "final-trim");
+  if (!guard.accepted) {
+    restoreSnapshot(state, snap);
+    syncBlogFromDocument(state);
+  }
+  assertRenderedCacheMatchesDocument(state);
+  const outputFp = fp(state.blog);
+  recordStage(state, "final-trim", inputFp, outputFp, guard.accepted, guard.accepted ? undefined : "pre-stage-restore");
+  return state;
+}
+
 async function runInternalLinks(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
   const snap = snapshotState(state);
   try {
@@ -2289,10 +2993,21 @@ export function runFinalValidation(state: PipelineState): { passed: boolean; rea
       research: state.ctx?.research || [],
       claimOwnership: state.ctx?.claimOwnership,
       referenceDate: state.ctx?.generationDate ? new Date(state.ctx.generationDate) : new Date(),
+      fullDocumentEditorial: state.fullDocumentEditorial,
     },
   );
   const policy = buildPolicy(state.requestedWordCount, state.wordMin, state.wordMax, state.keyphrase);
-  return evaluatePolicy(metrics, policy);
+  const result = evaluatePolicy(metrics, policy);
+  if (!result.passed && state.articleDoc) {
+    const languageViolations = scanEnglishLanguageConsistency(state.articleDoc);
+    if (languageViolations.length > 0) {
+      console.error(
+        `[final-validation] ${languageViolations.length} language-consistency violation(s):\n` +
+        formatLanguageConsistencyViolations(languageViolations).join("\n"),
+      );
+    }
+  }
+  return result;
 }
 
 /**

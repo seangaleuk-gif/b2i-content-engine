@@ -2,6 +2,12 @@
 // Captures a structural baseline before normalization and validates after.
 
 import { detectNestedParagraphs } from "@/lib/blog/article-document";
+import { parseWordpressBlockStructure } from "@/lib/blog/wordpress-block-structure";
+export {
+  parseWordpressBlockStructure,
+  tokenizeWordpressBlockComments,
+  validateWordpressBlockPairs,
+} from "@/lib/blog/wordpress-block-structure";
 
 export interface ArticleIntegrityBaseline {
   htmlHash: string;
@@ -15,7 +21,6 @@ export interface ArticleIntegrityBaseline {
   ctaBlocks: string[];
   scriptBlocks: string[];
 }
-
 export interface ArticleIntegrityResult {
   valid: boolean;
   errors: string[];
@@ -32,7 +37,6 @@ export interface ArticleIntegrityResult {
     ctaPresent: boolean;
   };
 }
-
 function simpleHash(text: string): string {
   let hash = 0;
   for (let i = 0; i < text.length; i++) {
@@ -44,13 +48,9 @@ function simpleHash(text: string): string {
 }
 
 function extractWpHtmlBlocks(html: string): string[] {
-  const blocks: string[] = [];
-  const re = /<!--\s*wp:html\s*-->([\s\S]*?)<!--\s*\/wp:html\s*-->/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    blocks.push(m[1]);
-  }
-  return blocks;
+  return parseWordpressBlockStructure(html).ranges
+    .filter((range) => range.type === "wp:html" && range.depth === 0)
+    .map((range) => html.slice(range.openEnd, range.closeStart));
 }
 
 function extractScriptBlocks(html: string): string[] {
@@ -129,10 +129,11 @@ export function createArticleIntegrityBaseline(html: string): ArticleIntegrityBa
     /FAQPage/i.test(b),
   );
 
+  const wpStructure = parseWordpressBlockStructure(html);
   return {
     htmlHash: simpleHash(html),
-    wordpressOpeningBlocks: (html.match(/<!--\s*wp:\w+/gi) ?? []).length,
-    wordpressClosingBlocks: (html.match(/<!--\s*\/wp:\w+/gi) ?? []).length,
+    wordpressOpeningBlocks: wpStructure.openingCount,
+    wordpressClosingBlocks: wpStructure.closingCount,
     linkDestinations: allHrefs,
     externalLinkDestinations: allHrefs.filter((h) => h.startsWith("http")),
     internalLinkDestinations: allHrefs.filter((h) => !h.startsWith("http")),
@@ -157,9 +158,9 @@ export function validateFinalArticleIntegrity(
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "");
 
-  const openingBlocks = (html.match(/<!--\s*wp:\w+/gi) ?? []).length;
-  const closingBlocks = (html.match(/<!--\s*\/wp:\w+/gi) ?? []).length;
-  const blockMatch = openingBlocks === closingBlocks;
+  const wpStructure = parseWordpressBlockStructure(html);
+  const openingBlocks = wpStructure.openingCount;
+  const closingBlocks = wpStructure.closingCount;
 
   // Nested paragraph detection — uses shared canonical implementation
   const nestedParagraphs = detectNestedParagraphs(html);
@@ -295,8 +296,11 @@ export function validateFinalArticleIntegrity(
   }
 
   // Non-structural warnings
-  if (!blockMatch) {
+  if (openingBlocks !== closingBlocks) {
     errors.push(`WordPress block mismatch: ${openingBlocks} opening vs ${closingBlocks} closing`);
+  }
+  for (const issue of wpStructure.issues) {
+    if (!errors.includes(issue)) errors.push(issue);
   }
   if (hasNested) {
     errors.push(`${nestedParagraphs} nested paragraph(s) detected`);
@@ -360,80 +364,5 @@ export function validateFinalArticleIntegrity(
       languageSwitcherPresent: switcherPresent,
       ctaPresent,
     },
-  };
-}
-
-// ── Type-aware WordPress block pair validation ──
-
-interface WpBlockToken {
-  kind: "open" | "close";
-  type: string;
-  index: number;
-}
-
-export interface WpBlockValidationResult {
-  valid: boolean;
-  issues: string[];
-}
-
-/** Tokenize WordPress block comment markers from HTML into a sequence of open/close tokens.
- *  Self-closing blocks (`<!-- wp:block /-->`) are skipped. */
-export function tokenizeWordpressBlockComments(html: string): WpBlockToken[] {
-  const tokens: WpBlockToken[] = [];
-  const re = /<!--\s*(?:\/)?(wp:[\w-]+)(?:\s[^>]*)?\s*(?:\/)?\s*-->/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    const full = m[0];
-    const type = m[1];
-    // Self-closing: <!-- wp:block /-->
-    if (/\/-->\s*$/.test(full)) continue;
-    // Closing: starts with /
-    if (full.startsWith("<!-- /") || full.startsWith("<!--  /")) {
-      tokens.push({ kind: "close", type, index: m.index });
-    } else {
-      tokens.push({ kind: "open", type, index: m.index });
-    }
-  }
-  return tokens;
-}
-
-/** Validate WordPress block pairing by matching types, not just total counts.
- *  Uses a stack to ensure every opener is matched by a closer of the same type,
- *  with no crossing. */
-export function validateWordpressBlockPairs(html: string): WpBlockValidationResult {
-  const stack: Array<{ type: string; index: number }> = [];
-  const issues: string[] = [];
-
-  for (const token of tokenizeWordpressBlockComments(html)) {
-    if (token.kind === "open") {
-      stack.push({ type: token.type, index: token.index });
-      continue;
-    }
-
-    const opener = stack.pop();
-
-    if (!opener) {
-      issues.push(
-        `Unexpected closing block wp:${token.type} at offset ${token.index}`
-      );
-      continue;
-    }
-
-    if (opener.type !== token.type) {
-      issues.push(
-        `WordPress block type mismatch: opened wp:${opener.type} at offset ${opener.index} but closed wp:${token.type} at offset ${token.index}`
-      );
-    }
-  }
-
-  for (const opener of stack) {
-    issues.push(
-      `Unclosed WordPress block wp:${opener.type} at offset ${opener.index}`
-    );
-  }
-
-  return {
-    valid: issues.length === 0,
-    issues,
   };
 }

@@ -162,7 +162,7 @@ function buildDeterministic2500WordDocument(): {
     languageSwitcher: {
       id: "language-switcher",
       type: "language-switcher",
-      html: `<!-- wp:html --><div class="b2i-language-switcher" data-language="en"><span>English</span> | <a href="/blog/test-zh">繁體中文</a></div><!-- /wp:html -->`,
+      html: `<!-- wp:html --><div class="b2i-language-switcher" data-language="en"><span>English</span> | <a href="/blog/threads-marketing-hong-kong-practical-sme-guide-zh">繁體中文</a></div><!-- /wp:html -->`,
       fingerprint: "language-switcher",
     },
     introduction: component("intro", introHtml),
@@ -294,8 +294,8 @@ describe("external-link pipeline diagnostics", () => {
 
   it("injects eligible research sources and keeps them in the final article", async () => {
     const sources = [
-      { url: "https://example.com/local-teams", title: "Local Teams Share Useful Lessons", snippet: "Clear and honest words build trust with customers." },
-      { url: "https://example.com/weekly-plan", title: "A Small Weekly Plan Keeps Work Steady", snippet: "Simple examples help busy owners take a practical next step." },
+      { url: "https://example.com/threads-local-brands", title: "Threads Marketing for Small Local Brands in Hong Kong", snippet: "Local teams share useful lessons from daily work with clear and honest words." },
+      { url: "https://example.com/understand-audience", title: "Understand the People You Want to Reach", snippet: "Simple examples help busy owners understand the idea and take a practical next step." },
     ];
     let result: Awaited<ReturnType<typeof runPostAssemblyPipeline>> | undefined;
     try {
@@ -304,6 +304,15 @@ describe("external-link pipeline diagnostics", () => {
       // final validation may fail for unrelated editorial reasons; inspect state
     }
     const finalBlog = result ? result.blog : "";
+    if (finalBlog) {
+      for (const url of sources.map((s) => s.url)) {
+        const idx = finalBlog.indexOf(url);
+        if (idx >= 0) {
+          const start = Math.max(0, idx - 400);
+          console.log(`[DEBUG-PLACE] ${url.split("/").pop()} near: ` + JSON.stringify(finalBlog.slice(start, idx + 120).replace(/\s+/g, " ")));
+        }
+      }
+    }
     const present = sources.filter((source) => finalBlog.includes(source.url));
     expect(present.length).toBeGreaterThan(0);
     if (result) {

@@ -72,6 +72,8 @@ export interface PolishRequest {
   malformedIssuesByBlockId?: Record<string, string[]>;
   /** Per-block preserve/replace context for the repetition-repair pass. */
   repetitionTargets?: RepetitionPairTarget[];
+  /** Complete canonical document supplied read-only by the final-document owner. */
+  fullDocumentContext?: unknown;
 }
 
 export interface CandidateValidation {
@@ -93,6 +95,8 @@ export interface EditorialPolishOptions {
   malformedIssuesByBlockId?: Record<string, string[]>;
   /** Per-block preserve/replace context for the repetition-repair pass. */
   repetitionTargets?: RepetitionPairTarget[];
+  /** Complete canonical document supplied read-only; never an editable surface. */
+  fullDocumentContext?: unknown;
 }
 
 export type EditorialPolishMode =
@@ -326,6 +330,9 @@ If no block needs editing, return {"edits":[]}.`;
     },
     sectionMemory: request.sectionSummaries,
     editableBlocks: request.blocks,
+    ...(request.fullDocumentContext !== undefined
+      ? { completeDocumentReadOnly: request.fullDocumentContext }
+      : {}),
     ...(request.mode === "malformed"
       ? { malformedIssuesByBlockId: request.malformedIssuesByBlockId ?? {} }
       : {}),
@@ -1421,6 +1428,7 @@ export async function runEditorialPolish(
     mode: options.mode,
     malformedIssuesByBlockId: options.malformedIssuesByBlockId,
     repetitionTargets: options.repetitionTargets,
+    fullDocumentContext: options.fullDocumentContext,
   };
   if (request.blocks.length === 0) {
     return resultForFailure(articleDoc, keyphrase, "No editable blocks matched the repair scope", 0, 0, 0);
@@ -1447,7 +1455,6 @@ export async function runEditorialPolish(
       const response = await aiCall(messages, {
         responseFormat: { type: "json_object" },
         temperature: attempt === 1 ? 0.35 : 0.2,
-        maxTokens: 16_384,
         timeoutMs: 120_000,
       });
       responseContent = response.content;

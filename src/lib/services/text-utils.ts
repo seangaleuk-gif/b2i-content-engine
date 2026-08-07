@@ -1,5 +1,6 @@
 import { AppError } from "./errors";
-import { splitSentences } from "@/lib/seo/seo-text-utils";
+import { findSentenceBoundaryOffsets, splitSentences } from "@/lib/seo/seo-text-utils";
+import { parseWordpressBlockStructure, type WordpressBlockRange } from "@/lib/blog/wordpress-block-structure";
 
 export function countReadableWords(html: string): number {
   // Strip non-readable content first
@@ -252,53 +253,225 @@ export function repairMetaDescription(meta: string, min: number, max: number): s
   return lastSpace > 0 ? truncated.substring(0, lastSpace) + "\u2026" : truncated + "\u2026";
 }
 
-/** Split WordPress paragraph blocks that exceed MAX_SENTENCES per paragraph.
- *  Preserves inline HTML (<strong>, <em>, <a>, <br>). Never splits lists/headings/tables/quotes/html blocks. */
-/** Unwrap nested <p> tags — outer <p> that contains child <p> tags is removed,
- *  leaving the inner content intact. Prevents paragraph splitting from breaking
- *  on AI-generated content that wraps already-paragraphed text in a new <p>. */
-function flattenNestedParagraphs(html: string): string {
-  // Repeatedly find outermost <p>...</p> that contains another <p> and remove the outer wrapper
-  let prev = "";
-  let result = html;
-  while (result !== prev) {
-    prev = result;
-    result = result.replace(/<p\b[^>]*>([\s\S]*?)<\/p>/g, (match, inner) => {
-      if (/<p\b[^>]*>/i.test(inner)) {
-        return inner;
-      }
-      return match;
-    });
+/** Split validated, top-level WordPress paragraph blocks only. */
+interface InlineTagToken {
+  start: number;
+  end: number;
+  kind: "open" | "close" | "self" | "comment";
+  name: string | null;
+}
+
+interface InlineScan {
+  valid: boolean;
+  error: string | null;
+  visibleText: string;
+  rawIndexByVisibleIndex: number[];
+  stackAtVisibleIndex: string[][];
+  tags: InlineTagToken[];
+}
+
+const VOID_INLINE_TAGS = new Set(["br", "img", "hr", "input", "source", "wbr"]);
+const BLOCK_HTML_TAGS = new Set([
+  "address", "article", "aside", "blockquote", "button", "div", "footer", "form",
+  "h1", "h2", "h3", "h4", "h5", "h6", "header", "li", "main", "nav", "ol",
+  "p", "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+]);
+
+function findHtmlTagEnd(html: string, start: number): number {
+  let quote: "\"" | "'" | null = null;
+  for (let index = start + 1; index < html.length; index++) {
+    const char = html[index];
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === ">") return index + 1;
   }
-  return result;
+  return -1;
+}
+
+function scanInlineHtml(html: string): InlineScan {
+  const visible: string[] = [];
+  const rawIndexByVisibleIndex: number[] = [];
+  const stackAtVisibleIndex: string[][] = [];
+  const tags: InlineTagToken[] = [];
+  const stack: string[] = [];
+
+  for (let index = 0; index < html.length;) {
+    if (html.startsWith("<!--", index)) {
+      const commentEnd = html.indexOf("-->", index + 4);
+      if (commentEnd < 0) {
+        return { valid: false, error: `unclosed inline HTML comment at offset ${index}`, visibleText: "", rawIndexByVisibleIndex: [], stackAtVisibleIndex: [], tags: [] };
+      }
+      tags.push({ start: index, end: commentEnd + 3, kind: "comment", name: null });
+      index = commentEnd + 3;
+      continue;
+    }
+
+    if (html[index] === "<") {
+      const end = findHtmlTagEnd(html, index);
+      if (end < 0) {
+        return { valid: false, error: `unclosed inline HTML tag at offset ${index}`, visibleText: "", rawIndexByVisibleIndex: [], stackAtVisibleIndex: [], tags: [] };
+      }
+      const raw = html.slice(index, end);
+      const close = raw.match(/^<\s*\/\s*([A-Za-z][\w:-]*)\s*>$/);
+      const open = raw.match(/^<\s*([A-Za-z][\w:-]*)(?:\s[\s\S]*?)?\s*(\/?)>$/);
+      if (close) {
+        const name = close[1].toLowerCase();
+        if (stack[stack.length - 1] !== name) {
+          return { valid: false, error: `mismatched inline closing tag </${name}> at offset ${index}`, visibleText: "", rawIndexByVisibleIndex: [], stackAtVisibleIndex: [], tags: [] };
+        }
+        stack.pop();
+        tags.push({ start: index, end, kind: "close", name });
+      } else if (open) {
+        const name = open[1].toLowerCase();
+        if (BLOCK_HTML_TAGS.has(name)) {
+          return { valid: false, error: `block-level <${name}> is not valid inside a paragraph`, visibleText: "", rawIndexByVisibleIndex: [], stackAtVisibleIndex: [], tags: [] };
+        }
+        const selfClosing = open[2] === "/" || VOID_INLINE_TAGS.has(name);
+        tags.push({ start: index, end, kind: selfClosing ? "self" : "open", name });
+        if (!selfClosing) stack.push(name);
+      } else {
+        return { valid: false, error: `malformed inline HTML tag at offset ${index}`, visibleText: "", rawIndexByVisibleIndex: [], stackAtVisibleIndex: [], tags: [] };
+      }
+      index = end;
+      continue;
+    }
+
+    visible.push(html[index]);
+    rawIndexByVisibleIndex.push(index);
+    stackAtVisibleIndex.push([...stack]);
+    index++;
+  }
+
+  if (stack.length > 0) {
+    return { valid: false, error: `unclosed inline HTML tag <${stack[stack.length - 1]}>`, visibleText: "", rawIndexByVisibleIndex: [], stackAtVisibleIndex: [], tags: [] };
+  }
+  return {
+    valid: true,
+    error: null,
+    visibleText: visible.join(""),
+    rawIndexByVisibleIndex,
+    stackAtVisibleIndex,
+    tags,
+  };
+}
+
+function findSafeRawBoundary(
+  html: string,
+  punctuationRawIndex: number,
+  nextVisibleRawIndex: number,
+  openAtPunctuation: string[],
+  tags: InlineTagToken[],
+): number | null {
+  const stack = [...openAtPunctuation];
+  let cursor = punctuationRawIndex + 1;
+  let boundary = cursor;
+  for (const tag of tags) {
+    if (tag.start < cursor || tag.end > nextVisibleRawIndex) continue;
+    if (/\S/.test(html.slice(cursor, tag.start))) return null;
+    if (stack.length === 0) return tag.start;
+    if (tag.kind === "close") {
+      if (stack[stack.length - 1] !== tag.name) return null;
+      stack.pop();
+    } else if (tag.kind === "open" && tag.name) {
+      stack.push(tag.name);
+    }
+    cursor = tag.end;
+    if (stack.length === 0) boundary = cursor;
+  }
+  if (/\S/.test(html.slice(cursor, nextVisibleRawIndex))) return null;
+  return stack.length === 0 ? Math.max(boundary, nextVisibleRawIndex) : null;
+}
+
+function splitParagraphBlock(
+  html: string,
+  range: WordpressBlockRange,
+  maxSentences: number,
+): { replacement: string; splitCount: number } {
+  const original = html.slice(range.start, range.end);
+  const opener = html.slice(range.start, range.openEnd);
+  const closer = html.slice(range.closeStart, range.end);
+  const inner = html.slice(range.openEnd, range.closeStart);
+  const paragraph = inner.match(/^(\s*)(<p\b[^>]*>)([\s\S]*)(<\/p>)(\s*)$/i);
+  if (!paragraph) {
+    throw new Error(`Invalid wp:paragraph HTML at offset ${range.start}: expected one complete <p> wrapper`);
+  }
+  if (/"anchor"\s*:/.test(opener) || /\bid\s*=/i.test(paragraph[2])) {
+    return { replacement: original, splitCount: 0 };
+  }
+
+  const content = paragraph[3];
+  const scan = scanInlineHtml(content);
+  if (!scan.valid) {
+    throw new Error(`Invalid wp:paragraph HTML at offset ${range.start}: ${scan.error}`);
+  }
+  const boundaries = findSentenceBoundaryOffsets(scan.visibleText);
+  const sentenceCount = splitSentences(scan.visibleText).length;
+  if (sentenceCount <= maxSentences) return { replacement: original, splitCount: 0 };
+
+  const rawBoundaries: number[] = [];
+  for (let sentenceIndex = maxSentences; sentenceIndex < sentenceCount; sentenceIndex += maxSentences) {
+    const visibleBoundary = boundaries[sentenceIndex - 1];
+    if (visibleBoundary === undefined) return { replacement: original, splitCount: 0 };
+    let nextVisible = visibleBoundary;
+    while (nextVisible < scan.visibleText.length && /\s/.test(scan.visibleText[nextVisible])) nextVisible++;
+    if (nextVisible >= scan.visibleText.length) break;
+    const punctuationVisibleIndex = visibleBoundary - 1;
+    const rawBoundary = findSafeRawBoundary(
+      content,
+      scan.rawIndexByVisibleIndex[punctuationVisibleIndex],
+      scan.rawIndexByVisibleIndex[nextVisible],
+      scan.stackAtVisibleIndex[punctuationVisibleIndex],
+      scan.tags,
+    );
+    if (rawBoundary === null) return { replacement: original, splitCount: 0 };
+    rawBoundaries.push(rawBoundary);
+  }
+
+  const chunks: string[] = [];
+  let start = 0;
+  for (const boundary of [...rawBoundaries, content.length]) {
+    const chunk = content.slice(start, boundary).trim();
+    if (chunk) {
+      const chunkScan = scanInlineHtml(chunk);
+      if (!chunkScan.valid) return { replacement: original, splitCount: 0 };
+      chunks.push(chunk);
+    }
+    start = boundary;
+  }
+  if (chunks.length <= 1) return { replacement: original, splitCount: 0 };
+
+  const blocks = chunks.map((chunk) =>
+    `${opener}${paragraph[1]}${paragraph[2]}${chunk}${paragraph[4]}${paragraph[5]}${closer}`,
+  );
+  return { replacement: blocks.join("\n\n"), splitCount: blocks.length - 1 };
 }
 
 export function splitLongParagraphs(html: string, maxSentences: number = 3): { html: string; splitCount: number } {
+  if (!Number.isInteger(maxSentences) || maxSentences < 1) {
+    throw new Error(`maxSentences must be a positive integer, received ${maxSentences}`);
+  }
+  const structure = parseWordpressBlockStructure(html);
+  if (!structure.valid) {
+    throw new Error(`Invalid WordPress block structure: ${structure.issues.join("; ")}`);
+  }
+
+  const paragraphs = structure.ranges
+    .filter((range) => range.type === "wp:paragraph" && range.depth === 0)
+    .sort((a, b) => b.start - a.start);
+  let result = html;
   let splitCount = 0;
-  const flatHtml = flattenNestedParagraphs(html);
-
-  const result = flatHtml.replace(
-    /<!--\s*wp:paragraph\s*-->\s*<p>([\s\S]*?)<\/p>\s*<!--\s*\/wp:paragraph\s*-->/gi,
-    (match: string, content: string) => {
-      const trimmed = content.trim();
-      if (!trimmed) return match;
-
-      const sentences = splitSentences(trimmed);
-
-      if (sentences.length <= maxSentences) return match;
-
-      const blocks: string[] = [];
-      for (let i = 0; i < sentences.length; i += maxSentences) {
-        const chunk = sentences.slice(i, i + maxSentences).join(" ");
-        if (chunk.trim()) {
-          blocks.push(`<!-- wp:paragraph -->\n<p>${chunk.trim()}</p>\n<!-- /wp:paragraph -->`);
-        }
-      }
-      splitCount += blocks.length - 1;
-      return blocks.join("\n\n");
-    }
-  );
-
+  for (const range of paragraphs) {
+    const split = splitParagraphBlock(html, range, maxSentences);
+    if (split.splitCount === 0) continue;
+    result = result.slice(0, range.start) + split.replacement + result.slice(range.end);
+    splitCount += split.splitCount;
+  }
   return { html: result, splitCount };
 }
 
@@ -386,13 +559,22 @@ export function rebalanceWpBlocks(html: string): string {
  *  Uses the exact same sentence-counting logic as splitLongParagraphs.
  *  Shared by: paragraphs-final pipeline stage, SEO audit, final validation, post-save readback. */
 export function countLongParagraphs(html: string, maxSentences: number = 3): number {
-  const paraRe = /<!--\s*wp:paragraph\s*-->\s*<p>([\s\S]*?)<\/p>\s*<!--\s*\/wp:paragraph\s*-->/gi;
+  const structure = parseWordpressBlockStructure(html);
+  const paragraphs = structure.ranges.filter(
+    (range) => range.type === "wp:paragraph" && range.depth === 0,
+  );
   let count = 0;
-  let m: RegExpExecArray | null;
-  while ((m = paraRe.exec(html)) !== null) {
-    const content = m[1].trim();
+  for (const range of paragraphs) {
+    const inner = html.slice(range.openEnd, range.closeStart);
+    const paragraph = inner.match(/^\s*<p\b[^>]*>([\s\S]*)<\/p>\s*$/i);
+    if (!paragraph) {
+      count++;
+      continue;
+    }
+    const content = paragraph[1].trim();
     if (!content) continue;
-    if (splitSentences(content).length > maxSentences) count++;
+    const scan = scanInlineHtml(content);
+    if (!scan.valid || splitSentences(scan.visibleText).length > maxSentences) count++;
   }
   return count;
 }
@@ -465,4 +647,99 @@ export function ensureKeyphraseInTitle(title: string, keyphrase: string): string
   }
 
   return result;
+}
+
+// ── Deterministic English title casing ──
+
+/** Configured proper nouns whose exact casing must always be preserved in an
+ *  English title. "Hong kong" from a lowercase keyphrase is corrected to the
+ *  canonical "Hong Kong" casing. */
+const TITLE_PROPER_NOUNS: Array<{ match: RegExp; canonical: string }> = [
+  { match: /\bhong\s+kong\b/i, canonical: "Hong Kong" },
+  { match: /\bhsbc\b/i, canonical: "HSBC" },
+  { match: /\bb2i\s*hub\b/i, canonical: "B2I Hub" },
+  { match: /\bai\b/i, canonical: "AI" },
+  { match: /\bar\b/i, canonical: "AR" },
+  { match: /\bseo\b/i, canonical: "SEO" },
+  { match: /\bsme\b/i, canonical: "SME" },
+  { match: /\bmeta\b/i, canonical: "Meta" },
+  { match: /\bthreads\b/i, canonical: "Threads" },
+  { match: /\bwhatsapp\b/i, canonical: "WhatsApp" },
+  { match: /\binstagram\b/i, canonical: "Instagram" },
+  { match: /\btiktok\b/i, canonical: "TikTok" },
+  { match: /\blinkedin\b/i, canonical: "LinkedIn" },
+  { match: /\byoutube\b/i, canonical: "YouTube" },
+  { match: /\bwechat\b/i, canonical: "WeChat" },
+  { match: /\bcauseway bay\b/i, canonical: "Causeway Bay" },
+  { match: /\bkowloon\b/i, canonical: "Kowloon" },
+  { match: /\bapac\b/i, canonical: "APAC" },
+  { match: /\bhk\b/i, canonical: "HK" },
+];
+
+const TITLE_SMALL_WORDS = new Set([
+  "a", "an", "and", "or", "but", "for", "of", "on", "in", "to", "with",
+  "by", "at", "from", "as", "vs", "via", "nor", "yet", "so", "the",
+]);
+
+function capitalizeToken(token: string): string {
+  if (token.length <= 1) return token;
+  if (/^[A-Z0-9]{2,}$/.test(token)) return token; // keep acronyms/numbers
+  if (/[a-z]/.test(token) === false) return token; // keep "2026" and all-caps
+  return token.charAt(0).toUpperCase() + token.slice(1);
+}
+
+/** Replace configured proper nouns with their exact canonical casing. */
+export function fixConfiguredProperNouns(text: string): string {
+  let result = text;
+  for (const { match, canonical } of TITLE_PROPER_NOUNS) {
+    result = result.replace(match, canonical);
+  }
+  return result;
+}
+
+/**
+ * Deterministic English title casing: configured proper nouns keep their exact
+ * casing ("Hong Kong", "HSBC", "AI"), acronyms stay uppercase, small words are
+ * lowercased (unless first/last), and every other word is capitalized. This
+ * turns a model-produced "Hong kong marketing trends 2026: ..." into
+ * "Hong Kong Marketing Trends 2026: ..." without touching numbers or URLs.
+ */
+export function normalizeEnglishTitleCasing(title: string, keyphrase?: string): string {
+  if (!title) return title;
+  const withProperNouns = fixConfiguredProperNouns(String(title));
+  const keyphraseWords = new Set(
+    (keyphrase ?? "")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean),
+  );
+  const segments = withProperNouns.split(/(:\s*)/g); // keep the colon separator
+  return segments
+    .map((segment) => {
+      if (/^\s*:\s*$/.test(segment)) return segment;
+      const words = segment.split(/(\s+)/g); // keep whitespace
+      const tokenIndexes = words.map((word, index) => (/\S/.test(word) ? index : -1)).filter((i) => i >= 0);
+      const result = words.map((word, index) => {
+        if (!/\S/.test(word)) return word;
+        const position = tokenIndexes.indexOf(index);
+        const firstOrLast = position === 0 || position === tokenIndexes.length - 1;
+        const lower = word.toLowerCase();
+        // The configured keyphrase casing stays exact wherever it appears.
+        if (keyphraseWords.has(lower) && !/^\d+$/.test(lower)) return capitalizeToken(word);
+        if (TITLE_SMALL_WORDS.has(lower) && !firstOrLast) return lower;
+        // Hyphenated compounds are capitalized per part.
+        if (word.includes("-") && !/^[A-Z0-9-]{3,}$/.test(word)) {
+          return word.split("-").map((part) => capitalizeToken(part)).join("-");
+        }
+        return capitalizeToken(word);
+      });
+      return result.join("");
+    })
+    .join("");
+}
+
+/** Title-case a keyphrase for natural heading placement ("hong kong marketing
+ *  trends 2026" → "Hong Kong Marketing Trends 2026"). */
+export function titleCaseKeyphrase(keyphrase: string): string {
+  return normalizeEnglishTitleCasing(keyphrase);
 }

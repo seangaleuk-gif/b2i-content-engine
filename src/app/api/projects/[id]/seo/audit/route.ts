@@ -5,6 +5,8 @@ import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { seoRepository, blogVersionRepository } from "@/lib/repositories";
 import { runAudit, runChineseAudit } from "@/lib/services/seo-auditor";
 import { parseTranslationVersionSummary } from "@/lib/services/translation-version-metadata";
+import { countReadableWords } from "@/lib/seo/seo-text-utils";
+import { extractVisibleFaqFromArticle, parseArticleDocumentFromHtml, countCanonicalVisibleWords, type ArticleDocument } from "@/lib/blog/article-document";
 
 export async function POST(
   request: Request,
@@ -103,7 +105,6 @@ export async function POST(
       if (Array.isArray(savedFaq) && savedFaq.length > 0) {
         pairedEnglishFaqCount = savedFaq.length;
       } else if (pairedEnglishVersion?.blog) {
-        const { extractVisibleFaqFromArticle } = await import("@/lib/blog/article-document");
         const parsedFaq = extractVisibleFaqFromArticle(pairedEnglishVersion.blog);
         pairedEnglishFaqCount = parsedFaq.length;
       }
@@ -112,7 +113,51 @@ export async function POST(
       ? (pairedEnglishVersion?.wordCount || targetWordCount)
       : targetWordCount;
 
-    console.log(`[seo:audit] versionId=${targetedVersion.id} sourceEnVersionId=${pairedEnglishVersion?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language} enWordCount=${englishWordCount} enFaqCount=${pairedEnglishFaqCount}`);
+    // For the log, separate the configured TARGET from MEASURED values of the
+    // exact saved canonical content. `targetWordCount` is the project's
+    // configured target (a target, never a measurement). `measuredWordCount`
+    // uses the SAME authoritative canonical counter as the pipeline and the
+    // audit's word_count check (intro + editorial sections + conclusion + FAQ
+    // Q&A; CTA, language switcher and schema excluded), so the log, the
+    // publication gate and the SEO score can never disagree.
+    const measuredFaqCount = (Array.isArray(targetedVersion.faq) && targetedVersion.faq.length > 0)
+      ? targetedVersion.faq.length
+      : (() => {
+          try {
+            const parsedFaq = extractVisibleFaqFromArticle(blog);
+            return parsedFaq.length;
+          } catch {
+            return 0;
+          }
+        })();
+    const measuredWordCount = (() => {
+      try {
+        const seedDoc: ArticleDocument = {
+          metadata: {
+            title,
+            slug: "",
+            metaDescription,
+            excerpt: "",
+            targetWordCount,
+            focusKeyphrase: keyword,
+          },
+          languageSwitcher: null,
+          introduction: { id: "audit-introduction", blocks: [], status: "generated" },
+          sections: [],
+          visibleFaq: [],
+          conclusion: { id: "audit-conclusion", blocks: [], status: "generated" },
+          cta: null,
+          faqSchema: null,
+          insertedLinks: [],
+        };
+        const parsed = parseArticleDocumentFromHtml(blog, seedDoc);
+        return parsed.doc ? countCanonicalVisibleWords(parsed.doc) : countReadableWords(blog);
+      } catch {
+        return countReadableWords(blog);
+      }
+    })();
+
+    console.log(`[seo:audit] versionId=${targetedVersion.id} sourceEnVersionId=${pairedEnglishVersion?.id} blogLen=${blog.length} title="${title.substring(0, 50)}..." metaLen=${metaDescription.length} keyword="${keyword}" lang=${language} targetWordCount=${targetWordCount} measuredWordCount(canonical)=${measuredWordCount} pairedEnFaqCount=${pairedEnglishFaqCount} measuredFaqCount=${measuredFaqCount}`);
 
     if (!blog) {
       throw AppError.badRequest("No blog content to audit");

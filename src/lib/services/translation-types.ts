@@ -1,4 +1,4 @@
-import type { ArticleDocument, FaqEntry, ProtectedArticleBlock } from "@/lib/blog/article-document";
+import type { ArticleDocument } from "@/lib/blog/article-document";
 import type { StructuredTranslationShadowResult } from "./editorial-block-translation";
 
 export interface TranslationMetrics {
@@ -49,6 +49,8 @@ export interface TranslationResult {
     retainedCount: number;
     status: "not-run" | "run" | "failed";
     failure: string | null;
+    documentAccepted?: boolean;
+    unresolvedUnitIds?: string[];
   };
 }
 

@@ -208,6 +208,37 @@ describe("runBlogGeneration — section successful retry", () => {
     ]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
   });
+
+  it("repair response with generic heading block type is normalized and succeeds", async () => {
+    vi.mocked(createPipelineState).mockClear();
+    const mock = buildRequestMock([
+      { stage: "section_0", content: para("<!-- wp:paragraph -->bad") },
+      { stage: "section_0_repair", content: blocksResponse([
+        { type: "heading", text: "Key Benefits" },
+        { type: "paragraph", text: "Valid section body after repair." },
+      ]) },
+    ]);
+    const result = await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+    expect(result).toBeDefined();
+    const articleDoc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+    expect(articleDoc.sections[0].blocks[0]).toMatchObject({ type: "subheading", level: 3 });
+    const subheadingBlock = articleDoc.sections[0].blocks.find((b) => b.type === "subheading");
+    if (!subheadingBlock || subheadingBlock.type !== "subheading") throw new Error("expected subheading");
+    expect(subheadingBlock.content).toEqual([{ type: "text", text: "Key Benefits" }]);
+  });
+
+  it("repair response with heading requesting level 2 still throws", async () => {
+    const mock = buildRequestMock([
+      { stage: "section_0", content: para("<!-- wp:paragraph -->bad") },
+      { stage: "section_0_repair", content: blocksResponse([{ type: "heading", text: "Wrong", level: 2 }]) },
+    ]);
+    let err: unknown = null;
+    try { await runBlogGeneration("u", 1, { requestDeepSeek: mock }); } catch (e) { err = e; }
+    expect(err).not.toBeNull();
+    const msg = err instanceof Error && "cause" in err && err.cause instanceof Error ? err.cause.message : "";
+    expect(msg).toContain("Section 0");
+    expect(msg).toContain("disallowed level 2");
+  });
 });
 
 // ── Conclusion failure ──

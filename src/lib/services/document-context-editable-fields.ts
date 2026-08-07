@@ -235,7 +235,13 @@ export function buildEditableFieldIndex(zhDoc: ArticleDocument, enDoc: ArticleDo
   const faqCount = Math.min(zhDoc.visibleFaq.length, enDoc.visibleFaq.length);
   for (let fi = 0; fi < faqCount; fi++) {
     pushField(fields, `faq.${fi}.question`, zhDoc.visibleFaq[fi].question, enDoc.visibleFaq[fi]?.question ?? "", "faq-question", `faq.${fi}.question`, "text", false, { kind: "faq-question", faqIndex: fi });
-    pushField(fields, `faq.${fi}.answer`, zhDoc.visibleFaq[fi].answerText, enDoc.visibleFaq[fi]?.answerText ?? "", "faq-answer", `faq.${fi}.answer`, "text", false, { kind: "faq-answer", faqIndex: fi });
+    // A plain one-paragraph FAQ answer can safely be replaced as one text
+    // leaf.  Marked-up answers (links, emphasis, spans or multiple blocks) are
+    // protected until they have a structured inline representation; exposing
+    // them as one plain field would flatten answerHtml and lose markup.
+    if (isPlainFaqAnswerHtml(zhDoc.visibleFaq[fi].answerHtml)) {
+      pushField(fields, `faq.${fi}.answer`, zhDoc.visibleFaq[fi].answerText, enDoc.visibleFaq[fi]?.answerText ?? "", "faq-answer", `faq.${fi}.answer`, "text", false, { kind: "faq-answer", faqIndex: fi });
+    }
   }
 
   const byId = new Map<string, EditableField>();
@@ -303,11 +309,12 @@ export function writeFieldValue(doc: ArticleDocument, location: FieldLocation, v
       doc.visibleFaq[location.faqIndex].question = value;
       return;
     case "faq-answer": {
-      // FAQ answers are plain paragraphs in this pipeline. Keep answerText and
-      // answerHtml consistent so the FAQPage schema and visible FAQ stay in parity.
       const entry = doc.visibleFaq[location.faqIndex];
+      if (!isPlainFaqAnswerHtml(entry.answerHtml)) {
+        throw new Error(`FAQ ${location.faqIndex} answer contains protected inline markup`);
+      }
       entry.answerText = value;
-      entry.answerHtml = `<p>${value}</p>`;
+      entry.answerHtml = `<p>${escapeFaqText(value)}</p>`;
       return;
     }
     case "block": {
@@ -317,6 +324,22 @@ export function writeFieldValue(doc: ArticleDocument, location: FieldLocation, v
       return;
     }
   }
+}
+
+function isPlainFaqAnswerHtml(html: string): boolean {
+  const trimmed = html.trim();
+  if (!trimmed) return true;
+  const match = trimmed.match(/^<p(?:\s[^>]*)?>([\s\S]*?)<\/p>$/i);
+  return Boolean(match && !/<\/?[a-z][^>]*>/i.test(match[1]));
+}
+
+function escapeFaqText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 /**
@@ -357,6 +380,9 @@ export function applyEditableFieldEdits(
       errors.push(`empty replacement for ${edit.fieldId}`);
       continue;
     }
+    // A replace decision that returns the current value is not an applied
+    // change and must not inflate audit counts.
+    if (normalized === live) continue;
     writeFieldValue(out, field.location, normalized);
     applied.push({ fieldId: edit.fieldId, sourceUnitId: field.sourceUnitId });
   }

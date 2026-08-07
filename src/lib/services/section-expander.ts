@@ -10,6 +10,10 @@ const stripMainH2Blocks = (html: string): string =>
 
 export interface SectionExpansionContext {
   chatWithRetry: (messages: ChatMessage[], options?: ChatOptions) => Promise<ChatResult>;
+  /** Optional canonical article counter supplied by the ArticleDocument owner. */
+  measureCanonicalVisibleWords?: () => number;
+  /** Compatibility input; evidence is accepted only through each section's evidencePrompt. */
+  research?: unknown[];
 }
 
 export interface ExpandableSection {
@@ -101,6 +105,19 @@ export async function expandToMinimum(
       const beforeWC = countReadableWords(target.body);
       const additionWC = countReadableWords(aiBody);
 
+      if (/<a\b[^>]*href\s*=|app\.b2ihub\.com\/signup/i.test(aiBody)) {
+        results.push({
+          accepted: false,
+          beforeSection: beforeWC,
+          afterSection: additionWC,
+          sectionIndex: target.origIndex,
+          reason: "expansion-introduced-link-or-cta",
+        });
+        console.log(`[section-expander:REJECT] section=${target.origIndex} reason=expansion-introduced-link-or-cta`);
+        expansions++;
+        continue;
+      }
+
       let mergedBody: string;
       let afterWC: number;
 
@@ -125,7 +142,9 @@ export async function expandToMinimum(
 
       // Recalculate total from structured components
       const allHtml = [intro, ...workingSections.map((s) => s.body), conclusion].join("\n\n");
-      wordCount = countReadableWords(allHtml);
+      wordCount = ctx.measureCanonicalVisibleWords
+        ? ctx.measureCanonicalVisibleWords()
+        : countReadableWords(allHtml);
       console.log(`[section-expander:EXPAND] articleWords=${wordCount} minimum=${minimumWordCount}`);
       expansions++;
     } catch (err) {

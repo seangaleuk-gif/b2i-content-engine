@@ -26,6 +26,7 @@ import { pairedSlugs, sanitizeSectionUrls, isEligibleExternalSourceUrl } from "@
 import { rebalanceWpBlocks } from "@/lib/services/text-utils";
 import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks } from "@/lib/blog/article-content";
 import { buildClaimOwnershipLedger, formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
+import { stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 
 /** Strip ALL heading blocks (H2, H3, bare <h2>, bare <h3>) from section body content.
  *  Handles complete blocks, orphaned openers/closers, and malformed heading markup
@@ -312,7 +313,7 @@ export async function runBlogGeneration(
       wordCount: Number((project as any).word_count ?? 0),
       content: project.content ?? "", status: project.status,
     },
-    research: research.map((r: any) => ({ category: r.category, title: r.title, snippet: r.snippet, url: r.url })),
+    research: research.map((r: any) => ({ category: r.category, title: r.title, snippet: stripSourceBoilerplate(r.snippet ?? ""), url: r.url })),
     knowledge: knowledge.map((k: any) => ({ title: k.title, content: k.content, tags: k.tags })),
     promptSections: promptSections.map((s: any) => ({ key: s.section_key ?? "", label: s.section_key ?? "", content: s.content })),
     generationDate: new Date().toISOString().slice(0, 10),
@@ -333,7 +334,7 @@ export async function runBlogGeneration(
   const outlinePrompt = userMessage + `
 
 === STEP 1 ===
-Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section headings (the accepted editorial range is ${editorialH2Min}-${editorialH2Max}), followed by one final FAQ H2 heading (${editorialH2Min + 1} headings total). Do not include a Conclusion or Summary H2. The LAST heading MUST be an FAQ section. Do NOT write full content yet. Keep the title, slug, meta description and headings topic-level: do not place research statistics, percentages, dates, currencies, survey findings, quotations or source names in metadata or headings. Precise evidence will be assigned to one body section after the outline is approved. Return as JSON: {"title": "...", "slug": "...", "metaDescription": "...", "h2Headings": ["Editorial Heading 1", "Editorial Heading 2", "...", "Frequently Asked Questions About [Topic]"]}.`;
+Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section headings (the accepted editorial range is ${editorialH2Min}-${editorialH2Max}), followed by one final FAQ H2 heading (${editorialH2Min + 1} headings total). Do not include a Conclusion or Summary H2. The LAST heading MUST be an FAQ section. Do NOT write full content yet. Keep the title, slug, meta description and headings topic-level: do not place research statistics, percentages, dates, currencies, survey findings, quotations or source names in metadata or headings. Precise evidence will be assigned to one body section after the outline is approved. Write the title, slug, meta description and headings in ENGLISH ONLY — never use Chinese characters, and never end the slug with "-zh". Return as JSON: {"title": "...", "slug": "...", "metaDescription": "...", "h2Headings": ["Editorial Heading 1", "Editorial Heading 2", "...", "Frequently Asked Questions About [Topic]"]}.`;
 
   const outlineRes = await trackedChat("outline",
     [{ role: "system", content: outlineSystemPrompt }, { role: "user", content: outlinePrompt }],
@@ -444,7 +445,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   // only `limit` HTTP requests are in flight simultaneously.
   const taskFactories: (() => Promise<TaskResult>)[] = [];
 
-  const introUserMsg = `Write the introduction (${introTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another supported type is clearly useful.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+  const introUserMsg = `Write the introduction (${introTarget} words). Write it in ENGLISH ONLY — do not use Chinese characters. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another supported type is clearly useful.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
   taskFactories.push(() => trackedChat("intro", [{ role: "system", content: bundle.introSystem }, { role: "user", content: introUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
     let parsed: any;
     try { parsed = robustJsonParse(res.content, "intro"); } catch {
@@ -476,7 +477,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
 
     if (isFaq) {
       // FAQ: structured output with heading + entries, not an editorial section
-      const faqMsg = `Return FAQ content as structured JSON. Use: {"heading": "...", "entries": [{"question": "...", "answer": "..."}]}. Generate ${faqTarget} words total across ${faqRange.min}-${faqRange.max} entries. Each answer must be 1-3 complete sentences. Do not include HTML, WordPress comments, Markdown fences, signup URLs, CTA content, or precise statistics. Questions must be conceptual or practical rather than asking for a number already owned by a body section.\n\nHeading: "${h2Text}"\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+      const faqMsg = `Return FAQ content as structured JSON. Use: {"heading": "...", "entries": [{"question": "...", "answer": "..."}]}. Generate ${faqTarget} words total across ${faqRange.min}-${faqRange.max} entries. Each answer must be 1-3 complete sentences. Write every question and answer in ENGLISH ONLY — do not use Chinese characters. Do not include HTML, WordPress comments, Markdown fences, signup URLs, CTA content, or precise statistics. Questions must be conceptual or practical rather than asking for a number already owned by a body section.\n\nHeading: "${h2Text}"\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
       taskFactories.push(() => trackedChat("faq", [{ role: "system", content: bundle.faqSystem }, { role: "user", content: faqMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
         const raw = robustJsonParse(res.content, "faq");
         const heading = (raw as any).heading || h2Text;
@@ -494,7 +495,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       // Editorial section: structured JSON blocks
       const ownedEvidence = formatOwnedEvidencePacket(claimOwnership, `section-${i}`);
       const sectionResearchPrompt = `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${ownedEvidence}\n\nUse only assigned evidence. Preserve complete meaning and use natural named attribution. Never print SOURCE-N identifiers. Do not repeat precise evidence from earlier or later sections.`;
-      const msg = `Return section BODY as structured JSON blocks. Do NOT return H2 heading. Section heading: "${h2Text}". Target ${wordsPerSection} words. Previous heading: ${prev}. Next heading: ${next}. Title: ${outline.title}. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Use paragraph, subheading (H3 only), list, quote or table types as needed.${kpNote}${sectionResearchPrompt}`;
+      const msg = `Return section BODY as structured JSON blocks. Do NOT return H2 heading. Write the body in ENGLISH ONLY — do not use Chinese characters. Section heading: "${h2Text}". Target ${wordsPerSection} words. Previous heading: ${prev}. Next heading: ${next}. Title: ${outline.title}. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Use paragraph, subheading (H3 only), list, quote or table types as needed.${kpNote}${sectionResearchPrompt}`;
       taskFactories.push(() => trackedChat(`section_${i}`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: msg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 90_000 }).then(async (res: any) => {
         const raw = robustJsonParse(res.content, `section_${i}`);
         const normalized = normalizeAiEditorialPayload(raw, `section-${i}`);
@@ -517,7 +518,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     }
   }
 
-  const concUserMsg = `Write the conclusion (${conclusionTarget} words). Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another type is clearly useful. Do NOT include any CTA content, signup buttons, or CTA headings — the application handles the CTA separately. Summarize only ideas already established in the body and do not repeat any precise factual claim.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+  const concUserMsg = `Write the conclusion (${conclusionTarget} words). Write it in ENGLISH ONLY — do not use Chinese characters. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another type is clearly useful. Do NOT include any CTA content, signup buttons, or CTA headings — the application handles the CTA separately. Summarize only ideas already established in the body and do not repeat any precise factual claim.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
   taskFactories.push(() => trackedChat("conclusion", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: concUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
     let parsed: any;
     try { parsed = robustJsonParse(res.content, "conclusion"); } catch {

@@ -98,23 +98,34 @@ export function calculateFleschReadingEase(text: string): number {
  *  Avoids false positives from abbreviations, decimals, URLs, file extensions. */
 const NO_SPLIT_BEFORE = /\b(?:Mr|Ms|Mrs|Dr|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|inc|ltd|co|corp|ave|blvd|rd|st|sq|dept|univ|inst|assn|tel|ext|no|vol|pg|pp|ed|par|chap|sec|fig|ref|e\.g|i\.e|viz|al)\.$/i;
 
-export function splitSentences(text: string): string[] {
-  const sentences: string[] = [];
-  let current = "";
-  const chars = [...text];
-  for (let i = 0; i < chars.length; i++) {
-    current += chars[i];
-    if (/[.!?！？。]/.test(chars[i])) {
-      if (chars[i] === "." && NO_SPLIT_BEFORE.test(current)) continue;
-      const rest = text.substring(i + 1);
-      const restContent = rest.replace(/<[^>]+>/g, "").trimStart();
-      if (restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent)) {
-        sentences.push(current.trim());
-        current = "";
-      }
+/** Return UTF-16 offsets immediately after real sentence-ending punctuation. */
+export function findSentenceBoundaryOffsets(text: string): number[] {
+  const boundaries: number[] = [];
+  let sentenceStart = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (!/[.!?！？。]/.test(char)) continue;
+    const current = text.slice(sentenceStart, i + 1);
+    if (char === "." && NO_SPLIT_BEFORE.test(current)) continue;
+    const restContent = text.slice(i + 1).trimStart();
+    if (restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent)) {
+      boundaries.push(i + 1);
+      sentenceStart = i + 1;
     }
   }
-  if (current.trim()) sentences.push(current.trim());
+  return boundaries;
+}
+
+export function splitSentences(text: string): string[] {
+  const sentences: string[] = [];
+  let start = 0;
+  for (const boundary of findSentenceBoundaryOffsets(text)) {
+    const sentence = text.slice(start, boundary).trim();
+    if (sentence) sentences.push(sentence);
+    start = boundary;
+  }
+  const finalSentence = text.slice(start).trim();
+  if (finalSentence) sentences.push(finalSentence);
   return sentences;
 }
 

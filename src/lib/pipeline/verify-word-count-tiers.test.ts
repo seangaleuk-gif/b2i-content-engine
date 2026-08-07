@@ -5,10 +5,11 @@ import {
   paragraphSentenceLimit, internalLinkRange, englishKeyphraseDensity, chineseKeyphraseDensity,
   chineseCharRange, computeKeyphraseDensity, computeKeyphraseTargets, translationFaqCount,
 } from "@/lib/content-standards";
-import { buildPolicy, evaluatePolicy, analyzeFinalArticle, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
+import { buildPolicy, evaluatePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { CONCLUSION_START_MARKER, CONCLUSION_END_MARKER, FAQ_HEADING_MARKER } from "@/lib/blog/article-document";
 import { runAudit, runChineseAudit } from "@/lib/services/seo-auditor";
 import { countReadableWords } from "@/lib/services/text-utils";
+import { CANONICAL_ENGLISH_CTA_HTML } from "@/lib/blog/canonical-cta";
 
 // Two body sentences with known metrics: ASL~14.5, ASW~1.48, Flesch ~67
 const EN_SENT_A = "Brand marketing needs good plans to help firms reach new clients across Hong Kong local markets.";
@@ -74,9 +75,8 @@ function makeEnglishArticle(exact: {
     parts.push(`<!-- wp:html --><script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[${entities.join(",")}]}</script><!-- /wp:html -->`);
   }
 
-  // CTA with detectable h2
-  parts.push(`<!-- wp:heading {"level":2} --><h2 class="wp-block-heading">Ready to grow your brand with Hong Kong creators?</h2><!-- /wp:heading -->`);
-  parts.push(`<!-- wp:paragraph --><p>Join B2I Hub today. <a href="https://app.b2ihub.com/signup">Sign up now</a> to start connecting with creators and reach new clients across Hong Kong local markets.</p><!-- /wp:paragraph -->`);
+  // The final publication policy accepts only the application-owned CTA.
+  parts.push(CANONICAL_ENGLISH_CTA_HTML);
 
   let html = parts.join("\n\n");
 
@@ -408,8 +408,8 @@ describe("version filtering", () => {
     { id: 3, slug: "test-article-v2", versionNumber: 2 },
     { id: 4, slug: "test-article-v2-zh", versionNumber: 2 },
   ];
-  it("en filter", () => { const f = mock.filter((v: any) => !v.slug?.endsWith("-zh")); expect(f.length).toBe(2); expect(f.every((v) => !v.slug.endsWith("-zh"))).toBe(true); });
-  it("zh filter", () => { const f = mock.filter((v: any) => v.slug?.endsWith("-zh")); expect(f.length).toBe(2); expect(f.every((v) => v.slug.endsWith("-zh"))).toBe(true); });
+  it("en filter", () => { const f = mock.filter((v) => !v.slug.endsWith("-zh")); expect(f.length).toBe(2); expect(f.every((v) => !v.slug.endsWith("-zh"))).toBe(true); });
+  it("zh filter", () => { const f = mock.filter((v) => v.slug.endsWith("-zh")); expect(f.length).toBe(2); expect(f.every((v) => v.slug.endsWith("-zh"))).toBe(true); });
   it("outdated detection", () => {
     expect({ id: 3 }.id !== 1).toBe(true);
     expect({ id: 3 }.id === 3).toBe(true);

@@ -13,7 +13,7 @@
 // unrepaired, the new translation is NOT saved and precise diagnostics are
 // reported — there is no silent fallback to the unreviewed translation.
 
-import type { ArticleDocument } from "@/lib/blog/article-document";
+import { type ArticleDocument, fingerprintHtml, renderArticleDocument, renderComponentHtml } from "@/lib/blog/article-document";
 import { buildFaqSchemaBlock } from "./document-context-shadow-preview";
 import { resolveModelRouting, EDITORIAL_REVIEW_LABEL } from "./deepseek-model-routing";
 import { getCantoneseIndexes, type CantoneseIndexes } from "./cantonese-corpus";
@@ -43,11 +43,17 @@ import {
   checkCtaParity,
   unresolvedMandatoryFindings,
 } from "./editorial-review-gate";
+import { checkNumbersPreserved, extractLinks } from "./translation-validator";
 
 // ── Selection constants ─────────────────────────────────────────────────────
 
 /** Hard maximum number of selected units per review call. */
 export const REVIEW_SELECTION_CAP = 25;
+export const FULL_DOCUMENT_ZH_REVIEW_FLAG = "ENABLE_FULL_DOCUMENT_ZH_REVIEW";
+
+export function isFullDocumentZhReviewEnabled(): boolean {
+  return process.env[FULL_DOCUMENT_ZH_REVIEW_FLAG] === "true";
+}
 
 // Source-claim risk patterns (applied to the ENGLISH source text).
 const CLAIM_CLAUSE_RE =
@@ -63,7 +69,7 @@ const NEGATION_RE =
 const FACTUAL_RE = /\b\d+(?:[.,]\d+)*%?|\$?\d[\d,.]*(?:%| dollars?|港元| HKD)?|\bHK\$\s?\d|\b\d+(?:st|nd|rd|th)\b/iu;
 
 // Translation-risk patterns (applied to the CHINESE output).
-const CALQUE_RE = /精製|大粉絲|人性化|被見到|被相信|賣到貨|大名人/gu;
+const CALQUE_RE = /精製|大粉絲|人性化|被見到|被相信|賣到貨|大名人|活動廣告板|人肉廣告板/gu;
 const SLANG_RE = /人肉|靜靜雞|靚到爆|吹水|搞掂晒/gu;
 const REDUNDANT_ALT_RE = /(創作者|意見領袖|KOL)\s*或者\s*(創作者|意見領袖|KOL)/gu;
 const MAINLAND_RE = /營銷|視頻|網絡紅人|質量|信息|博主|素質/gu;
@@ -136,6 +142,27 @@ function riskWeight(reasons: string[]): number {
 function testRe(re: RegExp, text: string): boolean {
   re.lastIndex = 0;
   return re.test(text);
+}
+
+const SOURCE_AWARE_LITERAL_PAIRS: Array<{ source: RegExp; target: RegExp; label: string }> = [
+  { source: /\bnice[- ]to[- ]have\b/iu, target: /有就最好|有就好|算係最好/gu, label: "literal-nice-to-have" },
+  { source: /\bwalking billboard\b/iu, target: /活動廣告板|人肉廣告板/gu, label: "literal-walking-billboard" },
+  { source: /\bout of touch\b/iu, target: /失焦/gu, label: "literal-out-of-touch" },
+  { source: /\bkeeps? (?:everyone|both sides|all parties) honest\b/iu, target: /令[^。！？]{0,12}老實啲|保持誠實/gu, label: "literal-keeps-honest" },
+];
+
+function sourceAwareLiteralReasons(unit: AlignedUnit): string[] {
+  const reasons: string[] = [];
+  for (const pair of SOURCE_AWARE_LITERAL_PAIRS) {
+    pair.source.lastIndex = 0;
+    pair.target.lastIndex = 0;
+    if (pair.source.test(unit.en) && pair.target.test(unit.zh)) reasons.push(pair.label);
+  }
+  return reasons;
+}
+
+export function findSourceAwareLiteralTranslations(aligned: AlignedUnit[]): Array<{ sourceUnitId: string; reason: string }> {
+  return aligned.flatMap((unit) => sourceAwareLiteralReasons(unit).map((reason) => ({ sourceUnitId: unit.id, reason })));
 }
 
 const CREATOR_ZH_RENDERINGS = ["創作者", "KOL", "意見領袖", "網紅", "超小型創作者", "微型創作者", "中型創作者", "大型創作者", "頂級創作者"];
@@ -260,6 +287,7 @@ export function selectEditorialReviewCandidates(params: {
     if (testRe(MAINLAND_RE, unit.zh)) reasons.add("mainland-terminology");
     if (testRe(UNNATURAL_PASSIVE_RE, unit.zh)) reasons.add("unnatural-passive");
     if (testRe(AVOIDED_LANGUAGE_RE, unit.zh)) reasons.add("avoided-language");
+    for (const reason of sourceAwareLiteralReasons(unit)) reasons.add(reason);
     if (reasons.size > 0 && collisionRe && testRe(collisionRe, unit.zh)) reasons.add("meaning-collision");
     if (testRe(CREATOR_FAMILY_RE, unit.en) || /創作者|KOL|意見領袖|超小型創作者|微型創作者|中型創作者|大型創作者|頂級創作者/.test(unit.zh)) {
       reasons.add("terminology");
@@ -345,7 +373,7 @@ function extractUrls(text: string): string[] {
 }
 
 /** Build the reviewer system prompt (glossary + style contract + constraints). */
-export function buildEditorialReviewSystemPrompt(styleContract: ZhHkStyleContract): string {
+export function buildEditorialReviewSystemPrompt(styleContract: ZhHkStyleContract, fullDocument = false): string {
   const preferred = [...styleContract.preferredTerms.entries()].map(([a, b]) => `${a} → ${b}`).join("; ");
   // Only emit avoided terms that have a real, non-identity preferred replacement.
   // Markers with no safe deterministic replacement are dropped from the map so the
@@ -355,7 +383,9 @@ export function buildEditorialReviewSystemPrompt(styleContract: ZhHkStyleContrac
     .filter(([a, b]) => b !== a)
     .map(([a, b]) => `${a} → ${b}`).join("; ");
   return [
-    "You are a senior bilingual Hong Kong Cantonese editor. Review selected translated units against their immutable English source and return JSON text-leaf edits only.",
+    fullDocument
+      ? "You are a senior bilingual Hong Kong Cantonese editor. Review the COMPLETE aligned document against its immutable English source, select every suspicious unit yourself, and return JSON text-leaf edits only."
+      : "You are a senior bilingual Hong Kong Cantonese editor. Review selected translated units against their immutable English source and return JSON text-leaf edits only.",
     "",
     buildTranslationGlossaryPrompt(),
     "",
@@ -365,7 +395,9 @@ export function buildEditorialReviewSystemPrompt(styleContract: ZhHkStyleContrac
     avoided ? `AVOIDED TERMS (repair these): ${avoided}` : "",
     "",
     "REVIEW REQUIREMENTS:",
-    "- Compare every selected translation directly with its English source.",
+    fullDocument
+      ? "- Compare EVERY translation directly with its English source. Do not assume a unit is acceptable merely because no deterministic reason is listed."
+      : "- Compare every selected translation directly with its English source.",
     "- Preserve the EXACT meaning and claim strength. Never strengthen or weaken a claim.",
     "- CHECK CLAIM POLARITY: if the English source asserts a reduction/avoidance (e.g. 'reduces risk', 'fewer risks', 'avoids mistakes'), the Chinese must not imply the opposite (e.g. 'brings risk'). Reverse any inverted claim so it matches the source.",
     "- Remove invented claims, additions and unsupported attribution.",
@@ -388,14 +420,24 @@ export function buildEditorialReviewSystemPrompt(styleContract: ZhHkStyleContrac
     "- Do NOT change source attribution (source names, 來源 citation links).",
     "- Do NOT change block type, list/table dimensions, heading level, inline structure, or link hrefs.",
     "- Do NOT edit adjacent read-only context.",
-    "- Do NOT edit unselected units.",
+    fullDocument ? "- Edit only units whose supplied FIELD IDs require a correction; return no decision for acceptable non-required units." : "- Do NOT edit unselected units.",
     "- Return ONLY the JSON decision object. No drafts, explanations or notes.",
   ].join("\n");
 }
 
 /** Build the reviewer user prompt with selected units + editable fields + read-only context. */
-export function buildEditorialReviewUserPrompt(units: ReviewUnit[]): string {
-  const parts: string[] = ["Review the following selected source units. Return one decision object.", ""];
+export function buildEditorialReviewUserPrompt(
+  units: ReviewUnit[],
+  options: { fullDocument?: boolean; requiredUnitIds?: string[] } = {},
+): string {
+  const fullDocument = options.fullDocument === true;
+  const requiredUnitIds = options.requiredUnitIds ?? units.map((unit) => unit.sourceUnitId);
+  const parts: string[] = [
+    fullDocument
+      ? "Review the complete aligned document. Select and correct suspicious units; all REQUIRED units must receive a decision."
+      : "Review the following selected source units. Return one decision object.",
+    "",
+  ];
   const byId = new Map(units.map((u) => [u.sourceUnitId, u]));
   const orderedIds = units.map((u) => u.sourceUnitId);
   for (const id of orderedIds) {
@@ -410,7 +452,8 @@ export function buildEditorialReviewUserPrompt(units: ReviewUnit[]): string {
       `ENGLISH: ${u.en}`,
       `CURRENT ZH-HK: ${u.zh}`,
       `PROTECTED: numbers=[${nums.join(",") || "none"}] urls=[${urls.join(",") || "none"}]`,
-      `SELECTION REASONS: ${u.reasons.join(", ")}`,
+      `REVIEW STATUS: ${requiredUnitIds.includes(u.sourceUnitId) ? "REQUIRED DECISION" : "FULL-DOCUMENT SCAN"}`,
+      `SELECTION REASONS: ${u.reasons.join(", ") || "none; inspect semantically"}`,
       `EDITABLE FIELDS (edit only these text values):`,
       fieldsText,
     );
@@ -435,12 +478,23 @@ export function buildEditorialReviewUserPrompt(units: ReviewUnit[]): string {
           reasonCodes: [],
         },
       ],
+      ...(fullDocument
+        ? { documentAcceptance: { decision: "accept", unresolvedUnitIds: [], reasonCodes: [] } }
+        : {}),
     }, null, 2),
     "",
-    "- Provide EXACTLY one decision per selected sourceUnitId, in the same order as listed.",
+    fullDocument
+      ? `- Provide a decision for every REQUIRED sourceUnitId (${requiredUnitIds.join(", ") || "none"}) and for any additional unit you decide to replace. Do not return retain decisions for non-required acceptable units.`
+      : "- Provide EXACTLY one decision per selected sourceUnitId, in the same order as listed.",
     "- decision \"replace\" requires at least one valid edit referencing a supplied fieldId.",
     "- decision \"retain\" must have an EMPTY edits array.",
     "- reasonCodes are short codes such as meaning-inversion, claim-strength, attribution, omission, terminology, register, slang, translationese, naturalness, untranslated-english.",
+    ...(fullDocument
+      ? [
+          "- documentAcceptance.decision must be accept only when the complete target is natural, faithful and publishable after the returned edits.",
+          "- If more than 25 units require changes, set documentAcceptance.decision to reject and list every unresolved unit ID; do not truncate silently.",
+        ]
+      : []),
   );
   return parts.join("\n");
 }
@@ -448,10 +502,12 @@ export function buildEditorialReviewUserPrompt(units: ReviewUnit[]): string {
 export function buildEditorialReviewMessages(params: {
   units: ReviewUnit[];
   styleContract: ZhHkStyleContract;
+  fullDocument?: boolean;
+  requiredUnitIds?: string[];
 }): ChatMessage[] {
   return [
-    { role: "system", content: buildEditorialReviewSystemPrompt(params.styleContract) },
-    { role: "user", content: buildEditorialReviewUserPrompt(params.units) },
+    { role: "system", content: buildEditorialReviewSystemPrompt(params.styleContract, params.fullDocument) },
+    { role: "user", content: buildEditorialReviewUserPrompt(params.units, { fullDocument: params.fullDocument, requiredUnitIds: params.requiredUnitIds }) },
   ];
 }
 
@@ -467,6 +523,43 @@ export interface ReviewDecision {
   decision: "replace" | "retain";
   edits: ReviewEdit[];
   reasonCodes: string[];
+}
+
+export interface ReviewDocumentAcceptance {
+  decision: "accept" | "reject";
+  unresolvedUnitIds: string[];
+  reasonCodes: string[];
+}
+
+export interface EditorialReviewEnvelope {
+  decisions: ReviewDecision[];
+  documentAcceptance: ReviewDocumentAcceptance | null;
+}
+
+export function parseEditorialReviewEnvelope(content: string): EditorialReviewEnvelope {
+  const cleaned = content.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+  const parsed = JSON.parse(cleaned) as unknown;
+  const decisions = parseEditorialReviewDecisions(cleaned);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { decisions, documentAcceptance: null };
+  }
+  const raw = (parsed as Record<string, unknown>).documentAcceptance;
+  if (raw === undefined) return { decisions, documentAcceptance: null };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("editorial-review: invalid documentAcceptance");
+  }
+  const value = raw as Record<string, unknown>;
+  if (value.decision !== "accept" && value.decision !== "reject") {
+    throw new Error("editorial-review: invalid documentAcceptance decision");
+  }
+  return {
+    decisions,
+    documentAcceptance: {
+      decision: value.decision,
+      unresolvedUnitIds: Array.isArray(value.unresolvedUnitIds) ? value.unresolvedUnitIds.map(String) : [],
+      reasonCodes: Array.isArray(value.reasonCodes) ? value.reasonCodes.map(String) : [],
+    },
+  };
 }
 
 // Keys that would indicate the model is trying to define structure/nodes/paths.
@@ -514,12 +607,13 @@ export interface DecisionValidationResult {
 export function validateEditorialReviewDecisions(params: {
   decisions: ReviewDecision[];
   selectedUnitIds: string[];
+  allowedUnitIds?: string[];
   fieldIndex: FieldIndex;
   allowedEntities: ReadonlySet<string>;
 }): DecisionValidationResult {
   const { decisions, selectedUnitIds, fieldIndex, allowedEntities } = params;
   const errors: string[] = [];
-  const selectedSet = new Set(selectedUnitIds);
+  const selectedSet = new Set(params.allowedUnitIds ?? selectedUnitIds);
 
   // Structure-key rejection (a response attempting to define structure).
   for (const d of decisions) {
@@ -538,6 +632,9 @@ export function validateEditorialReviewDecisions(params: {
   if (missingUnits.length > 0) errors.push(`selected unit missing a decision: ${missingUnits.join(", ")}`);
 
   const seenFieldIds = new Set<string>();
+  if (decisions.filter((decision) => decision.decision === "replace").length > REVIEW_SELECTION_CAP) {
+    errors.push(`review returned more than ${REVIEW_SELECTION_CAP} changed units`);
+  }
   for (const d of decisions) {
     if (!selectedSet.has(d.sourceUnitId)) {
       errors.push(`decision for unselected unit ${d.sourceUnitId}`);
@@ -594,8 +691,51 @@ export function documentStructureSignature(doc: ArticleDocument): string {
   }
   parts.push(doc.conclusion.blocks.map((b) => editorialStructureSignature([b])[0]).join("|"));
   parts.push(`faq:${doc.visibleFaq.length}`);
-  parts.push(`metadata:${doc.metadata.title.length}:${doc.metadata.metaDescription.length}:${doc.metadata.excerpt.length}`);
+  parts.push(`metadata:${Boolean(doc.metadata.title)}:${Boolean(doc.metadata.metaDescription)}:${Boolean(doc.metadata.excerpt)}`);
   return parts.join("§");
+}
+
+function sameSequence(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/** Rerun source-to-target protected-surface parity after editorial patches. */
+export function validatePostReviewSourceParity(enDoc: ArticleDocument, zhDoc: ArticleDocument): string[] {
+  const errors: string[] = [];
+  const pairs: Array<{ id: string; source: string; target: string }> = [
+    { id: "metadata.title", source: enDoc.metadata.title, target: zhDoc.metadata.title },
+    { id: "metadata.metaDescription", source: enDoc.metadata.metaDescription, target: zhDoc.metadata.metaDescription },
+    { id: "metadata.excerpt", source: enDoc.metadata.excerpt, target: zhDoc.metadata.excerpt },
+    { id: "introduction", source: renderComponentHtml(enDoc.introduction), target: renderComponentHtml(zhDoc.introduction) },
+    { id: "conclusion", source: renderComponentHtml(enDoc.conclusion), target: renderComponentHtml(zhDoc.conclusion) },
+  ];
+  for (let index = 0; index < Math.min(enDoc.sections.length, zhDoc.sections.length); index++) {
+    pairs.push({ id: `section.${index}.heading`, source: enDoc.sections[index].heading, target: zhDoc.sections[index].heading });
+    pairs.push({ id: `section.${index}`, source: renderComponentHtml(enDoc.sections[index]), target: renderComponentHtml(zhDoc.sections[index]) });
+  }
+  for (let index = 0; index < Math.min(enDoc.visibleFaq.length, zhDoc.visibleFaq.length); index++) {
+    pairs.push({ id: `faq.${index}.question`, source: enDoc.visibleFaq[index].question, target: zhDoc.visibleFaq[index].question });
+    pairs.push({
+      id: `faq.${index}.answer`,
+      source: enDoc.visibleFaq[index].answerHtml || enDoc.visibleFaq[index].answerText,
+      target: zhDoc.visibleFaq[index].answerHtml || zhDoc.visibleFaq[index].answerText,
+    });
+  }
+  if (enDoc.cta && zhDoc.cta) pairs.push({ id: "cta", source: enDoc.cta.html, target: zhDoc.cta.html });
+
+  if (enDoc.sections.length !== zhDoc.sections.length) errors.push("section count changed after review");
+  if (enDoc.visibleFaq.length !== zhDoc.visibleFaq.length) errors.push("FAQ count changed after review");
+  for (const pair of pairs) {
+    const numbers = checkNumbersPreserved(pair.source, pair.target);
+    if (numbers.lost.length > 0 || numbers.extras.length > 0) {
+      errors.push(`${pair.id} numbers changed`);
+    }
+    if (!sameSequence(extractLinks(pair.source), extractLinks(pair.target))) {
+      errors.push(`${pair.id} URLs changed`);
+    }
+  }
+  if (/__NUM_\d+__/.test(renderArticleDocument(zhDoc))) errors.push("unresolved number placeholder after review");
+  return errors;
 }
 
 // ── Orchestration ───────────────────────────────────────────────────────────
@@ -612,6 +752,8 @@ export interface EditorialReviewOutcome {
   diagnostics: string[];
   callCount: number;
   truncated: boolean;
+  documentAccepted: boolean;
+  unresolvedUnitIds: string[];
 }
 
 /** Run the bounded editorial review: select → call → parse → validate → apply → revalidate. */
@@ -626,6 +768,7 @@ export async function runEditorialReview(params: {
   const { enDoc, sourceDoc, zhDoc, qualityReport, styleContract, callProvider } = params;
   void sourceDoc;
   const indexes = getCantoneseIndexes();
+  const fullDocumentReview = isFullDocumentZhReviewEnabled();
   const aligned = collectAlignedUnits(enDoc, zhDoc);
   const fieldIndex = buildEditableFieldIndex(zhDoc, enDoc);
   const allowedEntities = extractAutoAllowedEntities(enDoc);
@@ -634,6 +777,7 @@ export async function runEditorialReview(params: {
   const base: EditorialReviewOutcome = {
     doc: zhDoc, status: "not-run", selectedUnitIds: [], selectedReasons: [],
     decisions: [], appliedEditCount: 0, retainedCount: 0, failure: null, diagnostics: [], callCount: 0, truncated: false,
+    documentAccepted: false, unresolvedUnitIds: [],
   };
 
   if (capacityExceeded) {
@@ -646,21 +790,24 @@ export async function runEditorialReview(params: {
       selectedReasons: selected.map((s) => ({ sourceUnitId: s.sourceUnitId, reasons: s.reasons, mandatory: s.mandatory })),
     };
   }
-  if (selected.length === 0) return base;
+  if (selected.length === 0 && !fullDocumentReview) return base;
 
   const alignedById = new Map(aligned.map((u) => [u.id, u]));
   const ordered = aligned.map((u) => u.id);
-  const units: ReviewUnit[] = selected.map((s) => {
-    const pos = ordered.indexOf(s.sourceUnitId);
+  const requiredById = new Map(selected.map((selection) => [selection.sourceUnitId, selection]));
+  const reviewUnitIds = fullDocumentReview ? ordered : selected.map((selection) => selection.sourceUnitId);
+  const units: ReviewUnit[] = reviewUnitIds.map((sourceUnitId) => {
+    const selection = requiredById.get(sourceUnitId);
+    const pos = ordered.indexOf(sourceUnitId);
     const prev = pos > 0 ? alignedById.get(ordered[pos - 1]) : undefined;
     const next = pos >= 0 && pos < ordered.length - 1 ? alignedById.get(ordered[pos + 1]) : undefined;
-    const cur = alignedById.get(s.sourceUnitId)!;
+    const cur = alignedById.get(sourceUnitId)!;
     return {
-      sourceUnitId: s.sourceUnitId,
+      sourceUnitId,
       en: cur.en,
       zh: cur.zh,
-      fields: fieldIndex.byUnit.get(s.sourceUnitId) ?? [],
-      reasons: s.reasons,
+      fields: fieldIndex.byUnit.get(sourceUnitId) ?? [],
+      reasons: selection?.reasons ?? [],
       previous: prev ? { id: prev.id, en: prev.en, zh: prev.zh } : undefined,
       next: next ? { id: next.id, en: next.en, zh: next.zh } : undefined,
     };
@@ -671,7 +818,12 @@ export async function runEditorialReview(params: {
   }
 
   const routing = resolveModelRouting(EDITORIAL_REVIEW_LABEL);
-  const messages = buildEditorialReviewMessages({ units, styleContract });
+  const messages = buildEditorialReviewMessages({
+    units,
+    styleContract,
+    fullDocument: fullDocumentReview,
+    requiredUnitIds: selected.map((selection) => selection.sourceUnitId),
+  });
   let response: ShadowProviderResponse;
   try {
     response = await callProvider(messages, {
@@ -696,15 +848,43 @@ export async function runEditorialReview(params: {
   }
 
   let decisions: ReviewDecision[];
+  let documentAcceptance: ReviewDocumentAcceptance | null = null;
   try {
-    decisions = parseEditorialReviewDecisions(response.content);
+    const envelope = parseEditorialReviewEnvelope(response.content);
+    decisions = envelope.decisions;
+    documentAcceptance = envelope.documentAcceptance;
   } catch (error) {
     return { ...base, status: "failed", failure: `malformed review decisions: ${error instanceof Error ? error.message : String(error)}`, diagnostics: ["malformed review JSON"], callCount: 1 };
+  }
+
+  if (fullDocumentReview && !documentAcceptance) {
+    return { ...base, status: "failed", failure: "full-document review omitted documentAcceptance", diagnostics: ["missing documentAcceptance"], callCount: 1 };
+  }
+  if (fullDocumentReview && documentAcceptance?.decision === "reject") {
+    return {
+      ...base,
+      status: "failed",
+      failure: `full-document review rejected target: ${documentAcceptance.reasonCodes.join(", ") || "unresolved quality findings"}`,
+      diagnostics: documentAcceptance.reasonCodes,
+      unresolvedUnitIds: documentAcceptance.unresolvedUnitIds,
+      callCount: 1,
+    };
+  }
+  if (fullDocumentReview && (documentAcceptance?.unresolvedUnitIds.length ?? 0) > 0) {
+    return {
+      ...base,
+      status: "failed",
+      failure: `full-document review returned unresolved units: ${documentAcceptance!.unresolvedUnitIds.join(", ")}`,
+      diagnostics: documentAcceptance!.unresolvedUnitIds,
+      unresolvedUnitIds: documentAcceptance!.unresolvedUnitIds,
+      callCount: 1,
+    };
   }
 
   const validation = validateEditorialReviewDecisions({
     decisions,
     selectedUnitIds: selected.map((s) => s.sourceUnitId),
+    allowedUnitIds: fullDocumentReview ? units.map((unit) => unit.sourceUnitId) : undefined,
     fieldIndex,
     allowedEntities,
   });
@@ -713,7 +893,9 @@ export async function runEditorialReview(params: {
     return { ...base, status: "failed", failure: `invalid review decisions: ${validation.errors.join("; ")}`, diagnostics: validation.errors, callCount: 1 };
   }
 
-  const selectedUnitIdSet = new Set(selected.map((s) => s.sourceUnitId));
+  const selectedUnitIdSet = new Set(
+    fullDocumentReview ? decisions.map((decision) => decision.sourceUnitId) : selected.map((selection) => selection.sourceUnitId),
+  );
   const edits: Array<{ fieldId: string; replacementText: string }> = [];
   for (const d of decisions) {
     if (d.decision === "replace") edits.push(...d.edits);
@@ -724,7 +906,12 @@ export async function runEditorialReview(params: {
   for (const e of edits) {
     const field = fieldIndex.byId.get(e.fieldId);
     beforeTextByField.set(e.fieldId, field ? field.currentText : "<unknown>");
-    console.warn(`[document-context-shadow] review edit | field=${e.fieldId} unit=${field?.sourceUnitId ?? "?"} before=${JSON.stringify(field?.currentText ?? "")} after=${JSON.stringify(e.replacementText)}`);
+    console.warn(
+      `[document-context-shadow] review edit | field=${e.fieldId} unit=${field?.sourceUnitId ?? "?"}`
+      + ` beforeHash=${fingerprintHtml(field?.currentText ?? "")}`
+      + ` afterHash=${fingerprintHtml(e.replacementText)}`
+      + ` beforeLength=${field?.currentText.length ?? 0} afterLength=${e.replacementText.length}`,
+    );
   }
   const applied = applyEditableFieldEdits(zhDoc, edits, fieldIndex, selectedUnitIdSet);
   console.warn(`[document-context-shadow] review apply | edits=${edits.length} accepted=${applied.applied.length} rejected=${applied.errors.length}`);
@@ -734,10 +921,35 @@ export async function runEditorialReview(params: {
 
   // Post-apply: deterministic zh-HK normalisation + quality report; structure integrity.
   const { doc: normalizedDoc, report } = applyZhHkLanguageQuality(applied.doc, enDoc);
+  normalizedDoc.faqSchema = buildFaqSchemaBlock(normalizedDoc.visibleFaq);
   const beforeSig = documentStructureSignature(zhDoc);
   const afterSig = documentStructureSignature(normalizedDoc);
   if (beforeSig !== afterSig) {
     return { ...base, status: "failed", failure: "review changed document structure", diagnostics: ["structure signature changed after review"], callCount: 1, doc: normalizedDoc };
+  }
+
+  const parityErrors = validatePostReviewSourceParity(enDoc, normalizedDoc);
+  if (parityErrors.length > 0) {
+    return {
+      ...base,
+      status: "failed",
+      failure: `post-review source parity failed: ${parityErrors.join("; ")}`,
+      diagnostics: parityErrors,
+      callCount: 1,
+      doc: normalizedDoc,
+    };
+  }
+
+  const literalFailures = findSourceAwareLiteralTranslations(collectAlignedUnits(enDoc, normalizedDoc));
+  if (literalFailures.length > 0) {
+    return {
+      ...base,
+      status: "failed",
+      failure: `unnatural review replacement: source-aware literal translation(s) remain: ${literalFailures.map((failure) => `${failure.sourceUnitId}:${failure.reason}`).join(", ")}`,
+      diagnostics: literalFailures.map((failure) => `${failure.sourceUnitId}:${failure.reason}`),
+      callCount: 1,
+      doc: normalizedDoc,
+    };
   }
 
   // ── Strengthened post-editorial gate ──
@@ -784,14 +996,20 @@ export async function runEditorialReview(params: {
   // Final post-editorial quality scan summary.
   console.warn(`[document-context-shadow] review finalScan | critical=${report.criticalCount} major=${report.majorCount} minor=${report.minorCount} advisory=${report.advisoryCount}`);
 
-  normalizedDoc.faqSchema = buildFaqSchemaBlock(normalizedDoc.visibleFaq);
   const retainedCount = decisions.filter((d) => d.decision === "retain").length;
   console.warn(`[document-context-shadow] review result | status=run applied=${applied.applied.length} retained=${retainedCount}`);
   return {
     doc: normalizedDoc,
     status: "run",
-    selectedUnitIds: selected.map((s) => s.sourceUnitId),
-    selectedReasons: selected.map((s) => ({ sourceUnitId: s.sourceUnitId, reasons: s.reasons, mandatory: s.mandatory })),
+    selectedUnitIds: fullDocumentReview
+      ? [...new Set([...selected.map((s) => s.sourceUnitId), ...decisions.map((decision) => decision.sourceUnitId)])]
+      : selected.map((s) => s.sourceUnitId),
+    selectedReasons: fullDocumentReview
+      ? [...new Set([...selected.map((s) => s.sourceUnitId), ...decisions.map((decision) => decision.sourceUnitId)])].map((sourceUnitId) => {
+          const selection = requiredById.get(sourceUnitId);
+          return { sourceUnitId, reasons: selection?.reasons ?? ["full-document-model-selection"], mandatory: selection?.mandatory ?? false };
+        })
+      : selected.map((s) => ({ sourceUnitId: s.sourceUnitId, reasons: s.reasons, mandatory: s.mandatory })),
     decisions,
     appliedEditCount: applied.applied.length,
     retainedCount,
@@ -799,5 +1017,7 @@ export async function runEditorialReview(params: {
     diagnostics: [],
     callCount: 1,
     truncated: false,
+    documentAccepted: fullDocumentReview ? documentAcceptance?.decision === "accept" : true,
+    unresolvedUnitIds: documentAcceptance?.unresolvedUnitIds ?? [],
   };
 }

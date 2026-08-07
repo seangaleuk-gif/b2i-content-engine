@@ -6,6 +6,14 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 /** Provider-supported maximum output tokens for deepseek-v4-flash. */
 const MAX_TOKENS_LIMIT = 32768;
 
+/** Default output budget for every call. Document-generation calls that once
+ *  passed a lower explicit budget (16,384) truncate on large inputs; the
+ *  default is now the full 32,768 provider limit for all calls. */
+const DEFAULT_MAX_TOKENS = 32768;
+
+/** Warn before a call when the estimated input plus output budget exceeds this. */
+const MAX_CONTEXT_BUDGET = 100_000;
+
 /** Retry budget multipliers for reasoning-token exhaustion (finish_reason=length with empty content). */
 const TOKEN_EXHAUSTION_MULTIPLIERS = [1.5, 2];
 
@@ -221,13 +229,14 @@ export async function chat(
   const model = options.model ?? "deepseek-v4-flash";
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const thinkingMode = resolveThinkingMode(stage, options.thinkingMode);
+  const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
 
   const body: Record<string, unknown> = {
     model,
     messages,
     stream: false,
     temperature: options.temperature ?? 0.7,
-    max_tokens: options.maxTokens ?? 32768,
+    max_tokens: maxTokens,
     thinking: { type: thinkingMode },
   };
 
@@ -239,7 +248,13 @@ export async function chat(
   if (options.stop) body.stop = options.stop;
   if (options.responseFormat) body.response_format = options.responseFormat;
 
-  console.log(`[deepseek:${stage}:${requestId}] model=${model} | thinking=${thinkingMode} | max_tokens=${body.max_tokens} | timeout=${timeoutMs}ms | attempt=${attempt} | input_tokens≈${Math.round(messages.reduce((s, m) => s + m.content.length, 0) / 4)}`);
+  const estimatedInputTokens = Math.round(messages.reduce((sum, message) => sum + message.content.length, 0) / 4);
+  if (estimatedInputTokens + maxTokens > MAX_CONTEXT_BUDGET) {
+    console.warn(
+      `[deepseek:${stage}:${requestId}] ⚠️ large context: estimated input_tokens≈${estimatedInputTokens} + max_tokens=${maxTokens} = ${estimatedInputTokens + maxTokens} > ${MAX_CONTEXT_BUDGET}`,
+    );
+  }
+  console.log(`[deepseek:${stage}:${requestId}] model=${model} | thinking=${thinkingMode} | max_tokens=${maxTokens} | timeout=${timeoutMs}ms | attempt=${attempt} | input_tokens≈${estimatedInputTokens}`);
 
   const response = await fetchWithTimeout(
     DEEPSEEK_API_URL,
@@ -355,7 +370,7 @@ export async function chatWithRetry(
     // first retry ×1.5, second retry ×2, capped at the provider maximum.
     let attemptOptions = options;
     if (attempt > 0 && (lastError?.type === "token_exhaustion" || lastError?.type === "truncated")) {
-      const originalBudget = options.maxTokens ?? 32768;
+      const originalBudget = options.maxTokens ?? DEFAULT_MAX_TOKENS;
       const multiplier = TOKEN_EXHAUSTION_MULTIPLIERS[attempt - 1] ?? TOKEN_EXHAUSTION_MULTIPLIERS[TOKEN_EXHAUSTION_MULTIPLIERS.length - 1];
       const escalated = Math.min(MAX_TOKENS_LIMIT, Math.floor(originalBudget * multiplier));
       attemptOptions = { ...options, maxTokens: escalated };

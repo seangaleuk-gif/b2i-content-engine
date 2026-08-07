@@ -440,4 +440,36 @@ describe("truncated partial-content handling", () => {
     expect(result.content).toBe('{"units":[]}');
     expect(result.finishReason).toBe("stop");
   });
+
+  it("uses the 32,768 default max_tokens when a document-generation call passes no explicit budget", async () => {
+    mockFetchResponse(successBody('{"blocks":[]}'));
+    await chat([{ role: "user", content: "write a long document" }], {}, "full-document-editorial");
+    expect(lastFetchBody().max_tokens).toBe(32768);
+  });
+
+  it("logs a warning before the call when estimated input + max_tokens exceeds 100,000", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      mockFetchResponse(successBody("ok"));
+      // ~52k estimated input tokens + 32,768 max_tokens > 100,000
+      const longInput = "a ".repeat(210_000);
+      await chat([{ role: "user", content: longInput }], {}, "section-0");
+      const warned = warnSpy.mock.calls.some((call) => String(call[0]).includes("large context"));
+      expect(warned).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not log a large-context warning for a normal-sized call", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      mockFetchResponse(successBody("ok"));
+      await chat([{ role: "user", content: "short prompt" }], {}, "section-0");
+      const warned = warnSpy.mock.calls.some((call) => String(call[0]).includes("large context"));
+      expect(warned).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });

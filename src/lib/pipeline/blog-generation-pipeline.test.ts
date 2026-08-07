@@ -747,8 +747,13 @@ describe("FAQ generation guarantees", () => {
     const visible = extractVisibleFaqFromArticle(html);
     expect(visible.length).toBe(2);
     const rebuilt = renderFaqSchema(visible.map((v) => ({ question: v.question, answerHtml: "", answerText: v.answerText })));
-    const concIdx = html.lastIndexOf("Conclusion.");
-    const finalHtml = concIdx >= 0 ? html.substring(0, concIdx) + rebuilt + "\n\n" + html.substring(concIdx) : html + "\n\n" + rebuilt;
+    doc.faqSchema = {
+      id: "faq-schema",
+      type: "faq-schema",
+      html: rebuilt,
+      fingerprint: "faq-schema",
+    };
+    const finalHtml = renderArticleDocument(doc);
 
     // Validate
     const wpResult = validateWordpressBlockPairs(finalHtml);

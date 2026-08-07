@@ -1,0 +1,304 @@
+// ── Post-Ownership SEO Reconciliation ──
+// Factual-scan and claim-ownership sentence removal run AFTER SEO
+// normalisation and can remove keyphrase placements. This deterministic stage
+// runs immediately after ownership enforcement and restores the exact
+// keyphrase in one suitable editorial H2 and naturally in the first 100
+// readable words, while keeping keyphrase density inside 0.5%–3%.
+//
+// It never introduces unsupported claims, ownership violations, repetition or
+// changes to protected content (CTA, language switcher, FAQ/schema, links,
+// application-owned blocks). Reconciliation is computed on a cloned document
+// and committed to the canonical document only when every guarantee holds.
+
+import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
+import {
+  renderArticleDocument,
+  countCanonicalVisibleWords,
+} from "@/lib/blog/article-document";
+import {
+  countExactPhrase,
+  extractReadableText,
+  getFirstNReadableWords,
+} from "@/lib/seo/seo-text-utils";
+import { computeKeyphraseDensity, englishKeyphraseDensity } from "@/lib/content-standards";
+import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
+import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
+import { titleCaseKeyphrase } from "@/lib/services/text-utils";
+
+export interface PostOwnershipSeoReconcileResult {
+  h2KeyphraseRestored: boolean;
+  first100KeyphraseRestored: boolean;
+  changedHeading: string | null;
+  changedComponentIds: string[];
+  keyphraseCountBefore: number;
+  keyphraseCountAfter: number;
+  densityBefore: number;
+  densityAfter: number;
+  ownershipViolationsAfter: number;
+}
+
+function readableKeyphraseCount(doc: ArticleDocument, keyphrase: string): number {
+  return countExactPhrase(extractReadableText(renderArticleDocument(doc)), keyphrase);
+}
+
+/** The editorial H2s are the canonical section headings of non-FAQ,
+ *  non-conclusion sections only. The FAQ heading, the conclusion heading and
+ *  the CTA heading (a protected block) never count as editorial-H2 placement. */
+function editorialHeadingTexts(doc: ArticleDocument): string[] {
+  return doc.sections
+    .filter(
+      (section) =>
+        section.sectionType !== "faq-heading"
+        && section.sectionType !== "conclusion-heading",
+    )
+    .map((section) => section.heading);
+}
+
+/** Pick the most suitable editorial H2 to carry the keyphrase: the one with
+ *  the highest word overlap, preferring earlier sections for natural flow. */
+function bestHeadingForKeyphrase(
+  sections: Array<{ id: string; heading: string }>,
+  keyphrase: string,
+): { id: string; heading: string } | null {
+  if (sections.length === 0) return null;
+  const kpWords = keyphrase.toLowerCase().split(/\s+/).filter(Boolean);
+  const kpLower = keyphrase.toLowerCase();
+  let best: { id: string; heading: string } | null = null;
+  let bestOverlap = -1;
+  let bestIndex = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < sections.length; index++) {
+    const heading = sections[index].heading;
+    const hLower = heading.toLowerCase();
+    if (hLower.includes(kpLower)) return null;
+    const overlap = [...new Set(hLower.split(/\s+/))]
+      .filter((word) => kpWords.includes(word))
+      .length;
+    if (overlap > bestOverlap || (overlap === bestOverlap && index < bestIndex)) {
+      bestOverlap = overlap;
+      bestIndex = index;
+      best = sections[index];
+    }
+  }
+  return best;
+}
+
+/** Build a natural editorial H2 that contains the exact keyphrase. When the
+ *  heading already ends with a prefix of the keyphrase (e.g. "…Hong Kong
+ *  Marketing" + "hong kong marketing trends 2026"), the remaining words are
+ *  appended naturally ("…Hong Kong Marketing Trends 2026"). When the heading
+ *  already covers the topic and year (e.g. "The State of Digital Marketing in
+ *  Hong Kong for 2026"), appending the keyphrase would duplicate the topic, so
+ *  the keyphrase is PREPENDED instead ("Hong Kong Marketing Trends 2026: The
+ *  State of Digital Marketing"). As a last resort the ": Keyphrase" suffix is
+ *  used only when the heading does not cover the topic. */
+export function buildNaturalHeading(heading: string, keyphrase: string): string {
+  const kpLower = keyphrase.toLowerCase();
+  if (heading.toLowerCase().includes(kpLower)) return heading;
+
+  const titleCase = titleCaseKeyphrase(keyphrase);
+  const kpHasYear = /\b(?:19|20)\d{2}\b/.test(kpLower);
+
+  // When the keyphrase itself carries the year, a heading that repeats the
+  // year ("...for 2026" / "...in Hong Kong for 2026") is stripped so the
+  // result never contains two years.
+  let trimmed = heading.replace(/[:：\s]+$/, "").trim();
+  if (kpHasYear) {
+    const stripped = trimmed
+      .replace(/\s+(?:for\s+(?:19|20)\d{2}|in\s+(?:Hong Kong\s+)?for\s+(?:19|20)\d{2}|in\s+(?:19|20)\d{2})$/i, "")
+      .trim();
+    if (stripped !== trimmed) {
+      trimmed = stripped || trimmed;
+      // The year is now carried by the keyphrase: prepend it for a natural
+      // "Keyphrase: Topic" title/subtitle form.
+      const prefix = `${titleCase}: ${trimmed}`;
+      return prefix.length <= 90 ? prefix : heading;
+    }
+  }
+
+  const kpWords = kpLower.split(/\s+/).filter(Boolean);
+  const hLower = trimmed.toLowerCase();
+  const headingLowerWords = hLower.split(/\s+/);
+
+  // A heading that already covers the topic must not receive a duplicated
+  // ": Keyphrase" append.
+  if (headingAlreadyCoversTopic(trimmed, keyphrase)) {
+    const prefix = `${titleCase}: ${trimmed}`;
+    return prefix.length <= 90 ? prefix : heading;
+  }
+
+  // Longest keyphrase-prefix that matches the heading tail (word boundaries).
+  for (let matchLen = kpWords.length - 1; matchLen >= 1; matchLen--) {
+    const tail = headingLowerWords.slice(-matchLen);
+    const kpPrefix = kpWords.slice(0, matchLen);
+    if (tail.join(" ") === kpPrefix.join(" ")) {
+      const missing = kpWords.slice(matchLen);
+      const suffix = missing.map((word) => titleCaseKeyphrase(word)).join(" ");
+      const candidate = `${trimmed} ${suffix}`;
+      if (candidate.length <= 90) return candidate;
+    }
+  }
+
+  const candidate = `${trimmed}: ${titleCase}`;
+  if (candidate.length <= 90) return candidate;
+  const prefix = `${titleCase}: ${trimmed}`;
+  return prefix.length <= 90 ? prefix : heading;
+}
+
+/** True when the heading already states the keyphrase's topic and year, so
+ *  appending the keyphrase would be a duplicated concatenation. */
+function headingAlreadyCoversTopic(heading: string, keyphrase: string): boolean {
+  const lower = heading.toLowerCase();
+  const words = keyphrase.toLowerCase().split(/\s+/).filter(Boolean);
+  const year = words.find((word) => /^\d{4}$/.test(word));
+  const contentWords = words.filter((word) => !/^\d{4}$/.test(word) && word.length > 2);
+  if (year && lower.includes(year)) {
+    const covered = contentWords.filter((word) => lower.includes(word)).length;
+    return covered >= 2;
+  }
+  return contentWords.filter((word) => lower.includes(word)).length >= Math.max(2, contentWords.length - 1);
+}
+
+/** Insert the exact keyphrase naturally at the start of the introduction's
+ *  first paragraph so it appears inside the first 100 readable words. */
+function insertKeyphraseInIntroduction(
+  doc: ArticleDocument,
+  keyphrase: string,
+): { changed: boolean } {
+  const intro = doc.introduction;
+  const target = intro.blocks.findIndex((block) => {
+    if (block.type !== "paragraph") return false;
+    const text = block.content.map((node) => node.text).join("").trim();
+    return text.length >= 20;
+  });
+  if (target < 0) return { changed: false };
+  const block = intro.blocks[target] as Extract<EditorialBlock, { type: "paragraph" }>;
+  const fullText = block.content.map((node) => node.text).join("");
+  if (fullText.toLowerCase().includes(keyphrase.toLowerCase())) {
+    return { changed: false };
+  }
+  const firstSentence = fullText.match(/^[^.!?]+[.!?]+/)?.[0];
+  if (!firstSentence) return { changed: false };
+  const lead = `When it comes to ${keyphrase}, `;
+  const replacement = lead + firstSentence.charAt(0).toLowerCase() + firstSentence.slice(1);
+  const rest = fullText.slice(firstSentence.length);
+  const newBlock: Extract<EditorialBlock, { type: "paragraph" }> = {
+    ...block,
+    content: [{ type: "text", text: `${replacement}${rest}` }],
+  };
+  intro.blocks[target] = newBlock;
+  return { changed: true };
+}
+
+/**
+ * Restore missing keyphrase placements deterministically after factual and
+ * ownership enforcement. The canonical document is committed only when the
+ * reconciled clone keeps density inside 0.5%–3%, introduces no unsupported
+ * claims and introduces no ownership violations.
+ */
+export function reconcilePostOwnershipKeyphrase(
+  doc: ArticleDocument,
+  keyphrase: string,
+  research: Array<{ title?: string; snippet?: string; url?: string }>,
+  ledger?: ClaimOwnershipLedger,
+): PostOwnershipSeoReconcileResult {
+  const result: PostOwnershipSeoReconcileResult = {
+    h2KeyphraseRestored: false,
+    first100KeyphraseRestored: false,
+    changedHeading: null,
+    changedComponentIds: [],
+    keyphraseCountBefore: 0,
+    keyphraseCountAfter: 0,
+    densityBefore: 0,
+    densityAfter: 0,
+    ownershipViolationsAfter: 0,
+  };
+  const kpLower = keyphrase.toLowerCase().trim();
+  if (!kpLower) return result;
+  result.keyphraseCountBefore = readableKeyphraseCount(doc, keyphrase);
+  const wordCountBefore = countCanonicalVisibleWords(doc);
+  result.densityBefore = computeKeyphraseDensity(
+    result.keyphraseCountBefore,
+    keyphrase,
+    wordCountBefore,
+  );
+
+  const candidate = structuredClone(doc);
+  const changedIds = new Set<string>();
+
+  // 1. One suitable editorial H2. The FAQ heading and CTA heading never count:
+  // placement and detection both use the canonical editorial section headings.
+  const hasKpInH2 = editorialHeadingTexts(candidate).some((heading) =>
+    heading.toLowerCase().includes(kpLower),
+  );
+  let changedHeading: string | null = null;
+  if (!hasKpInH2) {
+    const editorialSections = candidate.sections
+      .filter(
+        (section) =>
+          section.sectionType !== "faq-heading"
+          && section.sectionType !== "conclusion-heading",
+      )
+      .map((section) => ({ id: section.id, heading: section.heading }));
+    const target = bestHeadingForKeyphrase(editorialSections, keyphrase);
+    if (target) {
+      const newHeading = buildNaturalHeading(target.heading, keyphrase);
+      if (newHeading !== target.heading) {
+        const section = candidate.sections.find((item) => item.id === target.id);
+        if (section) {
+          changedHeading = target.heading;
+          section.heading = newHeading;
+          changedIds.add(target.id);
+        }
+      }
+    }
+  }
+
+  // 2. First 100 readable words.
+  const first100 = getFirstNReadableWords(renderArticleDocument(candidate), 100).toLowerCase();
+  if (!first100.includes(kpLower)) {
+    if (insertKeyphraseInIntroduction(candidate, keyphrase).changed) {
+      changedIds.add(candidate.introduction.id);
+    }
+  }
+
+  // 3. Guarantees. Reject the whole reconciliation unless every guarantee holds.
+  const { warningBelow: kpWarning, stuffingAbove: kpStuffing } = englishKeyphraseDensity();
+  const finalWordCount = countCanonicalVisibleWords(candidate);
+  const density = computeKeyphraseDensity(
+    readableKeyphraseCount(candidate, keyphrase),
+    keyphrase,
+    finalWordCount,
+  );
+  const unsupported = scanFactualRisks(
+    renderArticleDocument(candidate),
+    keyphrase,
+    research,
+  ).claims.filter((claim) => !claim.supported);
+  const ownershipViolations = ledger
+    ? validateClaimOwnership(candidate, ledger, keyphrase, research)
+    : [];
+  result.ownershipViolationsAfter = ownershipViolations.length;
+
+  const safe = density >= kpWarning
+    && density <= kpStuffing
+    && unsupported.length === 0
+    && ownershipViolations.length === 0;
+
+  if (safe && changedIds.size > 0) {
+    // Commit the reconciled clone onto the canonical document.
+    doc.sections = candidate.sections;
+    doc.introduction = candidate.introduction;
+    result.h2KeyphraseRestored = changedHeading !== null;
+    result.first100KeyphraseRestored = changedIds.has(candidate.introduction.id);
+    result.changedHeading = changedHeading;
+    result.changedComponentIds = [...changedIds];
+  }
+
+  result.keyphraseCountAfter = readableKeyphraseCount(doc, keyphrase);
+  result.densityAfter = computeKeyphraseDensity(
+    result.keyphraseCountAfter,
+    keyphrase,
+    countCanonicalVisibleWords(doc),
+  );
+  return result;
+}

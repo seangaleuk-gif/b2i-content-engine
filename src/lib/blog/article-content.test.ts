@@ -126,6 +126,47 @@ describe("normalizeAiEditorialPayload", () => {
     expect(result.blocks.length).toBe(0);
   });
 
+  it("normalizes generic heading block to canonical H3 subheading", () => {
+    const input = { blocks: [{ type: "heading", text: "Key Benefits" }] };
+    const result = normalizeAiEditorialPayload(input, "sec-heading");
+    expect(result.errors.length).toBe(0);
+    expect(result.blocks.length).toBe(1);
+    expect(result.blocks[0]).toMatchObject({
+      type: "subheading",
+      level: 3,
+    });
+    const html = renderEditorialBlocksToWordPress(result.blocks);
+    expect(html).toContain("<!-- wp:heading {\"level\":3} --><h3>Key Benefits</h3><!-- /wp:heading -->");
+  });
+
+  it("normalizes heading with explicit level 3 to canonical H3 subheading", () => {
+    const input = { blocks: [{ type: "heading", text: "Explicit H3", level: 3 }] };
+    const result = normalizeAiEditorialPayload(input, "sec-heading");
+    expect(result.errors.length).toBe(0);
+    expect(result.blocks[0]).toMatchObject({ type: "subheading", level: 3 });
+  });
+
+  it("rejects generic heading requesting level 2", () => {
+    const input = { blocks: [{ type: "heading", text: "Wrong", level: 2 }] };
+    const result = normalizeAiEditorialPayload(input, "sec-heading");
+    expect(result.errors.join(" ")).toContain("disallowed level 2");
+    expect(result.blocks.length).toBe(0);
+  });
+
+  it("rejects generic heading requesting an unsupported level", () => {
+    const input = { blocks: [{ type: "heading", text: "Wrong", level: 1 }] };
+    const result = normalizeAiEditorialPayload(input, "sec-heading");
+    expect(result.errors.join(" ")).toContain("unsupported level");
+    expect(result.blocks.length).toBe(0);
+  });
+
+  it("rejects empty generic heading", () => {
+    const input = { blocks: [{ type: "heading", text: "" }] };
+    const result = normalizeAiEditorialPayload(input, "sec-heading");
+    expect(result.errors.join(" ")).toContain("empty");
+    expect(result.blocks.length).toBe(0);
+  });
+
   it("rejects text containing WordPress block comments", () => {
     const input = { blocks: [{ type: "paragraph", text: "Some <!-- wp:paragraph --> text" }] };
     const result = normalizeAiEditorialPayload(input, "sec-11");

@@ -1,6 +1,5 @@
-const WP_API_BASE = process.env.NEXT_PUBLIC_WP_SITE_URL || "";
-
 import { AppError } from "./errors";
+import { fingerprintHtml } from "@/lib/blog/article-document";
 
 function getCredentials() {
   const siteUrl = process.env.NEXT_PUBLIC_WP_SITE_URL;
@@ -121,6 +120,72 @@ export async function publishToWordPress(input: WpPostInput): Promise<{ id: numb
   return { id: data.id, url: data.link };
 }
 
+interface WpPostReadback {
+  id: number;
+  link: string;
+  status: string;
+  content?: { raw?: string; rendered?: string };
+}
+
+async function readWordPressPost(id: number): Promise<WpPostReadback> {
+  const { baseUrl, auth } = getCredentials();
+  const response = await fetch(`${baseUrl}/wp-json/wp/v2/posts/${id}?context=edit`, {
+    headers: { Authorization: `Basic ${auth}` },
+  });
+  if (!response.ok) {
+    throw AppError.internal(new Error(`WordPress readback failed for post ${id}: ${response.status}`));
+  }
+  return response.json() as Promise<WpPostReadback>;
+}
+
+async function verifyWordPressPost(id: number, expectedContent: string, expectedStatus: "draft" | "publish"): Promise<WpPostReadback> {
+  const post = await readWordPressPost(id);
+  const raw = post.content?.raw;
+  if (typeof raw !== "string") {
+    throw AppError.internal(new Error(`WordPress readback for post ${id} omitted raw content`));
+  }
+  if (fingerprintHtml(raw) !== fingerprintHtml(expectedContent)) {
+    throw AppError.internal(new Error(`WordPress content readback mismatch for post ${id}`));
+  }
+  if (post.status !== expectedStatus) {
+    throw AppError.internal(new Error(`WordPress status mismatch for post ${id}: expected ${expectedStatus}, got ${post.status}`));
+  }
+  return post;
+}
+
+async function setWordPressPostStatus(id: number, status: "draft" | "publish"): Promise<WpPostReadback> {
+  const { baseUrl, auth } = getCredentials();
+  const response = await fetch(`${baseUrl}/wp-json/wp/v2/posts/${id}`, {
+    method: "POST",
+    headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  if (!response.ok) {
+    throw AppError.internal(new Error(`WordPress status update failed for post ${id}: ${response.status}`));
+  }
+  return response.json() as Promise<WpPostReadback>;
+}
+
+async function compensateWordPressPost(id: number): Promise<void> {
+  const { baseUrl, auth } = getCredentials();
+  const response = await fetch(`${baseUrl}/wp-json/wp/v2/posts/${id}?force=true`, {
+    method: "DELETE",
+    headers: { Authorization: `Basic ${auth}` },
+  });
+  if (!response.ok && response.status !== 404) {
+    console.error(`[wp] Compensation failed for post ${id}: ${response.status}`);
+  }
+}
+
+/** Delete both posts created by a completed bilingual attempt when a later
+ * application-owned commit (for example, project status) fails. */
+export async function compensateBilingualWordPress(enPostId: number, zhPostId: number): Promise<void> {
+  await Promise.all([
+    compensateWordPressPost(enPostId),
+    compensateWordPressPost(zhPostId),
+  ]);
+}
+
 export async function publishBilingual(
   enTitle: string,
   enContent: string,
@@ -140,40 +205,58 @@ export async function publishBilingual(
   zhFocusKeyword: string,
   status: "publish" | "draft" = "publish"
 ): Promise<{ en: { id: number; url: string }; zh: { id: number; url: string } }> {
-  const en = await publishToWordPress({
-    title: enTitle,
-    content: enContent,
-    slug: enSlug,
-    categories: enCategories,
-    tags: enTags,
-    seoTitle: enSeoTitle,
-    metaDescription: enMetaDescription,
-    focusKeyword: enFocusKeyword,
-    status,
-  });
-
-  let zh: { id: number; url: string } | null = null;
-
-  if (zhContent) {
-    try {
-      zh = await publishToWordPress({
-        title: zhTitle,
-        content: zhContent,
-        slug: zhSlug,
-        categories: zhCategories,
-        tags: zhTags,
-        seoTitle: zhSeoTitle,
-        metaDescription: zhMetaDescription,
-        focusKeyword: zhFocusKeyword,
-        status,
-      });
-    } catch (err) {
-      console.error("[wp] Chinese version publish failed:", err);
-    }
+  if (!zhContent) {
+    throw AppError.badRequest("A validated Traditional Chinese version is required for bilingual WordPress saving");
   }
 
-  return {
-    en,
-    zh: zh || { id: 0, url: "" },
-  };
+  let en: { id: number; url: string } | null = null;
+  let zh: { id: number; url: string } | null = null;
+  try {
+    // Stage both language versions as drafts first. Nothing becomes publicly
+    // visible until both posts have passed raw-content readback.
+    en = await publishToWordPress({
+      title: enTitle,
+      content: enContent,
+      slug: enSlug,
+      categories: enCategories,
+      tags: enTags,
+      seoTitle: enSeoTitle,
+      metaDescription: enMetaDescription,
+      focusKeyword: enFocusKeyword,
+      status: "draft",
+    });
+    await verifyWordPressPost(en.id, enContent, "draft");
+
+    zh = await publishToWordPress({
+      title: zhTitle,
+      content: zhContent,
+      slug: zhSlug,
+      categories: zhCategories,
+      tags: zhTags,
+      seoTitle: zhSeoTitle,
+      metaDescription: zhMetaDescription,
+      focusKeyword: zhFocusKeyword,
+      status: "draft",
+    });
+    await verifyWordPressPost(zh.id, zhContent, "draft");
+
+    if (status === "publish") {
+      await setWordPressPostStatus(en.id, "publish");
+      await setWordPressPostStatus(zh.id, "publish");
+      const enPublished = await verifyWordPressPost(en.id, enContent, "publish");
+      const zhPublished = await verifyWordPressPost(zh.id, zhContent, "publish");
+      en = { id: enPublished.id, url: enPublished.link };
+      zh = { id: zhPublished.id, url: zhPublished.link };
+    }
+
+    return { en, zh };
+  } catch (error) {
+    // WordPress has no cross-post transaction. Delete every post created by
+    // this attempt so a partial bilingual publication is never reported as
+    // successful or left public.
+    if (zh?.id && en?.id) await compensateBilingualWordPress(en.id, zh.id);
+    else if (zh?.id) await compensateWordPressPost(zh.id);
+    else if (en?.id) await compensateWordPressPost(en.id);
+    throw error;
+  }
 }

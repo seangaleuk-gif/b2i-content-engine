@@ -60,7 +60,8 @@ export type MalformedProseIssueCode =
   | "corrupt-token"
   | "serialized-program-value"
   | "instruction-placeholder"
-  | "replacement-character";
+  | "replacement-character"
+  | "punctuation-fragment";
 
 export interface MalformedProseTextIssue {
   textIndex: number;
@@ -206,6 +207,11 @@ export function findMalformedProseTextIssues(texts: string[]): MalformedProseTex
     if (/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i.test(trimmed)) {
       addIssue(index, "incomplete-sentence-ending", "incomplete sentence ending", trimmed);
     }
+    // A block reduced to punctuation only (".", "...", "—") is a leftover
+    // fragment from a deterministic sentence removal and is always malformed.
+    if (/^[\s\p{P}\p{S}]+$/u.test(trimmed) && /[.!?—–…]/.test(trimmed)) {
+      addIssue(index, "punctuation-fragment", "block contains only punctuation", trimmed);
+    }
     for (const pattern of CORRUPT_TEXT_PATTERNS) {
       if (pattern.regex.test(trimmed)) {
         addIssue(index, pattern.code, pattern.label, trimmed);
@@ -219,6 +225,42 @@ export function detectMalformedProseTexts(texts: string[]): string[] {
   return findMalformedProseTextIssues(texts).map(
     (issue) => `text ${issue.textIndex + 1}: ${issue.message}`,
   );
+}
+
+function malformedTextsForBlock(block: EditorialBlock): string[] {
+  if (block.type === "list") {
+    return block.items.map((item) => item.map((inline) => inline.text).join(""));
+  }
+  return [extractPlainTextFromEditorialBlocks([block])];
+}
+
+/**
+ * Authoritative malformed-prose scan over the final canonical ArticleDocument
+ * (intro, editorial sections and conclusion). Blocks with any malformed-prose
+ * issue are unresolved deterministic corruption and must be a hard failure at
+ * the final gate and in the pre-save gate.
+ */
+export function scanMalformedProseInDocument(doc: ArticleDocument): Array<{
+  componentId: string;
+  blockId: string;
+  issues: MalformedProseTextIssue[];
+}> {
+  const findings: Array<{ componentId: string; blockId: string; issues: MalformedProseTextIssue[] }> = [];
+  const checkComponent = (componentId: string, blocks: EditorialBlock[]) => {
+    for (const block of blocks) {
+      const issues = findMalformedProseTextIssues(malformedTextsForBlock(block));
+      if (issues.length > 0) {
+        findings.push({ componentId, blockId: block.id, issues });
+      }
+    }
+  };
+  checkComponent(doc.introduction.id, doc.introduction.blocks);
+  for (const section of doc.sections) {
+    if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
+    checkComponent(section.id, section.blocks);
+  }
+  checkComponent(doc.conclusion.id, doc.conclusion.blocks);
+  return findings;
 }
 
 function countRoboticPhrases(text: string): number {

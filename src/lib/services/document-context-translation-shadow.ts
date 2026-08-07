@@ -215,6 +215,8 @@ export interface ShadowEditorialReviewInfo {
   failure: string | null;
   diagnostics: string[];
   truncated: boolean;
+  documentAccepted?: boolean;
+  unresolvedUnitIds?: string[];
 }
 
 export interface ShadowLanguagePackDiagnostics {
@@ -397,6 +399,7 @@ function emptyResult(forceEnabled = false): DocumentContextTranslationShadowResu
       enabled: false, status: "not-run", callCount: 0, selectedUnitIds: [],
       selectedReasons: [], patches: [], appliedPatchCount: 0, retainedCount: 0,
       failure: null, diagnostics: [], truncated: false,
+      documentAccepted: false, unresolvedUnitIds: [],
     },
     preview: { previewOnly: true, retainedDoc: null, retainedSource: "none", stored: false, exportPath: null, timestamp: "" },
     warnings: [],

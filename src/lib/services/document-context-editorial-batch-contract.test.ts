@@ -1,6 +1,4 @@
 import { describe, it, expect } from "vitest";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { ArticleDocument } from "@/lib/blog/article-document";
 import { extractPlainTextFromEditorialBlocks } from "@/lib/blog/article-content";
 import { buildTranslationSourceDocument } from "./translation-source-document";
@@ -41,9 +39,17 @@ function oneFinding(overrides: Partial<StyleFinding> = {}): StyleFinding {
 
 describe("live bilingual-a finding-contract rejection (from failed preview metadata)", () => {
   it("reproduces the other=2 finding-contract rejection with two named codes", () => {
-    const json = fs.readFileSync(path.join(".tmp", "shadow-previews", "project-19-2026-08-02T10-51-49-072Z.json"), "utf8");
-    const parsed = JSON.parse(json);
-    const zh = parsed.preEditorialDoc as ArticleDocument;
+    const zh: ArticleDocument = {
+      metadata: { title: "香港 followers 指南", slug: "fixture", metaDescription: "因此要進行 campaign。", excerpt: "越來越多人出 post。", targetWordCount: 1000, focusKeyphrase: "營銷" },
+      languageSwitcher: null,
+      introduction: { id: "intro", blocks: [{ id: "i0", type: "paragraph", content: [{ type: "text", text: "因此要進行 campaign，同時保持誠實。" }] }], status: "generated" },
+      sections: [{ id: "s0", heading: "發布內容", headingLevel: 2, sectionType: "main", blocks: [{ id: "s0b0", type: "paragraph", content: [{ type: "text", text: "越來越多 followers 會出 post。" }] }], status: "generated" }],
+      visibleFaq: [{ question: "點樣開始？", answerHtml: "", answerText: "因此要進行測試。" }],
+      conclusion: { id: "conclusion", blocks: [{ id: "c0", type: "paragraph", content: [{ type: "text", text: "此外要保持一致。" }] }], status: "generated" },
+      cta: null,
+      faqSchema: null,
+      insertedLinks: [],
+    };
     const sourceDoc = buildTranslationSourceDocument(zh);
     const batchA = buildBilingualEditorialBatches(sourceDoc)[0];
 

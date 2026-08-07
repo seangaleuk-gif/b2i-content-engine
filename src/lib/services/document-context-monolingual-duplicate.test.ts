@@ -1,6 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { ArticleDocument } from "@/lib/blog/article-document";
 import { extractPlainTextFromEditorialBlocks } from "@/lib/blog/article-content";
 import {
@@ -42,6 +40,32 @@ function draftUnits(zh: ArticleDocument): Array<{ sourceUnitId: string; text: st
 
 function paragraphBlock(id: string, text: string): ArticleDocument["introduction"]["blocks"][number] {
   return { id, type: "paragraph", content: [{ type: "text", text }] };
+}
+
+function makeDuplicateFindingFixture(): ArticleDocument {
+  const sections = Array.from({ length: 5 }, (_, sectionIndex) => ({
+    id: `s${sectionIndex}`,
+    heading: `第${sectionIndex + 1}節`,
+    headingLevel: 2 as const,
+    sectionType: "main" as const,
+    blocks: Array.from({ length: sectionIndex === 3 ? 8 : sectionIndex === 4 ? 7 : 1 }, (_, blockIndex) =>
+      paragraphBlock(
+        `s${sectionIndex}-${blockIndex}`,
+        "內容越來越正式，因此 followers 同時出 post。",
+      )),
+    status: "generated" as const,
+  }));
+  return {
+    metadata: { title: "香港營銷指南", slug: "fixture", metaDescription: "實用香港營銷指南。", excerpt: "實用指南。", targetWordCount: 1500, focusKeyphrase: "香港營銷" },
+    languageSwitcher: null,
+    introduction: { id: "intro", blocks: [paragraphBlock("i0", "香港品牌可以由小步開始。")], status: "generated" },
+    sections,
+    visibleFaq: [],
+    conclusion: { id: "conclusion", blocks: [paragraphBlock("c0", "最後按結果調整。")], status: "generated" },
+    cta: null,
+    faqSchema: null,
+    insertedLinks: [],
+  };
 }
 
 function makeEnDoc(): ArticleDocument {
@@ -115,8 +139,7 @@ describe("monolingual duplicate-unit diagnosis (from failed live preview)", () =
   afterEach(() => { delete process.env[DOCUMENT_CONTEXT_SHADOW_FLAG]; delete process.env[SHADOW_BILINGUAL_EDITORIAL_POLISH_FLAG]; });
 
   it("1/2/3. input units are unique but the five rejected units each carry multiple findings, grouped into one record each", () => {
-    const json = fs.readFileSync(path.join(".tmp", "shadow-previews", "project-19-2026-08-02T14-41-31-967Z.json"), "utf8");
-    const zh = JSON.parse(json).preEditorialDoc as ArticleDocument;
+    const zh = makeDuplicateFindingFixture();
     const draft = draftUnits(zh);
 
     // Serialized input is unique per unitId.

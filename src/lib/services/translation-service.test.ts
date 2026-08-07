@@ -24,6 +24,23 @@ import {
 } from "./translation-service";
 import { formatWordCount } from "@/lib/services/text-utils";
 
+// This suite verifies deterministic orchestration and must never contact a
+// translation provider. Provider-owned metadata calls fail immediately so the
+// production deterministic fallback is exercised without network access.
+vi.mock("@/lib/services/deepseek", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/services/deepseek")>();
+  return {
+    ...actual,
+    AiService: class OfflineAiService {
+      get chatWithRetry() {
+        return async () => {
+          throw new Error("translation-service.test offline provider guard");
+        };
+      }
+    },
+  };
+});
+
 // ── Service-flow integration tests ──
 
 function makeSourceDoc(): ArticleDocument {
@@ -218,7 +235,7 @@ describe("translateArticle — structured helper orchestration", () => {
     // the route reject the candidate before any bilingual persistence.
     expect(result.doc.sections.length).toBeGreaterThan(0);
     expect(result.doc.sections[0].blocks.length).toBeGreaterThan(0);
-    expect(result.failedComponents).toContain("section-0");
+    expect(result.failedComponents).toContain("zh-section-0-editorial");
     expect(result.failedComponents.some((component) => component.startsWith("validation:"))).toBe(true);
   });
 
@@ -433,9 +450,13 @@ describe("structured translation shadow orchestration", () => {
   it("shadow disabled by default makes zero shadow calls", async () => {
     const mockCalls: Array<string> = [];
     const mockHelper = makeShadowMock(mockCalls);
-    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], { translateEditorialBlocks: mockHelper });
-    // No structured shadow was configured, so zero DTO-related calls
-    expect(mockCalls.filter((c) => c === "conclusion").length).toBe(1); // HTML path conclusion call
+    const shadowTranslate = vi.fn(async () => "");
+    await translateArticle(makeMinimalEnHtml(), makeSourceDoc(), [], {
+      translateEditorialBlocks: mockHelper,
+      structuredTranslationShadow: { enabled: false, translatePayload: shadowTranslate },
+    });
+    expect(shadowTranslate).not.toHaveBeenCalled();
+    expect(mockCalls.filter((c) => c === "conclusion").length).toBeGreaterThanOrEqual(1);
   });
 
   it("enabled shadow runs for conclusion but not intro, sections, FAQ, CTA", async () => {

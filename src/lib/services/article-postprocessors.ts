@@ -105,11 +105,21 @@ export function insertExternalResearchLinks(
   const blockRe = /<!--\s*wp:(\w+)(?:\s[\s\S]*?)?\s*-->([\s\S]*?)<!--\s*\/wp:\1\s*-->/gi;
   let match: RegExpExecArray | null;
   let sectionIndex = 0;
+  const sectionHeadings: string[] = [];
   while ((match = blockRe.exec(articleHtml)) !== null) {
     const type = match[1].toLowerCase();
     const full = match[0];
-    if (type === "heading" && /<h2\b/i.test(full)) sectionIndex++;
-    if (type === "html" || type === "heading") continue;
+    if (type === "heading") {
+      const headingMatch = /<h2\b[^>]*>([\s\S]*?)<\/h2>/i.exec(full);
+      if (/<h2\b/i.test(full)) {
+        // Blocks after this heading use the incremented section index, so the
+        // heading text is stored at the index the following blocks read.
+        sectionIndex++;
+        if (headingMatch) sectionHeadings[sectionIndex] = headingMatch[1].replace(/<[^>]+>/g, " ").trim();
+      }
+      continue;
+    }
+    if (type === "html") continue;
     blocks.push({
       start: match.index,
       end: match.index + full.length,
@@ -119,6 +129,17 @@ export function insertExternalResearchLinks(
       sectionIndex,
     });
   }
+
+  // Lexical agreement with the section's H2: a source citation must support
+  // the section's actual topic, never merely its prose pool.
+  const headingTopicTokens = (heading: string | undefined): Set<string> =>
+    new Set(
+      (heading ?? "")
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, " ")
+        .split(/\s+/)
+        .filter((word) => word.length >= 4),
+    );
 
   type Assignment = {
     position: number;
@@ -131,11 +152,24 @@ export function insertExternalResearchLinks(
     for (const block of blocks) {
       const score = evidenceRelevanceScore(block.text, `${source.title} ${source.snippet ?? ""}`);
       if (score <= 0) continue;
+      // Section-topic relevance bonus: cite a source in a section whose H2
+      // shares topic words with the source, so a citation never contradicts
+      // the surrounding section's topic.
+      const sourceTokens = (text: string) => new Set(
+        text.toLowerCase()
+          .replace(/\d+(?:[.,]\d+)*/g, " ")
+          .replace(/[^\p{L}\p{N}\s]/gu, " ")
+          .split(/\s+/)
+          .filter((word) => word.length >= 4 && !["that", "this", "with", "from", "threads"].includes(word)),
+      );
+      const headingTokens = headingTopicTokens(sectionHeadings[block.sectionIndex]);
+      const sourceSet = sourceTokens(`${source.title} ${source.snippet ?? ""}`);
+      const headingOverlap = [...headingTokens].filter((token) => sourceSet.has(token)).length;
       candidates.push({
         position: block.end,
         sectionIndex: block.sectionIndex,
         source,
-        score,
+        score: score + Math.min(60, headingOverlap * 8),
       });
     }
   }
