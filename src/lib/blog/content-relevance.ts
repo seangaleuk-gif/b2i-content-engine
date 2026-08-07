@@ -238,6 +238,31 @@ function isPureSourceCitationBlock(html: string): boolean {
 }
 
 /**
+ * Find every pure `Source: <a>…</a>.` citation block flagged as off-topic by
+ * relevance, keyed by stable block ID. This is the single detection used by
+ * both the bounded removal and its diagnostics, so a block that is reported as
+ * removed is exactly the block that will be removed.
+ */
+export function collectOffTopicSourceCitationBlockIds(
+  doc: ArticleDocument,
+  violations: SourceRelevanceViolation[],
+): Array<{ sectionId: string; blockId: string; url: string }> {
+  const found: Array<{ sectionId: string; blockId: string; url: string }> = [];
+  for (const violation of violations) {
+    const section = doc.sections.find((item) => item.id === violation.sectionId);
+    if (!section) continue;
+    const index = section.blocks.findIndex((block) => {
+      if (block.type !== "paragraph") return false;
+      const html = renderComponentHtml({ id: section.id, blocks: [block], status: section.status });
+      return html.includes(violation.url) && isPureSourceCitationBlock(html);
+    });
+    if (index < 0) continue;
+    found.push({ sectionId: section.id, blockId: section.blocks[index].id, url: violation.url });
+  }
+  return found;
+}
+
+/**
  * Bounded deterministic repair for off-topic source citations: a pure
  * `Source: <a>…</a>.` citation paragraph flagged by relevance is removed from
  * its section (it carries no body claims or numbers). Citations embedded in
@@ -248,19 +273,14 @@ export function removeOffTopicSourceCitations(
   doc: ArticleDocument,
   violations: SourceRelevanceViolation[],
 ): number {
-  let removed = 0;
-  for (const violation of violations) {
-    const section = doc.sections.find((item) => item.id === violation.sectionId);
+  const targets = collectOffTopicSourceCitationBlockIds(doc, violations);
+  for (const target of targets) {
+    const section = doc.sections.find((item) => item.id === target.sectionId);
     if (!section) continue;
-    const index = section.blocks.findIndex((block) => {
-      if (block.type !== "paragraph") return false;
-      const html = renderComponentHtml({ id: section.id, blocks: [block], status: section.status });
-      return html.includes(violation.url) && isPureSourceCitationBlock(html);
-    });
+    const index = section.blocks.findIndex((block) => block.id === target.blockId);
     if (index < 0) continue;
     section.blocks.splice(index, 1);
     section.status = "trimmed";
-    removed++;
   }
-  return removed;
+  return targets.length;
 }

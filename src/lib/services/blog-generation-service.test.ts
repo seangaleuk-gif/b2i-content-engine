@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { normalizeOutlineHeadings, runBlogGeneration } from "@/lib/services/blog-generation-service";
+import {
+  normalizeOutlineHeadings,
+  runBlogGeneration,
+  runGenerationTasksWithConcurrency,
+} from "@/lib/services/blog-generation-service";
 import { resolveResearchDispatch } from "@/lib/services/blog-generation-service";
 import { runPostAssemblyPipeline, createPipelineState } from "@/lib/pipeline/blog-generation-pipeline";
 import { runBraveResearchWithRetry } from "@/lib/services/brave";
@@ -287,6 +291,54 @@ describe("runBlogGeneration — successful flow", () => {
   it("completes without errors", async () => {
     const mock = buildRequestMock([]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
+  });
+});
+
+describe("generation concurrency failure boundary", () => {
+  it("awaits in-flight siblings and starts no new work after the first fatal failure", async () => {
+    let releaseSibling!: () => void;
+    const siblingGate = new Promise<void>((resolve) => { releaseSibling = resolve; });
+    let siblingSettled = false;
+    let pipelineRejected = false;
+    const neverStarted = vi.fn(async () => "third");
+
+    const running = runGenerationTasksWithConcurrency([
+      async () => { throw new Error("section failed"); },
+      async () => {
+        await siblingGate;
+        siblingSettled = true;
+        return "late sibling";
+      },
+      neverStarted,
+    ], 2).catch((error) => {
+      pipelineRejected = true;
+      throw error;
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(pipelineRejected).toBe(false);
+    expect(siblingSettled).toBe(false);
+    expect(neverStarted).not.toHaveBeenCalled();
+
+    releaseSibling();
+    await expect(running).rejects.toThrow("section failed");
+    expect(siblingSettled).toBe(true);
+    expect(neverStarted).not.toHaveBeenCalled();
+  });
+
+  it("treats an undefined rejection reason as a real failure", async () => {
+    let secondStarted = false;
+    const running = runGenerationTasksWithConcurrency([
+      () => Promise.reject(undefined),
+      async () => {
+        secondStarted = true;
+        return "late";
+      },
+    ], 1);
+
+    await expect(running).rejects.toBeUndefined();
+    expect(secondStarted).toBe(false);
   });
 });
 

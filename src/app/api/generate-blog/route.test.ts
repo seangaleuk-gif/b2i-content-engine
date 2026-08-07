@@ -89,9 +89,9 @@ function invalidGenerationResult(): GenerationResult {
       title: doc.metadata.title,
       slug: doc.metadata.slug,
       metaDescription: doc.metadata.metaDescription,
-      excerpt: "",
+      excerpt: doc.metadata.excerpt,
       blog: pipelineState.blog,
-      faq: [],
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
       internalLinks: [],
       externalLinks: [],
       categories: [],
@@ -300,9 +300,9 @@ function ownershipViolationGenerationResult(): GenerationResult {
       title: doc.metadata.title,
       slug: doc.metadata.slug,
       metaDescription: doc.metadata.metaDescription,
-      excerpt: "",
+      excerpt: doc.metadata.excerpt,
       blog: pipelineState.blog,
-      faq: [],
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
       internalLinks: [],
       externalLinks: [],
       categories: [],
@@ -330,9 +330,9 @@ function coherenceViolationGenerationResult(): GenerationResult {
       title: doc.metadata.title,
       slug: doc.metadata.slug,
       metaDescription: doc.metadata.metaDescription,
-      excerpt: "",
+      excerpt: doc.metadata.excerpt,
       blog: pipelineState.blog,
-      faq: [],
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
       internalLinks: [],
       externalLinks: [],
       categories: [],
@@ -360,9 +360,9 @@ function sentenceQualityViolationGenerationResult(): GenerationResult {
       title: doc.metadata.title,
       slug: doc.metadata.slug,
       metaDescription: doc.metadata.metaDescription,
-      excerpt: "",
+      excerpt: doc.metadata.excerpt,
       blog: pipelineState.blog,
-      faq: [],
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
       internalLinks: [],
       externalLinks: [],
       categories: [],
@@ -390,9 +390,9 @@ function boilerplateViolationGenerationResult(): GenerationResult {
       title: doc.metadata.title,
       slug: doc.metadata.slug,
       metaDescription: doc.metadata.metaDescription,
-      excerpt: "",
+      excerpt: doc.metadata.excerpt,
       blog: pipelineState.blog,
-      faq: [],
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
       internalLinks: [],
       externalLinks: [],
       categories: [],
@@ -428,6 +428,24 @@ describe("generate-blog persistence boundary", () => {
     }));
 
     expect(response.status).toBe(422);
+    expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
+    expect(mocks.createVersion).not.toHaveBeenCalled();
+    expect(mocks.updateProject).not.toHaveBeenCalled();
+  });
+
+  it("never validates one representation and persists a different rendered payload", async () => {
+    const mismatched = invalidGenerationResult();
+    mismatched.generated.blog += "<!-- wp:paragraph --><p>Different payload.</p><!-- /wp:paragraph -->";
+    mocks.runBlogGeneration.mockResolvedValue(mismatched);
+
+    const response = await POST(new Request("http://localhost/api/generate-blog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: 1 }),
+    }));
+
+    expect(response.status).toBe(422);
+    expect(JSON.stringify(await response.json())).toContain("Canonical pre-save agreement failed");
     expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
     expect(mocks.createVersion).not.toHaveBeenCalled();
     expect(mocks.updateProject).not.toHaveBeenCalled();

@@ -6,6 +6,23 @@ import type { TranslateEditorialBlocksOptions } from "./editorial-block-translat
 /** Shared event log proving the shadow runs only after production provider work. */
 const order: string[] = [];
 
+// This integration suite verifies orchestration order, not the live provider.
+// Keep metadata fallbacks deterministic and prevent fixture content from ever
+// leaving the test process even though individual cases install a fake key.
+vi.mock("@/lib/services/deepseek", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/services/deepseek")>();
+  return {
+    ...actual,
+    AiService: class OfflineAiService {
+      get chatWithRetry() {
+        return async () => {
+          throw new Error("document-context shadow integration offline provider guard");
+        };
+      }
+    },
+  };
+});
+
 vi.mock("./document-context-translation-shadow", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./document-context-translation-shadow")>();
   return {

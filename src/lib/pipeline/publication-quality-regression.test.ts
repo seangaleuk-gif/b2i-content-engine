@@ -111,14 +111,18 @@ describe("publication-quality regression (blog 13, version 15 fixture)", () => {
       paragraph("low-3", "A small weekly plan keeps the work steady without adding stress to the whole team."),
     ];
 
+    const wordsBeforeCompression = countCanonicalVisibleWords(doc);
     const compression = compressDocumentStructureAware(
       doc,
-      countCanonicalVisibleWords(doc) - 150,
-      countCanonicalVisibleWords(doc) - 400,
+      wordsBeforeCompression - 150,
+      wordsBeforeCompression - 400,
       KEYPHRASE,
       [],
     );
     expect(compression.removedWords).toBeGreaterThanOrEqual(100);
+    expect(compression.removedWords).toBe(
+      wordsBeforeCompression - countCanonicalVisibleWords(doc),
+    );
 
     // The rebuilt section is coherent after compression (other fixture
     // sections retain their original pre-existing damage classes).
@@ -140,6 +144,67 @@ describe("publication-quality regression (blog 13, version 15 fixture)", () => {
     );
     const coherence = validateCoherence(doc);
     expect(coherence.some((v) => v.type === "orphan-transition" && v.blockId === "orphan-instead")).toBe(true);
+  });
+
+  it("accepts a contextual So transition after a Source citation", () => {
+    const doc = parseFixture();
+    const section = doc.sections.find((s) => s.sectionType === "main")!;
+    section.blocks = [
+      paragraph(
+        "antecedent",
+        "Short-form video now gives local brands a practical way to demonstrate products and answer customer questions.",
+      ),
+      {
+        id: "source",
+        type: "paragraph",
+        content: [
+          { type: "text", text: "Source: " },
+          { type: "link", text: "Hong Kong video research", href: "https://example.com/video" },
+          { type: "text", text: "." },
+        ],
+      },
+      paragraph(
+        "contextual-so",
+        "So, what does this mean for your business? If you haven't started experimenting with short-form video, begin with one useful customer question.",
+      ),
+      paragraph(
+        "close",
+        "A small test gives the team enough information to improve the next campaign without making an oversized commitment.",
+      ),
+    ];
+
+    expect(
+      validateCoherence(doc).filter((violation) => violation.blockId === "contextual-so"),
+    ).toEqual([]);
+  });
+
+  it("still rejects Instead when nearby prose contains no contrasting proposition", () => {
+    const doc = parseFixture();
+    const section = doc.sections.find((s) => s.sectionType === "main")!;
+    section.blocks = [
+      paragraph("unrelated", "Creator-led content can help a local team explain its work in a familiar voice."),
+      paragraph("orphan-instead-context", "Instead, use creator-led content for the next campaign."),
+      paragraph("close", "Review the response and use the result to plan the following campaign."),
+    ];
+
+    expect(
+      validateCoherence(doc).some((violation) =>
+        violation.type === "orphan-transition" && violation.blockId === "orphan-instead-context"),
+    ).toBe(true);
+  });
+
+  it("accepts Instead when the preceding substantive paragraph establishes the rejected alternative", () => {
+    const doc = parseFixture();
+    const section = doc.sections.find((s) => s.sectionType === "main")!;
+    section.blocks = [
+      paragraph("contrast", "Generic display ads no longer earn the same attention, and teams should avoid interruptive messages."),
+      paragraph("valid-instead", "Instead, use creator-led content that answers a specific customer question."),
+      paragraph("close", "The clearer context makes the recommendation useful rather than disruptive."),
+    ];
+
+    expect(
+      validateCoherence(doc).filter((violation) => violation.blockId === "valid-instead"),
+    ).toEqual([]);
   });
 
   it("compression never removes evidence, links or protected content, and keeps sections above the floor", () => {

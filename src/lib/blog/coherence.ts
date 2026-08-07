@@ -50,7 +50,19 @@ const ORPHAN_TRANSITION_RE =
   /^\s*(?:instead|however|therefore|meanwhile|moreover|furthermore|nevertheless|nonetheless|consequently|additionally|likewise|similarly|hence|thus|yet|so|but|and)\s*[,:]/i;
 
 const ORPHAN_TRANSITION_PHRASES =
-  /^\s*(?:as a result|on the other hand|that said|in addition|at the same time|for this reason|in other words)\s*[,:]/i;
+  /^\s*(?:as a result|on the other hand|that said|in addition|at the same time|for this reason|for that reason|in other words)\s*[,:]/i;
+
+const INSTEAD_TRANSITION_RE = /^\s*instead\s*[,:]/i;
+
+/**
+ * "Instead" is contrast-dependent in a way that summary/additive transitions
+ * are not. A nearby paragraph is an antecedent only when it actually presents
+ * an alternative, limitation or rejected approach. This keeps genuine
+ * orphaned "Instead" openings blocked while allowing normal summary prose
+ * such as "So, what does this mean ...?" after a source citation.
+ */
+const CONTRAST_ANTECEDENT_RE =
+  /\b(?:not|never|no longer|rather than|instead of|but|however|avoid|stop|cannot|can['’]t|do(?:es)?n['’]t|won['’]t|shouldn['’]t|traditional (?:approach|method|model)|generic (?:approach|message|content)|rejected alternative)\b/i;
 
 const DANGLING_REFERENCE_RE =
   /^\s*(?:this|that|these|those|it|they|its|their|them)\s+(?:is|are|was|were|means|mean|shows?|show|suggests?|suggest|makes?|make|reflects?|reflect|represents?|represent)\b/i;
@@ -72,6 +84,29 @@ function editorialSections(doc: ArticleDocument): ArticleSection[] {
   return doc.sections.filter(
     (section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading",
   );
+}
+
+function isSourceCitation(text: string): boolean {
+  return /^\s*sources?:\s*/i.test(text);
+}
+
+function hasCompleteSubstantiveAntecedent(text: string): boolean {
+  if (isSourceCitation(text)) return false;
+  if (countReadableWords(text) < 5) return false;
+  const trimmed = text.replace(/["”’)\]]+$/, "");
+  return /[.!?]$/.test(trimmed) && !SETUP_ENDING_RE.test(trimmed);
+}
+
+function previousSubstantiveParagraph(
+  paragraphs: Array<{ block: EditorialBlock; text: string }>,
+  currentIndex: number,
+): { block: EditorialBlock; text: string } | null {
+  for (let index = currentIndex - 1; index >= 0; index--) {
+    const candidate = paragraphs[index];
+    if (isSourceCitation(candidate.text)) continue;
+    return hasCompleteSubstantiveAntecedent(candidate.text) ? candidate : null;
+  }
+  return null;
 }
 
 /**
@@ -129,21 +164,17 @@ export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
         }
       }
 
-      // 3. Orphan transition: the paragraph opens with a transition that needs
-      //    a preceding statement. Valid when it is a continuation within the
-      //    same paragraph flow (never the first paragraph of a component, and
-      //    never directly after a source citation or an incomplete paragraph).
+      // 3. Orphan transition: inspect nearby substantive context instead of
+      //    treating the immediately previous block as the whole context. A
+      //    Source: citation is metadata for the preceding claim, so it is
+      //    skipped when looking for an antecedent. "Instead" additionally
+      //    requires an actual contrast/alternative signal in that antecedent.
       const transition = ORPHAN_TRANSITION_RE.test(text) || ORPHAN_TRANSITION_PHRASES.test(text);
       if (transition) {
-        const isFirst = i === 0;
-        const previous = paragraphs[i - 1];
-        const previousIsCitation = previous
-          ? /^\s*sources?:/i.test(previous.text)
-          : false;
-        const previousIncomplete = previous
-          ? !/[.!?]["”’)]*$/.test(previous.text.replace(/["”’)\]]+$/, ""))
-          : false;
-        if (isFirst || previousIsCitation || previousIncomplete) {
+        const antecedent = previousSubstantiveParagraph(paragraphs, i);
+        const missingSemanticRelationship = !antecedent
+          || (INSTEAD_TRANSITION_RE.test(text) && !CONTRAST_ANTECEDENT_RE.test(antecedent.text));
+        if (missingSemanticRelationship) {
           violations.push({
             componentId,
             blockId: block.id,
@@ -349,8 +380,8 @@ export function compressDocumentStructureAware(
         const lastRemainder = sentences.slice(0, -1).join(" ");
         const firstWords = countReadableWords(firstRemainder);
         const lastWords = countReadableWords(lastRemainder);
-        const firstDrops = sentences[0].length;
-        const lastDrops = sentences[sentences.length - 1].length;
+        const firstDrops = countReadableWords(sentences[0]);
+        const lastDrops = countReadableWords(sentences[sentences.length - 1]);
 
         let candidate: { newText: string; removedWords: number } | null = null;
         if (firstWords >= 12) {

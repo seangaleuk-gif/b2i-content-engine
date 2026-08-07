@@ -43,12 +43,12 @@ vi.mock("@/lib/services/link-injector", () => ({
 
 import {
   parseWordPressEditorialBlocks,
-  renderComponentHtml,
   type ArticleDocument,
   type ArticleSection,
 } from "@/lib/blog/article-document";
 import {
   createPipelineState,
+  parseCompactionBlocksJson,
   runPostAssemblyPipeline,
   runFinalValidation,
 } from "@/lib/pipeline/blog-generation-pipeline";
@@ -267,7 +267,7 @@ async function runPipeline(
 }
 
 describe("final-trim bounded fallback (incomplete quotation + orphan transition)", () => {
-  it("restores the complete prior snapshot and compacts only the affected sections", async () => {
+  it("distinguishes pre-existing coherence findings and compacts only affected sections", async () => {
     const { result, compactedHeadings, thrown } = await runPipeline(validCandidateForHeading);
     expect(thrown).toBeUndefined();
     expect(result).toBeDefined();
@@ -275,11 +275,10 @@ describe("final-trim bounded fallback (incomplete quotation + orphan transition)
     expect(compactedHeadings.some((h) => h.includes("AI and Personalisation"))).toBe(true);
     expect(compactedHeadings.some((h) => h.includes("Budgeting"))).toBe(true);
     expect(compactedHeadings.every((h) => h.includes("AI and Personalisation") || h.includes("Budgeting"))).toBe(true);
-    // The complete prior snapshot was restored: non-affected sections keep
-    // their pre-trim content (a paragraph the deterministic trim would have
-    // removed is still present).
-    const section1 = result!.articleDoc.sections[1];
-    expect(renderComponentHtml(section1)).toContain("Simple examples help busy owners");
+    const finalTrim = result!.stageOutputs.find((stage) => stage.stage === "final-trim");
+    expect(finalTrim?.metadata?.preTrimCoherenceViolations).toHaveLength(2);
+    expect(finalTrim?.metadata?.postTrimCoherenceViolations).toHaveLength(2);
+    expect(finalTrim?.metadata?.newTrimIntroducedViolations).toEqual([]);
     // The quotation is preserved completely (verbatim), not truncated.
     expect(result!.blog).toContain(QUOTE_TEXT);
     // The orphan "Instead" did not survive without its antecedent.
@@ -303,7 +302,12 @@ describe("final-trim bounded fallback (incomplete quotation + orphan transition)
   });
 
   it("an invalid candidate (truncated quotation) still blocks with the hard failure", async () => {
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
     const { result, compactedHeadings, thrown } = await runPipeline(truncatedQuoteCandidate);
+    errorSpy.mockRestore();
     expect(result).toBeUndefined();
     // The compaction fallback was attempted for the affected sections.
     expect(compactedHeadings.some((h) => h.includes("AI and Personalisation"))).toBe(true);
@@ -311,5 +315,25 @@ describe("final-trim bounded fallback (incomplete quotation + orphan transition)
     // remains a hard failure.
     expect(thrown).toBeDefined();
     expect(String(thrown!.message)).toMatch(/Coherence violations after final trim/);
+    expect(errors.join("\n")).toContain("quote-integrity");
+  });
+});
+
+describe("bounded compaction response classification", () => {
+  it("accepts a complete JSON code fence as a bounded recoverable wrapper", () => {
+    const result = parseCompactionBlocksJson(
+      '```json\n{"blocks":[{"type":"paragraph","text":"Complete professional sentence."}]}\n```',
+    );
+    expect(result.accepted).toBe(true);
+    if (result.accepted) expect(result.normalizedWrapper).toBe(true);
+  });
+
+  it("reports invalid-json separately from schema-invalid", () => {
+    const invalidJson = parseCompactionBlocksJson('{"blocks": [');
+    const invalidSchema = parseCompactionBlocksJson(
+      '{"blocks":[{"type":"unknown","text":"Unsafe"}]}',
+    );
+    expect(invalidJson).toMatchObject({ accepted: false, reason: "invalid-json" });
+    expect(invalidSchema).toMatchObject({ accepted: false, reason: "schema-invalid" });
   });
 });

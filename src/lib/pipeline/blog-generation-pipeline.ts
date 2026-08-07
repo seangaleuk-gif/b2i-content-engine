@@ -58,6 +58,7 @@ import {
   validateCoherence,
   coherenceViolationSummary,
   MIN_SECTION_WORDS,
+  type CoherenceViolation,
 } from "@/lib/blog/coherence";
 import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
 import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
@@ -67,6 +68,7 @@ import {
   assessSectionTopicGrounding,
   assessHeadingNaturalness,
   removeOffTopicSourceCitations,
+  collectOffTopicSourceCitationBlockIds,
   formatRelevanceViolations,
 } from "@/lib/blog/content-relevance";
 import { repairTemporalFreshnessDocument, findTemporalFreshnessIssues } from "@/lib/blog/temporal-freshness";
@@ -158,6 +160,15 @@ function syncBlogFromDocument(state: PipelineState): void {
     question: entry.question,
     answer: entry.answerText,
   }));
+}
+
+/** Keep the canonical ArticleDocument metadata aligned with the pipeline's
+ * legacy scalar fields until those consumers can read metadata directly. */
+function syncMetadataToDocument(state: PipelineState): void {
+  state.articleDoc.metadata.title = state.title;
+  state.articleDoc.metadata.slug = state.slug;
+  state.articleDoc.metadata.metaDescription = state.metaDescription;
+  state.articleDoc.metadata.excerpt = state.excerpt;
 }
 
 /** Fail immediately if the rendered cache diverges from the canonical document. */
@@ -678,21 +689,26 @@ export function assertFinalEditorialBoundary(state: PipelineState): void {
 interface PipelineSnapshot {
   articleDoc: string;
   title: string;
+  slug: string;
   metaDescription: string;
+  excerpt: string;
   currentWordCount: number;
   expansionAttempts: number;
   trimAttempts: number;
   retryCount: number;
   componentRegenerations: number;
-  normalizationResult: any;
+  normalizationResult: FinalSeoNormalizerResult | null;
   normalizationAccepted: boolean;
+  fullDocumentEditorial: FullDocumentEditorialOutcome | null;
 }
 
 function snapshotState(state: PipelineState): PipelineSnapshot {
   return {
     articleDoc: JSON.stringify(state.articleDoc),
     title: state.title,
+    slug: state.slug,
     metaDescription: state.metaDescription,
+    excerpt: state.excerpt,
     currentWordCount: state.currentWordCount,
     expansionAttempts: state.expansionAttempts,
     trimAttempts: state.trimAttempts,
@@ -700,6 +716,9 @@ function snapshotState(state: PipelineState): PipelineSnapshot {
     componentRegenerations: state.componentRegenerations,
     normalizationResult: state.normalizationResult,
     normalizationAccepted: state.normalizationAccepted,
+    fullDocumentEditorial: state.fullDocumentEditorial
+      ? structuredClone(state.fullDocumentEditorial)
+      : null,
   };
 }
 
@@ -707,7 +726,9 @@ function restoreSnapshot(state: PipelineState, snap: PipelineSnapshot): void {
   state.articleDoc = JSON.parse(snap.articleDoc);
   syncBlogFromDocument(state);
   state.title = snap.title;
+  state.slug = snap.slug;
   state.metaDescription = snap.metaDescription;
+  state.excerpt = snap.excerpt;
   state.currentWordCount = snap.currentWordCount;
   state.expansionAttempts = snap.expansionAttempts;
   state.trimAttempts = snap.trimAttempts;
@@ -715,6 +736,10 @@ function restoreSnapshot(state: PipelineState, snap: PipelineSnapshot): void {
   state.componentRegenerations = snap.componentRegenerations;
   state.normalizationResult = snap.normalizationResult;
   state.normalizationAccepted = snap.normalizationAccepted;
+  state.fullDocumentEditorial = snap.fullDocumentEditorial
+    ? structuredClone(snap.fullDocumentEditorial)
+    : null;
+  syncMetadataToDocument(state);
 }
 
 // ── Stage runner: HTML-returning stages must parse back to ArticleDocument ──
@@ -740,6 +765,7 @@ function runTrackedHtmlStage(state: PipelineState, stageName: string, fn: (html:
   assertValidStageInput(preHtml, stageBaseline, stageName);
 
   const resultHtml = fn(state.blog);
+  syncMetadataToDocument(state);
 
   // Parse back to ArticleDocument. If parsing fails, restore snapshot.
   if (!applyHtmlToDocument(state, resultHtml, state.articleDoc)) {
@@ -2100,23 +2126,48 @@ export async function runPostAssemblyPipeline(
   // diagnosis can never repair deterministic corruption — it is diagnosis-only.
   state = runTrackedHtmlStage(state, "final-qc-scan", () => {
     const research = deps.context?.research || [];
-    const coherence = validateCoherence(state.articleDoc);
-    const malformed = scanMalformedProseInDocument(state.articleDoc);
-    const sentenceQuality = scanSentenceQualityInDocument(state.articleDoc);
-    const boilerplate = countBoilerplateInDocument(state.articleDoc);
-    // Off-topic source citations are first repaired deterministically: a pure
-    // `Source: <a>…</a>.` citation paragraph that does not support its H2 is
-    // removed. Only violations that survive the removal (citations embedded in
-    // prose, or ungrounded sections) are hard failures.
+    // Off-topic source citations are repaired deterministically as an explicit
+    // transaction: snapshot the complete canonical state, remove pure
+    // `Source: <a>…</a>.` citation paragraphs that do not support their H2,
+    // re-render from ArticleDocument, then recompute EVERY final scanner
+    // against the modified document. Only violations that survive the removal
+    // (citations embedded in prose, or ungrounded sections) are hard failures.
+    // Never reuse arrays computed before the mutation: the removal can shift
+    // block indices and change sentence boundaries, so post-removal findings
+    // are the only trustworthy ones.
+    const snap = snapshotState(state);
+    const inputFp = fp(state.blog);
+    const stageBaseline = createArticleIntegrityBaseline(state.blog);
     let relevance = assessSourceSectionRelevance(state.articleDoc, research);
     if (relevance.length > 0) {
+      const removedBlockIds = collectOffTopicSourceCitationBlockIds(state.articleDoc, relevance).map((target) => target.blockId);
       const removed = removeOffTopicSourceCitations(state.articleDoc, relevance);
       if (removed > 0) {
         syncBlogFromDocument(state);
         relevance = assessSourceSectionRelevance(state.articleDoc, research);
-        console.log(`[final-qc-scan] removed ${removed} off-topic source citation(s)`);
+        const afterFp = fp(state.blog);
+        const guard = guardStageOutput(state.blog, inputFp, stageBaseline, "final-qc-scan-citation-removal");
+        if (!guard.accepted) {
+          restoreSnapshot(state, snap);
+          syncBlogFromDocument(state);
+          relevance = assessSourceSectionRelevance(state.articleDoc, research);
+        }
+        const pass = guard.accepted && relevance.length === 0;
+        console.log(
+          `[final-qc-scan] candidate=off-topic-citation-removal` +
+          ` beforeFingerprint=${inputFp} afterFingerprint=${afterFp}` +
+          ` pass=${pass} removalReason=pure-off-topic-source-citation` +
+          ` removedBlockIds=[${removedBlockIds.join(", ")}]` +
+          ` rollback=${guard.accepted ? "not-needed" : "success"}`,
+        );
       }
     }
+    // Recompute every final scanner AFTER the mutation so the gate evaluates
+    // the exact document that would be saved, not a stale pre-removal snapshot.
+    const coherence = validateCoherence(state.articleDoc);
+    const malformed = scanMalformedProseInDocument(state.articleDoc);
+    const sentenceQuality = scanSentenceQualityInDocument(state.articleDoc);
+    const boilerplate = countBoilerplateInDocument(state.articleDoc);
     const ungrounded = assessSectionTopicGrounding(state.articleDoc);
     const headings = assessHeadingNaturalness(state.articleDoc, state.keyphrase);
     const unsupportedClaims = scanFactualRisks(
@@ -2462,45 +2513,132 @@ async function runRegeneration(state: PipelineState, deps: PipelineDependencies)
   return runTrackedHtmlStage(state, "regeneration", (html) => regeneratedBlog, snap);
 }
 
-/** Parse a model compaction `{"blocks":[...]}` payload into WordPress blocks.
- *  Only paragraph, list and quote blocks are accepted; anything else rejects
- *  the candidate so protected markup can never be introduced. */
-function parseCompactionBlocksJson(raw: string): Array<{ type: "paragraph"; text: string } | { type: "list"; items: string[] } | { type: "quote"; text: string }> | null {
+type CompactionBlock =
+  | { type: "paragraph"; text: string }
+  | { type: "subheading"; text: string }
+  | { type: "list"; ordered: boolean; items: string[] }
+  | { type: "quote"; text: string }
+  | { type: "table"; headers: string[]; rows: string[][] };
+
+export type CompactionParseRejectionReason = "invalid-json" | "schema-invalid";
+
+export type CompactionParseResult =
+  | { accepted: true; blocks: CompactionBlock[]; normalizedWrapper: boolean }
+  | { accepted: false; reason: CompactionParseRejectionReason; diagnostic: string };
+
+/** Parse a bounded compaction payload without guessing at ambiguous content.
+ * A complete Markdown JSON fence or harmless prose around one complete JSON
+ * object is recoverable. Syntactically invalid JSON and schema-invalid JSON
+ * remain separate rejection classes for production observability. */
+export function parseCompactionBlocksJson(raw: string): CompactionParseResult {
+  const trimmed = raw.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  const candidates = [
+    { text: trimmed, normalized: false },
+    ...(fenced ? [{ text: fenced[1].trim(), normalized: true }] : []),
+    ...(firstBrace >= 0 && lastBrace > firstBrace
+      ? [{ text: trimmed.slice(firstBrace, lastBrace + 1), normalized: true }]
+      : []),
+  ];
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { blocks?: unknown }).blocks)) return null;
-  const blocks: Array<{ type: "paragraph"; text: string } | { type: "list"; items: string[] } | { type: "quote"; text: string }> = [];
-  for (const block of (parsed as { blocks: unknown[] }).blocks) {
-    if (!block || typeof block !== "object") return null;
-    const item = block as Record<string, unknown>;
-    if (item.type === "paragraph" && typeof item.text === "string" && item.text.trim()) {
-      blocks.push({ type: "paragraph", text: item.text.trim() });
-    } else if (item.type === "list" && Array.isArray(item.items) && item.items.length > 0) {
-      const items = item.items.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
-      if (items.length === 0) return null;
-      blocks.push({ type: "list", items });
-    } else if (item.type === "quote" && typeof item.text === "string" && item.text.trim()) {
-      blocks.push({ type: "quote", text: item.text.trim() });
-    } else {
-      return null;
+  let normalizedWrapper = false;
+  for (const candidate of candidates) {
+    try {
+      parsed = JSON.parse(candidate.text);
+      normalizedWrapper = candidate.normalized;
+      break;
+    } catch {
+      // Try the next bounded representation; never repair JSON string content.
     }
   }
-  return blocks.length > 0 ? blocks : null;
+  if (parsed === undefined) {
+    return {
+      accepted: false,
+      reason: "invalid-json",
+      diagnostic: `unable to parse one complete JSON object (chars=${raw.length})`,
+    };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { accepted: false, reason: "schema-invalid", diagnostic: "root must be an object" };
+  }
+  const rawBlocks = (parsed as { blocks?: unknown }).blocks;
+  if (!Array.isArray(rawBlocks) || rawBlocks.length === 0) {
+    return { accepted: false, reason: "schema-invalid", diagnostic: "blocks must be a non-empty array" };
+  }
+
+  const blocks: CompactionBlock[] = [];
+  for (let index = 0; index < rawBlocks.length; index++) {
+    const block = rawBlocks[index];
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      return { accepted: false, reason: "schema-invalid", diagnostic: `block=${index} must be an object` };
+    }
+    const item = block as Record<string, unknown>;
+    const text = typeof item.text === "string" ? item.text.trim() : "";
+    if (item.type === "paragraph" && text) {
+      blocks.push({ type: "paragraph", text });
+    } else if (item.type === "subheading" && text) {
+      blocks.push({ type: "subheading", text });
+    } else if (item.type === "list" && Array.isArray(item.items) && item.items.length > 0) {
+      if (!item.items.every((entry) => typeof entry === "string" && entry.trim().length > 0)) {
+        return { accepted: false, reason: "schema-invalid", diagnostic: `block=${index} list items must be non-empty strings` };
+      }
+      if (item.ordered !== undefined && typeof item.ordered !== "boolean") {
+        return { accepted: false, reason: "schema-invalid", diagnostic: `block=${index} ordered must be boolean` };
+      }
+      blocks.push({ type: "list", ordered: item.ordered === true, items: (item.items as string[]).map((entry) => entry.trim()) });
+    } else if (item.type === "quote" && text) {
+      blocks.push({ type: "quote", text });
+    } else if (item.type === "table" && Array.isArray(item.headers) && Array.isArray(item.rows)) {
+      const headers = item.headers;
+      const rows = item.rows;
+      if (
+        headers.length === 0
+        || !headers.every((entry) => typeof entry === "string" && entry.trim().length > 0)
+        || rows.length === 0
+        || !rows.every((row) => Array.isArray(row)
+          && row.length === headers.length
+          && row.every((entry) => typeof entry === "string" && entry.trim().length > 0))
+      ) {
+        return { accepted: false, reason: "schema-invalid", diagnostic: `block=${index} table dimensions or cells are invalid` };
+      }
+      blocks.push({
+        type: "table",
+        headers: (headers as string[]).map((entry) => entry.trim()),
+        rows: (rows as string[][]).map((row) => row.map((entry) => entry.trim())),
+      });
+    } else {
+      return {
+        accepted: false,
+        reason: "schema-invalid",
+        diagnostic: `block=${index} unsupported type or missing required content (${String(item.type)})`,
+      };
+    }
+  }
+  return { accepted: true, blocks, normalizedWrapper };
 }
 
-function compactionBlocksToHtml(blocks: NonNullable<ReturnType<typeof parseCompactionBlocksJson>>): string {
+function compactionBlocksToHtml(blocks: CompactionBlock[]): string {
   return blocks
     .map((block) => {
       if (block.type === "paragraph") {
         return `<!-- wp:paragraph --><p>${escapeCompactionText(block.text)}</p><!-- /wp:paragraph -->`;
       }
+      if (block.type === "subheading") {
+        return `<!-- wp:heading {"level":3} --><h3>${escapeCompactionText(block.text)}</h3><!-- /wp:heading -->`;
+      }
       if (block.type === "list") {
+        const tag = block.ordered ? "ol" : "ul";
         const items = block.items.map((item) => `<li>${escapeCompactionText(item)}</li>`).join("");
-        return `<!-- wp:list --><ul>${items}</ul><!-- /wp:list -->`;
+        return `<!-- wp:list {"ordered":${block.ordered}} --><${tag}>${items}</${tag}><!-- /wp:list -->`;
+      }
+      if (block.type === "table") {
+        const headers = block.headers.map((header) => `<th>${escapeCompactionText(header)}</th>`).join("");
+        const rows = block.rows
+          .map((row) => `<tr>${row.map((cell) => `<td>${escapeCompactionText(cell)}</td>`).join("")}</tr>`)
+          .join("");
+        return `<!-- wp:table --><figure class="wp-block-table"><table><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table></figure><!-- /wp:table -->`;
       }
       return `<!-- wp:quote --><blockquote><p>${escapeCompactionText(block.text)}</p></blockquote><!-- /wp:quote -->`;
     })
@@ -2545,6 +2683,82 @@ function extractQuoteTextsFromHtml(html: string): string[] {
     quotes.push(m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim());
   }
   return quotes;
+}
+
+function protectedSectionStructureSignature(blocks: EditorialBlock[]): string[] {
+  return blocks.flatMap((block) => {
+    if (block.type === "subheading") {
+      return [`subheading:${extractPlainTextFromEditorialBlocks([block]).replace(/\s+/g, " ").trim()}`];
+    }
+    if (block.type === "list") {
+      return [`list:${block.ordered ? "ordered" : "unordered"}:${block.items.length}`];
+    }
+    if (block.type === "table") {
+      const headers = block.headers.map((cell) => cell.map((node) => node.text).join("").trim());
+      const rows = block.rows.map((row) => row.map((cell) => cell.map((node) => node.text).join("").trim()));
+      return [`table:${JSON.stringify({ headers, rows })}`];
+    }
+    return [];
+  });
+}
+
+function protectedArticleContentUnchanged(before: ArticleDocument, after: ArticleDocument): boolean {
+  return JSON.stringify({
+    languageSwitcher: before.languageSwitcher,
+    cta: before.cta,
+    visibleFaq: before.visibleFaq,
+    faqSchema: before.faqSchema,
+    metadata: before.metadata,
+  }) === JSON.stringify({
+    languageSwitcher: after.languageSwitcher,
+    cta: after.cta,
+    visibleFaq: after.visibleFaq,
+    faqSchema: after.faqSchema,
+    metadata: after.metadata,
+  });
+}
+
+export type CompactionRejectionReason =
+  | CompactionParseRejectionReason
+  | "ai-call"
+  | "target-unavailable"
+  | "not-shorter"
+  | "min-section-words"
+  | "word-count"
+  | "link-equivalence"
+  | "claim-equivalence"
+  | "ownership"
+  | "unsupported-claim"
+  | "quote-integrity"
+  | `coherence:${CoherenceViolation["type"]}`
+  | "source-relevance"
+  | "wordpress-integrity"
+  | "protected-content";
+
+interface BoundedCompactionResult {
+  removedWords: number;
+  sectionId: string | null;
+  accepted: boolean;
+  rejectionReasons: CompactionRejectionReason[];
+}
+
+function rejectCompaction(
+  state: PipelineState,
+  snap: PipelineSnapshot,
+  sectionId: string | null,
+  reasons: CompactionRejectionReason[],
+  diagnostic?: string,
+): BoundedCompactionResult {
+  restoreSnapshot(state, snap);
+  const safeDiagnostic = diagnostic
+    ? ` diagnostic="${diagnostic.replace(/[\r\n]+/g, " ").slice(0, 240)}"`
+    : "";
+  console.error(
+    `[final-trim:compaction] rejected section=${sectionId ?? "none"}`
+    + ` reason=${reasons[0] ?? "target-unavailable"}`
+    + ` reasons=[${reasons.join(",")}] rollback=success${safeDiagnostic}`,
+  );
+  return { removedWords: 0, sectionId, accepted: false, rejectionReasons: reasons };
 }
 
 function supportedClaimSentences(
@@ -2638,23 +2852,30 @@ async function runBoundedSectionCompaction(
   state: PipelineState,
   deps: PipelineDependencies,
   options?: { targetSectionIds?: string[] },
-): Promise<{ removedWords: number; sectionId: string | null; accepted: boolean }> {
+): Promise<BoundedCompactionResult> {
   const research = deps.context?.research || [];
   const editorialSections = state.articleDoc.sections.filter(
     (section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading",
   );
-  let target = editorialSections[0];
+  let target: ArticleDocument["sections"][number] | undefined;
   if (options?.targetSectionIds && options.targetSectionIds.length > 0) {
-    target = editorialSections.find((section) => options.targetSectionIds!.includes(section.id)) ?? target;
+    target = editorialSections.find((section) => options.targetSectionIds!.includes(section.id));
   } else {
     target = editorialSections
       .map((section) => ({ section, words: countReadableWords(componentHtml(section)) }))
       .filter((entry) => entry.words > MIN_SECTION_WORDS + 80)
-      .sort((a, b) => b.words - a.words)[0]?.section ?? target;
+      .sort((a, b) => b.words - a.words)[0]?.section;
   }
-  if (!target) return { removedWords: 0, sectionId: null, accepted: false };
-
   const snap = snapshotState(state);
+  if (!target) {
+    return rejectCompaction(
+      state,
+      snap,
+      options?.targetSectionIds?.[0] ?? null,
+      ["target-unavailable"],
+      "no eligible editable section matched the requested target",
+    );
+  }
   const ledger = deps.context?.claimOwnership;
   const evidencePrompt = ledger
     ? formatOwnedEvidencePacket(ledger, target.id)
@@ -2682,7 +2903,8 @@ async function runBoundedSectionCompaction(
     `Keep the meaning and structure identical. Do not add new facts, claims, numbers or opinions.`,
     `Remove only repetition and low-value detail.`,
     `Keep all sentences complete. Never leave an example, setup, quotation or comparison unfinished.`,
-    `Return JSON only: {"blocks": [{"type": "paragraph", "text": "..."}]}.`,
+    `Preserve every H3 subheading, list shape and table exactly.`,
+    `Return JSON only: {"blocks": [{"type": "paragraph", "text": "..."}]}. Allowed types are paragraph, subheading, list, quote and table. Lists require ordered and items. Tables require headers and rows.`,
     `Section heading: ${target.heading}`,
     ...(neighbourContext ? [`Neighbouring context:\n${neighbourContext}`] : []),
     ...(evidencePrompt ? [`Evidence owned by this section: ${evidencePrompt}`] : []),
@@ -2705,23 +2927,35 @@ async function runBoundedSectionCompaction(
     );
     content = response.content;
   } catch (error) {
-    console.error(`[final-trim:compaction] AI call failed: ${error instanceof Error ? error.message : String(error)} — restoring snapshot`);
-    restoreSnapshot(state, snap);
-    return { removedWords: 0, sectionId: target.id, accepted: false };
+    return rejectCompaction(
+      state,
+      snap,
+      target.id,
+      ["ai-call"],
+      error instanceof Error ? error.message : String(error),
+    );
   }
 
-  const parsedBlocks = parseCompactionBlocksJson(content);
-  if (!parsedBlocks) {
-    console.error("[final-trim:compaction] candidate JSON rejected — restoring snapshot");
-    restoreSnapshot(state, snap);
-    return { removedWords: 0, sectionId: target.id, accepted: false };
+  const parsedPayload = parseCompactionBlocksJson(content);
+  if (!parsedPayload.accepted) {
+    return rejectCompaction(
+      state,
+      snap,
+      target.id,
+      [parsedPayload.reason],
+      parsedPayload.diagnostic,
+    );
   }
-  const candidateHtml = compactionBlocksToHtml(parsedBlocks);
+  const candidateHtml = compactionBlocksToHtml(parsedPayload.blocks);
   const parsed = parseWordPressEditorialBlocks(candidateHtml, `${target.id}-compaction`);
   if (parsed.errors.length > 0 || parsed.blocks.length === 0) {
-    console.error(`[final-trim:compaction] candidate blocks invalid (${parsed.errors.join("; ")}) — restoring snapshot`);
-    restoreSnapshot(state, snap);
-    return { removedWords: 0, sectionId: target.id, accepted: false };
+    return rejectCompaction(
+      state,
+      snap,
+      target.id,
+      ["wordpress-integrity"],
+      parsed.errors.join("; ") || "no parsed editorial blocks",
+    );
   }
 
   const candidateWords = countReadableWords(candidateHtml);
@@ -2735,8 +2969,7 @@ async function runBoundedSectionCompaction(
   const candidate = structuredClone(state.articleDoc);
   const targetIndex = candidate.sections.findIndex((section) => section.id === target.id);
   if (targetIndex < 0) {
-    restoreSnapshot(state, snap);
-    return { removedWords: 0, sectionId: target.id, accepted: false };
+    return rejectCompaction(state, snap, target.id, ["target-unavailable"]);
   }
   candidate.sections[targetIndex] = {
     ...candidate.sections[targetIndex],
@@ -2775,6 +3008,9 @@ async function runBoundedSectionCompaction(
   const shorter = candidateWords < originalWords;
   const withinFloor = candidateWords >= MIN_SECTION_WORDS;
   const structurallyValid = parsed.errors.length === 0;
+  const protectedStructure = JSON.stringify(protectedSectionStructureSignature(target.blocks))
+    === JSON.stringify(protectedSectionStructureSignature(parsed.blocks));
+  const protectedContent = protectedStructure && protectedArticleContentUnchanged(state.articleDoc, candidate);
 
   const accepted = shorter
     && withinFloor
@@ -2788,26 +3024,62 @@ async function runBoundedSectionCompaction(
     && relevanceViolations.length === 0
     && withinWordRange
     && wpStructureValid
-    && structurallyValid;
+    && structurallyValid
+    && protectedContent;
 
   if (!accepted) {
-    console.error(
-      `[final-trim:compaction] candidate rejected — restoring snapshot` +
-      ` (shorter=${shorter} floor=${withinFloor} links=${linkEquivalence} claims=${claimEquivalence}` +
-      ` quotes=${quoteIntegrity} unmatchedQuotes=${unmatchedQuotes} ownership=${ownershipViolations.length}` +
-      ` unsupported=${candidateUnsupported.length} coherence=${sectionCoherence.length}` +
-      ` relevance=${relevanceViolations.length} wc=${canonicalCount} range=${state.wordMin}-${state.wordMax}` +
-      ` wp=${wpStructureValid})`,
+    const reasons: CompactionRejectionReason[] = [];
+    if (!shorter) reasons.push("not-shorter");
+    if (!withinFloor) reasons.push("min-section-words");
+    if (!withinWordRange) reasons.push("word-count");
+    if (!linkEquivalence) reasons.push("link-equivalence");
+    if (!claimEquivalence) reasons.push("claim-equivalence");
+    if (ownershipViolations.length > 0) reasons.push("ownership");
+    if (candidateUnsupported.length > 0) reasons.push("unsupported-claim");
+    if (!quoteIntegrity || unmatchedQuotes) reasons.push("quote-integrity");
+    for (const violation of sectionCoherence) reasons.push(`coherence:${violation.type}`);
+    if (relevanceViolations.length > 0) reasons.push("source-relevance");
+    if (!wpStructureValid || !structurallyValid) reasons.push("wordpress-integrity");
+    if (!protectedContent) reasons.push("protected-content");
+    return rejectCompaction(
+      state,
+      snap,
+      target.id,
+      [...new Set(reasons)],
+      `originalWords=${originalWords} candidateWords=${candidateWords} canonical=${canonicalCount}`,
     );
-    restoreSnapshot(state, snap);
-    return { removedWords: 0, sectionId: target.id, accepted: false };
   }
 
   state.articleDoc = candidate;
   console.log(
     `[final-trim:compaction] accepted section=${target.id} words ${originalWords} → ${candidateWords} canonical=${canonicalCount}`,
   );
-  return { removedWords: originalWords - candidateWords, sectionId: target.id, accepted: true };
+  return {
+    removedWords: originalWords - candidateWords,
+    sectionId: target.id,
+    accepted: true,
+    rejectionReasons: [],
+  };
+}
+
+function coherenceIdentity(violation: CoherenceViolation): string {
+  const snippet = violation.snippet.replace(/\s+/g, " ").trim();
+  return `${violation.componentId}:${violation.blockId ?? "-"}:${violation.type}:${snippet}`;
+}
+
+function newlyIntroducedCoherenceViolations(
+  before: CoherenceViolation[],
+  after: CoherenceViolation[],
+): CoherenceViolation[] {
+  const existing = new Set(before.map(coherenceIdentity));
+  return after.filter((violation) => !existing.has(coherenceIdentity(violation)));
+}
+
+function logTrimCoherenceDiagnostics(
+  label: "preTrimCoherenceViolations" | "postTrimCoherenceViolations" | "newTrimIntroducedViolations" | "finalCoherenceViolations",
+  violations: CoherenceViolation[],
+): void {
+  console.log(`[final-trim] ${label}=${JSON.stringify(coherenceViolationSummary(violations))}`);
 }
 
 /**
@@ -2835,9 +3107,19 @@ async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencie
   const inputFp = fp(preHtml);
   const stageBaseline = createArticleIntegrityBaseline(preHtml);
   const initialWordCount = countCanonicalVisibleWords(state.articleDoc);
+  const preTrimCoherence = validateCoherence(state.articleDoc);
+  logTrimCoherenceDiagnostics("preTrimCoherenceViolations", preTrimCoherence);
   if (initialWordCount <= state.wordMax) {
     console.log(`[final-trim] skipped (wc=${initialWordCount} <= ${state.wordMax})`);
-    recordStage(state, "final-trim", inputFp, inputFp, true, undefined, { skipped: true, reason: "within-max" });
+    logTrimCoherenceDiagnostics("postTrimCoherenceViolations", preTrimCoherence);
+    logTrimCoherenceDiagnostics("newTrimIntroducedViolations", []);
+    recordStage(state, "final-trim", inputFp, inputFp, true, undefined, {
+      skipped: true,
+      reason: "within-max",
+      preTrimCoherenceViolations: preTrimCoherence,
+      postTrimCoherenceViolations: preTrimCoherence,
+      newTrimIntroducedViolations: [],
+    });
     return state;
   }
 
@@ -2862,19 +3144,33 @@ async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencie
   );
 
   let coherence = validateCoherence(state.articleDoc);
+  const deterministicPostTrimCoherence = coherence;
+  const newTrimIntroduced = newlyIntroducedCoherenceViolations(preTrimCoherence, coherence);
+  logTrimCoherenceDiagnostics("postTrimCoherenceViolations", deterministicPostTrimCoherence);
+  logTrimCoherenceDiagnostics("newTrimIntroducedViolations", newTrimIntroduced);
   let finalWordCount = countCanonicalVisibleWords(state.articleDoc);
 
   if (coherence.length > 0) {
-    // 2a. The deterministic trim reached the target but damaged coherence.
-    //     Reject it, restore the complete pre-trim snapshot, and compact ONLY
-    //     the affected sections.
+    // 2a. Restore only when deterministic trimming introduced a new violation.
+    //     Pre-existing violations are reported accurately and repaired from
+    //     the current coherent-as-possible deterministic candidate.
     const affectedSectionIds = [...new Set(coherence.map((violation) => violation.componentId))];
-    restoreSnapshot(state, snap);
-    syncBlogFromDocument(state);
-    console.log(
-      `[final-trim] deterministic trim rejected (${coherence.length} coherence violation(s): ${coherence[0].type} in ${coherence[0].componentId})` +
-      ` — restoring pre-trim snapshot and compacting affected sections: ${affectedSectionIds.join(", ")}`,
-    );
+    if (newTrimIntroduced.length > 0) {
+      restoreSnapshot(state, snap);
+      syncBlogFromDocument(state);
+      totalRemoved = 0;
+      console.log(
+        `[final-trim] deterministic trim rejected`+
+        ` (${newTrimIntroduced.length} newly introduced coherence violation(s):`+
+        ` ${newTrimIntroduced[0].type} in ${newTrimIntroduced[0].componentId})` +
+        ` — rollback=success; compacting affected sections: ${affectedSectionIds.join(", ")}`,
+      );
+    } else {
+      console.log(
+        `[final-trim] deterministic trim did not introduce the ${coherence.length}`+
+        ` pre-existing coherence violation(s); compacting affected sections: ${affectedSectionIds.join(", ")}`,
+      );
+    }
     for (const sectionId of affectedSectionIds.slice(0, 3)) {
       const compaction = await runBoundedSectionCompaction(state, deps, { targetSectionIds: [sectionId] });
       if (compaction.accepted) totalRemoved += compaction.removedWords;
@@ -2891,6 +3187,7 @@ async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencie
     syncBlogFromDocument(state);
     coherence = validateCoherence(state.articleDoc);
   }
+  logTrimCoherenceDiagnostics("finalCoherenceViolations", coherence);
 
   // 3. Post-trim gate: unresolved coherence damage or an out-of-range word
   //    count after the bounded fallback blocks saving.
@@ -2930,12 +3227,27 @@ async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencie
   }
   assertRenderedCacheMatchesDocument(state);
   const outputFp = fp(state.blog);
-  recordStage(state, "final-trim", inputFp, outputFp, guard.accepted, guard.accepted ? undefined : "pre-stage-restore");
+  recordStage(
+    state,
+    "final-trim",
+    inputFp,
+    outputFp,
+    guard.accepted,
+    guard.accepted ? undefined : "pre-stage-restore",
+    {
+      preTrimCoherenceViolations: preTrimCoherence,
+      postTrimCoherenceViolations: deterministicPostTrimCoherence,
+      newTrimIntroducedViolations: newTrimIntroduced,
+      finalCoherenceViolations: coherence,
+    },
+  );
   return state;
 }
 
 async function runInternalLinks(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
   const snap = snapshotState(state);
+  let skipReason = "no-links-to-inject";
+  let diagnostic: string | undefined;
   try {
     const { seedDefaultLinks } = await import("@/lib/services/default-links");
     const { injectLinks } = await import("@/lib/services/link-injector");
@@ -2945,16 +3257,28 @@ async function runInternalLinks(state: PipelineState, deps: PipelineDependencies
       return runTrackedHtmlStage(state, "internal-links", (html) => result.modifiedContent, snap);
     }
   } catch (err) {
-    // Non-fatal
+    skipReason = "link-injection-failed";
+    diagnostic = err instanceof Error ? err.message : String(err);
+    state.warnings.push(`Internal-link injection failed and was skipped: ${diagnostic}`);
+    console.warn(
+      `[internal-links] candidate=link-injection pass=false reason=${skipReason}`+
+      ` rollback=not-needed recoverable=true diagnostic="${diagnostic.replace(/[\r\n]+/g, " ").slice(0, 240)}"`,
+    );
   }
   const preHtml = state.blog;
   const inputFp = fp(preHtml);
-  recordStage(state, "internal-links", inputFp, inputFp, true, undefined, { skipped: true, reason: "no-links-to-inject" });
+  recordStage(state, "internal-links", inputFp, inputFp, true, undefined, {
+    skipped: true,
+    reason: skipReason,
+    ...(diagnostic ? { diagnostic } : {}),
+  });
   return state;
 }
 
 async function runSeoNormalization(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
   const snap = snapshotState(state);
+  let skipReason = "normalization-rejected";
+  let diagnostic: string | undefined;
   try {
     const result = await normalizeFinalSeo(
       { html: state.blog, focusKeyphrase: state.keyphrase, targetWordCount: state.requestedWordCount, targetKeyphraseCount: state.exactKeyphraseTarget, minReadingEase: FLESCH_MIN, maxReadingEase: FLESCH_MAX },
@@ -2967,13 +3291,23 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
     if (accepted) {
       return runTrackedHtmlStage(state, "seo-normalization", (html) => result.html, snap);
     }
-  } catch {
+  } catch (error) {
     state.normalizationResult = null;
     state.normalizationAccepted = false;
+    skipReason = "normalization-failed";
+    diagnostic = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `[seo-normalization] candidate=normalization pass=false reason=${skipReason}`+
+      ` rollback=not-needed recoverable=true diagnostic="${diagnostic.replace(/[\r\n]+/g, " ").slice(0, 240)}"`,
+    );
   }
   const preHtml = state.blog;
   const inputFp = fp(preHtml);
-  recordStage(state, "seo-normalization", inputFp, inputFp, true, undefined, { skipped: true, reason: "normalization-rejected-or-failed" });
+  recordStage(state, "seo-normalization", inputFp, inputFp, true, undefined, {
+    skipped: true,
+    reason: skipReason,
+    ...(diagnostic ? { diagnostic } : {}),
+  });
   return state;
 }
 

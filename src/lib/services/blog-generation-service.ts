@@ -169,6 +169,52 @@ export interface ResearchDispatchDecision {
 }
 
 /**
+ * Run lazy generation tasks with bounded concurrency. On the first failure no
+ * further task is started, but every already-running sibling is awaited before
+ * the failure escapes. This prevents late model completions from outliving a
+ * failed generation boundary.
+ */
+export async function runGenerationTasksWithConcurrency<T>(
+  taskFns: Array<() => Promise<T>>,
+  limit: number,
+  onActiveCount?: (active: number) => void,
+): Promise<T[]> {
+  if (!Number.isInteger(limit) || limit < 1) throw new Error("Concurrency limit must be a positive integer");
+  const results: T[] = new Array(taskFns.length);
+  let nextIndex = 0;
+  let active = 0;
+  let failed = false;
+  let firstFailure: unknown;
+
+  async function worker(): Promise<void> {
+    while (!failed && nextIndex < taskFns.length) {
+      const index = nextIndex++;
+      active++;
+      onActiveCount?.(active);
+      try {
+        results[index] = await taskFns[index]();
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          firstFailure = error;
+        }
+      } finally {
+        active--;
+        onActiveCount?.(active);
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(limit, taskFns.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  if (failed) throw firstFailure;
+  return results;
+}
+
+/**
  * Deterministic research-dispatch decision for a normal blog generation.
  *
  * Contract (supported by the UI generation step "Loading Research", the
@@ -420,27 +466,6 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   let activeGenerationRequests = 0;
   let maxObservedConcurrency = 0;
 
-  /** Run async tasks with a concurrency limit, preserving result order. */
-  async function runWithConcurrency<T>(taskFns: (() => Promise<T>)[], limit: number): Promise<T[]> {
-    const results: T[] = new Array(taskFns.length);
-    let nextIdx = 0;
-    async function worker(): Promise<void> {
-      while (nextIdx < taskFns.length) {
-        const idx = nextIdx++;
-        activeGenerationRequests++;
-        maxObservedConcurrency = Math.max(maxObservedConcurrency, activeGenerationRequests);
-        try {
-          results[idx] = await taskFns[idx]();
-        } finally {
-          activeGenerationRequests--;
-        }
-      }
-    }
-    const workers = Array.from({ length: Math.min(limit, taskFns.length) }, () => worker());
-    await Promise.all(workers);
-    return results;
-  }
-
   // Lazy task factories — each factory is wrapped by runWithConcurrency so
   // only `limit` HTTP requests are in flight simultaneously.
   const taskFactories: (() => Promise<TaskResult>)[] = [];
@@ -540,7 +565,14 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     return { type: "conclusion", content: renderEditorialBlocksToWordPress(normalized.blocks) };
   }));
 
-  const settledResults = await runWithConcurrency(taskFactories, 2);
+  const settledResults = await runGenerationTasksWithConcurrency(
+    taskFactories,
+    2,
+    (active) => {
+      activeGenerationRequests = active;
+      maxObservedConcurrency = Math.max(maxObservedConcurrency, activeGenerationRequests);
+    },
+  );
 
   console.log(`[blog-generation] max observed concurrency: ${maxObservedConcurrency}`);
   const results = settledResults.filter((r) => r !== undefined);
@@ -646,8 +678,8 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   const finalMeta = pipelineState.metaDescription;
 
   const generated = {
-    title: finalTitle, slug: slugs.englishSlug, metaDescription: finalMeta,
-    excerpt: outline.excerpt || "", blog: finalBlog, faq: pipelineState.faq || [],
+    title: finalTitle, slug: pipelineState.slug, metaDescription: finalMeta,
+    excerpt: pipelineState.excerpt, blog: finalBlog, faq: pipelineState.faq || [],
     internalLinks: [], externalLinks: extractEditorialExternalLinkUrls(finalBlog),
     categories: [], tags: [], readingTime: "", summary: "",
   };

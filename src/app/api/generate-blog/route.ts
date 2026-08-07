@@ -8,7 +8,7 @@ import {
   aiLogRepository,
 } from "@/lib/repositories";
 import { runBlogGeneration, type GenerationResult } from "@/lib/services/blog-generation-service";
-import { countCanonicalVisibleWords } from "@/lib/blog/article-document";
+import { countCanonicalVisibleWords, renderArticleDocument } from "@/lib/blog/article-document";
 import { analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { runFinalValidation } from "@/lib/pipeline/blog-generation-pipeline";
 
@@ -28,6 +28,41 @@ export async function POST(request: Request) {
 
     const result: GenerationResult = await runBlogGeneration(userId, Number(projectId));
 
+    const canonicalRender = renderArticleDocument(result.pipelineState.articleDoc);
+    const persistedFaq = result.pipelineState.articleDoc.visibleFaq.map((entry) => ({
+      question: entry.question,
+      answer: entry.answerText,
+    }));
+    const representationIssues: string[] = [];
+    if (result.pipelineState.blog !== canonicalRender) representationIssues.push("rendered cache differs from ArticleDocument");
+    if (result.generated.blog !== canonicalRender) representationIssues.push("generated blog differs from canonical render");
+    if (result.generated.title !== result.pipelineState.title
+      || result.generated.title !== result.pipelineState.articleDoc.metadata.title) {
+      representationIssues.push("title differs from canonical metadata");
+    }
+    if (result.generated.slug !== result.pipelineState.slug
+      || result.generated.slug !== result.pipelineState.articleDoc.metadata.slug) {
+      representationIssues.push("slug differs from canonical metadata");
+    }
+    if (result.generated.metaDescription !== result.pipelineState.metaDescription
+      || result.generated.metaDescription !== result.pipelineState.articleDoc.metadata.metaDescription) {
+      representationIssues.push("meta description differs from canonical metadata");
+    }
+    if (result.generated.excerpt !== result.pipelineState.excerpt
+      || result.generated.excerpt !== result.pipelineState.articleDoc.metadata.excerpt) {
+      representationIssues.push("excerpt differs from canonical metadata");
+    }
+    if (JSON.stringify(result.generated.faq || []) !== JSON.stringify(persistedFaq)) {
+      representationIssues.push("FAQ payload differs from canonical FAQ");
+    }
+    if (representationIssues.length > 0) {
+      console.error(
+        `[generate-blog:PRE-SAVE] canonical agreement failed projectId=${projectId}`+
+        ` reasons=[${representationIssues.join("; ")}] zeroWrites=true`,
+      );
+      throw AppError.unprocessable(`Canonical pre-save agreement failed: ${representationIssues.join("; ")}`);
+    }
+
     const finalBlogHtml = result.generated.blog;
     const finalTitle = result.generated.title;
     const finalWordCount = countCanonicalVisibleWords(result.pipelineState.articleDoc);
@@ -37,6 +72,10 @@ export async function POST(request: Request) {
     // pipeline result still passes the sole final acceptance policy.
     const preSaveValidation = runFinalValidation(result.pipelineState);
     if (!preSaveValidation.passed) {
+      console.error(
+        `[generate-blog:PRE-SAVE] final policy failed projectId=${projectId}`+
+        ` firstInvariant="${preSaveValidation.reasons[0] ?? "unknown"}" zeroWrites=true`,
+      );
       throw AppError.unprocessable(
         `Final validation failed before save: ${preSaveValidation.reasons.join("; ")}`,
       );

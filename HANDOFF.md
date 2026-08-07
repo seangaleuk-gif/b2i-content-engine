@@ -5,11 +5,45 @@
 
 ## 1. Current state
 
-The English blog-generation pipeline has been heavily repaired and is now much safer than the earlier versions. Versions 15, 16 and 17 are preserved as read-only regression fixtures. Version 17 is the latest successfully saved English version for project/blog 13 (`version_number=17`, DB record `id=230`).
+The English blog-generation pipeline has been heavily repaired and is now much safer than the earlier versions. Versions 15, 16 and 17 are preserved as read-only regression fixtures. Version 17 is the latest confirmed successfully saved English version for project/blog 13 (`version_number=17`, DB record `id=230`).
 
-A new attempt that should have become version 18 did **not** save. It failed earlier during Section 5 repair because DeepSeek returned an unsupported block type `"heading"`. That is the current English blocker.
+The earlier generic `"heading"` repair-schema blocker is already fixed and regression-covered. The next attempted version 18 reached final trimming but did **not** save because contextual `So, ...` prose was falsely classified as an orphan transition. That defect, its ambiguous compaction diagnostics, the late-sibling concurrency boundary, rollback coverage and the pre-save canonical-representation boundary are now repaired in this codebase.
 
-Once that narrow schema/retry issue is fixed and one clean new English version saves, the English pipeline should be frozen and work should move to Traditional Chinese translation parity.
+No live production generation was run during this audit. The next operator action is one controlled English generation; if it saves cleanly, freeze English and continue Traditional Chinese parity work.
+
+## 1A. Final-QC fragment / stale-scan fix (this audit)
+
+### Proven root cause
+
+A production attempt reached final deterministic QC and failed with two unresolved findings:
+
+```text
+type=malformed-prose component=section-2 block=section-2-wp-8 issues=incomplete sentence ending
+type=fragment          component=section-3 block=section-3-wp-3 sentence="."
+```
+
+Forensic conclusion (not inferred from log order — verified by reading `final-qc-scan`):
+
+1. **Stale-scan defect (Q11 = YES).** In `blog-generation-pipeline.ts`, `final-qc-scan` computed `coherence`, `malformed`, `sentenceQuality` and `boilerplate` **before** the `removeOffTopicSourceCitations` mutation and never recomputed them after it — only `relevance`/`ungrounded`/`headings`/`unsupportedClaims` were recomputed. The log printed the removal message and then reported **pre-removal** findings. After the removal shifts block indices and sentence boundaries, only post-mutation findings are trustworthy. This violated the "Final-QC transaction requirement".
+
+2. **Producer.** The two blocks existed malformed on entry to final QC. `final-trim` ran only Pass 1 whole-paragraph removal (`shortened=0`), so it cannot create an interior `.` fragment in a surviving block. `removeUnsupportedSentences` correctly removes whole sentence ranges; the residual defect class is a paragraph left as terminal punctuation only (`.`, `..`) or ending in a dangling `stop-word.` (`…to.`, `…and.`). `removeTextRanges` had no guard against leaving that residue.
+
+### Fixes
+
+- **`src/lib/pipeline/blog-generation-pipeline.ts`** — `final-qc-scan` is now an explicit deterministic transaction: snapshot before, collect the exact off-topic citation block IDs, remove, re-render from `ArticleDocument`, integrity-guard, accept-or-restore, then **recompute every final scanner against the modified document** before computing `unresolved`. Added `[final-qc-scan] candidate=off-topic-citation-removal beforeFingerprint=… afterFingerprint=… pass=… removedBlockIds=[…] rollback=…` diagnostics.
+- **`src/lib/blog/content-relevance.ts`** — added `collectOffTopicSourceCitationBlockIds` (single detection shared by the removal and its diagnostics) and reimplemented `removeOffTopicSourceCitations` on top of it so a reported block is exactly the block removed.
+- **`src/lib/blog/factual-risk-scanner.ts`** — added `finalizeRemovedParagraph` guard after `removeTextRanges`: a punctuation-only paragraph is removed as a whole block; a trailing dangling `stop-word.` residue is stripped deterministically (plain-text blocks only) so the paragraph scans clean. Never deletes substantive prose, links or numbers.
+
+### Tests
+
+- New `src/lib/blog/final-qc-fragment-regression.test.ts` (12 tests): dot-only removal, trailing `stop-word.` residue, embedded-link preservation, pure off-topic citation removed as one whole block, embedded citation not partially deleted, stale-scan/recompute, parse→render→parse, snapshot restoration, deterministic malformed repair, hard-gate retained.
+- Full suite: **2,269 passed / 0 failed** (82 files). `tsc --noEmit` clean. Build passes. Lint: no new findings vs baseline (pipeline baseline 14 err/13 warn → current 13 err/13 warn; changed regions clean). `git diff --check` clean.
+- Fixtures `blog-13-v15.json`, `v16.json`, `v17.json` unchanged (tracked, `git status` clean).
+
+### Remaining risks
+
+- The `stop-word.` strip only rewrites plain-text paragraphs; a paragraph ending in `…to.` that also carries an inline link is left to the existing hard gate (reject, zero writes) rather than risk breaking the anchor. This is intentional.
+- The fragment class can still originate from model output or other upstream inline editors; this fix guarantees the two deterministic removal paths never create it and the final gate reports only post-mutation truth.
 
 ## 2. Stack and architecture
 
@@ -351,99 +385,48 @@ Relevant regression file:
 
 - `src/lib/pipeline/final-trim-fallback.test.ts`
 
-Latest completed verification before the current runtime failure:
+Latest completed verification for the final-trim/canonical-boundary repair:
 
-- 2,242 tests passed
+- 2,256 tests passed before the final self-audit edge-case addition; the final packaged count is recorded in `FINAL_AUDIT_REPORT_2026-08-07.md`
 - 0 failed
 - 81 test files
 - `tsc --noEmit`: clean
-- `next build`: passes
-- lint baseline: 450 findings (271 errors / 179 warnings)
-- new/changed files reported lint-clean
+- `next build`: passes with inert build-only public Supabase placeholders
+- repository lint remains a pre-existing debt; changed-file comparison introduced no new lint findings
 - no changes to model routing, thinking, token budgets, general retry budgets, SEO thresholds, translation workflow, persistence semantics or shadow-mode meaning
 
-# 6. CURRENT BLOCKER — latest production attempt
+# 6. RESOLVED LATEST BLOCKER — contextual transition at final trim
 
-A fresh English generation was started after the fallback repair.
+The latest failed version-18 attempt reached final trim. The paragraph beginning `So, what does this mean for your business?` was already in the canonical document and had a valid preceding substantive explanation, with a `Source:` citation between them. The old coherence rule looked only at the immediately preceding paragraph, treated the citation as no antecedent, and produced a false `orphan-transition` finding.
 
-It failed **before final trim and final QC** during Section 5 repair.
+The production log proves the finding was pre-existing rather than introduced by deterministic trimming: the trim was rejected and rolled back, the bounded compaction candidate was rejected and rolled back, and the same finding remained. The historic compaction log proves rejection occurred at the JSON/schema parser boundary, but the old implementation discarded whether the exact subclass was invalid JSON or schema-invalid JSON. That missing evidence cannot be reconstructed honestly.
 
-Section:
+Current repairs:
 
-`Budgeting for 2026: Where to Invest Your Marketing Dollars`
+- contextual transition validation skips `Source:` citation paragraphs and looks at the nearest complete substantive paragraph;
+- genuine contrast-dependent `Instead, ...` openings still require an actual contrasting proposition;
+- final trim logs pre-trim, post-trim, newly introduced and final coherence findings separately;
+- every compaction rejection logs the exact failed gate, section, safe diagnostic and rollback result;
+- rejected candidates restore complete canonical state;
+- in-flight concurrent siblings settle before failure escapes and no new task starts after a failure;
+- the route refuses to start persistence unless `ArticleDocument`, rendered cache and the exact generated payload agree;
+- generated slug/excerpt/FAQ now come from the final pipeline state rather than stale assembly inputs.
 
-Exact failure:
-
-```text
-[generate-blog:POST] Internal server error
-[AppError INTERNAL_ERROR] Error: Section 5 ("Budgeting for 2026: Where to Invest Your Marketing Dollars"): generation failed after retry — Block 2: unknown or missing block type "heading"
-```
-
-The Section 5 repair response contained:
-
-```json
-{
-  "type": "heading"
-}
-```
-
-The section schema does not accept generic `"heading"` there, so validation rejected the repaired section and aborted generation.
-
-The conclusion request had already been launched concurrently, so it completed after the fatal Section 5 error. Its result was not used.
-
-### Important
-
-This was **not random** and it was **not the final-trim/coherence bug returning**.
-
-The current blocker is a narrow section-repair schema/retry robustness problem.
-
-No version 18 was saved.
-
-Project 13 still ends at:
-
-- version 17
-- DB record 230
+No version 18 was created by the failed run. No live run was performed during this audit.
 
 # 7. Immediate next task
 
-Fix only the Section 5 repair-schema issue.
+Run one controlled production English generation using this exact package. Do not make further architecture changes before seeing that result.
 
-Desired behavior:
+Verify from one log:
 
-- if DeepSeek returns a clearly legitimate section-internal heading using generic `"heading"`, normalize it to the canonical supported H3/subheading representation only when unambiguous and safe
-- otherwise reject and use a bounded schema-correction retry with the exact allowed block types
-- never silently accept unknown block types
-- never crash the entire generation for a recoverable block-type alias
-- keep the hard failure if the corrected response remains invalid
+- `preTrimCoherenceViolations`, `postTrimCoherenceViolations`, `newTrimIntroducedViolations` and `finalCoherenceViolations` are present;
+- any compaction rejection has an exact `reason=...` and `rollback=success`;
+- final canonical agreement and final policy pass before `getNextVersionNumber`/save;
+- version 18 is created only after all generation tasks have settled;
+- saved HTML, title, slug, meta, excerpt and FAQ match the final canonical document.
 
-Add regression coverage for:
-
-- repair response contains `"type": "heading"`
-- valid H3-like heading is safely normalized or schema-corrected
-- unknown/unsafe block types remain rejected
-- WordPress rendering remains correct
-- section facts, links and ownership remain unchanged
-- failed repair still produces zero DB writes
-
-Do not change:
-
-- model routing
-- thinking configuration
-- token budgets
-- broad retry budgets
-- SEO thresholds
-- translation workflow
-- persistence semantics
-- shadow editorial semantics
-
-Recommended mode:
-
-- **Code mode**
-- **High thinking**
-
-Then run one new English generation.
-
-If it successfully saves version 18 and the saved article is structurally normal, freeze English generation.
+If version 18 saves and the saved article is structurally normal, freeze English generation and continue Traditional Chinese localisation parity. Preserve model routing, thinking configuration, token budgets, broad retry budgets, SEO thresholds, translation workflow, persistence semantics and shadow-editorial semantics.
 
 # 8. English freeze rule
 
@@ -618,19 +601,13 @@ Preserve them unless a new proven root cause requires otherwise.
 
 # 13. What the next chat should do
 
-1. Fix the exact Section 5 schema failure:
-   `Block 2: unknown or missing block type "heading"`
-2. Audit the allowed section block schema and repair normalization/retry path.
-3. Make the smallest safe fix.
-4. Run focused regression tests.
-5. Run complete test suite.
-6. Run `tsc --noEmit`.
-7. Lint changed/new files.
-8. Run production build.
-9. Generate one fresh English article for project 13.
-10. Expected next saved version: **18**.
-11. If version 18 saves and final QC is clean, freeze English.
-12. Immediately move to Traditional Chinese localisation parity using version 18 as immutable source.
+1. Read `FINAL_AUDIT_REPORT_2026-08-07.md` and preserve every listed invariant.
+2. Deploy/load this audited package without changing feature-flag meaning or model configuration.
+3. Generate one fresh English article for project 13.
+4. Expected next saved version: **18**.
+5. Inspect the new final-trim/compaction/pre-save diagnostics.
+6. If version 18 saves and final QC is clean, freeze English.
+7. Immediately move to Traditional Chinese localisation parity using version 18 as immutable source.
 
 The goal is no longer endless English perfection. The goal is a stable English → Traditional Chinese production system.
 
@@ -671,16 +648,4 @@ Do not treat category C as another architecture emergency.
 
 # 15. Latest known verification baseline
 
-Before the current Section 5 runtime failure:
-
-- **2,242 tests passed**
-- **0 failed**
-- **81 test files**
-- `tsc --noEmit`: clean
-- `next build`: passes
-- lint baseline: **450 findings**
-  - 271 errors
-  - 179 warnings
-- new/changed files reported lint-clean
-
-The latest production attempt then failed before save on the unsupported `"heading"` block. That is the immediate next issue.
+See `FINAL_AUDIT_REPORT_2026-08-07.md` for the final packaged verification counts and remaining risks. The generic `"heading"` alias and contextual final-trim failures are both resolved in this package. The immediate next action is a controlled live generation, not another speculative English-pipeline redesign.

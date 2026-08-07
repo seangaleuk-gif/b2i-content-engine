@@ -803,9 +803,12 @@ export function removeUnsupportedSentences(
     const paragraph = parsed.blocks[0];
     if (parsed.errors.length > 0 || paragraph?.type !== "paragraph") continue;
     const repaired = removeTextRanges(paragraph, plan.ranges);
-    const repairedText = repaired.content.map((node) => node.text).join("").trim();
+    const finalized = finalizeRemovedParagraph(repaired);
+    const repairedText = finalized
+      ? finalized.content.map((node) => node.text).join("").trim()
+      : "";
     const replacement = repairedText
-      ? renderEditorialBlocksToWordPress([repaired])
+      ? renderEditorialBlocksToWordPress([finalized!])
       : "";
     const start = match.index ?? 0;
     modified = modified.slice(0, start) + replacement + modified.slice(start + paragraphHtml.length);
@@ -1060,6 +1063,44 @@ function removeTextRanges(
     content[content.length - 1].text = content[content.length - 1].text.trimEnd();
   }
   return { ...paragraph, content };
+}
+
+/**
+ * Bounded deterministic guard applied after a sentence/claim removal. A removal
+ * can leave a paragraph reduced to terminal punctuation only (a lone `.`, `..`,
+ * `!`, `…`) or ending in a dangling stop-word followed by a period (`…to.`,
+ * `…and.`). Both are malformed fragments that must never survive:
+ *
+ * - a punctuation-only paragraph is semantically empty and removed as a whole
+ *   block (the caller renders `null` as no block);
+ * - a trailing dangling `stop-word.` residue is stripped so the paragraph ends
+ *   cleanly; if that empties it, the block is removed.
+ *
+ * This never deletes substantive prose and never touches links or numbers.
+ */
+const DANGLING_END_RE = /\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i;
+const PUNCTUATION_ONLY_RE = /^[\s\p{P}\p{S}]+$/u;
+
+function finalizeRemovedParagraph(
+  paragraph: Extract<EditorialBlock, { type: "paragraph" }>,
+): Extract<EditorialBlock, { type: "paragraph" }> | null {
+  const text = paragraph.content.map((node) => node.text).join("").trim();
+  if (!text) return null;
+  if (PUNCTUATION_ONLY_RE.test(text)) return null;
+
+  if (DANGLING_END_RE.test(text)) {
+    // Remove the trailing dangling stop-word + period residue. Use a regex that
+    // drops the malformed tail, then re-check: if nothing substantive remains,
+    // the paragraph is removed.
+    const stripped = text.replace(DANGLING_END_RE, "").trim();
+    if (!stripped || PUNCTUATION_ONLY_RE.test(stripped)) return null;
+    // Only commit a plain-text rewrite; never rebuild link/anchor-bearing
+    // paragraphs with a textual splice that could break an anchor.
+    if (paragraph.content.every((node) => node.type === "text")) {
+      return { ...paragraph, content: [{ type: "text", text: stripped }] };
+    }
+  }
+  return paragraph;
 }
 
 // ── Format claims for logging ──
