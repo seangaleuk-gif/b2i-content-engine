@@ -22,55 +22,17 @@ import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
-import { pairedSlugs, sanitizeSectionUrls, isEligibleExternalSourceUrl } from "@/lib/services/article-postprocessors";
-import { rebalanceWpBlocks } from "@/lib/services/text-utils";
-import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks } from "@/lib/blog/article-content";
+import { pairedSlugs, sanitizeSectionUrls, isEligibleExternalSourceUrl, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
+import { CTA_CONTENT_RE, normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks } from "@/lib/blog/article-content";
 import { buildClaimOwnershipLedger, formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
 import { stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
+import { repairHeadingNaturalness } from "@/lib/blog/content-relevance";
 
-/** Strip ALL heading blocks (H2, H3, bare <h2>, bare <h3>) from section body content.
- *  Handles complete blocks, orphaned openers/closers, and malformed heading markup
- *  that the AI may produce despite explicit formatting instructions. */
-function stripHeadingBlocks(raw: string): string {
-  let cleaned = raw;
-
-  // Pass 1: strip well-formed H2 heading blocks (opener + <h2>...</h2> + closer)
-  cleaned = cleaned.replace(
-    /<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*\n?<h2[^>]*>[\s\S]*?<\/h2>\s*\n?<!--\s*\/wp:heading\s*-->/gi,
-    "",
-  );
-
-  // Pass 2: strip well-formed H3 heading blocks (opener + <h3>...</h3> + closer)
-  cleaned = cleaned.replace(
-    /<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*3[^}]*\}\s*-->\s*\n?<h3[^>]*>[\s\S]*?<\/h3>\s*\n?<!--\s*\/wp:heading\s*-->/gi,
-    "",
-  );
-
-  // Pass 3: strip any remaining <!-- wp:heading ... --> openers and <!-- /wp:heading --> closers
-  // (catches orphaned markers from malformed AI output)
-  cleaned = cleaned.replace(/<!--\s*wp:heading[^>]*-->/gi, "");
-  cleaned = cleaned.replace(/<!--\s*\/wp:heading\s*-->/gi, "");
-
-  // Pass 4: strip bare <h2> and <h3> tags (opener + content + closer)
-  cleaned = cleaned.replace(/<h2\b[^>]*>[\s\S]*?<\/h2>/gi, "");
-  cleaned = cleaned.replace(/<h3\b[^>]*>[\s\S]*?<\/h3>/gi, "");
-
-  // Pass 5: strip any remaining orphaned <h2>, <h3>, </h2>, </h3> tags
-  cleaned = cleaned.replace(/<\/?h[23]\b[^>]*>/gi, "");
-
-  // Pass 6: clean up empty paragraph blocks that may result from heading removal
-  cleaned = cleaned.replace(
-    /<!--\s*wp:paragraph\s*-->\s*\n?<p>\s*<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi,
-    "",
-  );
-
-  // Pass 7: rebalance WordPress blocks via shared utility
-  cleaned = rebalanceWpBlocks(cleaned);
-
-  // Collapse multiple blank lines
-  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
-
-  return cleaned;
+export class OutlineHeadingValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OutlineHeadingValidationError";
+  }
 }
 
 /** Normalize an AI outline to the canonical H2 policy.
@@ -103,7 +65,26 @@ export function normalizeOutlineHeadings(
   }
 
   const existingFaq = unique.find((heading) => faqPattern.test(heading));
-  let editorial = unique.filter((heading) => !faqPattern.test(heading) && !conclusionPattern.test(heading));
+  const repairedEditorial: string[] = [];
+  for (const [index, heading] of unique
+    .filter((candidate) => !faqPattern.test(candidate) && !conclusionPattern.test(candidate))
+    .entries()) {
+    const repair = repairHeadingNaturalness(heading, keyphrase, `outline-${index}`);
+    if (!repair.resolved) {
+      throw new OutlineHeadingValidationError(
+        `Outline H2 ${index + 1} is not safely repairable: ${repair.remainingViolations.map((item) => item.code).join(", ")} — "${heading}"`,
+      );
+    }
+    if (repair.changed) {
+      console.log(
+        `[outline-heading-normalization] index=${index} issues=${repair.initialViolations.map((item) => item.code).join(",")} before=${JSON.stringify(repair.original)} after=${JSON.stringify(repair.heading)}`,
+      );
+    }
+    if (!repairedEditorial.some((candidate) => candidate.toLowerCase() === repair.heading.toLowerCase())) {
+      repairedEditorial.push(repair.heading);
+    }
+  }
+  let editorial = repairedEditorial;
   if (editorial.length > editorialMax) editorial = editorial.slice(0, editorialMax);
 
   const topic = (title || keyphrase || "This Topic").replace(/:.*$/, "").trim();
@@ -120,18 +101,98 @@ export function normalizeOutlineHeadings(
 
   for (const candidate of fallbackCandidates) {
     if (editorial.length >= editorialMin) break;
-    const key = candidate.toLowerCase();
-    if (!editorial.some((heading) => heading.toLowerCase() === key)) editorial.push(candidate);
+    const repair = repairHeadingNaturalness(candidate, keyphrase, `outline-fallback-${editorial.length}`);
+    if (!repair.resolved) continue;
+    const key = repair.heading.toLowerCase();
+    if (!editorial.some((heading) => heading.toLowerCase() === key)) editorial.push(repair.heading);
   }
 
   if (editorial.length < editorialMin) {
-    throw AppError.internal(new Error(
+    throw new OutlineHeadingValidationError(
       `Outline produced ${editorial.length} editorial H2 headings; ${editorialMin}-${editorialMax} required`,
-    ));
+    );
   }
 
   const faqHeading = existingFaq || `Frequently Asked Questions About ${topic}`;
   return [...editorial, faqHeading];
+}
+
+function extractOutlineHeadings(outline: unknown): string[] {
+  if (!outline || typeof outline !== "object") return [];
+  const record = outline as Record<string, unknown>;
+  if (Array.isArray(record.h2Headings)) return record.h2Headings.filter((item): item is string => typeof item === "string");
+  if (Array.isArray(record.headings)) return record.headings.filter((item): item is string => typeof item === "string");
+  if (!Array.isArray(record.sections)) return [];
+  return record.sections
+    .map((section) => {
+      if (typeof section === "string") return section;
+      if (!section || typeof section !== "object") return "";
+      const item = section as Record<string, unknown>;
+      return typeof item.heading === "string" ? item.heading : typeof item.title === "string" ? item.title : "";
+    })
+    .filter(Boolean);
+}
+
+/** Model-produced metadata is plain text, never an HTML or WordPress surface. */
+function normalizeOutlinePlainText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  let text = value;
+  // Two passes also remove tags that were entity-encoded once.
+  for (let pass = 0; pass < 2; pass++) {
+    text = text
+      .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#(?:39|x27);/gi, "'")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">");
+  }
+  return text.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+interface AcceptedFaqPayload {
+  entries: Array<{ question: string; answer: string }>;
+  errors: string[];
+}
+
+function validateFaqPayload(raw: unknown, min: number, max: number): AcceptedFaqPayload {
+  if (!raw || typeof raw !== "object" || !Array.isArray((raw as Record<string, unknown>).entries)) {
+    return { entries: [], errors: ["entries must be an array"] };
+  }
+  const rawEntries = (raw as { entries: unknown[] }).entries;
+  const errors: string[] = [];
+  if (rawEntries.length < min || rawEntries.length > max) {
+    errors.push(`entry count ${rawEntries.length}; expected ${min}-${max}`);
+  }
+  const entries: Array<{ question: string; answer: string }> = [];
+  for (const [index, entry] of rawEntries.entries()) {
+    if (!entry || typeof entry !== "object") {
+      errors.push(`entry ${index + 1} must be an object`);
+      continue;
+    }
+    const item = entry as Record<string, unknown>;
+    const question = typeof item.question === "string" ? item.question.replace(/\s+/g, " ").trim() : "";
+    const answer = typeof item.answer === "string" ? item.answer.replace(/\s+/g, " ").trim() : "";
+    if (!question) errors.push(`entry ${index + 1} has an empty question`);
+    if (!answer) errors.push(`entry ${index + 1} has an empty answer`);
+    if (/<!--[\s\S]*?-->|<[^>]+>|```/.test(question) || /<!--[\s\S]*?-->|<[^>]+>|```/.test(answer)) {
+      errors.push(`entry ${index + 1} contains markup`);
+    }
+    const faqCopy = `${question} ${answer}`;
+    if (
+      CTA_CONTENT_RE.test(faqCopy)
+      || /https?:\/\/\S*(?:signup|register|sign-up)|app\.b2ihub\.com\/signup|\b(?:sign[- ]?up|register)\b/i.test(faqCopy)
+    ) {
+      errors.push(`entry ${index + 1} contains protected CTA/signup copy`);
+    }
+    if (/\p{Script=Han}/u.test(question) || /\p{Script=Han}/u.test(answer)) {
+      errors.push(`entry ${index + 1} is not English-only`);
+    }
+    entries.push({ question, answer });
+  }
+  return { entries, errors };
 }
 
 export { buildGenerationReport, buildPolicy, analyzeFinalArticle, evaluatePolicy, validatePipelineOrder };
@@ -280,7 +341,14 @@ export async function runBlogGeneration(
   const trackedChat = overrides?.requestDeepSeek
     ? overrides.requestDeepSeek
     : (stage: string, messages: ChatMessage[], options?: ChatOptions) => ai.call(stage, messages, options);
-  const makeTrackedChatForStage = (stage: string) => ai.makeCallerForStage(stage);
+  const pipelineChatWithRetry = overrides?.requestDeepSeek
+    ? (messages: ChatMessage[], options?: ChatOptions, stage = "pipeline") =>
+        overrides.requestDeepSeek!(stage, messages, options)
+    : ai.chatWithRetry;
+  const makeTrackedChatForStage = overrides?.requestDeepSeek
+    ? (stage: string) => (messages: ChatMessage[], options?: ChatOptions) =>
+        overrides.requestDeepSeek!(stage, messages, options)
+    : (stage: string) => ai.makeCallerForStage(stage);
 
   const research = await researchRepository.findByProject(Number(projectId));
   const knowledge = await knowledgeRepository.findByUser(userId);
@@ -398,27 +466,54 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     outline = robustJsonParse(retryRes.content, "outline-retry");
   }
 
-  let h2Headings: string[] = outline?.h2Headings ?? [];
-  if (h2Headings.length === 0) {
-    h2Headings = outline?.headings ?? [];
+  if (!outline || typeof outline !== "object" || Array.isArray(outline)) {
+    throw AppError.internal(new Error("Outline response must be a JSON object"));
   }
-  if (h2Headings.length === 0 && Array.isArray(outline?.sections)) {
-    h2Headings = outline.sections.map((s: any) => typeof s === "string" ? s : s.heading ?? s.title ?? "").filter(Boolean);
-  }
+
+  outline.title = normalizeOutlinePlainText(outline?.title) || "Untitled";
+  outline.metaDescription = normalizeOutlinePlainText(outline?.metaDescription);
+  outline.excerpt = normalizeOutlinePlainText(outline?.excerpt);
+
+  let h2Headings = extractOutlineHeadings(outline);
   if (h2Headings.length === 0) {
-    console.error("[blog-generation] No H2 headings generated. Outline keys:", Object.keys(outline ?? {}));
-    console.error("[blog-generation] Outline snippet:", JSON.stringify(outline).substring(0, 500));
+    console.error("[blog-generation] No H2 headings generated. Outline keys:", Object.keys(outline));
     throw AppError.internal(new Error("No H2 headings generated"));
   }
 
   // Normalize the outline to the canonical policy: editorialH2Min-editorialH2Max
   // editorial headings plus exactly one FAQ heading at the end.
-  h2Headings = normalizeOutlineHeadings(
-    h2Headings,
-    requestedWordCount,
-    outline?.title || "",
-    keyphrase,
-  );
+  try {
+    h2Headings = normalizeOutlineHeadings(
+      h2Headings,
+      requestedWordCount,
+      outline?.title || "",
+      keyphrase,
+    );
+  } catch (error) {
+    if (!(error instanceof OutlineHeadingValidationError)) throw error;
+    console.warn(`[outline-heading-validation] retrying before drafting: ${error.message}`);
+    const qualityRetryPrompt = `${outlinePrompt}\n\nYour previous outline headings failed deterministic acceptance: ${error.message}. Return ONLY JSON containing a corrected \"h2Headings\" array. Preserve the intended section topics, but remove repeated years, repeated locations, duplicated keyphrases and topic phrases repeated across a colon. Do not include full article content. Previous headings: ${JSON.stringify(h2Headings)}`;
+    const retryRes = await trackedChat("outline_quality_retry",
+      [{ role: "system", content: outlineSystemPrompt }, { role: "user", content: qualityRetryPrompt }],
+      { responseFormat: { type: "json_object" }, maxTokens: 4096, timeoutMs: 60_000 },
+    );
+    const retryOutline = robustJsonParse(retryRes.content, "outline-quality-retry");
+    const retryHeadings = extractOutlineHeadings(retryOutline);
+    if (retryHeadings.length === 0) {
+      throw AppError.internal(new Error("Outline heading quality retry returned no H2 headings"));
+    }
+    try {
+      h2Headings = normalizeOutlineHeadings(
+        retryHeadings,
+        requestedWordCount,
+        outline?.title || "",
+        keyphrase,
+      );
+    } catch (retryError) {
+      const message = retryError instanceof Error ? retryError.message : String(retryError);
+      throw AppError.internal(new Error(`Outline headings failed deterministic acceptance after one targeted retry: ${message}`));
+    }
+  }
   const faqPattern = /faq|frequently\s*asked|common\s*questions?/i;
 
   const { min: metaMin, max: metaMax } = englishMetaRange();
@@ -504,16 +599,37 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       // FAQ: structured output with heading + entries, not an editorial section
       const faqMsg = `Return FAQ content as structured JSON. Use: {"heading": "...", "entries": [{"question": "...", "answer": "..."}]}. Generate ${faqTarget} words total across ${faqRange.min}-${faqRange.max} entries. Each answer must be 1-3 complete sentences. Write every question and answer in ENGLISH ONLY — do not use Chinese characters. Do not include HTML, WordPress comments, Markdown fences, signup URLs, CTA content, or precise statistics. Questions must be conceptual or practical rather than asking for a number already owned by a body section.\n\nHeading: "${h2Text}"\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
       taskFactories.push(() => trackedChat("faq", [{ role: "system", content: bundle.faqSystem }, { role: "user", content: faqMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
-        const raw = robustJsonParse(res.content, "faq");
-        const heading = (raw as any).heading || h2Text;
-        const entries: Array<{ question: string; answer: string }> = (raw as any).entries || [];
-        if (entries.length < faqRange.min || entries.length > faqRange.max) {
-          throw AppError.internal(new Error(`FAQ generation returned ${entries.length} entries; expected ${faqRange.min}-${faqRange.max}`));
+        let raw: unknown;
+        let parsed: AcceptedFaqPayload;
+        try {
+          raw = robustJsonParse(res.content, "faq");
+          parsed = validateFaqPayload(raw, faqRange.min, faqRange.max);
+        } catch (error) {
+          parsed = { entries: [], errors: [error instanceof Error ? error.message : String(error)] };
+          raw = {};
         }
-        // Sanitize answers — strip any signup URL or CTA content
-        for (const e of entries) {
-          e.answer = e.answer.replace(/https?:\/\/\S*(?:signup|register|sign-up)/gi, "").trim();
+        if (parsed.errors.length > 0) {
+          const repairMsg = `${faqMsg}\n\nYour previous FAQ failed deterministic acceptance: ${parsed.errors.join("; ")}. Return ONLY corrected JSON with ${faqRange.min}-${faqRange.max} complete entries. Do not return HTML, WordPress comments, Markdown, CTA/signup copy or Chinese text.`;
+          const repairRes = await trackedChat("faq_repair", [{ role: "system", content: bundle.faqSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 60_000 });
+          raw = robustJsonParse(repairRes.content, "faq-repair");
+          parsed = validateFaqPayload(raw, faqRange.min, faqRange.max);
+          if (parsed.errors.length > 0) {
+            throw AppError.internal(new Error(`FAQ generation failed deterministic acceptance after one targeted retry: ${parsed.errors.join("; ")}`));
+          }
         }
+        // The accepted outline owns the FAQ H2. The FAQ model owns only the
+        // Q&A entries and may not replace an already validated heading with
+        // markup, a different topic, or a second H2 variant.
+        const returnedHeading = typeof (raw as any).heading === "string"
+          ? (raw as any).heading.replace(/\s+/g, " ").trim()
+          : "";
+        const heading = h2Text;
+        if (returnedHeading && returnedHeading !== h2Text) {
+          console.log(
+            `[faq-heading] ignored model override returned=${JSON.stringify(returnedHeading)} canonical=${JSON.stringify(h2Text)}`,
+          );
+        }
+        const entries = parsed.entries;
         return { type: "faq", index: faqIndex, heading, content: JSON.stringify({ heading, entries }) };
       }));
     } else {
@@ -638,9 +754,14 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     });
   }
 
+  const languageSwitcherHtml = renderLanguageSwitcher({
+    currentLanguage: "en",
+    englishSlug: slugs.englishSlug,
+    chineseSlug: slugs.chineseSlug,
+  });
   const articleDoc: ArticleDocument = {
     metadata: { title: outline.title || "Untitled", slug: slugs.englishSlug, metaDescription: repairedMeta, excerpt: outline.excerpt || "", targetWordCount: requestedWordCount, focusKeyphrase: keyphrase },
-    languageSwitcher: { id: "ls", type: "language-switcher", html: `<!-- wp:html --><div class="b2i-language-switcher"><span>English</span> | <a href="/blog/${slugs.chineseSlug}">繁體中文</a></div><!-- /wp:html -->`, fingerprint: fingerprintHtml("switcher") },
+    languageSwitcher: { id: "language-switcher", type: "language-switcher", html: languageSwitcherHtml, fingerprint: fingerprintHtml(languageSwitcherHtml) },
     introduction: { id: "intro", blocks: parseWordPressEditorialBlocks(intro, "intro").blocks, status: "generated" },
     sections: docSections,
     visibleFaq: faqEntries.map((e) => ({
@@ -664,8 +785,8 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   });
 
   await runPostAssemblyPipeline(pipelineState, {
-    chatWithRetry: ai.chatWithRetry,
-    makeTrackedChatForStage: (s: string) => ai.makeCallerForStage(s),
+    chatWithRetry: pipelineChatWithRetry,
+    makeTrackedChatForStage,
     telemetry,
     context,
   } satisfies PipelineDependencies);

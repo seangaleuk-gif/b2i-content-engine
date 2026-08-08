@@ -3135,7 +3135,7 @@ describe("external link injection", () => {
 
   it("does not place two external-link paragraphs consecutively", () => {
     const input = `<!-- wp:heading {"level":2} -->
-<h2>Section One</h2>
+<h2>Survey Respondent Preferences</h2>
 <!-- /wp:heading -->
 
 <!-- wp:paragraph -->
@@ -3143,7 +3143,7 @@ describe("external link injection", () => {
 <!-- /wp:paragraph -->
 
 <!-- wp:heading {"level":2} -->
-<h2>Section Two</h2>
+<h2>Advertising Reach by Market</h2>
 <!-- /wp:heading -->
 
 <!-- wp:paragraph -->
@@ -3151,7 +3151,7 @@ describe("external link injection", () => {
 <!-- /wp:paragraph -->
 
 <!-- wp:heading {"level":2} -->
-<h2>Section Three</h2>
+<h2>Average Engagement Benchmark</h2>
 <!-- /wp:heading -->
 
 <!-- wp:paragraph -->
@@ -3191,7 +3191,7 @@ describe("external link injection", () => {
   });
 
   it("adds a named source beside a matching factual claim", () => {
-    const input = `<!-- wp:heading {"level":2} --><h2>Audience</h2><!-- /wp:heading -->
+    const input = `<!-- wp:heading {"level":2} --><h2>Threads Usage Survey Audience</h2><!-- /wp:heading -->
 <!-- wp:paragraph --><p>A survey found that 97.9% of respondents had used Threads.</p><!-- /wp:paragraph -->`;
     const result = insertExternalResearchLinks(input, [{
       url: "https://example.com/hong-kong-survey",
@@ -3224,6 +3224,18 @@ describe("external link injection", () => {
       title: "Unrelated benchmark",
       snippet: "A different platform reached 42% of users.",
     }], 3);
+    expect(result.linksInserted).toBe(0);
+    expect(result.html).toBe(input);
+  });
+
+  it("does not emit a body-matching citation that the final H2 relevance gate would reject", () => {
+    const input = `<!-- wp:heading {"level":2} --><h2>Customer Retention Strategy</h2><!-- /wp:heading -->
+<!-- wp:paragraph --><p>The Hong Kong digital marketing budget guide explains channel allocation and campaign spending.</p><!-- /wp:paragraph -->`;
+    const result = insertExternalResearchLinks(input, [{
+      url: "https://example.com/hong-kong-budget-guide",
+      title: "Hong Kong Digital Marketing Budget Guide",
+      snippet: "A guide to channel allocation and campaign spending in Hong Kong.",
+    }], 1);
     expect(result.linksInserted).toBe(0);
     expect(result.html).toBe(input);
   });
@@ -4856,6 +4868,7 @@ describe("pipeline stage order and fallback", () => {
     const state = makeEmptyState();
     state.stageOutputs = [
       { stage: "claim-check", inputFingerprint: "a0", outputFingerprint: "a0", accepted: true },
+      { stage: "source-relevance-repair", inputFingerprint: "a0", outputFingerprint: "a0", accepted: true },
       { stage: "expansion", inputFingerprint: "a0", outputFingerprint: "a1", accepted: true },
       { stage: "trim", inputFingerprint: "a1", outputFingerprint: "a2", accepted: true },
       { stage: "paragraphs", inputFingerprint: "a2", outputFingerprint: "a3", accepted: true },
@@ -4943,7 +4956,7 @@ describe("pipeline stage 2 integration", () => {
   it("every post-assembly stage executes once in the required order", () => {
     const state = makeEmptyState();
     const required = [
-      "claim-check", "expansion", "trim", "paragraphs", "regeneration",
+      "claim-check", "source-relevance-repair", "expansion", "trim", "paragraphs", "regeneration",
       "seo-normalization", "title-repair", "factual-scan", "claim-ownership", "temporal-freshness",
       "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
       "language-switcher", "internal-links", "external-links", "external-dedup",
@@ -5267,6 +5280,7 @@ describe("pipeline stage skip recording and rollback", () => {
     const state = makeFullState();
     state.stageOutputs = [
       { stage: "claim-check", inputFingerprint: "a0", outputFingerprint: "a0", accepted: true },
+      { stage: "source-relevance-repair", inputFingerprint: "a0", outputFingerprint: "a0", accepted: true },
       { stage: "expansion", inputFingerprint: "a0", outputFingerprint: "a1", accepted: true },
       { stage: "trim", inputFingerprint: "a1", outputFingerprint: "a2", accepted: true },
       { stage: "paragraphs", inputFingerprint: "a2", outputFingerprint: "a3", accepted: true },
@@ -5301,7 +5315,7 @@ describe("pipeline stage skip recording and rollback", () => {
 
   it("each pipeline stage is recorded exactly once", () => {
     const state = makeFullState();
-    const stageNames = ["claim-check", "expansion", "trim", "paragraphs", "regeneration",
+    const stageNames = ["claim-check", "source-relevance-repair", "expansion", "trim", "paragraphs", "regeneration",
       "language-switcher", "external-links", "external-dedup", "internal-links",
       "seo-normalization", "title-repair", "faq-recovery", "final-validation"];
 

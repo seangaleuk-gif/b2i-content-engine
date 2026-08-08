@@ -39,6 +39,15 @@ export interface HeadingNaturalnessViolation {
   snippet: string;
 }
 
+export interface HeadingNaturalnessRepair {
+  original: string;
+  heading: string;
+  changed: boolean;
+  resolved: boolean;
+  initialViolations: HeadingNaturalnessViolation[];
+  remainingViolations: HeadingNaturalnessViolation[];
+}
+
 function topicWords(text: string): string[] {
   return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
     .filter((word) => word.length > 2 && !TOPIC_STOP_WORDS.has(word));
@@ -54,6 +63,24 @@ function linkHrefs(html: string): string[] {
 
 function normalizeUrl(url: string): string {
   return url.replace(/\/+$/, "").replace(/^https?:\/\//i, "");
+}
+
+/** Single heading/source relevance rule used by both citation production and
+ * final validation. A producer can no longer emit a citation that its own
+ * final gate is guaranteed to remove. */
+export function assessHeadingSourceTextRelevance(
+  heading: string,
+  sourceText: string,
+): { relevant: boolean; sharedWords: string[]; hasSpecificWord: boolean } {
+  const headingTokens = topicWords(heading);
+  const sourceTokens = topicWords(sourceText);
+  const sharedWords = [...new Set(headingTokens.filter((word) => sourceTokens.includes(word)))];
+  const hasSpecificWord = sharedWords.some((word) => !GENERIC_TOPIC_WORDS.has(word));
+  return {
+    relevant: sharedWords.length >= 2 || hasSpecificWord,
+    sharedWords,
+    hasSpecificWord,
+  };
 }
 
 /**
@@ -102,9 +129,12 @@ export function assessSourceSectionRelevance(
       let bestHasSpecific = false;
       let bestSnippet = "";
       for (const variant of variants) {
-        const sourceWords = topicWords(`${variant.title} ${variant.snippet}`);
-        const shared = [...new Set(headingWords.filter((word) => sourceWords.includes(word)))];
-        const hasSpecific = shared.some((word) => !GENERIC_TOPIC_WORDS.has(word));
+        const assessment = assessHeadingSourceTextRelevance(
+          section.heading,
+          `${variant.title} ${variant.snippet}`,
+        );
+        const shared = assessment.sharedWords;
+        const hasSpecific = assessment.hasSpecificWord;
         if (shared.length > bestShared.length || (shared.length === bestShared.length && hasSpecific && !bestHasSpecific)) {
           bestShared = shared;
           bestHasSpecific = hasSpecific;
@@ -157,6 +187,201 @@ const KEYPHRASE_FUNCTION_WORDS = new Set([
   "is", "are", "was", "were", "be", "been", "being", "it", "its", "your", "you",
 ]);
 
+function headingWords(text: string): string[] {
+  return text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function countTokenSequence(words: string[], sequence: string[]): number {
+  if (sequence.length === 0 || sequence.length > words.length) return 0;
+  let count = 0;
+  for (let i = 0; i <= words.length - sequence.length; i++) {
+    if (sequence.every((word, offset) => words[i + offset] === word)) count++;
+  }
+  return count;
+}
+
+/**
+ * Text-level heading validator shared by the outline acceptance boundary and
+ * the final ArticleDocument backstop. Keeping one detector prevents the
+ * producer and final gate from drifting apart.
+ */
+export function assessHeadingTextNaturalness(
+  heading: string,
+  keyphrase: string,
+  sectionId = "outline",
+): HeadingNaturalnessViolation[] {
+  const violations: HeadingNaturalnessViolation[] = [];
+  const words = headingWords(heading);
+  const keyphraseWords = headingWords(keyphrase);
+  const kpContentWords = keyphraseWords.filter((word) => !KEYPHRASE_FUNCTION_WORDS.has(word));
+
+  const years = words.filter((word) => /^(?:19|20)\d{2}$/.test(word));
+  if (new Set(years).size < years.length) {
+    violations.push({ sectionId, heading, code: "repeated-year", snippet: heading.slice(0, 160) });
+  }
+
+  const colonParts = heading.split(/[:：]/).map((part) => part.trim()).filter(Boolean);
+  if (colonParts.length >= 2) {
+    const prefixWords = headingWords(colonParts.slice(0, -1).join(" "));
+    const suffixWords = headingWords(colonParts[colonParts.length - 1]);
+    const suffixHasKeyphrase = countTokenSequence(suffixWords, keyphraseWords) > 0;
+    const prefixCoversTopic = kpContentWords.filter((word) => prefixWords.includes(word)).length >= 2;
+    if (suffixHasKeyphrase && prefixCoversTopic) {
+      violations.push({
+        sectionId,
+        heading,
+        code: "duplicated-topic-append",
+        snippet: heading.slice(0, 160),
+      });
+    }
+  }
+
+  const repeatedExactKeyphrase = keyphraseWords.length > 0
+    && countTokenSequence(words, keyphraseWords) > 1;
+  // Repeating a location can be legitimate in a comparison (for example,
+  // "Hong Kong vs Singapore: What Hong Kong Brands Need to Know"). Treat it
+  // as mechanical duplication only when the two colon halves also repeat a
+  // content topic, or when the second location is a redundant trailing
+  // "in/for Hong Kong" suffix. This keeps the production defect detectable
+  // without making every second location mention a false positive.
+  const colonRepeatedLocationTopic = colonParts.length >= 2 && (() => {
+    const prefixWords = headingWords(colonParts.slice(0, -1).join(" "));
+    const suffixWords = headingWords(colonParts[colonParts.length - 1]);
+    const prefixHasLocation = countTokenSequence(prefixWords, ["hong", "kong"]) > 0;
+    const suffixHasLocation = countTokenSequence(suffixWords, ["hong", "kong"]) > 0;
+    const locationAndFunctionWords = new Set([...KEYPHRASE_FUNCTION_WORDS, "hong", "kong"]);
+    const prefixTopics = new Set(prefixWords.filter((word) =>
+      word.length > 2 && !locationAndFunctionWords.has(word),
+    ));
+    const sharedTopic = suffixWords.some((word) =>
+      word.length > 2 && !locationAndFunctionWords.has(word) && prefixTopics.has(word),
+    );
+    return prefixHasLocation && suffixHasLocation && sharedTopic;
+  })();
+  const trailingRepeatedLocation = countTokenSequence(words, ["hong", "kong"]) > 1
+    && /\b(?:in|for)\s+hong\s+kong\s*$/i.test(heading);
+  const repeatedHongKong = colonRepeatedLocationTopic || trailingRepeatedLocation;
+  if (repeatedExactKeyphrase || repeatedHongKong) {
+    violations.push({
+      sectionId,
+      heading,
+      code: "duplicated-keyphrase-heading",
+      snippet: heading.slice(0, 160),
+    });
+  }
+
+  return violations;
+}
+
+function numericTokens(text: string): string[] {
+  // Treat alphanumeric forms such as 5G and B2B as numeric-bearing meaning as
+  // well. A repair may not silently choose a colon half that drops one.
+  return headingWords(text).filter((word) => /\d/.test(word));
+}
+
+const HEADING_FRAMING_WORDS = new Set([
+  "what", "whats", "shaping", "why", "how", "guide", "overview",
+  "introduction", "understanding", "explained", "matters", "state",
+  "practical", "look", "future", "next", "steps",
+]);
+
+function chooseSafeColonPart(heading: string, keyphrase: string): string | null {
+  const parts = heading.split(/[:：]/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  const requiredNumbers = new Set(numericTokens(heading));
+  const keyphraseWords = headingWords(keyphrase);
+  const allMeaningful = headingWords(heading)
+    .filter((word) => word.length > 2 && !KEYPHRASE_FUNCTION_WORDS.has(word));
+  const candidates = parts
+    .map((part, index) => {
+      const words = headingWords(part);
+      const numbers = new Set(numericTokens(part));
+      const losesNumber = [...requiredNumbers].some((number) => !numbers.has(number));
+      const meaningful = words.filter((word) => word.length > 2 && !KEYPHRASE_FUNCTION_WORDS.has(word));
+      const losesSubstantiveTopic = allMeaningful.some((word) =>
+        !meaningful.includes(word) && !HEADING_FRAMING_WORDS.has(word),
+      );
+      const exactKeyphraseBonus = countTokenSequence(words, keyphraseWords) > 0 ? 6 : 0;
+      return {
+        part,
+        index,
+        safe: words.length >= 3 && !losesNumber && !losesSubstantiveTopic,
+        score: new Set(meaningful).size + exactKeyphraseBonus,
+      };
+    })
+    .filter((candidate) => candidate.safe)
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+  return candidates[0]?.part ?? null;
+}
+
+function removeRepeatedYears(heading: string): string {
+  const seen = new Set<string>();
+  let repaired = heading.replace(/\b(?:19|20)\d{2}\b/gi, (year) => {
+    if (seen.has(year)) return "";
+    seen.add(year);
+    return year;
+  });
+  repaired = repaired
+    .replace(/\b(?:for|in)\s*(?=[:：,;.!?]|$)/gi, "")
+    .replace(/\s+([:：,;.!?])/g, "$1")
+    .replace(/([:：,;])\s*([:：,;])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .replace(/[\s:：,;-]+$/, "")
+    .trim();
+  return repaired;
+}
+
+/**
+ * Bounded deterministic repair for the heading defects detected above. It
+ * only removes duplicated wording already present in the heading; it never
+ * invents a new topic or drops a distinct numeric token. Unresolved headings
+ * are returned unchanged so the caller can retry or fail before drafting.
+ */
+export function repairHeadingNaturalness(
+  heading: string,
+  keyphrase: string,
+  sectionId = "outline",
+): HeadingNaturalnessRepair {
+  const original = heading.replace(/\s+/g, " ").trim();
+  const initialViolations = assessHeadingTextNaturalness(original, keyphrase, sectionId);
+  if (initialViolations.length === 0) {
+    return {
+      original,
+      heading: original,
+      changed: false,
+      resolved: true,
+      initialViolations,
+      remainingViolations: [],
+    };
+  }
+
+  let candidate = original;
+  const hasColonDuplication = initialViolations.some((violation) =>
+    violation.code === "duplicated-topic-append" || violation.code === "duplicated-keyphrase-heading",
+  ) && /[:：]/.test(candidate);
+  if (hasColonDuplication) candidate = chooseSafeColonPart(candidate, keyphrase) ?? candidate;
+
+  // The outline fallback can otherwise produce "Why Hong Kong ... in Hong
+  // Kong". Removing only the redundant trailing location is deterministic.
+  const trailingHongKong = /\s+(?:in|for)\s+Hong Kong$/i;
+  if (trailingHongKong.test(candidate)) {
+    const withoutTail = candidate.replace(trailingHongKong, "").trim();
+    if (/\bhong kong\b/i.test(withoutTail)) candidate = withoutTail;
+  }
+
+  candidate = removeRepeatedYears(candidate);
+  const remainingViolations = assessHeadingTextNaturalness(candidate, keyphrase, sectionId);
+  const resolved = remainingViolations.length === 0;
+  return {
+    original,
+    heading: resolved ? candidate : original,
+    changed: resolved && candidate !== original,
+    resolved,
+    initialViolations,
+    remainingViolations,
+  };
+}
+
 /**
  * An editorial H2 is unnatural when it repeats the same year, appends the
  * title-cased keyphrase to a heading that already covers the topic, or
@@ -167,49 +392,9 @@ export function assessHeadingNaturalness(
   keyphrase: string,
 ): HeadingNaturalnessViolation[] {
   const violations: HeadingNaturalnessViolation[] = [];
-  const kpLower = keyphrase.toLowerCase().trim();
-  const kpContentWords = kpLower.split(/\s+/).filter((word) => !KEYPHRASE_FUNCTION_WORDS.has(word));
   for (const section of doc.sections) {
     if (section.sectionType !== "main") continue;
-    const heading = section.heading;
-    const lower = heading.toLowerCase();
-    // Repeated year ("2026 ... 2026").
-    const years = lower.match(/\b(?:19|20)\d{2}\b/g) ?? [];
-    if (new Set(years).size < years.length) {
-      violations.push({
-        sectionId: section.id,
-        heading,
-        code: "repeated-year",
-        snippet: heading.slice(0, 160),
-      });
-      continue;
-    }
-    // The keyphrase appended after a heading that already covers the topic.
-    const colonParts = heading.split(/[:：]/).map((part) => part.trim());
-    if (colonParts.length >= 2) {
-      const prefix = colonParts.slice(0, -1).join(" ").toLowerCase();
-      const suffix = colonParts[colonParts.length - 1].toLowerCase();
-      const suffixHasKeyphrase = kpLower.length > 0 && suffix.includes(kpLower);
-      const prefixCoversTopic = kpContentWords.filter((word) => prefix.includes(word)).length >= 2;
-      if (suffixHasKeyphrase && prefixCoversTopic) {
-        violations.push({
-          sectionId: section.id,
-          heading,
-          code: "duplicated-topic-append",
-          snippet: heading.slice(0, 160),
-        });
-        continue;
-      }
-      // Duplicated "Hong Kong" topic phrase across the colon.
-      if (prefix.includes("hong kong") && /hong kong/i.test(colonParts[colonParts.length - 1])) {
-        violations.push({
-          sectionId: section.id,
-          heading,
-          code: "duplicated-keyphrase-heading",
-          snippet: heading.slice(0, 160),
-        });
-      }
-    }
+    violations.push(...assessHeadingTextNaturalness(section.heading, keyphrase, section.id));
   }
   return violations;
 }
@@ -248,6 +433,7 @@ export function collectOffTopicSourceCitationBlockIds(
   violations: SourceRelevanceViolation[],
 ): Array<{ sectionId: string; blockId: string; url: string }> {
   const found: Array<{ sectionId: string; blockId: string; url: string }> = [];
+  const seenBlockIds = new Set<string>();
   for (const violation of violations) {
     const section = doc.sections.find((item) => item.id === violation.sectionId);
     if (!section) continue;
@@ -257,7 +443,10 @@ export function collectOffTopicSourceCitationBlockIds(
       return html.includes(violation.url) && isPureSourceCitationBlock(html);
     });
     if (index < 0) continue;
-    found.push({ sectionId: section.id, blockId: section.blocks[index].id, url: violation.url });
+    const blockId = section.blocks[index].id;
+    if (seenBlockIds.has(blockId)) continue;
+    seenBlockIds.add(blockId);
+    found.push({ sectionId: section.id, blockId, url: violation.url });
   }
   return found;
 }
@@ -274,6 +463,7 @@ export function removeOffTopicSourceCitations(
   violations: SourceRelevanceViolation[],
 ): number {
   const targets = collectOffTopicSourceCitationBlockIds(doc, violations);
+  let removed = 0;
   for (const target of targets) {
     const section = doc.sections.find((item) => item.id === target.sectionId);
     if (!section) continue;
@@ -281,6 +471,7 @@ export function removeOffTopicSourceCitations(
     if (index < 0) continue;
     section.blocks.splice(index, 1);
     section.status = "trimmed";
+    removed++;
   }
-  return targets.length;
+  return removed;
 }

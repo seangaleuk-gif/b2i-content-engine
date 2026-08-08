@@ -15,6 +15,7 @@ import { type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { normalizeFinalSeo } from "@/lib/blog/final-seo-normalizer";
 import {
   createArticleIntegrityBaseline,
+  createIntegrityBaselineAfterLinkRemoval,
   validateFinalArticleIntegrity,
   validateWordpressBlockPairs,
   type ArticleIntegrityBaseline,
@@ -273,13 +274,14 @@ export function evaluateEditorialStageCandidate(
  * restore a fragment that a targeted repair already fixed.
  */
 export function chooseEditorialCommitDoc(params: {
+  baselineDoc: ArticleDocument;
   workingDoc: ArticleDocument;
   targetedRepairsDoc: ArticleDocument | null;
   accepted: boolean;
 }): { doc: ArticleDocument; targetedRepairsPersisted: boolean } {
   if (params.accepted) return { doc: params.workingDoc, targetedRepairsPersisted: false };
   if (params.targetedRepairsDoc) return { doc: params.targetedRepairsDoc, targetedRepairsPersisted: true };
-  return { doc: params.workingDoc, targetedRepairsPersisted: false };
+  return { doc: params.baselineDoc, targetedRepairsPersisted: false };
 }
 
 /** Return the only article-level word count used by the pipeline and final gate. */
@@ -369,6 +371,22 @@ function replaceComponentHtml(
   const parsed = parseWordPressEditorialBlocks(html, component.id);
   component.blocks = parsed.blocks;
   if (status) component.status = status;
+}
+
+/** Replace the exact candidate object that the editor will later commit. */
+function replaceArticleDocumentInPlace(target: ArticleDocument, source: ArticleDocument): void {
+  const copy = structuredClone(source);
+  target.metadata = copy.metadata;
+  target.languageSwitcher = copy.languageSwitcher;
+  target.introduction = copy.introduction;
+  target.sections = copy.sections;
+  target.conclusion = copy.conclusion;
+  target.visibleFaq = copy.visibleFaq;
+  target.cta = copy.cta;
+  target.faqSchema = copy.faqSchema;
+  target.insertedLinks = copy.insertedLinks;
+  if (copy.sourceReferences) target.sourceReferences = copy.sourceReferences;
+  else delete target.sourceReferences;
 }
 
 function paragraphPlainText(block: EditorialBlock): string | null {
@@ -822,7 +840,7 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
   const issues: Array<{ code: string; message: string; stage: string }> = [];
   const stages = state.stageOutputs.map((s) => s.stage);
   const required = [
-    "claim-check", "expansion", "trim", "paragraphs", "regeneration",
+    "claim-check", "source-relevance-repair", "expansion", "trim", "paragraphs", "regeneration",
     "seo-normalization", "title-repair", "factual-scan", "claim-ownership", "temporal-freshness",
     "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
     "language-switcher", "internal-links", "external-links", "external-dedup",
@@ -841,6 +859,7 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
   }
   const expectedOrder = [
     "claim-check",
+    "source-relevance-repair",
     ...(isEditorialPolishEnabled() ? ["conclusion-discipline"] : []),
     "expansion", "trim", "paragraphs", "regeneration", "seo-normalization",
     "title-repair", "factual-scan", "claim-ownership", "temporal-freshness", "post-factual-keyphrase",
@@ -925,8 +944,14 @@ export function validateTemporalCandidate(
   if ((after.malformedProseCount ?? 0) > (before.malformedProseCount ?? 0)) {
     reasons.push(`malformed prose regressed: ${before.malformedProseCount ?? 0} → ${after.malformedProseCount ?? 0}`);
   }
-  if (after.readableWordCount < state.wordMin || after.readableWordCount > state.wordMax) {
-    reasons.push(`word count=${after.readableWordCount} (range: ${state.wordMin}-${state.wordMax})`);
+  if (before.readableWordCount >= state.wordMin && before.readableWordCount <= state.wordMax) {
+    if (after.readableWordCount < state.wordMin || after.readableWordCount > state.wordMax) {
+      reasons.push(`word count=${after.readableWordCount} (range: ${state.wordMin}-${state.wordMax})`);
+    }
+  } else if (before.readableWordCount > state.wordMax && after.readableWordCount > before.readableWordCount) {
+    reasons.push(`word count overrun regressed: ${before.readableWordCount} → ${after.readableWordCount}`);
+  } else if (before.readableWordCount < state.wordMin && after.readableWordCount < before.readableWordCount) {
+    reasons.push(`word count shortfall regressed: ${before.readableWordCount} → ${after.readableWordCount}`);
   }
   return reasons;
 }
@@ -972,6 +997,8 @@ function runTemporalFreshnessStage(
       rewrittenSentences: repair.rewrittenSentences,
       removedSentences: repair.removedSentences,
       changedComponentIds: repair.changedComponentIds,
+      beforeCanonicalWordCount: beforeMetrics.readableWordCount,
+      afterCanonicalWordCount: afterMetrics.readableWordCount,
       reasons,
     });
     throw new Error(
@@ -984,12 +1011,95 @@ function runTemporalFreshnessStage(
     rewrittenSentences: repair.rewrittenSentences,
     removedSentences: repair.removedSentences,
     changedComponentIds: repair.changedComponentIds,
+    beforeCanonicalWordCount: beforeMetrics.readableWordCount,
+    afterCanonicalWordCount: afterMetrics.readableWordCount,
   });
   console.log(
     `[temporal-freshness] detected=${initialIssues.length}` +
     ` rewritten=${repair.rewrittenSentences}` +
     ` removed=${repair.removedSentences}` +
     ` accepted=true`,
+  );
+  return state;
+}
+
+/**
+ * Remove only pure off-topic `Source:` citation paragraphs at the earliest
+ * canonical boundary. Running this before expansion means the existing word-
+ * count owner can compensate for intentionally removed citation text. The
+ * final QC scanner remains a mutation-free backstop for anything introduced
+ * later or anything that cannot be removed safely.
+ */
+export function runSourceRelevanceRepairStage(
+  state: PipelineState,
+  research: Array<{ title?: string; snippet?: string; url?: string }>,
+): PipelineState {
+  const inputFingerprint = fp(state.blog);
+  const preRemovalHtml = state.blog;
+  const snap = snapshotState(state);
+  const stageBaseline = createArticleIntegrityBaseline(preRemovalHtml);
+  const initial = assessSourceSectionRelevance(state.articleDoc, research);
+
+  if (initial.length === 0) {
+    recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, true, undefined, {
+      detected: 0,
+      removedBlockIds: [],
+      removedUrls: [],
+      unresolved: 0,
+    });
+    return state;
+  }
+
+  const targets = collectOffTopicSourceCitationBlockIds(state.articleDoc, initial);
+  const removedBlockIds = targets.map((target) => target.blockId);
+  const removedUrls = targets.map((target) => target.url);
+  const removed = removeOffTopicSourceCitations(state.articleDoc, initial);
+  if (removed !== targets.length) {
+    restoreSnapshot(state, snap);
+    recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, false, "pre-stage-restore", {
+      detected: initial.length,
+      targeted: targets.length,
+      removed,
+      reason: "target-removal-count-mismatch",
+    });
+    throw new Error(`Source relevance repair removed ${removed} of ${targets.length} selected citation blocks`);
+  }
+
+  syncBlogFromDocument(state);
+  const candidateBaseline = createIntegrityBaselineAfterLinkRemoval(stageBaseline, removedUrls);
+  const guard = guardStageOutput(
+    state.blog,
+    preRemovalHtml,
+    candidateBaseline,
+    "source-relevance-repair",
+  );
+  const remaining = assessSourceSectionRelevance(state.articleDoc, research);
+  if (!guard.accepted || remaining.length > 0) {
+    restoreSnapshot(state, snap);
+    recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, false, "pre-stage-restore", {
+      detected: initial.length,
+      removedBlockIds,
+      removedUrls,
+      unresolved: remaining.length,
+      reason: !guard.accepted ? "integrity-rejection" : "unresolved-source-relevance",
+    });
+    throw new Error(
+      `Source relevance repair failed before expansion: ${!guard.accepted
+        ? "candidate integrity rejection"
+        : `${remaining.length} unresolved citation(s)`}`,
+    );
+  }
+
+  recordStage(state, "source-relevance-repair", inputFingerprint, fp(state.blog), true, undefined, {
+    detected: initial.length,
+    removedBlockIds,
+    removedUrls,
+    unresolved: 0,
+  });
+  console.log(
+    `[source-relevance-repair] beforeFingerprint=${inputFingerprint} afterFingerprint=${fp(state.blog)}`
+    + ` removedBlockIds=[${removedBlockIds.join(", ")}]`
+    + ` removedUrls=[${removedUrls.join(", ")}] unresolved=0`,
   );
   return state;
 }
@@ -1006,6 +1116,7 @@ export async function runPostAssemblyPipeline(
   state.stageOutputs.push({ stage: "assembly", inputFingerprint: fp(state.blog), outputFingerprint: fp(state.blog), accepted: true });
 
   state = await runClaimCheck(state, deps);
+  state = runSourceRelevanceRepairStage(state, deps.context?.research || []);
   if (isEditorialPolishEnabled()) state = runConclusionDiscipline(state);
   state = await runExpansion(state, deps);
   state = await runTrim(state, deps);
@@ -1256,6 +1367,7 @@ export async function runPostAssemblyPipeline(
   // removable during the deterministic evidence stages.
   // validation decides whether the cloned candidate is committed atomically.
   const preEditorialHtml = state.blog;
+  const preEditorialDoc = structuredClone(state.articleDoc);
   const preEditorialMetrics = analyzeFinalArticle(
     preEditorialHtml,
     state.keyphrase,
@@ -1322,7 +1434,7 @@ export async function runPostAssemblyPipeline(
           .map((claim) => claim.text.replace(/\s+/g, " ").trim().toLowerCase()),
       );
       return (candidate: ArticleDocument) => {
-        const candidateHtml = renderArticleDocument(candidate);
+        let candidateHtml = renderArticleDocument(candidate);
         const metrics = analyzeFinalArticle(
           candidateHtml,
           state.keyphrase,
@@ -1360,10 +1472,11 @@ export async function runPostAssemblyPipeline(
                 (r) => !r.startsWith("repeated idea pairs=") && !r.startsWith("editorial score="),
               );
               if (trimmedHard.length === 0) {
-                // Use the trimmed candidate for all downstream checks
-                metrics.readableWordCount = trimmedMetrics.readableWordCount;
-                metrics.repeatedIdeaPairCount = trimmedMetrics.repeatedIdeaPairCount;
-                metrics.editorialScore = trimmedMetrics.editorialScore;
+                // Commit and validate the same trimmed document. Mutating only
+                // the metrics would approve one candidate and save another.
+                replaceArticleDocumentInPlace(candidate, trimmedDoc);
+                candidateHtml = renderArticleDocument(candidate);
+                Object.assign(metrics, trimmedMetrics);
                 hardReasons = [];
                 console.log(
                   `[editorial-wc-trim] trimmed candidate ${residual.removedWords} words → ` +
@@ -1774,10 +1887,16 @@ export async function runPostAssemblyPipeline(
     // fragment that a targeted repair already fixed.
     const accepted = anyEditorialCandidateAccepted
       && finalEditorialScore >= state.policy.minimumEditorialScore;
-    const commitDecision = chooseEditorialCommitDoc({ workingDoc, targetedRepairsDoc, accepted });
+    const commitDecision = chooseEditorialCommitDoc({
+      baselineDoc: preEditorialDoc,
+      workingDoc,
+      targetedRepairsDoc,
+      accepted,
+    });
     const targetedRepairsPersisted = commitDecision.targetedRepairsPersisted;
     state.articleDoc = commitDecision.doc;
-    if (accepted || targetedRepairsPersisted) syncBlogFromDocument(state);
+    syncBlogFromDocument(state);
+    assertRenderedCacheMatchesDocument(state);
     if (accepted) {
       console.log(
         `[editorial-polish] accepted: malformed=${malformedResult?.result.accepted === true}` +
@@ -1907,7 +2026,7 @@ export async function runPostAssemblyPipeline(
     const requested = Math.min(6, eligible.length);
     const before = countEditorialExternalLinks(html);
     const result = insertExternalResearchLinks(html, eligible, 6);
-    const after = countEditorialExternalLinks(html);
+    const after = countEditorialExternalLinks(result.html);
     console.log(
       `[external-links:inject] requested=${requested} inserted=${result.linksInserted}` +
       ` skipped=${Math.max(0, requested - result.linksInserted)}` +
@@ -2126,44 +2245,9 @@ export async function runPostAssemblyPipeline(
   // diagnosis can never repair deterministic corruption — it is diagnosis-only.
   state = runTrackedHtmlStage(state, "final-qc-scan", () => {
     const research = deps.context?.research || [];
-    // Off-topic source citations are repaired deterministically as an explicit
-    // transaction: snapshot the complete canonical state, remove pure
-    // `Source: <a>…</a>.` citation paragraphs that do not support their H2,
-    // re-render from ArticleDocument, then recompute EVERY final scanner
-    // against the modified document. Only violations that survive the removal
-    // (citations embedded in prose, or ungrounded sections) are hard failures.
-    // Never reuse arrays computed before the mutation: the removal can shift
-    // block indices and change sentence boundaries, so post-removal findings
-    // are the only trustworthy ones.
-    const snap = snapshotState(state);
-    const inputFp = fp(state.blog);
-    const stageBaseline = createArticleIntegrityBaseline(state.blog);
-    let relevance = assessSourceSectionRelevance(state.articleDoc, research);
-    if (relevance.length > 0) {
-      const removedBlockIds = collectOffTopicSourceCitationBlockIds(state.articleDoc, relevance).map((target) => target.blockId);
-      const removed = removeOffTopicSourceCitations(state.articleDoc, relevance);
-      if (removed > 0) {
-        syncBlogFromDocument(state);
-        relevance = assessSourceSectionRelevance(state.articleDoc, research);
-        const afterFp = fp(state.blog);
-        const guard = guardStageOutput(state.blog, inputFp, stageBaseline, "final-qc-scan-citation-removal");
-        if (!guard.accepted) {
-          restoreSnapshot(state, snap);
-          syncBlogFromDocument(state);
-          relevance = assessSourceSectionRelevance(state.articleDoc, research);
-        }
-        const pass = guard.accepted && relevance.length === 0;
-        console.log(
-          `[final-qc-scan] candidate=off-topic-citation-removal` +
-          ` beforeFingerprint=${inputFp} afterFingerprint=${afterFp}` +
-          ` pass=${pass} removalReason=pure-off-topic-source-citation` +
-          ` removedBlockIds=[${removedBlockIds.join(", ")}]` +
-          ` rollback=${guard.accepted ? "not-needed" : "success"}`,
-        );
-      }
-    }
-    // Recompute every final scanner AFTER the mutation so the gate evaluates
-    // the exact document that would be saved, not a stale pre-removal snapshot.
+    // Mutation-free backstop: the owning repair stage ran before expansion, so
+    // any finding here is new, embedded in prose, or otherwise unsafe to alter.
+    const relevance = assessSourceSectionRelevance(state.articleDoc, research);
     const coherence = validateCoherence(state.articleDoc);
     const malformed = scanMalformedProseInDocument(state.articleDoc);
     const sentenceQuality = scanSentenceQualityInDocument(state.articleDoc);
@@ -2440,7 +2524,18 @@ async function runExpansion(state: PipelineState, deps: PipelineDependencies): P
   const snap = snapshotState(state);
   const sectionsInput = deriveSectionInput(state);
   const result = await expandToMinimum(
-    { chatWithRetry: deps.chatWithRetry },
+    {
+      chatWithRetry: deps.chatWithRetry,
+      measureCanonicalVisibleWords: (workingSections) => {
+        const candidate = structuredClone(state.articleDoc);
+        for (const section of workingSections) {
+          if (section.index >= 0 && section.index < candidate.sections.length) {
+            replaceComponentHtml(candidate.sections[section.index], section.body);
+          }
+        }
+        return countCanonicalVisibleWords(candidate);
+      },
+    },
     sectionsInput.map((section) => ({ ...section })),
     sectionsInput,
     componentHtml(state.articleDoc.introduction),
@@ -2472,7 +2567,18 @@ async function runTrim(state: PipelineState, deps: PipelineDependencies): Promis
   const snap = snapshotState(state);
   const sectionsInput = deriveSectionInput(state);
   const result = await trimToMaximum(
-    { chatWithRetry: deps.chatWithRetry },
+    {
+      chatWithRetry: deps.chatWithRetry,
+      measureCanonicalVisibleWords: (workingSections) => {
+        const candidate = structuredClone(state.articleDoc);
+        for (const section of workingSections) {
+          if (section.index >= 0 && section.index < candidate.sections.length) {
+            replaceComponentHtml(candidate.sections[section.index], section.body);
+          }
+        }
+        return countCanonicalVisibleWords(candidate);
+      },
+    },
     sectionsInput.map((section) => ({ ...section })),
     componentHtml(state.articleDoc.introduction),
     componentHtml(state.articleDoc.conclusion),
@@ -3281,8 +3387,21 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
   let diagnostic: string | undefined;
   try {
     const result = await normalizeFinalSeo(
-      { html: state.blog, focusKeyphrase: state.keyphrase, targetWordCount: state.requestedWordCount, targetKeyphraseCount: state.exactKeyphraseTarget, minReadingEase: FLESCH_MIN, maxReadingEase: FLESCH_MAX },
+      {
+        html: state.blog,
+        focusKeyphrase: state.keyphrase,
+        targetWordCount: state.requestedWordCount,
+        targetKeyphraseCount: state.exactKeyphraseTarget,
+        minReadingEase: FLESCH_MIN,
+        maxReadingEase: FLESCH_MAX,
+        canonicalVisibleWordCount: countCanonicalVisibleWords(state.articleDoc),
+      },
       deps.chatWithRetry as any,
+    );
+    console.log(
+      `[seo-normalization] canonicalWords=${countCanonicalVisibleWords(state.articleDoc)}` +
+      ` candidateWords=${result.after.readableWordCount}` +
+      ` faqEntries=${state.articleDoc.visibleFaq.length}`,
     );
     const accepted = shouldAcceptSeoNormalization(result);
     state.normalizationResult = result;

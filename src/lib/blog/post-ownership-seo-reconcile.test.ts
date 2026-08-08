@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
 import { renderArticleDocument, countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import { getFirstNReadableWords, extractH2Texts } from "@/lib/seo/seo-text-utils";
-import { reconcilePostOwnershipKeyphrase } from "./post-ownership-seo-reconcile";
+import { buildNaturalHeading, reconcilePostOwnershipKeyphrase } from "./post-ownership-seo-reconcile";
 import { buildClaimOwnershipLedger } from "./claim-ownership";
 import { computeKeyphraseDensity, englishKeyphraseDensity } from "@/lib/content-standards";
 import { countExactPhrase, extractReadableText } from "@/lib/seo/seo-text-utils";
@@ -123,6 +123,12 @@ function makeDocument(options?: {
 }
 
 describe("post-ownership SEO reconciliation", () => {
+  it("does not create a duplicated-location H2 while restoring a soft SEO placement", () => {
+    const heading = "Hong Kong Digital Marketing Strategy";
+    const keyphrase = "hong kong marketing trends 2026";
+    expect(buildNaturalHeading(heading, keyphrase)).toBe(heading);
+  });
+
   it("restores the exact keyphrase in one H2 and the first 100 words", () => {
     const doc = makeDocument();
     const result = reconcilePostOwnershipKeyphrase(doc, KEYPHRASE, RESEARCH);

@@ -1,24 +1,34 @@
 # B2I Content Engine — Read First
 
-**Authoritative handoff date:** 1 August 2026
+**Authoritative handoff date:** 8 August 2026
 
 The authoritative handoff is `NEW_CHAT_HANDOFF.md`. Read it and the other files in this pack before inspecting or modifying code. Older statements in project Markdown files that conflict with the handoff are stale. `B2I-MASTER-HANDOFF-2026-07-31.md` is superseded by `NEW_CHAT_HANDOFF.md`.
 
 ## Current verified state (summary)
 
-- **English generation is the production-verified working baseline.** Latest verified live result: editorial score **94**, repeated pairs **0**, malformed **0**, FAQ parity **6/6/6**, external links **6**, internal links **4**, keyphrase density **1.08%**, final validation **PASS**.
-- Auto-research and external-link generation are working (live verified).
-- Keyphrase exclusion is consistent across editorial and final validation.
-- Editorial minimum remains **80**; repetition overlap threshold remains **0.55**.
-- **Traditional Chinese translation is live verified** (project 19, version 6, saved ID 202; 40 API calls, 0 retries, 26 deterministic editorial changes; `deepseek-v4-flash`, thinking disabled). Structural translation works; source-label and paragraph punctuation fixed; FAQ/schema parity and CTA preserved; natural HK code-switching allowed.
+- The latest B2I-9 full-pipeline root audit is documented in
+  `FULL_PIPELINE_ROOT_AUDIT_2026-08-08.md`.
+- Staged English generation and canonical `ArticleDocument` ownership are
+  preserved.
+- Malformed model WordPress output is rejected; production stages do not call
+  `rebalanceWpBlocks()`.
+- Traditional Chinese acceptance is unified before save, after readback and at
+  publication, including source-aware literal-translation checks.
 - Simplified Chinese is out of scope.
-- Test baseline: **18 pre-existing failures, 1,473 passing** in the last recorded full-suite result.
-- Lint baseline: **468 findings** (285 errors, 183 warnings). Build passes.
-- Two pre-existing TypeScript errors remain in `section-expander.test.ts`.
+- Offline/mocked verification: English blog/pipeline/generation/route
+  **1,044/1,044**; selected translation/service/route suites **495/495**;
+  TypeScript pass; production
+  build pass.
+- Lint: **444 findings** (268 errors/176 warnings), versus a fresh run on the
+  exact recovered input baseline of 445 (269/176).
+- The provider-capable document-context batch was safety-blocked and is not
+  claimed as passing. Live production verification remains required.
 
 ## Next task
 
-A professional architecture audit of the translation pipeline (see `NEW_CHAT_HANDOFF.md` section 2). Audit-only; no code changes until the user manually switches thinking off.
+Deploy the audited package in a controlled environment, run one English
+generation and three consecutive live Traditional Chinese translations, and
+retain the resulting diagnostics as operational acceptance evidence.
 
 ## Read order
 

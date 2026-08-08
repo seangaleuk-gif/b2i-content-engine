@@ -16,9 +16,11 @@ Automated blog article generation for the B2I Hub platform.
 | Auth | `src/lib/services/auth.ts` | `getCurrentUserId()` — single identity resolver |
 | Authorization | `src/lib/services/project-authorization.ts` | `requireProjectAccess()` — project ownership |
 | Errors | `src/lib/services/errors.ts` | `AppError` + `toErrorResponse()` — single error model |
-| Blocks | `src/lib/services/text-utils.ts` | `rebalanceWpBlocks()` — stack-based validation |
+| Blocks | `src/lib/blog/wordpress-block-structure.ts` | Typed parser/validator; malformed candidates are rejected, never silently repaired |
 | Integrity | `src/lib/blog/article-integrity.ts` | Baselines, link extraction, block validation |
 | Editorial | `src/lib/pipeline/editorial-polish.ts` | Atomic AI-proposed block edits with deterministic commit/reject |
+| Translation acceptance | `src/lib/services/translation-acceptance.ts` | One EN/ZH parity, quality, literalness, CTA and review gate |
+| Heading acceptance | `src/lib/blog/content-relevance.ts` | Shared pre-draft and final H2 naturalness detector with bounded safe repair |
 
 ## Getting Started
 
@@ -46,7 +48,16 @@ FULL_DOCUMENT_EDITORIAL_MODE=shadow # change to enforce after shadow evaluation
 # Traditional Chinese: review every aligned source/target unit in the existing
 # second substantive translation call and require document-level acceptance.
 ENABLE_FULL_DOCUMENT_ZH_REVIEW=true
+
+# Translation primary path. Do not also enable the obsolete shadow path.
+ENABLE_DOCUMENT_CONTEXT_TRANSLATION_PRIMARY=true
 ```
+
+Recommended production flag cleanup: omit
+`ENABLE_DOCUMENT_CONTEXT_TRANSLATION_SHADOW` and
+`ENABLE_SHADOW_BILINGUAL_EDITORIAL_POLISH`. An explicit `false` has the same
+effect as an unset variable because the code enables flags only when their value
+is exactly `true`. Keep `ENABLE_DOCUMENT_CONTEXT_TRANSLATION_PRIMARY=true`.
 
 When English enforce mode is active, unresolved high/critical findings,
 selection overflow, unvalidated patches, or missing stored acceptance block the
@@ -87,18 +98,31 @@ tokens, or access-token files to the repository.
 - Final validation enforces FAQ block + JSON-LD + parity
 
 ### WordPress blocks
-- `rebalanceWpBlocks()` with stack-based matching at 3 boundaries:
-  - Section body cleanup (initial assembly)
-  - AI expansion output
-  - Post-detokenization (SEO normalizer)
+- Production stages do not call `rebalanceWpBlocks()`.
+- Outline H2s pass the same naturalness detector used by final QC before any
+  section is drafted; unsafe repairs get one bounded outline-only retry.
+- Pure off-topic source citations are removed atomically before expansion, not
+  after word-count/preflight checks.
+- External citations must pass both body/evidence matching and the same owning-H2
+  relevance rule used by final QC; final QC is mutation-free.
+- AI expansion, trim and SEO candidates must already contain balanced,
+  type-correct WordPress blocks; invalid candidates are rejected and the exact
+  pre-stage `ArticleDocument` snapshot is restored.
+- Paragraph splitting uses the typed WordPress structure parser and preserves
+  inline markup without crossing `wp:html` boundaries.
 - `assertValidStageInput()` validates pre-stage HTML before every mutation
 - Protected blocks (wp:html, scripts, links, buttons, images, media) tokenized during SEO normalization
 
 ### Current verification status
-- Full suite: 1,460 tests — 1,442 passed, 18 pre-existing failures (unchanged baseline, no new regressions)
-- Lint: 468 findings (285 errors / 183 warnings) — unchanged baseline
-- Build: passes
-- TypeScript: 2 pre-existing errors in `section-expander.test.ts`
+- Explicit offline/mocked verification: 1,044/1,044 English blog/pipeline/
+  generation/route tests and 495/495 translation/service/route tests passed.
+- The provider-capable document-context batch was not executed because the
+  safety layer blocked possible transmission of fixture content to DeepSeek.
+- Lint: 444 findings (268 errors / 176 warnings), improved from the exact
+  recovered input baseline of 445 (269 errors / 176 warnings); no new lint
+  findings.
+- Production build: passes.
+- TypeScript: `npx tsc --noEmit` passes.
 - English generation: production verified (fresh live run, editorial score 94, FAQ parity valid, final validation PASS)
 - Traditional Chinese translation: live verified (project 19, version 6, saved ID 202; 40 API calls, 0 retries, 26 deterministic editorial changes)
 - Automatic research and external links: live verified (external links injected, retained, saved and counted)
@@ -116,9 +140,9 @@ tokens, or access-token files to the repository.
 - Runs WordPress round-trip, word-count, SEO, repetition, prose and production validation
 - Commits the clone only when every guard passes; otherwise returns the original object unchanged
 
-The protected post-assembly order is:
+The exact protected post-assembly order is:
 
-`language switcher → internal links → external links → SEO normalization → paragraph normalization → editorial polish (flagged) → CTA preservation → final trim → FAQ schema → final validation`
+`claim-check → source-relevance-repair → conclusion-discipline (flagged) → expansion → trim → paragraphs → regeneration → SEO normalization → title repair → factual scan → claim ownership → temporal freshness → post-factual keyphrase check → final paragraphs → malformed-prose repair → targeted editorial polish (flagged) → final claim ownership → language switcher → internal links → external links → external deduplication → link enforcement → final factual scan → post-ownership SEO reconciliation → CTA preservation → final trim → FAQ recovery → canonical word-count check → final preflight → deterministic final QC → full-document editorial (flagged) → final validation`
 
 ---
 
@@ -210,7 +234,7 @@ The rendered article must appear in this order:
 | Audit version identity | Audit requests resolve one saved language version and return its exact version number and row ID |
 | Factuality instruction | Shared `FACTUALITY_INSTRUCTION` wired into all generation prompts |
 | Malformed JSON recovery | `extractMalformedJsonStringProperty()` handles unescaped quotes in `body`, `intro`, `conclusion` |
-| Doubled block prefixes | `rebalanceWpBlocks()` normalizes `wp:wp:paragraph` → `wp:paragraph` |
+| Invalid WordPress markers | Typed validation rejects the candidate and restores the pre-stage canonical snapshot; production no longer guesses a repair |
 | Multi-pass final trim | Up to 3 passes remove redundant paragraphs from non-FAQ sections |
 | Component order | `renderArticleDocument()` renders conclusion before CTA before FAQ schema |
 | Word count tolerance | `wordCountRange()` uses ±15% for ≥2,000 targets |

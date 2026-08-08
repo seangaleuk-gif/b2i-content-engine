@@ -188,7 +188,7 @@ export function renderArticleDocument(doc: ArticleDocument): string {
     if (section.sectionType === "faq-heading") continue;
     if (section.sectionType === "conclusion-heading") continue;
     parts.push(
-      `<!-- wp:heading {"level":2} -->\n<h2>${section.heading}</h2>\n<!-- /wp:heading -->`
+      `<!-- wp:heading {"level":2} -->\n<h2>${escapeHtml(section.heading)}</h2>\n<!-- /wp:heading -->`
     );
     const sectionHtml = renderEditorialBlocksToWordPress(section.blocks);
     if (sectionHtml) {
@@ -210,7 +210,7 @@ export function renderArticleDocument(doc: ArticleDocument): string {
     if (faqSection) {
       parts.push("<!-- b2i-faq-heading -->");
       parts.push(
-        `<!-- wp:heading {"level":2} -->\n<h2>${faqSection.heading}</h2>\n<!-- /wp:heading -->`
+        `<!-- wp:heading {"level":2} -->\n<h2>${escapeHtml(faqSection.heading)}</h2>\n<!-- /wp:heading -->`
       );
     }
     const visibleFaqHtml = renderVisibleFaq(doc.visibleFaq);
@@ -1112,7 +1112,11 @@ export function parseArticleDocumentFromHtml(
   const headingMatches: Array<{ index: number; endIndex: number; heading: string }> = [];
   let hm: RegExpExecArray | null;
   while ((hm = headingBlockRe.exec(html)) !== null) {
-    headingMatches.push({ index: hm.index, endIndex: hm.index + hm[0].length, heading: hm[2].replace(/<[^>]+>/g, "").trim() });
+    headingMatches.push({
+      index: hm.index,
+      endIndex: hm.index + hm[0].length,
+      heading: decodeHtmlEntities(hm[2].replace(/<[^>]+>/g, "").trim()),
+    });
   }
 
   if (headingMatches.length === 0) {

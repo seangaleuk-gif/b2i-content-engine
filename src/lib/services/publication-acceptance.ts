@@ -14,13 +14,7 @@ import {
   buildPolicy,
   evaluatePolicy,
 } from "@/lib/blog/final-article-policy";
-import { validateTranslatedDocument } from "@/lib/services/translation-service";
-import { analyzeZhHkLanguageQuality } from "@/lib/services/zh-hk-language-quality";
-import {
-  checkCtaParity,
-  findUnnaturalCalques,
-  unresolvedMandatoryFindings,
-} from "@/lib/services/editorial-review-gate";
+import { evaluateTranslationDocumentAcceptance } from "@/lib/services/translation-acceptance";
 import { runChineseAudit } from "@/lib/services/seo-auditor";
 import { parseTranslationVersionSummary } from "@/lib/services/translation-version-metadata";
 
@@ -176,30 +170,20 @@ export function validatePublicationPair(params: {
   if (!enDecision.passed) errors.push(...diagnostics.enPolicyReasons.map((reason) => `English gate: ${reason}`));
 
   const metadata = parseTranslationVersionSummary(pair.zh.summary);
-  if (process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW === "true") {
-    if (metadata?.review?.status !== "run" || metadata.review.documentAccepted !== true) {
-      errors.push("Traditional Chinese gate: complete-document editorial acceptance is missing");
-    }
-    const unresolvedUnitIds = metadata?.review?.unresolvedUnitIds ?? [];
-    if (unresolvedUnitIds.length > 0) {
-      errors.push(`Traditional Chinese gate: unresolved units=${unresolvedUnitIds.join(", ")}`);
-    }
-  }
-
-  diagnostics.translationParityErrors = validateTranslatedDocument(enDoc, zhDoc, research);
-  errors.push(...diagnostics.translationParityErrors.map((error) => `Translation parity: ${error}`));
-
-  diagnostics.zhBlockingQuality = unresolvedMandatoryFindings(analyzeZhHkLanguageQuality(zhDoc, enDoc));
-  errors.push(...diagnostics.zhBlockingQuality.map((finding) =>
-    `Traditional Chinese quality: ${finding.sourceUnitId}:${finding.messageCode}`,
-  ));
-  diagnostics.zhUnnaturalCalques = findUnnaturalCalques(zhDoc).map(({ sourceUnitId, reason }) => ({ sourceUnitId, reason }));
-  errors.push(...diagnostics.zhUnnaturalCalques.map((finding) =>
-    `Traditional Chinese naturalness: ${finding.sourceUnitId}:${finding.reason}`,
-  ));
-
-  const cta = checkCtaParity(zhDoc);
-  errors.push(...cta.missingClaims.map((claim) => `Traditional Chinese CTA missing: ${claim}`));
+  const translationAcceptance = evaluateTranslationDocumentAcceptance({
+    enDoc,
+    zhDoc,
+    research,
+    review: metadata?.review,
+    requireFullDocumentReview: process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW === "true",
+  });
+  diagnostics.translationParityErrors = translationAcceptance.parityErrors;
+  diagnostics.zhBlockingQuality = translationAcceptance.blockingQuality;
+  diagnostics.zhUnnaturalCalques = [
+    ...translationAcceptance.unnaturalCalques,
+    ...translationAcceptance.sourceAwareLiteralTranslations,
+  ];
+  errors.push(...translationAcceptance.errors);
   const zhAudit = runChineseAudit({
     title: pair.zh.title || "",
     metaDescription: pair.zh.metaDescription || "",

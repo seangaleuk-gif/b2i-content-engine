@@ -1,5 +1,6 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
-import { countReadableWords, robustJsonParse, splitLongParagraphs, rebalanceWpBlocks } from "@/lib/services/text-utils";
+import { countReadableWords, robustJsonParse, splitLongParagraphs } from "@/lib/services/text-utils";
+import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { MAX_SECTION_EXPANSIONS, MAX_SECTION_TRIMS } from "@/lib/services/generation-constants";
 import { paragraphSentenceLimit } from "@/lib/content-standards";
 
@@ -11,7 +12,7 @@ const stripMainH2Blocks = (html: string): string =>
 export interface SectionExpansionContext {
   chatWithRetry: (messages: ChatMessage[], options?: ChatOptions) => Promise<ChatResult>;
   /** Optional canonical article counter supplied by the ArticleDocument owner. */
-  measureCanonicalVisibleWords?: () => number;
+  measureCanonicalVisibleWords?: (sections: ExpandableSection[]) => number;
   /** Compatibility input; evidence is accepted only through each section's evidencePrompt. */
   research?: unknown[];
 }
@@ -31,6 +32,25 @@ interface ExpansionResult {
   afterSection: number;
   sectionIndex: number;
   reason?: string;
+}
+
+function validateEditorialFragment(html: string): { valid: boolean; reason?: string } {
+  if (!html.trim()) return { valid: false, reason: "empty-fragment" };
+  if (/<h2\b|<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2/i.test(html)) {
+    return { valid: false, reason: "fragment-introduced-h2" };
+  }
+  const wp = validateWordpressBlockPairs(html);
+  return wp.valid
+    ? { valid: true }
+    : { valid: false, reason: `invalid-wordpress-fragment:${wp.issues.join(";")}` };
+}
+
+function orderedHrefs(html: string): string[] {
+  return [...html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi)].map((match) => match[1]);
+}
+
+function numericTokens(html: string): string[] {
+  return (html.match(/(?:HK\$|US\$|[$£€¥])?\d[\d,.]*(?:%|\s*(?:percent|per cent))?/gi) ?? []);
 }
 
 /** Expand the weakest under-length sections to reach the word-count minimum.
@@ -118,6 +138,20 @@ export async function expandToMinimum(
         continue;
       }
 
+      const fragmentValidation = validateEditorialFragment(aiBody);
+      if (!fragmentValidation.valid) {
+        results.push({
+          accepted: false,
+          beforeSection: beforeWC,
+          afterSection: additionWC,
+          sectionIndex: target.origIndex,
+          reason: fragmentValidation.reason,
+        });
+        console.log(`[section-expander:REJECT] section=${target.origIndex} reason=${fragmentValidation.reason}`);
+        expansions++;
+        continue;
+      }
+
       let mergedBody: string;
       let afterWC: number;
 
@@ -130,7 +164,13 @@ export async function expandToMinimum(
       }
 
       if (afterWC > beforeWC) {
-        mergedBody = rebalanceWpBlocks(mergedBody);
+        const mergedValidation = validateEditorialFragment(mergedBody);
+        if (!mergedValidation.valid) {
+          results.push({ accepted: false, beforeSection: beforeWC, afterSection: afterWC, sectionIndex: target.origIndex, reason: mergedValidation.reason });
+          console.log(`[section-expander:REJECT] section=${target.origIndex} reason=${mergedValidation.reason}`);
+          expansions++;
+          continue;
+        }
         workingSections[target.origIndex] = { ...workingSections[target.origIndex], body: mergedBody };
         results.push({ accepted: true, beforeSection: beforeWC, afterSection: afterWC, sectionIndex: target.origIndex });
         console.log(`[section-expander:EXPAND] section=${target.origIndex} beforeSection=${beforeWC} addition=${additionWC} afterSection=${afterWC} accepted=true`);
@@ -141,10 +181,9 @@ export async function expandToMinimum(
       }
 
       // Recalculate total from structured components
-      const allHtml = [intro, ...workingSections.map((s) => s.body), conclusion].join("\n\n");
       wordCount = ctx.measureCanonicalVisibleWords
-        ? ctx.measureCanonicalVisibleWords()
-        : countReadableWords(allHtml);
+        ? ctx.measureCanonicalVisibleWords(workingSections)
+        : countReadableWords([intro, ...workingSections.map((s) => s.body), conclusion].join("\n\n"));
       console.log(`[section-expander:EXPAND] articleWords=${wordCount} minimum=${minimumWordCount}`);
       expansions++;
     } catch (err) {
@@ -195,11 +234,24 @@ export async function trimToMaximum(
 
       let newBody = (robustJsonParse(res.content) as Record<string, string>).body || target.body;
       newBody = stripMainH2Blocks(newBody);
-      newBody = rebalanceWpBlocks(newBody);
+      const beforeSectionWords = countReadableWords(target.body);
+      const afterSectionWords = countReadableWords(newBody);
+      const fragmentValidation = validateEditorialFragment(newBody);
+      const hrefsPreserved = JSON.stringify(orderedHrefs(newBody)) === JSON.stringify(orderedHrefs(target.body));
+      const numbersPreserved = JSON.stringify(numericTokens(newBody)) === JSON.stringify(numericTokens(target.body));
+      if (!fragmentValidation.valid || afterSectionWords >= beforeSectionWords || !hrefsPreserved || !numbersPreserved) {
+        console.log(
+          `[section-expander:TRIM-REJECT] section=${target.origIndex}` +
+          ` reason=${fragmentValidation.reason ?? (afterSectionWords >= beforeSectionWords ? "not-shorter" : !hrefsPreserved ? "href-parity" : "numeric-parity")}`,
+        );
+        trims++;
+        continue;
+      }
       workingSections[target.origIndex] = { ...workingSections[target.origIndex], body: newBody };
 
-      const allHtml = [intro, ...workingSections.map((s) => s.body), conclusion].join("\n\n");
-      wordCount = countReadableWords(allHtml);
+      wordCount = ctx.measureCanonicalVisibleWords
+        ? ctx.measureCanonicalVisibleWords(workingSections)
+        : countReadableWords([intro, ...workingSections.map((s) => s.body), conclusion].join("\n\n"));
       trims++;
     } catch (err) {
       console.warn(`[section-expander:TRIM] Trim failed for section ${target.origIndex}: ${err instanceof Error ? err.message : String(err)}`);

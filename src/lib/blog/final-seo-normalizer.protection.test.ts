@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { countReadableWords } from "@/lib/seo/seo-text-utils";
 import {
   normalizeFinalSeo,
   tokenizeProtectedBlocks,
@@ -196,5 +197,28 @@ describe("SEO normalizer: intro keyphrase preservation", () => {
     if (firstPara) {
       expect(firstPara[1].toLowerCase()).toContain("hong kong digital marketing");
     }
+  });
+});
+
+describe("SEO normalizer: canonical visible word count", () => {
+  it("retains the protected FAQ word offset and does not expand an already-sufficient document", async () => {
+    const html = articleWithFaqAndLinks();
+    const rawCount = countReadableWords(html);
+    const canonicalVisibleWordCount = rawCount + 80;
+    const chat = vi.fn(async () => ({ content: '{"expanded":"unexpected"}' }));
+
+    const result = await normalizeFinalSeo({
+      html,
+      focusKeyphrase: "hong kong digital marketing",
+      targetWordCount: rawCount + 40,
+      targetKeyphraseCount: 3,
+      minReadingEase: -100,
+      maxReadingEase: 200,
+      canonicalVisibleWordCount,
+    }, chat);
+
+    expect(chat).not.toHaveBeenCalled();
+    expect(result.before.readableWordCount).toBe(canonicalVisibleWordCount);
+    expect(result.after.readableWordCount).toBe(countReadableWords(result.html) + 80);
   });
 });

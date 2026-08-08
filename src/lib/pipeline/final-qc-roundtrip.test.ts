@@ -128,6 +128,23 @@ function parseIntroBlocks(html: string): ArticleDocument["introduction"]["blocks
 }
 
 describe("representative complete article regression (final-QC)", () => {
+  it("escapes canonical H2 text and decodes it on render-parse-render", () => {
+    const doc = buildCompleteArticle();
+    doc.sections[0].heading = 'Planning <script>alert("x")</script> & Measurement';
+    doc.sections.find((section) => section.sectionType === "faq-heading")!.heading = "Questions & Answers";
+
+    const html = renderArticleDocument(doc);
+    expect(html).not.toContain("<script>alert");
+    expect(html).toContain("Planning &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; Measurement");
+    expect(html).toContain("Questions &amp; Answers");
+
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+    expect(parsed.doc?.sections[0].heading).toBe(doc.sections[0].heading);
+    expect(parsed.doc?.sections.find((section) => section.sectionType === "faq-heading")?.heading)
+      .toBe("Questions & Answers");
+    expect(renderArticleDocument(parsed.doc!)).toBe(html);
+  });
+
   it("9+10+11. full document round-trips: switcher, sections, conclusion, 4-6 FAQs, schema, single CTA", () => {
     const doc = buildCompleteArticle();
     const html = renderArticleDocument(doc);

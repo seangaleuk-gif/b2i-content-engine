@@ -72,18 +72,9 @@ function isCtaBlock(html: string): boolean {
 
 function extractLinkHrefs(html: string): string[] {
   const hrefs: string[] = [];
-  // Exclude wp:html blocks
-  const wpHtmlRanges: [number, number][] = [];
-  const wpHtmlRe = /<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi;
-  let wm: RegExpExecArray | null;
-  while ((wm = wpHtmlRe.exec(html)) !== null) {
-    wpHtmlRanges.push([wm.index, wm.index + wm[0].length]);
-  }
-  const scriptRe = /<script[\s\S]*?<\/script>/gi;
-  while ((wm = scriptRe.exec(html)) !== null) {
-    wpHtmlRanges.push([wm.index, wm.index + wm[0].length]);
-  }
-
+  // Integrity covers every link occurrence, including protected wp:html blocks.
+  // Stage-specific policies may ignore protected links for SEO counting, but the
+  // structural guard must still notice if a CTA or language-switcher URL changes.
   const linkRe = /<a\b[^>]*href="([^"]*)"[^>]*>/gi;
 
   let lm: RegExpExecArray | null;
@@ -112,6 +103,53 @@ function extractLinkHrefs(html: string): string[] {
   }
 
   return hrefs.sort();
+}
+
+function multisetDifference(left: string[], right: string[]): string[] {
+  const remaining = new Map<string, number>();
+  for (const value of right) remaining.set(value, (remaining.get(value) ?? 0) + 1);
+
+  const difference: string[] = [];
+  for (const value of left) {
+    const count = remaining.get(value) ?? 0;
+    if (count > 0) remaining.set(value, count - 1);
+    else difference.push(value);
+  }
+  return difference;
+}
+
+function subtractLinkOccurrences(hrefs: string[], removedHrefs: string[]): string[] {
+  const remaining = [...hrefs];
+  for (const href of removedHrefs) {
+    const index = remaining.indexOf(href);
+    if (index < 0) {
+      throw new Error(`Cannot remove absent integrity-baseline link occurrence: ${href}`);
+    }
+    remaining.splice(index, 1);
+  }
+  return remaining.sort();
+}
+
+/**
+ * Derive the only valid baseline for an intentional, pre-selected link-removal
+ * transaction. All non-link protected state remains byte-for-byte identical.
+ */
+export function createIntegrityBaselineAfterLinkRemoval(
+  baseline: ArticleIntegrityBaseline,
+  removedHrefs: string[],
+): ArticleIntegrityBaseline {
+  return {
+    ...baseline,
+    linkDestinations: subtractLinkOccurrences(baseline.linkDestinations, removedHrefs),
+    externalLinkDestinations: subtractLinkOccurrences(
+      baseline.externalLinkDestinations,
+      removedHrefs.filter((href) => href.startsWith("http")),
+    ),
+    internalLinkDestinations: subtractLinkOccurrences(
+      baseline.internalLinkDestinations,
+      removedHrefs.filter((href) => !href.startsWith("http")),
+    ),
+  };
 }
 
 /** Capture a structural baseline before any normalization run. */
@@ -254,8 +292,8 @@ export function validateFinalArticleIntegrity(
   const linksPreserved = JSON.stringify(currentHrefs) === JSON.stringify(baselineHrefs);
 
   if (!linksPreserved) {
-    const missing = baselineHrefs.filter((h) => !currentHrefs.includes(h));
-    const added = currentHrefs.filter((h) => !baselineHrefs.includes(h));
+    const missing = multisetDifference(baselineHrefs, currentHrefs);
+    const added = multisetDifference(currentHrefs, baselineHrefs);
     if (missing.length > 0) errors.push(`Missing link destinations: ${missing.join(", ")}`);
     if (added.length > 0) warnings.push(`Added link destinations: ${added.join(", ")}`);
   }

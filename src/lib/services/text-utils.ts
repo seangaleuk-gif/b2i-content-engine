@@ -65,22 +65,16 @@ export function cleanBodyText(text: string): string {
 }
 
 export function robustJsonParse(raw: string, stage?: string): unknown {
-  // ── Diagnostics: log raw content before parsing ──
+  // Log shape only. Model responses can contain private article copy and must
+  // never be echoed into application logs, even as first/last snippets.
   if (stage) {
     console.log(`[JSON-PARSE:${stage}] type=${typeof raw} length=${raw.length}`);
-    console.log(`[JSON-PARSE:${stage}] first300="${raw.substring(0, 300).replace(/\n/g, "\\n").replace(/\r/g, "\\r")}"`);
-    console.log(`[JSON-PARSE:${stage}] last300="${raw.substring(Math.max(0, raw.length - 300)).replace(/\n/g, "\\n").replace(/\r/g, "\\r")}"`);
   }
 
   function logParseError(label: string, err: unknown, text: string): void {
     if (!stage) return;
     const msg = err instanceof Error ? err.message : String(err);
-    const posMatch = msg.match(/position\s+(\d+)/i);
-    const pos = posMatch ? parseInt(posMatch[1]) : -1;
-    const ctx = pos >= 0
-      ? ` ctx="${text.substring(Math.max(0, pos - 60), Math.min(text.length, pos + 60)).replace(/\n/g, "\\n").replace(/\r/g, "\\r")}"`
-      : "";
-    console.log(`[JSON-PARSE:${stage}] ${label} FAILED: ${msg}${ctx}`);
+    console.log(`[JSON-PARSE:${stage}] ${label} FAILED: ${msg} inputLength=${text.length}`);
   }
 
   // Direct parse

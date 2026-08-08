@@ -149,6 +149,17 @@ describe("final-QC source-citation removal transaction", () => {
     expect(renderSectionText(doc, "section-0")).not.toContain("Cooking Blog");
   });
 
+  it("deduplicates repeated findings for the same citation block", () => {
+    const doc = citationDoc();
+    const research = [
+      { title: "Unrelated cooking recipes", snippet: "Recipes for busy families.", url: "https://example.com/ai-marketing" },
+    ];
+    const relevance = assessSourceSectionRelevance(doc, research);
+    const repeated = [...relevance, ...relevance];
+    expect(collectOffTopicSourceCitationBlockIds(doc, repeated)).toHaveLength(1);
+    expect(removeOffTopicSourceCitations(doc, repeated)).toBe(1);
+  });
+
   it("an embedded source link inside substantive prose is never partially deleted", () => {
     const doc = citationDoc();
     doc.sections[0].blocks = [

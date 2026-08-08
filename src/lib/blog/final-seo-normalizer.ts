@@ -7,13 +7,12 @@ import {
   countSentences,
   countSyllables,
   calculateFleschReadingEase,
-  calculateKeyphraseDensity,
   containsExactPhrase,
   normalizeHtmlWhitespace,
   getFirstNReadableWords,
 } from "@/lib/seo/seo-text-utils";
 import { computeKeyphraseTargets, computeKeyphraseDensity, englishKeyphraseDensity, getKeyphraseContentWordCount } from "@/lib/content-standards";
-import { rebalanceWpBlocks } from "@/lib/services/text-utils";
+import { splitLongParagraphs } from "@/lib/services/text-utils";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { parseWordPressEditorialBlocks } from "@/lib/blog/article-document";
 import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, computeWordCountTolerance, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
@@ -29,6 +28,8 @@ export interface FinalSeoNormalizerInput {
   targetKeyphraseCount: number;
   minReadingEase: number;
   maxReadingEase: number;
+  /** ArticleDocument-owned visible count, including protected FAQ answers. */
+  canonicalVisibleWordCount?: number;
 }
 
 export interface SeoNormalizationMetrics extends FinalArticleMetrics {
@@ -251,6 +252,10 @@ function extractWpParagraphBlocks(html: string): WpParagraphBlock[] {
   let m: RegExpExecArray | null;
   while ((m = regex.exec(html)) !== null) {
     const blockContent = m[1];
+    // A whole-paragraph rewrite cannot safely reconstruct live inline markup.
+    // Links have already been tokenized at mutation time, so their sentinels
+    // remain eligible while strong/em/span and other markup stay protected.
+    if (/<[a-z][^>]*>/i.test(blockContent)) continue;
     const visibleText = blockContent.replace(/<[^>]+>/g, "").trim();
     if (visibleText.length > 0) {
       blocks.push({
@@ -351,14 +356,34 @@ function replaceStatisticsWithQualitative(text: string): string {
 // Delegates to the canonical analyzeFinalArticle() from final-article-policy.ts.
 // Adds keyphraseDensity and readingEase which are normalizer-specific.
 
-function computeMetrics(html: string, keyphrase: string): SeoNormalizationMetrics {
-  const base = analyzeFinalArticle(html, keyphrase);
+function computeMetrics(
+  html: string,
+  keyphrase: string,
+  canonicalVisibleWordCount?: number,
+): SeoNormalizationMetrics {
+  const base = analyzeFinalArticle(
+    html,
+    keyphrase,
+    undefined,
+    undefined,
+    undefined,
+    canonicalVisibleWordCount,
+  );
   const readableText = extractReadableText(html);
   return {
     ...base,
-    keyphraseDensity: calculateKeyphraseDensity(readableText, keyphrase),
+    keyphraseDensity: computeKeyphraseDensity(
+      base.exactKeyphraseCount,
+      keyphrase,
+      base.readableWordCount,
+    ),
     readingEase: Math.round(calculateFleschReadingEase(readableText)),
   };
+}
+
+function countNormalizerVisibleWords(html: string, protectedVisibleWordOffset: number): number {
+  const withoutSentinels = html.replace(/%%PROTECTED_\d+_[A-Za-z0-9-]+_BLOCK%%/g, " ");
+  return countReadableWords(withoutSentinels) + protectedVisibleWordOffset;
 }
 
 // ── Fix 1: Exact keyphrase in H2 ──
@@ -528,9 +553,11 @@ function reduceInBlocks(
   });
 
   const rejected = new Set<string>();
+  const processed = new Set<number>();
   for (const candidate of candidates) {
     if (removed >= excessToRemove) break;
     const blockKey = `${candidate.block.start}`;
+    if (processed.has(candidate.block.start)) continue;
     if (rejected.has(blockKey)) continue;
     if (!candidate.removalSafe) continue;
 
@@ -552,6 +579,7 @@ function reduceInBlocks(
     }
 
     outHtml = replaceWpParagraphBlock(outHtml, candidate.block, newText);
+    processed.add(candidate.block.start);
     removed++;
     changes.push({
       type: "keyphrase_removed",
@@ -689,8 +717,9 @@ function fixMissingKeyphrase(html: string, keyphrase: string, targetCount: numbe
 
   let inserted = 0;
   let resultHtml = html;
+  const processed = new Set<number>();
 
-  for (const c of candidates) {
+  for (const c of [...candidates].sort((a, b) => b.block.start - a.block.start)) {
     if (inserted >= deficit) break;
     if (c.kpCount >= 2) continue;
 
@@ -698,6 +727,7 @@ function fixMissingKeyphrase(html: string, keyphrase: string, targetCount: numbe
 
     if (newText !== c.block.visibleText) {
       resultHtml = replaceWpParagraphBlock(resultHtml, c.block, newText);
+      processed.add(c.block.start);
       inserted++;
       changes.push({
         type: "keyphrase_inserted",
@@ -710,9 +740,13 @@ function fixMissingKeyphrase(html: string, keyphrase: string, targetCount: numbe
 
   // If still deficit, try concluding paragraphs (reversed)
   if (inserted < deficit) {
-    const lastParas = [...paraBlocks].reverse().slice(0, 3);
+    const lastParas = extractWpParagraphBlocks(resultHtml)
+      .filter((block) => countExactPhrase(block.visibleText, keyphrase) === 0)
+      .sort((a, b) => b.start - a.start)
+      .slice(0, 3);
     for (const block of lastParas) {
       if (inserted >= deficit) break;
+      if (processed.has(block.start)) continue;
       const newText = insertKeyphraseNaturally(block.visibleText, keyphrase);
       if (newText !== block.visibleText) {
         resultHtml = replaceWpParagraphBlock(resultHtml, block, newText);
@@ -770,6 +804,7 @@ async function expandWordCount(
   targetWordCount: number,
   chat: NormalizerChatFn,
   changes: SeoNormalizationChange[],
+  protectedVisibleWordOffset: number,
 ): Promise<{ html: string; wordCount: number }> {
   const deficit = targetWordCount + 50 - currentWordCount; // Aim for target + 50 buffer
   if (deficit <= 0) return { html, wordCount: currentWordCount };
@@ -800,8 +835,8 @@ async function expandWordCount(
   let resultHtml = html;
   let wordsAdded = 0;
 
-  for (let attempt = 0; attempt < MAX_EXPANSION_ATTEMPTS && wordsAdded < deficit; attempt++) {
-    const target = targetsToExpand[attempt % targetsToExpand.length];
+  for (let attempt = 0; attempt < Math.min(MAX_EXPANSION_ATTEMPTS, targetsToExpand.length) && wordsAdded < deficit; attempt++) {
+    const target = targetsToExpand[attempt];
     const remainingNeeded = Math.max(30, deficit - wordsAdded);
     const currentWords = countReadableWords(target.visibleText);
 
@@ -859,16 +894,6 @@ Return as JSON: {"expanded": "the full paragraph with expansion included (keepin
         resultHtml = replaceWpParagraphBlock(resultHtml, target, expanded);
         wordsAdded += added;
 
-        // Update the target in targetsToExpand to reflect new content
-        const idx = targetsToExpand.indexOf(target);
-        if (idx >= 0) {
-          targetsToExpand[idx] = {
-            ...target,
-            visibleText: expanded,
-            fullMatch: target.fullMatch,
-          };
-        }
-
         changes.push({
           type: "word_count_expansion",
           description: `Expanded paragraph: +${added} words`,
@@ -881,7 +906,7 @@ Return as JSON: {"expanded": "the full paragraph with expansion included (keepin
     }
   }
 
-  const newWordCount = countReadableWords(resultHtml);
+  const newWordCount = countNormalizerVisibleWords(resultHtml, protectedVisibleWordOffset);
   console.log(`[SEO-NORMALIZER] word deficit=${deficit} expansion words added=${wordsAdded}`);
 
   // If still below target, expand one more section using fresh block extraction
@@ -918,7 +943,7 @@ Return as JSON: {"expanded": "complete paragraph with new sentences appended"}`;
     }
   }
 
-  return { html: resultHtml, wordCount: countReadableWords(resultHtml) };
+  return { html: resultHtml, wordCount: countNormalizerVisibleWords(resultHtml, protectedVisibleWordOffset) };
 }
 
 function getContextBefore(html: string, position: number, chars: number): string {
@@ -940,55 +965,15 @@ function blockToContextString(block: WpParagraphBlock): string {
 // ── Fix 5: Paragraph splitting ──
 
 function fixParagraphLength(html: string, changes: SeoNormalizationChange[]): string {
-  // Use deterministic sentence-level splitting
-  const paraBlocks = extractWpParagraphBlocks(html);
-
-  // Protect ranges
-  const protectedRanges: [number, number][] = [];
-  const wpHtmlRegex = /<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi;
-  let wm: RegExpExecArray | null;
-  while ((wm = wpHtmlRegex.exec(html)) !== null) {
-    protectedRanges.push([wm.index, wm.index + wm[0].length]);
+  const result = splitLongParagraphs(html, 3);
+  if (result.splitCount > 0) {
+    changes.push({
+      type: "paragraph_split",
+      description: `Split ${result.splitCount} long paragraph boundary/boundaries while preserving inline markup`,
+    });
   }
-
-  let resultHtml = html;
-  let splitCount = 0;
-
-  // Process from end to start to avoid position shifts
-  const longBlocks = paraBlocks
-    .filter((b) => {
-      if (protectedRanges.some(([s, e]) => b.start >= s && b.start < e)) return false;
-      const sentences = b.visibleText.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0);
-      return sentences.length > 3;
-    })
-    .sort((a, b) => b.start - a.start); // Reverse order
-
-  for (const block of longBlocks) {
-    const sentences = block.visibleText.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0);
-
-    // Split into groups of max 3 sentences
-    const parts: string[] = [];
-    for (let i = 0; i < sentences.length; i += 3) {
-      const chunk = sentences.slice(i, i + 3).join(" ");
-      if (chunk.trim()) {
-        parts.push(`<!-- wp:paragraph -->\n<p>${chunk.trim()}</p>\n<!-- /wp:paragraph -->`);
-      }
-    }
-
-    if (parts.length > 1) {
-      const replacement = parts.join("\n\n");
-      resultHtml = resultHtml.substring(0, block.start) + replacement + resultHtml.substring(block.end);
-      splitCount += parts.length - 1;
-
-      changes.push({
-        type: "paragraph_split",
-        description: `Split paragraph with ${sentences.length} sentences into ${parts.length} blocks`,
-      });
-    }
-  }
-
-  console.log(`[SEO-NORMALIZER] paragraphs split=${splitCount}`);
-  return resultHtml;
+  console.log(`[SEO-NORMALIZER] paragraphs split=${result.splitCount}`);
+  return result.html;
 }
 
 // ── Fix 5b: Ensure keyphrase in first 100 visible words ──
@@ -1180,10 +1165,19 @@ export async function normalizeFinalSeo(
   // because the normalizer never sees them, only restores them at the end.
   const { content: tokenizedHtml, tokens } = tokenizeProtectedBlocks(html);
   const originalLinkHrefs = captureLinkHrefs(html);
+  const rawVisibleWordCount = countReadableWords(html);
+  const protectedVisibleWordOffset = Math.max(
+    0,
+    (input.canonicalVisibleWordCount ?? rawVisibleWordCount) - rawVisibleWordCount,
+  );
 
   // Compute before metrics from the ORIGINAL html (not tokenized), so
   // paragraph/link counts are comparable with the detokenized after state.
-  const beforeRaw = computeMetrics(html, focusKeyphrase);
+  const beforeRaw = computeMetrics(
+    html,
+    focusKeyphrase,
+    input.canonicalVisibleWordCount ?? countNormalizerVisibleWords(html, protectedVisibleWordOffset),
+  );
   console.log(`[SEO-NORMALIZER] before metrics=wc:${beforeRaw.readableWordCount} kp:${beforeRaw.exactKeyphraseCount} h2:${beforeRaw.exactKeyphraseInH2} paras>3:${beforeRaw.longParagraphCount} flesch:${beforeRaw.readingEase}`);
 
   let currentHtml = tokenizedHtml;
@@ -1202,9 +1196,17 @@ export async function normalizeFinalSeo(
   }
 
   // Step 6: Expand body to target word count
-  let currentWC = countReadableWords(currentHtml);
+  let currentWC = countNormalizerVisibleWords(currentHtml, protectedVisibleWordOffset);
   if (currentWC < targetWordCount && chat) {
-    const result = await expandWordCount(currentHtml, focusKeyphrase, currentWC, targetWordCount, chat, changes);
+    const result = await expandWordCount(
+      currentHtml,
+      focusKeyphrase,
+      currentWC,
+      targetWordCount,
+      chat,
+      changes,
+      protectedVisibleWordOffset,
+    );
     currentHtml = result.html;
     currentWC = result.wordCount;
   }
@@ -1237,11 +1239,12 @@ export async function normalizeFinalSeo(
   currentHtml = detokenizeProtectedBlocks(currentHtml, tokens);
   console.log(`[SEO-NORMALIZER] protected blocks restored, tokens=${tokens.length}`);
 
-  // Rebalance any orphaned WP blocks introduced during paragraph splitting
-  currentHtml = rebalanceWpBlocks(currentHtml);
-
   // Step 11: Final measurements (on restored HTML)
-  const after = computeMetrics(currentHtml, focusKeyphrase);
+  let after = computeMetrics(
+    currentHtml,
+    focusKeyphrase,
+    countNormalizerVisibleWords(currentHtml, protectedVisibleWordOffset),
+  );
   console.log(`[SEO-NORMALIZER] after metrics=wc:${after.readableWordCount} kp:${after.exactKeyphraseCount} h2:${after.exactKeyphraseInH2} paras>3:${after.longParagraphCount} flesch:${after.readingEase}`);
 
   // Step 12: Verify only link destinations (protected blocks are guaranteed byte-identical)
@@ -1268,8 +1271,12 @@ export async function normalizeFinalSeo(
     if (targetByDensity > 0 && targetByDensity < after.exactKeyphraseCount) {
       currentHtml = fixExcessiveKeyphrase(currentHtml, focusKeyphrase, targetByDensity, changes);
       console.log(`[SEO-NORMALIZER] density reduction: ${after.exactKeyphraseCount}→${targetByDensity} (kpDensity=${kpDensity.toFixed(1)}% > ${kpHigh}%)`);
-      const afterAfter = computeMetrics(currentHtml, focusKeyphrase);
-      kpDensity = computeKeyphraseDensity(afterAfter.exactKeyphraseCount, focusKeyphrase, afterAfter.readableWordCount);
+      after = computeMetrics(
+        currentHtml,
+        focusKeyphrase,
+        countNormalizerVisibleWords(currentHtml, protectedVisibleWordOffset),
+      );
+      kpDensity = computeKeyphraseDensity(after.exactKeyphraseCount, focusKeyphrase, after.readableWordCount);
     }
   }
   const kpCountOk = kpDensity <= kpHigh;

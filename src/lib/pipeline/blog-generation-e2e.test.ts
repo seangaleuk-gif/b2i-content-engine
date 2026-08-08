@@ -297,6 +297,7 @@ describe("external-link pipeline diagnostics", () => {
       { url: "https://example.com/threads-local-brands", title: "Threads Marketing for Small Local Brands in Hong Kong", snippet: "Local teams share useful lessons from daily work with clear and honest words." },
       { url: "https://example.com/understand-audience", title: "Understand the People You Want to Reach", snippet: "Simple examples help busy owners understand the idea and take a practical next step." },
     ];
+    const logSpy = vi.spyOn(console, "log");
     let result: Awaited<ReturnType<typeof runPostAssemblyPipeline>> | undefined;
     try {
       result = await runWithContext({ research: sources });
@@ -315,6 +316,11 @@ describe("external-link pipeline diagnostics", () => {
     }
     const present = sources.filter((source) => finalBlog.includes(source.url));
     expect(present.length).toBeGreaterThan(0);
+    const injectionLog = logSpy.mock.calls
+      .map((args) => args.map(String).join(" "))
+      .find((line) => line.includes("[external-links:inject]"));
+    logSpy.mockRestore();
+    expect(injectionLog).toMatch(/externalBefore=0 externalAfter=[1-9]\d*/);
     if (result) {
       expect(result.warnings.some((w: string) => w.includes("no research sources"))).toBe(false);
     }

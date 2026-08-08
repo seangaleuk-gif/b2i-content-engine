@@ -1,5 +1,20 @@
 # Test, TypeScript, Build, and Lint Status
 
+## Authoritative update — 8 August 2026 B2I-9 audit
+
+- English blog/pipeline/generation/route selection: **1,044/1,044 passed**.
+- Selected offline/mocked translation/service/route tests: **495/495 passed**.
+- Explicitly rerun safe total: **1,539 passed / 0 failed**.
+- `npx tsc --noEmit`: **pass**.
+- Production `next build`: **pass**.
+- Lint: **444 findings (268 errors / 176 warnings)**; fresh exact recovered
+  input: **445 (269 / 176)**. No new lint findings; one error removed.
+- Provider-capable document-context tests were not run because the execution
+  safety layer blocked possible transmission of fixture content to DeepSeek.
+
+The older 1 August results below are retained only as historical evidence and
+must not be reported as the current package result.
+
 **Verified:** 1 August 2026 (evening, latest development totals)
 
 > These totals are current only as of the latest recorded run. **Do not present them as current after future code changes unless rerun.**

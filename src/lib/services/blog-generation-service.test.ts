@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   normalizeOutlineHeadings,
+  OutlineHeadingValidationError,
   runBlogGeneration,
   runGenerationTasksWithConcurrency,
 } from "@/lib/services/blog-generation-service";
@@ -49,7 +50,21 @@ vi.mock("@/lib/pipeline/blog-generation-pipeline", () => ({
 
 vi.mock("@/lib/services/article-postprocessors", () => ({
   sanitizeSectionUrls: vi.fn((h: string) => h),
-  pairedSlugs: vi.fn((slug: string) => ({ englishSlug: slug.replace(/-zh$/, ""), chineseSlug: `${slug.replace(/-zh$/, "")}-zh` })),
+  pairedSlugs: vi.fn((slug: string) => {
+    const clean = String(slug || "")
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[’']/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/-{2,}/g, "-")
+      .replace(/^-|-$/g, "")
+      .replace(/-zh$/, "") || "blog-post";
+    return { englishSlug: clean, chineseSlug: `${clean}-zh` };
+  }),
+  renderLanguageSwitcher: vi.fn(({ chineseSlug }: { chineseSlug: string }) =>
+    `<!-- wp:html --><div class="b2i-language-switcher"><span>English</span> | <a href="/blog/${chineseSlug}">繁體中文</a></div><!-- /wp:html -->`,
+  ),
   isEligibleExternalSourceUrl: vi.fn((url: string) => {
     try {
       const host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
@@ -135,11 +150,74 @@ describe("normalizeOutlineHeadings", () => {
     expect(headings.filter((heading) => /faq|frequently asked/i.test(heading))).toHaveLength(1);
     expect(headings.at(-1)).toMatch(/faq|frequently asked/i);
   });
+
+  it("repairs duplicated editorial topic wording without changing count, order or FAQ copy", () => {
+    const faq = "Frequently Asked Questions About Hong Kong Marketing";
+    const headings = normalizeOutlineHeadings(
+      [
+        "Hong Kong Marketing Trends 2026: What's Shaping Hong Kong Marketing",
+        "Audience Behaviour",
+        "Channel Planning",
+        "Creative Execution",
+        "Measurement Strategy",
+        "Practical Next Steps",
+        faq,
+      ],
+      2500,
+      "Hong Kong Marketing Trends 2026",
+      "hong kong marketing trends 2026",
+    );
+    expect(headings).toHaveLength(7);
+    expect(headings[0]).toBe("Hong Kong Marketing Trends 2026");
+    expect(headings.slice(1, -1)).toEqual([
+      "Audience Behaviour",
+      "Channel Planning",
+      "Creative Execution",
+      "Measurement Strategy",
+      "Practical Next Steps",
+    ]);
+    expect(headings.at(-1)).toBe(faq);
+  });
+
+  it("normalizes the location-aware fallback instead of creating a duplicated Hong Kong", () => {
+    const headings = normalizeOutlineHeadings(
+      ["S1", "S2", "S3", "S4", "S5", "Frequently Asked Questions"],
+      2500,
+      "Hong Kong Marketing",
+      "hong kong marketing",
+    );
+    expect(headings).toContain("Why Hong Kong Marketing Matters");
+    expect(headings).not.toContain("Why Hong Kong Marketing Matters in Hong Kong");
+  });
+
+  it("fails early when a duplicated heading cannot be repaired without losing numbers", () => {
+    expect(() => normalizeOutlineHeadings(
+      [
+        "Hong Kong 5G Marketing: Hong Kong Marketing for 10 Teams",
+        "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions",
+      ],
+      2500,
+      "Hong Kong Marketing",
+      "hong kong marketing",
+    )).toThrow(OutlineHeadingValidationError);
+  });
 });
 
 // ── Introduction failure ──
 
 describe("runBlogGeneration — introduction failure", () => {
+  it("rejects a non-object outline without logging its model content", async () => {
+    const privateMarker = "PRIVATE-OUTLINE-MARKER";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const mock = buildRequestMock([{ stage: "outline", content: JSON.stringify(privateMarker) }]);
+      await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).rejects.toThrow();
+      expect(errorSpy.mock.calls.flat().join(" ")).not.toContain(privateMarker);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it("invalid intro after retry throws", async () => {
     const mock = buildRequestMock([
       { stage: "intro", content: "NOT JSON {{{" },
@@ -291,6 +369,204 @@ describe("runBlogGeneration — successful flow", () => {
   it("completes without errors", async () => {
     const mock = buildRequestMock([]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
+  });
+
+  it("keeps the accepted outline FAQ heading when the FAQ model returns a markup override", async () => {
+    vi.mocked(createPipelineState).mockClear();
+    const mock = buildRequestMock([{
+      stage: "faq",
+      content: JSON.stringify({
+        heading: '<script>alert("faq")</script>',
+        entries: [
+          { question: "What is this?", answer: "This is the first FAQ entry." },
+          { question: "How does it work?", answer: "It works through a simple process." },
+          { question: "Who should use this?", answer: "Anyone can use this effectively." },
+          { question: "When should I start?", answer: "Starting now is recommended for best results." },
+        ],
+      }),
+    }]);
+
+    await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+    const articleDoc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+    const faqHeading = articleDoc.sections.find((section) => section.sectionType === "faq-heading");
+    expect(faqHeading?.heading).toBe("Frequently Asked Questions About Test");
+    expect(faqHeading?.heading).not.toContain("<script>");
+  });
+
+  it("runs one targeted FAQ repair for invalid shape before assembly", async () => {
+    vi.mocked(createPipelineState).mockClear();
+    const validEntries = [
+      { question: "What is this?", answer: "This is the first FAQ entry." },
+      { question: "How does it work?", answer: "It works through a simple process." },
+      { question: "Who should use this?", answer: "Professional teams can use it." },
+      { question: "When should I start?", answer: "Start when the plan is ready." },
+    ];
+    const mock = buildRequestMock([
+      { stage: "faq", content: JSON.stringify({ entries: [{ question: "Only one?", answer: "Too few." }] }) },
+      { stage: "faq_repair", content: JSON.stringify({ entries: validEntries }) },
+    ]);
+
+    await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+    const doc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+    expect(doc.visibleFaq).toHaveLength(4);
+    expect(doc.visibleFaq[0].question).toBe("What is this?");
+  });
+
+  it("repairs CTA/signup copy found in either an FAQ question or answer", async () => {
+    const stages: string[] = [];
+    const base = buildRequestMock([
+      {
+        stage: "faq",
+        content: JSON.stringify({ entries: [
+          { question: "How do I sign up?", answer: "Create your free profile today." },
+          { question: "How does it work?", answer: "It follows a clear process." },
+          { question: "Who is it for?", answer: "It is for professional teams." },
+          { question: "When should I begin?", answer: "Begin when the plan is ready." },
+        ] }),
+      },
+      {
+        stage: "faq_repair",
+        content: JSON.stringify({ entries: [
+          { question: "What is this?", answer: "This is a practical planning approach." },
+          { question: "How does it work?", answer: "It follows a clear process." },
+          { question: "Who is it for?", answer: "It is for professional teams." },
+          { question: "When should I begin?", answer: "Begin when the plan is ready." },
+        ] }),
+      },
+    ]);
+    const request = async (stage: string) => {
+      stages.push(stage);
+      return base(stage);
+    };
+
+    await runBlogGeneration("u", 1, { requestDeepSeek: request });
+
+    expect(stages.filter((stage) => stage === "faq_repair")).toHaveLength(1);
+  });
+
+  it("fails before assembly when the targeted FAQ repair is still invalid", async () => {
+    const mock = buildRequestMock([
+      { stage: "faq", content: JSON.stringify({ entries: [] }) },
+      { stage: "faq_repair", content: JSON.stringify({ entries: [{ question: "Still one?", answer: "Still too few." }] }) },
+    ]);
+
+    let failure: unknown;
+    try {
+      await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeTruthy();
+    const cause = failure instanceof Error && "cause" in failure && failure.cause instanceof Error
+      ? failure.cause.message
+      : "";
+    expect(cause).toContain("FAQ generation failed deterministic acceptance");
+  });
+
+  it("normalizes outline metadata and slug before they enter prompts or protected markup", async () => {
+    vi.mocked(createPipelineState).mockClear();
+    const mock = buildRequestMock([{
+      stage: "outline",
+      content: JSON.stringify({
+        title: '<b>Safe Planning</b> <script>alert("x")</script>',
+        slug: 'Safe Planning"><img src=x onerror=alert(1)>',
+        metaDescription: "<em>Practical guidance</em> for professional teams that need a clear, safe and measurable planning process.",
+        excerpt: "<!-- wp:html -->A <strong>plain</strong> summary<!-- /wp:html -->",
+        h2Headings: ["S1", "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions"],
+      }),
+    }]);
+
+    await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+    const doc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+    expect(doc.metadata.title).toBe("Safe Planning");
+    expect(doc.metadata.metaDescription).not.toMatch(/[<>]/);
+    expect(doc.metadata.excerpt).toBe("A plain summary");
+    expect(doc.metadata.slug).toBe("safe-planning-img-src-x-onerror-alert-1");
+    expect(doc.languageSwitcher?.html).not.toMatch(/onclick|<img/i);
+  });
+
+  it("uses the corrected H2 in the section prompt and canonical document", async () => {
+    vi.mocked(projectRepository.findById).mockResolvedValue({
+      id: 1,
+      name: "T",
+      keyword: "hong kong marketing trends 2026",
+      audience: "t",
+      country: "HK",
+      wordCount: 2500,
+      content: "",
+      status: "draft",
+    } as unknown as Awaited<ReturnType<typeof projectRepository.findById>>);
+    vi.mocked(createPipelineState).mockClear();
+    const base = buildRequestMock([{
+      stage: "outline",
+      content: JSON.stringify({
+        title: "Hong Kong Marketing Trends 2026",
+        slug: "hong-kong-marketing-trends-2026",
+        metaDescription: "A practical guide to current marketing planning and execution for professional teams in Hong Kong.",
+        h2Headings: [
+          "Hong Kong Marketing Trends 2026: What's Shaping Hong Kong Marketing",
+          "Audience Behaviour", "Channel Planning", "Creative Execution",
+          "Measurement Strategy", "Practical Next Steps", "Frequently Asked Questions",
+        ],
+      }),
+    }]);
+    const calls: Array<{ stage: string; user: string }> = [];
+    const request = async (stage: string, messages: Array<{ role: string; content: string }>) => {
+      calls.push({ stage, user: messages.find((message) => message.role === "user")?.content ?? "" });
+      return base(stage);
+    };
+
+    await runBlogGeneration("u", 1, { requestDeepSeek: request });
+
+    const sectionCall = calls.find((call) => call.stage === "section_0");
+    expect(sectionCall?.user).toContain('Section heading: "Hong Kong Marketing Trends 2026"');
+    expect(sectionCall?.user).not.toContain("What's Shaping Hong Kong Marketing");
+    const articleDoc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+    expect(articleDoc.sections[0].heading).toBe("Hong Kong Marketing Trends 2026");
+  });
+
+  it("runs one targeted outline-quality retry before any section when repair is unsafe", async () => {
+    vi.mocked(projectRepository.findById).mockResolvedValue({
+      id: 1, name: "T", keyword: "hong kong marketing", audience: "t", country: "HK",
+      wordCount: 2500, content: "", status: "draft",
+    } as unknown as Awaited<ReturnType<typeof projectRepository.findById>>);
+    const base = buildRequestMock([
+      {
+        stage: "outline",
+        content: JSON.stringify({
+          title: "Hong Kong Marketing",
+          slug: "hong-kong-marketing",
+          metaDescription: "A practical guide to marketing planning and execution for professional teams working in Hong Kong.",
+          h2Headings: [
+            "Hong Kong 5G Marketing: Hong Kong Marketing for 10 Teams",
+            "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions",
+          ],
+        }),
+      },
+      {
+        stage: "outline_quality_retry",
+        content: JSON.stringify({
+          h2Headings: [
+            "5G Marketing for 10 Hong Kong Teams",
+            "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions",
+          ],
+        }),
+      },
+    ]);
+    const stages: string[] = [];
+    const request = async (stage: string) => {
+      stages.push(stage);
+      return base(stage);
+    };
+
+    await runBlogGeneration("u", 1, { requestDeepSeek: request });
+
+    expect(stages).toContain("outline_quality_retry");
+    expect(stages.indexOf("outline_quality_retry")).toBeLessThan(stages.indexOf("section_0"));
+    expect(stages.filter((stage) => stage === "outline_quality_retry")).toHaveLength(1);
   });
 });
 

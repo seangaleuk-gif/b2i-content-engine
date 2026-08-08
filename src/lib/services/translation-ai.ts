@@ -135,13 +135,12 @@ export async function chatWithBudget(
   const requestedRetries = (options as any).maxRetries ?? 2;
   const maxRetries = budget ? budget.capRetries(requestedRetries) : requestedRetries;
   const requestOptions = { ...options, maxRetries } as ChatOptions;
-  // Only forward the retry limit when the caller explicitly requested it.
-  // Existing callers that omit maxRetries retain the current default production
-  // behavior (deepseek's default of 2 retries, budget cap not applied).
+  // A shared budget must cap every call, including callers relying on the
+  // provider default. Calls without a budget retain the default retry path.
   const explicitRetries = options.maxRetries !== undefined;
 
   try {
-    const result = explicitRetries
+    const result = budget || explicitRetries
       ? await ai.chatWithRetry(messages, requestOptions, component, maxRetries)
       : await ai.chatWithRetry(messages, requestOptions, component);
     const actualRetries = result.attemptsUsed ?? 0;

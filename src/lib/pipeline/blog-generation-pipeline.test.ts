@@ -1480,6 +1480,29 @@ describe("temporal freshness comparative acceptance", () => {
     expect(reasons.some((reason) => reason.includes("factual score regressed"))).toBe(true);
     expect(reasons.some((reason) => reason.includes("editorial score regressed"))).toBe(true);
   });
+
+  it("allows an over-maximum article to improve without requiring an unrelated full trim", () => {
+    const before = { ...baseMetrics, readableWordCount: 3032 } as FinalArticleMetrics;
+    const after = { ...before, staleTemporalClaimCount: 0, readableWordCount: 3020 } as FinalArticleMetrics;
+    expect(validateTemporalCandidate(state, before, after)).toEqual([]);
+  });
+
+  it("rejects a growing word-count overrun", () => {
+    const before = { ...baseMetrics, readableWordCount: 3032 } as FinalArticleMetrics;
+    const after = { ...before, staleTemporalClaimCount: 0, readableWordCount: 3040 } as FinalArticleMetrics;
+    expect(validateTemporalCandidate(state, before, after).some((reason) => reason.includes("overrun regressed"))).toBe(true);
+  });
+
+  it("rejects moving an in-range article out of range", () => {
+    const after = { ...baseMetrics, staleTemporalClaimCount: 0, readableWordCount: 3000 } as FinalArticleMetrics;
+    expect(validateTemporalCandidate(state, baseMetrics, after).some((reason) => reason.includes("word count="))).toBe(true);
+  });
+
+  it("rejects worsening an existing word-count shortfall", () => {
+    const before = { ...baseMetrics, readableWordCount: 2000 } as FinalArticleMetrics;
+    const after = { ...before, staleTemporalClaimCount: 0, readableWordCount: 1900 } as FinalArticleMetrics;
+    expect(validateTemporalCandidate(state, before, after).some((reason) => reason.includes("shortfall regressed"))).toBe(true);
+  });
 });
 
 describe("editorial malformed-repair persistence by stable block ID", () => {
@@ -1520,6 +1543,7 @@ describe("editorial malformed-repair persistence by stable block ID", () => {
     // The commit decision must persist the repaired stable block, never the
     // original malformed text, so no later restore resurrects the fragment.
     const commit = chooseEditorialCommitDoc({
+      baselineDoc: doc,
       workingDoc: repairedDoc,
       targetedRepairsDoc: repairedDoc,
       accepted: false,
@@ -1531,16 +1555,23 @@ describe("editorial malformed-repair persistence by stable block ID", () => {
 
   it("an accepted polish commits the full working document", () => {
     const { doc } = docWithMalformedBlock();
-    const commit = chooseEditorialCommitDoc({ workingDoc: doc, targetedRepairsDoc: null, accepted: true });
+    const commit = chooseEditorialCommitDoc({ baselineDoc: structuredClone(doc), workingDoc: doc, targetedRepairsDoc: null, accepted: true });
     expect(commit.targetedRepairsPersisted).toBe(false);
     expect(commit.doc).toBe(doc);
   });
 
   it("a rejected polish with no successful targeted repair keeps the original document", () => {
-    const { doc } = docWithMalformedBlock();
-    const commit = chooseEditorialCommitDoc({ workingDoc: doc, targetedRepairsDoc: null, accepted: false });
+    const { doc: baselineDoc } = docWithMalformedBlock();
+    const rejectedWorkingDoc = structuredClone(baselineDoc);
+    rejectedWorkingDoc.sections[0].blocks.push({
+      id: "rejected-broad-rewrite",
+      type: "paragraph",
+      content: [{ type: "text", text: "This rejected broad rewrite must not persist." }],
+    });
+    const commit = chooseEditorialCommitDoc({ baselineDoc, workingDoc: rejectedWorkingDoc, targetedRepairsDoc: null, accepted: false });
     expect(commit.targetedRepairsPersisted).toBe(false);
-    expect(commit.doc).toBe(doc);
+    expect(commit.doc).toBe(baselineDoc);
+    expect(commit.doc.sections[0].blocks.some((block) => block.id === "rejected-broad-rewrite")).toBe(false);
   });
 });
 

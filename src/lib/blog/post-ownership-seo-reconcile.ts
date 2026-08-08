@@ -24,6 +24,7 @@ import { computeKeyphraseDensity, englishKeyphraseDensity } from "@/lib/content-
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import { titleCaseKeyphrase } from "@/lib/services/text-utils";
+import { assessHeadingNaturalness, assessHeadingTextNaturalness } from "@/lib/blog/content-relevance";
 
 export interface PostOwnershipSeoReconcileResult {
   h2KeyphraseRestored: boolean;
@@ -111,7 +112,10 @@ export function buildNaturalHeading(heading: string, keyphrase: string): string 
       // The year is now carried by the keyphrase: prepend it for a natural
       // "Keyphrase: Topic" title/subtitle form.
       const prefix = `${titleCase}: ${trimmed}`;
-      return prefix.length <= 90 ? prefix : heading;
+      return prefix.length <= 90
+        && assessHeadingTextNaturalness(prefix, keyphrase).length === 0
+        ? prefix
+        : heading;
     }
   }
 
@@ -123,7 +127,10 @@ export function buildNaturalHeading(heading: string, keyphrase: string): string 
   // ": Keyphrase" append.
   if (headingAlreadyCoversTopic(trimmed, keyphrase)) {
     const prefix = `${titleCase}: ${trimmed}`;
-    return prefix.length <= 90 ? prefix : heading;
+    return prefix.length <= 90
+      && assessHeadingTextNaturalness(prefix, keyphrase).length === 0
+      ? prefix
+      : heading;
   }
 
   // Longest keyphrase-prefix that matches the heading tail (word boundaries).
@@ -134,14 +141,20 @@ export function buildNaturalHeading(heading: string, keyphrase: string): string 
       const missing = kpWords.slice(matchLen);
       const suffix = missing.map((word) => titleCaseKeyphrase(word)).join(" ");
       const candidate = `${trimmed} ${suffix}`;
-      if (candidate.length <= 90) return candidate;
+      if (candidate.length <= 90 && assessHeadingTextNaturalness(candidate, keyphrase).length === 0) {
+        return candidate;
+      }
     }
   }
 
   const candidate = `${trimmed}: ${titleCase}`;
-  if (candidate.length <= 90) return candidate;
+  if (candidate.length <= 90 && assessHeadingTextNaturalness(candidate, keyphrase).length === 0) {
+    return candidate;
+  }
   const prefix = `${titleCase}: ${trimmed}`;
-  return prefix.length <= 90 ? prefix : heading;
+  return prefix.length <= 90 && assessHeadingTextNaturalness(prefix, keyphrase).length === 0
+    ? prefix
+    : heading;
 }
 
 /** True when the heading already states the keyphrase's topic and year, so
@@ -282,7 +295,8 @@ export function reconcilePostOwnershipKeyphrase(
   const safe = density >= kpWarning
     && density <= kpStuffing
     && unsupported.length === 0
-    && ownershipViolations.length === 0;
+    && ownershipViolations.length === 0
+    && assessHeadingNaturalness(candidate, keyphrase).length === 0;
 
   if (safe && changedIds.size > 0) {
     // Commit the reconciled clone onto the canonical document.

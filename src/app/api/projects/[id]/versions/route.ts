@@ -42,6 +42,14 @@ export async function DELETE(
       throw AppError.badRequest("versionId is required");
     }
 
+    const version = await blogVersionRepository.findById(Number(versionId));
+    if (
+      !version
+      || Number(version.projectId) !== Number(id)
+      || version.userId !== userId
+    ) {
+      throw AppError.notFound("Blog version");
+    }
     await blogVersionRepository.delete(Number(versionId));
     return NextResponse.json({ success: true });
   } catch (error) {

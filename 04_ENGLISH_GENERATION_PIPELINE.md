@@ -10,6 +10,8 @@ request validation
 → introduction and sections
 → FAQ and conclusion
 → assemble ArticleDocument
+→ claim check
+→ transactional source-relevance repair
 → section expansion/trim and component regeneration
 → SEO normalization
 → factual scan
@@ -17,7 +19,7 @@ request validation
 → malformed-prose repair
 → editorial repair/polish with guarded acceptance
 → internal links (link-injector)
-→ external links (approved research sources)
+→ external links (approved research sources; body and owning-H2 relevance)
 → external dedup
 → link enforcement
 → factual final confirmation
@@ -26,6 +28,8 @@ request validation
 → FAQ recovery/schema generation
 → word-count check
 → final preflight (malformed re-check, FAQ parity, external-link final count)
+→ mutation-free deterministic final QC
+→ selective full-document editorial review (when enabled)
 → final validation
 → persistence/readback
 ```
@@ -82,6 +86,9 @@ A missing exact keyphrase in an H2 is `[SOFT]`; it does not block the article.
 
 - The `external-links` stage injects `Source: <a href="...">title</a>.` citations from eligible approved sources (valid http(s), non-B2I domains) into relevant body sections.
 - A source attaches when the paragraph shares a quantity with it, contains a quotation with ≥6 shared tokens, or shares ≥6 lexical tokens (prose-only sources).
+- In addition to body/evidence matching, a candidate must pass the same H2/source relevance rule used by final QC. H2 overlap is an acceptance condition, not merely a ranking bonus.
+- `source-relevance-repair` removes any pure off-topic citation already present in model-produced content before expansion. It never removes a citation embedded in substantive prose; that condition restores the snapshot and fails closed.
+- `final-qc-scan` does not remove links or otherwise mutate the document.
 - Diagnostics: `[external-links:candidates]`, `[external-links:inject]`, `[external-links:final]`.
 - When zero eligible sources exist, the pipeline logs and records an explicit warning instead of pretending links were added.
 - External-link counting uses the canonical definition (`countEditorialExternalLinks`): FAQ schema script blocks, CTA signup links, language-switcher links, internal B2I URLs, and relative URLs are excluded. The SEO audit reads the same canonical metric.

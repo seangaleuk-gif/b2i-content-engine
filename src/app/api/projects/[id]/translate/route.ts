@@ -3,7 +3,8 @@ import { getCurrentUserId } from "@/lib/services/auth";
 import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse, AppError } from "@/lib/services/errors";
 import { blogVersionRepository, researchRepository } from "@/lib/repositories";
-import { translateArticle, validateTranslatedDocument } from "@/lib/services/translation-service";
+import { translateArticle } from "@/lib/services/translation-service";
+import { evaluateTranslationDocumentAcceptance } from "@/lib/services/translation-acceptance";
 import { runChineseAudit } from "@/lib/services/seo-auditor";
 import {
   type ArticleDocument,
@@ -17,8 +18,6 @@ import { pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-post
 import { buildTranslationVersionSummary } from "@/lib/services/translation-version-metadata";
 import type { BlogVersion } from "@/db/schema/blog-versions";
 import { scanTemporalFreshness } from "@/lib/blog/temporal-freshness";
-import { analyzeZhHkLanguageQuality } from "@/lib/services/zh-hk-language-quality";
-import { checkCtaParity, findUnnaturalCalques, unresolvedMandatoryFindings } from "@/lib/services/editorial-review-gate";
 
 export async function POST(
   _request: Request,
@@ -128,6 +127,22 @@ export async function POST(
       .filter((check) => check.status === "warning")
       .map((check) => ({ id: check.id, label: check.label, score: check.score }));
 
+    // Zero-write acceptance boundary: validate the exact canonical pair before
+    // asking for a version number or mutating either saved language version.
+    const preSaveAcceptance = evaluateTranslationDocumentAcceptance({
+      enDoc: parsedEnglishDoc,
+      zhDoc: result.doc,
+      research,
+      review: result.review,
+      requireFullDocumentReview: process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW === "true",
+    });
+    if (!preSaveAcceptance.accepted) {
+      console.error("[translate] Pre-save bilingual acceptance failed:", preSaveAcceptance.errors);
+      throw AppError.badRequest(
+        `Traditional Chinese acceptance failed: ${preSaveAcceptance.errors.join("; ")}`,
+      );
+    }
+
     const nextVersion = await blogVersionRepository.getNextVersionNumber(projectId);
     let createdChineseId: number | null = null;
     let englishUpdateAttempted = false;
@@ -186,11 +201,13 @@ export async function POST(
         throw new Error(`Saved Chinese ArticleDocument could not be reconstructed: ${parsedSavedChinese.errors.join("; ")}`);
       }
       const savedZhDoc = parsedSavedChinese.doc;
-      const parityErrors = validateTranslatedDocument(parsedEnglishDoc, savedZhDoc, research);
-      const savedQuality = analyzeZhHkLanguageQuality(savedZhDoc, parsedEnglishDoc);
-      const blockingQuality = unresolvedMandatoryFindings(savedQuality);
-      const unnatural = findUnnaturalCalques(savedZhDoc);
-      const ctaParity = checkCtaParity(savedZhDoc);
+      const savedAcceptance = evaluateTranslationDocumentAcceptance({
+        enDoc: parsedEnglishDoc,
+        zhDoc: savedZhDoc,
+        research,
+        review: result.review,
+        requireFullDocumentReview: process.env.ENABLE_FULL_DOCUMENT_ZH_REVIEW === "true",
+      });
       const savedZhAudit = runChineseAudit({
         title: savedChinese.title || "",
         metaDescription: savedChinese.metaDescription || "",
@@ -202,17 +219,11 @@ export async function POST(
       });
       const savedSeoFailures = savedZhAudit.checks.filter((check) => check.status === "fail");
       if (
-        parityErrors.length > 0
-        || blockingQuality.length > 0
-        || unnatural.length > 0
-        || !ctaParity.ok
+        !savedAcceptance.accepted
         || savedSeoFailures.length > 0
       ) {
         throw new Error([
-          ...parityErrors,
-          ...blockingQuality.map((finding) => `${finding.sourceUnitId}:${finding.messageCode}`),
-          ...unnatural.map((finding) => `${finding.sourceUnitId}:${finding.reason}`),
-          ...ctaParity.missingClaims.map((claim) => `CTA missing ${claim}`),
+          ...savedAcceptance.errors,
           ...savedSeoFailures.map((check) => `SEO ${check.label}`),
         ].join("; "));
       }

@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
+  createArticleIntegrityBaseline,
+  createIntegrityBaselineAfterLinkRemoval,
   parseWordpressBlockStructure,
   tokenizeWordpressBlockComments,
+  validateFinalArticleIntegrity,
   validateWordpressBlockPairs,
 } from "@/lib/blog/article-integrity";
 import {
@@ -134,5 +137,18 @@ describe("wordpress block pair validation", () => {
     const parsed = parseWordpressBlockStructure(html);
     expect(parsed.valid).toBe(false);
     expect(parsed.issues.some((issue) => issue.includes("cannot be nested inside leaf block wp:paragraph"))).toBe(true);
+  });
+
+  it("tracks duplicate link occurrences and adjusts only an intentional removal", () => {
+    const original = '<!-- wp:paragraph --><p><a href="/a">A1</a> <a href="/a">A2</a> <a href="/b">B</a></p><!-- /wp:paragraph -->';
+    const baseline = createArticleIntegrityBaseline(original);
+    const adjusted = createIntegrityBaselineAfterLinkRemoval(baseline, ["/a"]);
+    const oneRemoved = '<!-- wp:paragraph --><p><a href="/a">A2</a> <a href="/b">B</a></p><!-- /wp:paragraph -->';
+    const bothRemoved = '<!-- wp:paragraph --><p><a href="/b">B</a></p><!-- /wp:paragraph -->';
+
+    expect(validateFinalArticleIntegrity(oneRemoved, adjusted).valid).toBe(true);
+    const invalid = validateFinalArticleIntegrity(bothRemoved, adjusted);
+    expect(invalid.valid).toBe(false);
+    expect(invalid.errors).toContain("Missing link destinations: /a");
   });
 });

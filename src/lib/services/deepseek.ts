@@ -37,6 +37,8 @@ const THINKING_DISABLED_STAGES = new Set([
   // editorial rewriting & repairs
   "editorial-polish", "editorial-malformed-repair", "editorial-post-cleanup-repair",
   "editorial-repetition-repair", "editorial-prose-only-fallback",
+  "final-document-diagnosis", "final-document-patch", "final-document-acceptance",
+  "final-trim-compaction",
   // translation
   "cta", "metadata-final",
   "conc-shadow", "conc-shadow-repair",

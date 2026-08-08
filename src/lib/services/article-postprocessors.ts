@@ -1,4 +1,5 @@
 import { B2I_DOMAINS } from "@/lib/services/generation-constants";
+import { assessHeadingSourceTextRelevance } from "@/lib/blog/content-relevance";
 
 /** Deterministic language switcher inserted as the first article block.
  *  Links to the paired slug in the alternate language. */
@@ -7,7 +8,11 @@ export function renderLanguageSwitcher(params: {
   englishSlug: string;
   chineseSlug: string;
 }): string {
-  const { currentLanguage, englishSlug, chineseSlug } = params;
+  const { currentLanguage } = params;
+  // Slugs originate in model-produced outline JSON. Derive both destinations
+  // from one normalized English slug so quote characters, paths, schemes and
+  // mismatched alternate slugs can never enter the protected href markup.
+  const { englishSlug, chineseSlug } = pairedSlugs(params.englishSlug || params.chineseSlug);
 
   if (currentLanguage === "en") {
     return `<!-- wp:html -->
@@ -43,12 +48,25 @@ export function ensureLanguageSwitcher(html: string, params: {
   return `${switcher}\n\n${html}`;
 }
 
-/** Generate paired slugs: EN uses normal slug, ZH appends -zh */
+/** Normalize a model-produced slug to one safe WordPress path segment. */
+export function normalizeArticleSlug(baseSlug: string): string {
+  const normalized = String(baseSlug || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[’']/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-|-$/g, "");
+  return normalized || "blog-post";
+}
+
+/** Generate paired slugs: EN uses a safe normal slug, ZH appends -zh. */
 export function pairedSlugs(baseSlug: string): { englishSlug: string; chineseSlug: string } {
-  const clean = baseSlug.replace(/\/$/, "").replace(/^-zh$/, "");
+  const clean = normalizeArticleSlug(baseSlug).replace(/-zh$/, "") || "blog-post";
   return {
-    englishSlug: clean.replace(/-zh$/, ""),
-    chineseSlug: clean.endsWith("-zh") ? clean : `${clean}-zh`,
+    englishSlug: clean,
+    chineseSlug: `${clean}-zh`,
   };
 }
 
@@ -165,6 +183,11 @@ export function insertExternalResearchLinks(
       const headingTokens = headingTopicTokens(sectionHeadings[block.sectionIndex]);
       const sourceSet = sourceTokens(`${source.title} ${source.snippet ?? ""}`);
       const headingOverlap = [...headingTokens].filter((token) => sourceSet.has(token)).length;
+      const headingRelevance = assessHeadingSourceTextRelevance(
+        sectionHeadings[block.sectionIndex] ?? "",
+        `${source.title} ${source.snippet ?? ""}`,
+      );
+      if (!headingRelevance.relevant) continue;
       candidates.push({
         position: block.end,
         sectionIndex: block.sectionIndex,

@@ -1,7 +1,76 @@
 # B2I Content Engine — Handoff
-**Date:** 7 August 2026  
+**Date:** 8 August 2026  
 **Project:** B2I Content Engine  
 **Purpose:** Continue the English-generation stabilization work, then bring the Traditional Chinese translation pipeline into full parity without reopening already-fixed English architecture.
+
+> **Authoritative update — fresh full B2I-9 root audit completed on 8 August
+> 2026.** Read `FULL_PIPELINE_ROOT_AUDIT_2026-08-08.md` and
+> `NEW_CHAT_HANDOFF.md` before the historical material below. Where verification
+> counts or implementation details conflict, the full-pipeline audit wins.
+
+## 0. Latest audited package state
+
+- The exact production duplicated H2 is now rejected/repaired at outline
+  acceptance before section drafting. Unsafe semantic/numeric repairs receive
+  one bounded outline-quality retry before any section call.
+- Source-relevance removal now runs before expansion; the external-link producer
+  must independently pass the same owning-H2 relevance rule before insertion.
+  Final QC is a mutation-free backstop and all later word-count/preflight gates
+  see the real document.
+- FAQ shape/count/copy is accepted before assembly with one targeted retry;
+  the FAQ model cannot override the outline-owned H2.
+- Canonical H2 rendering, paired slugs and language-switcher hrefs are escaped,
+  normalized and round-trip tested. Outline metadata is plain-text normalized.
+- Model response snippets were removed from JSON parser logs.
+
+- The staged English generator remains intact; no full-article generation call
+  was added.
+- Production generation no longer calls `rebalanceWpBlocks()`. AI-produced
+  expansion, trim and SEO candidates must pass typed WordPress validation or
+  the complete pre-stage canonical snapshot is restored.
+- Final-QC intentional link removal now uses exact multiset-aware derived
+  baselines and real fallback HTML, with selected block IDs and URLs logged.
+- Temporal freshness repairs are baseline-relative for word count and remain
+  non-regressive for factual/editorial quality.
+- Rejected broad editorial work restores the pre-editorial document; validated
+  targeted repairs can persist; word-count trimming validates and commits the
+  same object.
+- SEO normalization receives the canonical visible word count, including the
+  protected FAQ offset, and no longer reuses stale block positions.
+- Section expansion/trim recalculate against a cloned complete
+  `ArticleDocument`; trim candidates must preserve ordered links and numbers.
+- `translation-acceptance.ts` is the shared EN/ZH acceptance owner used before
+  any translation write, after save/readback, and at publication.
+- Source-aware literal checks reject the four known unnatural translations,
+  including `out of touch` → `失焦`, without globally banning valid uses of
+  `失焦`.
+- Translation retry budgets cap default provider retries as well as explicit
+  retries.
+- Version deletion now verifies the target version's project and user before
+  deletion.
+- Verification: TypeScript pass; production build pass; English
+  blog/pipeline/generation/route 1,044/1,044; selected offline translation/
+  service/route suites 495/495; lint 444 (268 errors/176 warnings) versus a
+  fresh exact recovered input run of 445 (269/176).
+- The provider-capable document-context test batch was safety-blocked because it
+  can transmit fixtures to DeepSeek. It was not bypassed. No live production
+  generation/translation claim is made by this audit.
+
+### Runtime flags
+
+Keep:
+
+```text
+ENABLE_DOCUMENT_CONTEXT_TRANSLATION_PRIMARY=true
+ENABLE_FULL_DOCUMENT_ZH_REVIEW=true
+```
+
+Remove/unset the translation shadow flags when primary is enabled. Explicit
+`false` variables may be deleted because only exact `true` enables a flag.
+For English selective/full-document editorial, use
+`ENABLE_EDITORIAL_POLISH=true`, `ENABLE_FULL_DOCUMENT_EDITORIAL=true`, and
+`FULL_DOCUMENT_EDITORIAL_MODE=shadow` until deployment shadow evaluation is
+complete, then change only the mode to `enforce`.
 
 ## 1. Current state
 

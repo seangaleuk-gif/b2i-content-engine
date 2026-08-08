@@ -28,6 +28,7 @@ vi.mock("@/lib/services/deepseek", async (importOriginal) => {
 });
 
 import { chatWithBudget } from "./translation-ai";
+import { RetryBudget } from "./translation-types";
 
 describe("chatWithBudget retry forwarding", () => {
   beforeEach(() => {
@@ -62,5 +63,17 @@ describe("chatWithBudget retry forwarding", () => {
       "test-stage",
     );
     expect(captured[0].maxRetries).toBe(1);
+  });
+
+  it("an exhausted shared budget caps a default-retry call at zero", async () => {
+    const budget = new RetryBudget(1);
+    budget.record("previous-stage", 1, false);
+    await chatWithBudget(
+      [{ role: "user", content: "translate" }],
+      { maxTokens: 100 },
+      "next-stage",
+      budget,
+    );
+    expect(captured[0].maxRetries).toBe(0);
   });
 });
