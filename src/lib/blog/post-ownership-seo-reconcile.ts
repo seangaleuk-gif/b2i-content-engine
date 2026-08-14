@@ -24,7 +24,11 @@ import { computeKeyphraseDensity, englishKeyphraseDensity } from "@/lib/content-
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import { titleCaseKeyphrase } from "@/lib/services/text-utils";
-import { assessHeadingNaturalness, assessHeadingTextNaturalness } from "@/lib/blog/content-relevance";
+import {
+  assessHeadingNaturalness,
+  assessHeadingTextNaturalness,
+  repairHeadingNaturalness,
+} from "@/lib/blog/content-relevance";
 
 export interface PostOwnershipSeoReconcileResult {
   h2KeyphraseRestored: boolean;
@@ -315,4 +319,140 @@ export function reconcilePostOwnershipKeyphrase(
     countCanonicalVisibleWords(doc),
   );
   return result;
+}
+
+export interface EditorialH2EnforcementResult {
+  /** True when at least one natural editorial H2 carries the exact keyphrase. */
+  satisfied: boolean;
+  /** The editorial H2 text that was replaced, or null when nothing changed. */
+  changedHeading: string | null;
+  /** The canonical section ID whose heading was repaired, or null. */
+  changedSectionId: string | null;
+  /** The heading text after enforcement, or null when not applicable. */
+  headingAfter: string | null;
+  /** Human-readable reasons for an unsatisfied guarantee. */
+  reasons: string[];
+}
+
+/**
+ * Authoritative save-boundary guarantee for the English pipeline: at least one
+ * normal editorial H2 must contain the exact focus keyphrase, and every
+ * editorial heading must remain natural. FAQ, conclusion and CTA/protected
+ * headings never count as editorial-H2 placement.
+ *
+ * When the keyphrase is missing (or the only keyphrase-bearing editorial H2 is
+ * a duplicated/unnatural concatenation), the existing natural reconciliation
+ * helpers pick the most suitable editorial H2 and rebuild its heading so the
+ * exact keyphrase appears naturally. The mutation is committed only when the
+ * repaired heading carries the exact keyphrase and passes the shared
+ * naturalness gate. The caller must fail closed (block persistence) when this
+ * returns `satisfied: false`.
+ */
+export function enforceEditorialH2Keyphrase(
+  doc: ArticleDocument,
+  keyphrase: string,
+): EditorialH2EnforcementResult {
+  const kpLower = keyphrase.toLowerCase().trim();
+  const empty: EditorialH2EnforcementResult = {
+    satisfied: false,
+    changedHeading: null,
+    changedSectionId: null,
+    headingAfter: null,
+    reasons: [],
+  };
+  if (!kpLower) {
+    return { ...empty, reasons: ["empty focus keyphrase"] };
+  }
+
+  const editorialSections = doc.sections
+    .filter(
+      (section) =>
+        section.sectionType !== "faq-heading"
+        && section.sectionType !== "conclusion-heading",
+    )
+    .map((section) => ({ id: section.id, heading: section.heading }));
+
+  if (editorialSections.length === 0) {
+    return { ...empty, reasons: ["no editorial H2 available"] };
+  }
+
+  // A natural editorial H2 that already carries the exact keyphrase is
+  // compliant; the article is left unchanged.
+  const existing = editorialSections.find((section) =>
+    section.heading.toLowerCase().includes(kpLower),
+  );
+  if (
+    existing
+    && assessHeadingTextNaturalness(existing.heading, keyphrase, existing.id).length === 0
+  ) {
+    return {
+      satisfied: true,
+      changedHeading: null,
+      changedSectionId: null,
+      headingAfter: existing.heading,
+      reasons: [],
+    };
+  }
+
+  // When the only keyphrase-bearing editorial heading is unnatural (for
+  // example a duplicated year/topic append such as
+  // "The State of Digital Marketing in Hong Kong for 2026: Hong Kong
+  // Marketing Trends 2026"), strip the duplication first and then re-apply the
+  // keyphrase naturally. An unresolvable duplication stays a hard failure.
+  const existingSection = existing
+    ? doc.sections.find((section) => section.id === existing.id)
+    : undefined;
+  const baseHeading = existingSection
+    ? (() => {
+        const repair = repairHeadingNaturalness(
+          existingSection.heading,
+          keyphrase,
+          existingSection.id,
+        );
+        return repair.resolved && repair.changed ? repair.heading : existingSection.heading;
+      })()
+    : null;
+
+  const candidateSections = baseHeading !== null
+    ? editorialSections.map((section) =>
+        section.id === existing!.id ? { ...section, heading: baseHeading } : section,
+      )
+    : editorialSections;
+
+  const target = bestHeadingForKeyphrase(candidateSections, keyphrase);
+  if (!target) {
+    return {
+      ...empty,
+      reasons: ["no suitable editorial H2 to repair naturally"],
+    };
+  }
+
+  const newHeading = buildNaturalHeading(target.heading, keyphrase);
+  if (newHeading === target.heading || !newHeading.toLowerCase().includes(kpLower)) {
+    return {
+      ...empty,
+      reasons: ["natural repair could not produce a keyphrase-bearing editorial H2"],
+    };
+  }
+  const violations = assessHeadingTextNaturalness(newHeading, keyphrase, target.id);
+  if (violations.length > 0) {
+    return {
+      ...empty,
+      reasons: [`repaired heading fails naturalness: ${violations.map((v) => v.code).join(", ")}`],
+    };
+  }
+
+  const section = doc.sections.find((item) => item.id === target.id);
+  if (!section) {
+    return { ...empty, reasons: ["target editorial section not found"] };
+  }
+  const previous = section.heading;
+  section.heading = newHeading;
+  return {
+    satisfied: true,
+    changedHeading: previous,
+    changedSectionId: target.id,
+    headingAfter: newHeading,
+    reasons: [],
+  };
 }

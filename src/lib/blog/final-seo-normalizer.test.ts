@@ -4894,8 +4894,10 @@ describe("pipeline stage order and fallback", () => {
       { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
       { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
       { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
-      { stage: "final-qc-scan", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
-      { stage: "final-validation", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
+      { stage: "editorial-h2-enforce", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
+      { stage: "final-qc-scan", inputFingerprint: "c2", outputFingerprint: "c2", accepted: true },
+      { stage: "editorial-h2-save-assert", inputFingerprint: "c2", outputFingerprint: "c2", accepted: true },
+      { stage: "final-validation", inputFingerprint: "c2", outputFingerprint: "c3", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
     expect(issues.length).toBe(0);
@@ -4961,7 +4963,8 @@ describe("pipeline stage 2 integration", () => {
       "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
       "language-switcher", "internal-links", "external-links", "external-dedup",
       "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve", "final-trim",
-      "faq-recovery", "wc-check", "final-preflight", "final-qc-scan", "final-validation",
+      "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
+      "editorial-h2-save-assert", "final-validation",
     ];
     // All required stages present
     state.stageOutputs = required.map((s, i) => ({
@@ -5306,8 +5309,10 @@ describe("pipeline stage skip recording and rollback", () => {
       { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
       { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
       { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
-      { stage: "final-qc-scan", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
-      { stage: "final-validation", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
+      { stage: "editorial-h2-enforce", inputFingerprint: "c1", outputFingerprint: "c2", accepted: true },
+      { stage: "final-qc-scan", inputFingerprint: "c2", outputFingerprint: "c2", accepted: true },
+      { stage: "editorial-h2-save-assert", inputFingerprint: "c2", outputFingerprint: "c2", accepted: true },
+      { stage: "final-validation", inputFingerprint: "c2", outputFingerprint: "c3", accepted: true },
     ];
     const issues = validatePipelineOrder(state);
     expect(issues.filter((i) => i.code === "MISSING_STAGE").length).toBe(0);

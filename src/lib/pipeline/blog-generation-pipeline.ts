@@ -52,7 +52,7 @@ import {
   isTopicContextYearClaim,
   validateClaimOwnership,
 } from "@/lib/blog/claim-ownership";
-import { reconcilePostOwnershipKeyphrase } from "@/lib/blog/post-ownership-seo-reconcile";
+import { reconcilePostOwnershipKeyphrase, enforceEditorialH2Keyphrase } from "@/lib/blog/post-ownership-seo-reconcile";
 import { scanEnglishLanguageConsistency, formatLanguageConsistencyViolations } from "@/lib/blog/language-consistency";
 import {
   compressDocumentStructureAware,
@@ -62,7 +62,7 @@ import {
   type CoherenceViolation,
 } from "@/lib/blog/coherence";
 import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
-import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
+import { scanMalformedProseInDocument, classifyMalformedIssue } from "@/lib/blog/publication-quality";
 import { countBoilerplateInDocument } from "@/lib/blog/source-boilerplate";
 import {
   assessSourceSectionRelevance,
@@ -181,6 +181,37 @@ export function assertRenderedCacheMatchesDocument(state: Pick<PipelineState, "a
     );
   }
 }
+
+/**
+ * Non-mutating diagnostic of the editorial-H2 keyphrase status. At least one
+ * normal editorial H2 (FAQ, conclusion and CTA/protected headings never count)
+ * is a quality target; the exact focus keyphrase in an editorial H2 is a SOFT
+ * SEO signal, not a save-blocking invariant. Heading naturalness is reported
+ * separately because naturalness/structural corruption remains a genuine hard
+ * quality gate.
+ */
+function evaluateEditorialH2Status(state: PipelineState): {
+  editorialH2Exists: boolean;
+  exactKeyphrase: boolean;
+  unnaturalHeadings: number;
+} {
+  const kpLower = state.keyphrase.toLowerCase().trim();
+  const editorialHeadings = state.articleDoc.sections
+    .filter(
+      (section) =>
+        section.sectionType !== "faq-heading"
+        && section.sectionType !== "conclusion-heading",
+    )
+    .map((section) => section.heading);
+  return {
+    editorialH2Exists: editorialHeadings.length > 0,
+    exactKeyphrase: editorialHeadings.some((heading) =>
+      heading.toLowerCase().includes(kpLower),
+    ),
+    unnaturalHeadings: assessHeadingNaturalness(state.articleDoc, state.keyphrase).length,
+  };
+}
+
 
 /** SEO normalization runs before canonical CTA restoration, so a missing CTA at
  * this stage must not discard an otherwise valid normalized article. */
@@ -845,7 +876,8 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
     "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
     "language-switcher", "internal-links", "external-links", "external-dedup",
     "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve", "final-trim",
-    "faq-recovery", "wc-check", "final-preflight", "final-qc-scan", "final-document-editorial", "final-validation",
+    "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
+    "final-document-editorial", "editorial-h2-save-assert", "final-validation",
   ];
   if (isEditorialPolishEnabled()) {
     required.push("conclusion-discipline", "editorial-polish");
@@ -867,8 +899,9 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
     ...(isEditorialPolishEnabled() ? ["editorial-polish"] : []),
     "claim-ownership-final", "language-switcher", "internal-links", "external-links",
     "external-dedup",     "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve",
-    "final-trim", "faq-recovery", "wc-check", "final-preflight", "final-qc-scan",
+    "final-trim", "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
     ...(isFullDocumentEditorialEnabled() ? ["final-document-editorial"] : []),
+    "editorial-h2-save-assert",
     "final-validation",
   ];
   for (let left = 0; left < expectedOrder.length; left++) {
@@ -1331,12 +1364,22 @@ export async function runPostAssemblyPipeline(
   // Factual and ownership sentence removal can expose a dangling connector or
   // incomplete fragment. Repair those deterministic cases before any broad
   // editor sees the article, using stable block IDs rather than text ordinals.
+  // Explicit unresolved-output policy: a stage responsible for deterministic
+  // malformed-prose repair must (1) repair deterministically when safe,
+  // (2) remove an invalid whole block when safe and meaning-preserving
+  // (bounded removal is enabled here), (3) classify what remains, and (4) fail
+  // at this repair boundary for genuine publication-breaking corruption rather
+  // than carrying known defects through the rest of the pipeline. Scanner
+  // false positives cannot block publication because the false-positive-prone
+  // patterns are eliminated at the scanner level (classifyMalformedIssue).
   {
     const inputFingerprint = fp(state.blog);
+    const snap = snapshotState(state);
     const deterministic = repairDeterministicMalformedProse(
       state.articleDoc,
       state.wordMin,
       protectedSentencesByBlockId,
+      true,
     );
     syncBlogFromDocument(state);
     recordStage(
@@ -1357,6 +1400,27 @@ export async function runPostAssemblyPipeline(
         `[malformed-prose-repair] deterministic repaired=${deterministic.repairedBlockIds.length}` +
         ` removed=${deterministic.removedBlockIds.length}` +
         ` unresolved=${deterministic.unresolved.length}`,
+      );
+    }
+    // Boundary policy: scan the FULL document (all block types, matching the
+    // final gate) after the repair. Genuine publication-breaking corruption
+    // that could not be repaired or safely removed fails HERE; the stage must
+    // never carry known corruption downstream.
+    const remainingMalformed = scanMalformedProseInDocument(state.articleDoc);
+    const hardUnresolved = remainingMalformed.filter((finding) =>
+      finding.issues.some((issue) => classifyMalformedIssue(issue.code) === "hard"),
+    );
+    if (hardUnresolved.length > 0) {
+      // Rejected repair restores the exact pre-stage canonical snapshot, then
+      // the pipeline fails closed (zero writes) at this repair boundary.
+      restoreSnapshot(state, snap);
+      throw new Error(
+        `Unresolved malformed prose at repair boundary (${hardUnresolved.length}): ` +
+        hardUnresolved
+          .map((finding) =>
+            `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] component=${finding.componentId}`,
+          )
+          .join("; "),
       );
     }
   }
@@ -2099,13 +2163,17 @@ export async function runPostAssemblyPipeline(
       deps.context?.claimOwnership,
     );
     syncBlogFromDocument(state);
-    if (result.h2KeyphraseRestored || result.first100KeyphraseRestored) {
-      console.log(
-        `[post-ownership-seo-reconcile] h2=${result.h2KeyphraseRestored}` +
-        ` first100=${result.first100KeyphraseRestored}` +
-        ` density=${result.densityBefore.toFixed(2)}% → ${result.densityAfter.toFixed(2)}%`,
-      );
-    }
+    // Always log the outcome. A silent no-op previously hid the reason the
+    // editorial-H2 guarantee was not restored mid-pipeline; the authoritative
+    // save-boundary stage below now enforces it regardless.
+    console.log(
+      `[post-ownership-seo-reconcile] h2=${result.h2KeyphraseRestored}` +
+      ` first100=${result.first100KeyphraseRestored}` +
+      ` density=${result.densityBefore.toFixed(2)}% → ${result.densityAfter.toFixed(2)}%` +
+      (result.h2KeyphraseRestored || result.first100KeyphraseRestored
+        ? ""
+        : " (no change committed)"),
+    );
     return state.blog;
   });
 
@@ -2178,8 +2246,12 @@ export async function runPostAssemblyPipeline(
   // malformed repair (last-resort block removal allowed), rebuild the visible
   // FAQ and FAQ schema from the current canonical entries, and confirm parity.
   // The final gate must never discover a malformed fragment or FAQ mismatch
-  // that a prior stage claimed to repair.
+  // that a prior stage claimed to repair. Known genuine corruption that could
+  // not be repaired or safely removed fails closed HERE, at the last repair
+  // boundary, so final QC stays a backstop for defects missed earlier rather
+  // than the routine first point where already-known defects abort generation.
   state = runTrackedHtmlStage(state, "final-preflight", () => {
+    const snap = snapshotState(state);
     const repair = repairDeterministicMalformedProse(
       state.articleDoc,
       state.wordMin,
@@ -2191,6 +2263,24 @@ export async function runPostAssemblyPipeline(
         `[final-preflight] deterministic malformed repair repaired=${repair.repairedBlockIds.length}` +
         ` removed=${repair.removedBlockIds.length}` +
         ` unresolved=${repair.unresolved.length}`,
+      );
+    }
+    // Boundary policy: scan the full document (all block types) after the
+    // repair; genuine corruption that still cannot be repaired or safely
+    // removed fails closed HERE, at the last repair boundary.
+    const remainingMalformed = scanMalformedProseInDocument(state.articleDoc);
+    const hardUnresolved = remainingMalformed.filter((finding) =>
+      finding.issues.some((issue) => classifyMalformedIssue(issue.code) === "hard"),
+    );
+    if (hardUnresolved.length > 0) {
+      restoreSnapshot(state, snap);
+      throw new Error(
+        `Unresolved malformed prose at final repair boundary (${hardUnresolved.length}): ` +
+        hardUnresolved
+          .map((finding) =>
+            `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] component=${finding.componentId}`,
+          )
+          .join("; "),
       );
     }
     if (state.articleDoc.visibleFaq.length > 0) {
@@ -2231,6 +2321,38 @@ export async function runPostAssemblyPipeline(
         `Final preflight FAQ parity mismatch: canonical=${state.articleDoc.visibleFaq.length}` +
         ` rendered=${canonical.length} schema=${renderedCount}` +
         ` first=${first ? first.type : "unknown"}${first && first.index !== undefined ? `@${first.index}` : ""}`,
+      );
+    }
+    return state.blog;
+  });
+
+  // ── Mutating editorial-H2 keyphrase reconciliation ──
+  // A natural editorial H2 carrying the exact focus keyphrase is a SEO quality
+  // target, not a save-blocking invariant. The mid-pipeline
+  // post-ownership-seo-reconcile stage restores the keyphrase only when every
+  // all-or-nothing guarantee holds and can silently no-op; this deterministic
+  // stage makes one best-effort natural repair using the same reconciliation
+  // logic. It runs BEFORE the mutation-free final QC so that backstop measures
+  // the repaired document. When no natural, non-duplicated, naturalness-clean
+  // repair can be produced, the original headings are kept unchanged and the
+  // pipeline continues — the H2 keyphrase miss is reported as a soft diagnostic
+  // and the final SEO audit deducts points. Naturalness/structural corruption
+  // is still a genuine hard gate below.
+  state = runTrackedHtmlStage(state, "editorial-h2-enforce", () => {
+    const result = enforceEditorialH2Keyphrase(state.articleDoc, state.keyphrase);
+    syncBlogFromDocument(state);
+    if (result.satisfied) {
+      console.log(
+        `[editorial-h2-enforce] satisfied=true` +
+        ` changedSection=${result.changedSectionId ?? "none"}` +
+        ` headingAfter="${result.headingAfter ?? "-"}"`,
+      );
+    } else {
+      // Missing exact-focus-keyphrase in an editorial H2 is soft. Never force
+      // an awkward, duplicated or unnatural heading; keep originals untouched.
+      console.log(
+        `[editorial-h2-reconcile] satisfied=false repair=not-committed` +
+        ` reason=natural-repair-unavailable severity=soft`,
       );
     }
     return state.blog;
@@ -2379,6 +2501,30 @@ export async function runPostAssemblyPipeline(
       );
     }
   }
+
+  // ── Non-mutating editorial-H2 soft diagnostic at the final save boundary ──
+  // Reports whether a qualifying editorial H2 exists, whether the exact focus
+  // keyphrase is present, and heading naturalness. An absent exact keyphrase in
+  // an editorial H2 is a SOFT SEO signal and must never block persistence.
+  // Genuine heading-naturalness corruption is a real quality defect and remains
+  // a hard failure here as a defensive backstop. It is the last content stage
+  // immediately before final validation.
+  state = runTrackedHtmlStage(state, "editorial-h2-save-assert", () => {
+    const status = evaluateEditorialH2Status(state);
+    if (status.unnaturalHeadings > 0) {
+      throw new Error(
+        `Editorial-H2 naturalness corruption at save boundary: ` +
+        `unnatural=${status.unnaturalHeadings}`,
+      );
+    }
+    console.log(
+      `[editorial-h2-save-assert] editorialH2=${status.editorialH2Exists}` +
+      ` exactKeyphrase=${status.exactKeyphrase}` +
+      ` naturalness=${status.unnaturalHeadings}` +
+      ` severity=${status.exactKeyphrase ? "ok" : "soft"}`,
+    );
+    return state.blog;
+  });
 
   // Final validation
   state = runTrackedHtmlStage(state, "final-validation", (html) => {

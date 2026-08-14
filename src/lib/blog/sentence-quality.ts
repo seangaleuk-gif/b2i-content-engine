@@ -44,9 +44,14 @@ const REPEATED_ADJACENT_WORD_RE =
 
 /** Adjective/adverb immediately before a determiner is an ungrammatical noun
  *  phrase ("broader these market changes picture", "the wider the gap").
- *  Comparative/superlative and intensifier forms only. */
+ *  Only comparative/superlative adjectives and determiner-like words that can
+ *  never legitimately precede another determiner are included. Pure adverbs
+ *  ("simply", "clearly", "really", "quite") legitimately precede determiners
+ *  ("simply the best", "clearly the winner", "quite a challenge") and must
+ *  never be flagged — "AI and AR are simply the means to get there." is valid
+ *  English. */
 const MALFORMED_NOUN_PHRASE_RE =
-  /\b(?:broader|wider|larger|bigger|smaller|higher|lower|greater|lesser|more|most|other|same|such|whole|entire|very|really|simply|quite|fairly|pretty|extremely|highly|increasingly|incredibly|particularly|especially|generally|typically|often|usually|deeply|truly|genuinely|clearly|certainly|definitely|absolutely|completely|entirely|totally|fully|mostly|largely|mainly|primarily|essentially|basically|fundamentally|ultimately|eventually|currently|previously|originally|finally|initially|suddenly|quickly|rapidly|steadily|gradually|consistently|constantly|continually|continuously)\s+(?:the|this|that|these|those|a|an)\b/i;
+  /\b(?:broader|wider|larger|bigger|smaller|higher|lower|greater|lesser|more|most|other|same|such|whole|entire)\s+(?:the|this|that|these|those|a|an)\b/i;
 
 /** Broken punctuation: two or more consecutive sentence-end marks, a sentence
  *  ending with a dangling determiner, or stray double spaces. */

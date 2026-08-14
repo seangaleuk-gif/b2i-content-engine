@@ -873,11 +873,125 @@ function canRebuildAsPlainText(block: EditorialBlock): block is Extract<Editoria
 }
 
 /**
+ * Deterministic repair for dash-opened sentence continuations that start with
+ * a lowercase word — e.g. "Budget realistically. — that's the spirit of Hong
+ * Kong marketing: flexible, adaptive, and ready to try new things." The model
+ * can emit this continuation form directly, and a deterministic sentence
+ * deletion can also expose it. The sentence-quality scanner correctly treats
+ * the lowercase opening as invalid at the final gate; the continuation is
+ * grammatical once the first word is capitalized ("— That's the spirit ..."),
+ * so this pass capitalizes the first alpha after a sentence-opening dash.
+ * It never touches mid-sentence dashes, quotes, lists or any other block type.
+ */
+const DASH_LOWERCASE_SENTENCE_START_RE =
+  /(^|[.!?]["”’)]*\s*)([—–-]\s*)([a-z])/;
+
+function repairDashSentenceStarts(
+  doc: ArticleDocument,
+): { repairedBlockIds: string[] } {
+  const repairedBlockIds: string[] = [];
+  const checkComponent = (
+    component: Pick<ArticleComponent, "status">,
+    blocks: EditorialBlock[],
+  ) => {
+    for (const block of blocks) {
+      if (block.type !== "paragraph" || !canRebuildAsPlainText(block)) continue;
+      const original = textFromBlock(block);
+      if (!DASH_LOWERCASE_SENTENCE_START_RE.test(original)) continue;
+      const repaired = original.replace(
+        /(^|[.!?]["”’)]*\s*)([—–-]\s*)([a-z])/g,
+        (_match: string, prefix: string, dash: string, lower: string) =>
+          prefix + dash + lower.toUpperCase(),
+      );
+      if (repaired === original) continue;
+      block.content = [{ type: "text", text: repaired }];
+      component.status = "normalized";
+      repairedBlockIds.push(block.id);
+    }
+  };
+  checkComponent(doc.introduction, doc.introduction.blocks);
+  for (const section of doc.sections) {
+    if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
+    checkComponent(section, section.blocks);
+  }
+  checkComponent(doc.conclusion, doc.conclusion.blocks);
+  return { repairedBlockIds };
+}
+
+/**
  * Deterministic first aid after factual/ownership sentence deletion.
  * It trims only a trailing broken sentence from plain-text paragraphs. If that
  * is impossible, a short evidence-free malformed paragraph may be removed as
  * a last-resort fallback, provided the article remains above its word minimum.
  */
+/**
+ * Sentence boundaries identical to the sentence-quality scanner (split at every
+ * [.!?], consuming runs of marks and closing quotes, skipping decimal points)
+ * so a punctuation-only sentence found here is exactly what the final gate
+ * would flag.
+ */
+function splitScannerSentences(text: string): string[] {
+  const sentences: string[] = [];
+  let start = 0;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (char !== "." && char !== "!" && char !== "?") continue;
+    if (char === "." && /\d/.test(text[index - 1] ?? "") && /\d/.test(text[index + 1] ?? "")) continue;
+    let end = index + 1;
+    while (/[.!?]/.test(text[end] ?? "")) end++;
+    while (/["”’)]/.test(text[end] ?? "")) end++;
+    if (text.slice(start, end).trim()) sentences.push(text.slice(start, end).trim());
+    start = end;
+    index = end - 1;
+  }
+  if (start < text.length && text.slice(start).trim()) {
+    sentences.push(text.slice(start).trim());
+  }
+  return sentences;
+}
+
+const PUNCTUATION_ONLY_SENTENCE_RE = /^[\s\p{P}\p{S}]+$/u;
+const PUNCTUATION_MARK_RE = /[.!?—–…]/;
+
+/**
+ * Deterministic cleanup for stray punctuation-only sentences inside plain-text
+ * paragraphs ("Local teams share lessons. . Plan a weekly routine."). A lone
+ * "." or "…" sentence is the residue of a deleted sentence and carries no
+ * content, so removing it and rejoining the intact sentences preserves meaning.
+ * Meaningful punctuation inside normal prose is never touched.
+ */
+function stripPunctuationOnlySentences(
+  doc: ArticleDocument,
+): { repairedBlockIds: string[] } {
+  const repairedBlockIds: string[] = [];
+  const checkComponent = (
+    component: Pick<ArticleComponent, "status">,
+    blocks: EditorialBlock[],
+  ) => {
+    for (const block of blocks) {
+      if (block.type !== "paragraph" || !canRebuildAsPlainText(block)) continue;
+      const original = textFromBlock(block);
+      const sentences = splitScannerSentences(original);
+      const kept = sentences.filter((sentence) =>
+        !(PUNCTUATION_ONLY_SENTENCE_RE.test(sentence) && PUNCTUATION_MARK_RE.test(sentence)),
+      );
+      if (kept.length === sentences.length) continue;
+      const repaired = kept.join(" ").replace(/\s+/g, " ").trim();
+      if (!repaired || repaired === original) continue;
+      block.content = [{ type: "text", text: repaired }];
+      component.status = "normalized";
+      repairedBlockIds.push(block.id);
+    }
+  };
+  checkComponent(doc.introduction, doc.introduction.blocks);
+  for (const section of doc.sections) {
+    if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
+    checkComponent(section, section.blocks);
+  }
+  checkComponent(doc.conclusion, doc.conclusion.blocks);
+  return { repairedBlockIds };
+}
+
 export function repairDeterministicMalformedProse(
   doc: ArticleDocument,
   minimumWordCount: number,
@@ -886,6 +1000,13 @@ export function repairDeterministicMalformedProse(
 ): DeterministicMalformedRepairResult {
   const repairedBlockIds: string[] = [];
   const removedBlockIds: string[] = [];
+  // Dash-opened lowercase continuations are repaired deterministically before
+  // any other malformed-prose work: a sentence that opens with an em-dash is
+  // grammatical once capitalized, and no block removal is needed.
+  repairedBlockIds.push(...repairDashSentenceStarts(doc).repairedBlockIds);
+  // Stray punctuation-only sentences (a lone "." residue) are removed so the
+  // block never reaches the final sentence-quality gate as a fragment.
+  repairedBlockIds.push(...stripPunctuationOnlySentences(doc).repairedBlockIds);
   const initial = findMalformedEditableBlocks(doc)
     .sort((left, right) =>
       left.componentId.localeCompare(right.componentId) || right.blockIndex - left.blockIndex,

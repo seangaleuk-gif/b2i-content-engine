@@ -12,6 +12,7 @@ import {
   type EditorialBlock,
 } from "@/lib/blog/article-document";
 import { isSourceBoilerplate, stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
+import { hasDanglingSentenceEnding } from "@/lib/blog/publication-quality";
 
 // ── Types ──
 
@@ -1078,7 +1079,6 @@ function removeTextRanges(
  *
  * This never deletes substantive prose and never touches links or numbers.
  */
-const DANGLING_END_RE = /\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i;
 const PUNCTUATION_ONLY_RE = /^[\s\p{P}\p{S}]+$/u;
 
 function finalizeRemovedParagraph(
@@ -1088,11 +1088,11 @@ function finalizeRemovedParagraph(
   if (!text) return null;
   if (PUNCTUATION_ONLY_RE.test(text)) return null;
 
-  if (DANGLING_END_RE.test(text)) {
+  if (hasDanglingSentenceEnding(text)) {
     // Remove the trailing dangling stop-word + period residue. Use a regex that
     // drops the malformed tail, then re-check: if nothing substantive remains,
     // the paragraph is removed.
-    const stripped = text.replace(DANGLING_END_RE, "").trim();
+    const stripped = text.replace(/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i, "").trim();
     if (!stripped || PUNCTUATION_ONLY_RE.test(stripped)) return null;
     // Only commit a plain-text rewrite; never rebuild link/anchor-bearing
     // paragraphs with a textual splice that could break an anchor.

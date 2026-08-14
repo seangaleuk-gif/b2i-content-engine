@@ -56,6 +56,7 @@ vi.mock("@/lib/services/link-injector", () => ({
 import {
   parseWordPressEditorialBlocks,
   renderArticleDocument,
+  countCanonicalVisibleWords,
   type ArticleDocument,
   type ArticleSection,
 } from "@/lib/blog/article-document";
@@ -68,6 +69,8 @@ import {
 } from "@/lib/pipeline/blog-generation-pipeline";
 import { analyzeFinalArticle, buildPolicy } from "@/lib/blog/final-article-policy";
 import { englishWordTolerance } from "@/lib/content-standards";
+import { extractH2Texts } from "@/lib/seo/seo-text-utils";
+import { runAudit } from "@/lib/services/seo-auditor";
 
 function paragraph(text: string): string {
   return `<!-- wp:paragraph --><p>${text}</p><!-- /wp:paragraph -->`;
@@ -335,5 +338,400 @@ describe("external-link pipeline diagnostics", () => {
     }
     expect(result).toBeDefined();
     expect(result!.warnings.some((w: string) => w.includes("no research sources available"))).toBe(true);
+  });
+});
+
+describe("authoritative editorial-H2 keyphrase enforcement at the save boundary", () => {
+  async function runWithHeading0(heading: string) {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    doc.sections[0].heading = heading;
+    const range = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "h2-enforce-test",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    return runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => {
+        throw new Error("Unexpected AI call in deterministic end-to-end test");
+      },
+      makeTrackedChatForStage: () => async () => {
+        throw new Error("Unexpected tracked AI call in deterministic end-to-end test");
+      },
+      telemetry: {},
+      context: { research: [] },
+    });
+  }
+
+  it("guarantees the exact keyphrase in a normal editorial H2 before save", async () => {
+    const keyphrase = "threads marketing hong kong";
+    // Heading 0 no longer carries the keyphrase, and the FAQ heading does not
+    // contain it either — the article would otherwise save with h2:false.
+    const result = await runWithHeading0("A Practical Guide for Local Business Owners");
+
+    assertRenderedCacheMatchesDocument(result);
+    const validation = runFinalValidation(result);
+    expect(validation.passed).toBe(true);
+
+    const faqHeadingBefore = "Frequently Asked Questions About Threads Marketing";
+    const finalDocHeadings = result.articleDoc.sections
+      .filter((s) => s.sectionType !== "faq-heading" && s.sectionType !== "conclusion-heading")
+      .map((s) => s.heading);
+    expect(finalDocHeadings.some((h) => h.toLowerCase().includes(keyphrase))).toBe(true);
+    expect(
+      result.articleDoc.sections.find((s) => s.sectionType === "faq-heading")!.heading,
+    ).toBe(faqHeadingBefore);
+
+    // Final validation metrics see the qualifying editorial H2.
+    const metrics = analyzeFinalArticle(
+      result.blog,
+      keyphrase,
+      result.title,
+      result.metaDescription,
+      2500,
+      countCanonicalVisibleWords(result.articleDoc),
+    );
+    expect(metrics.exactKeyphraseInH2).toBe(true);
+
+    // CTA and FAQ schema are preserved.
+    expect((result.blog.match(/app\.b2ihub\.com\/signup/gi) ?? []).length).toBe(1);
+    expect((result.blog.match(/"@type": "FAQPage"/g) ?? []).length).toBe(1);
+    // Word count stays in the accepted range after the heading repair.
+    const finalWc = countCanonicalVisibleWords(result.articleDoc);
+    const range = englishWordTolerance(2500);
+    expect(finalWc).toBeGreaterThanOrEqual(range.min);
+    expect(finalWc).toBeLessThanOrEqual(range.max);
+  });
+
+  it("runs the mutating enforcement before final QC and a non-mutating assertion at the save boundary", async () => {
+    const result = await runWithHeading0("A Practical Guide for Local Business Owners");
+    const stages = result.stageOutputs.map((output) => output.stage);
+    const enforceIndex = stages.indexOf("editorial-h2-enforce");
+    const qcIndex = stages.indexOf("final-qc-scan");
+    const saveAssertIndex = stages.indexOf("editorial-h2-save-assert");
+    const validationIndex = stages.indexOf("final-validation");
+    expect(enforceIndex).toBeGreaterThanOrEqual(0);
+    // The mutating enforcement runs before the mutation-free final QC, so the
+    // backstop measures the enforced document.
+    expect(enforceIndex).toBeLessThan(qcIndex);
+    // The non-mutating assertion runs immediately before final validation and
+    // is the last content stage.
+    expect(saveAssertIndex).toBeGreaterThan(qcIndex);
+    expect(validationIndex).toBe(saveAssertIndex + 1);
+    expect(stages.slice(saveAssertIndex + 1)).toEqual(["final-validation"]);
+    // Both stages are accepted, and the save-boundary assertion is non-mutating.
+    expect(result.stageOutputs[enforceIndex].accepted).toBe(true);
+    const saveAssert = result.stageOutputs[saveAssertIndex];
+    expect(saveAssert.accepted).toBe(true);
+    expect(saveAssert.inputFingerprint).toBe(saveAssert.outputFingerprint);
+  });
+
+  it("leaves a compliant article unchanged", async () => {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    const headingBefore = doc.sections[0].heading;
+    const range = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "h2-enforce-compliant",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    const result = await runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => {
+        throw new Error("Unexpected AI call in deterministic end-to-end test");
+      },
+      makeTrackedChatForStage: () => async () => {
+        throw new Error("Unexpected tracked AI call in deterministic end-to-end test");
+      },
+      telemetry: {},
+      context: { research: [] },
+    });
+    expect(runFinalValidation(result).passed).toBe(true);
+    // The compliant heading survives all stages byte-for-byte.
+    expect(result.articleDoc.sections[0].heading).toBe(headingBefore);
+    const finalHeadings = extractH2Texts(result.blog).map((h) => h.toLowerCase());
+    expect(finalHeadings.some((h) => h.includes(keyphrase))).toBe(true);
+    expect(result.stageOutputs.find((o) => o.stage === "editorial-h2-enforce")!.accepted).toBe(true);
+  });
+});
+
+describe("production em-dash continuation end-to-end", () => {
+  it("repairs the exact production sentence before final QC so the article saves", async () => {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    // Inject the exact production defect into section-5's last paragraph:
+    // "Start with a clear budget. — that's the spirit of Hong Kong marketing:
+    // flexible, adaptive, and ready to try new things."
+    const section5 = doc.sections[5];
+    const lastBlock = section5.blocks[section5.blocks.length - 1];
+    if (lastBlock.type !== "paragraph") throw new Error("expected paragraph block");
+    lastBlock.content = [{
+      type: "text",
+      text: `${lastBlock.content.map((node) => node.text).join("")} Start with a clear budget. — that's the spirit of Hong Kong marketing: flexible, adaptive, and ready to try new things.`,
+    }];
+    const range = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "em-dash-e2e",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    const result = await runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => {
+        throw new Error("Unexpected AI call in deterministic end-to-end test");
+      },
+      makeTrackedChatForStage: () => async () => {
+        throw new Error("Unexpected tracked AI call in deterministic end-to-end test");
+      },
+      telemetry: {},
+      context: { research: [] },
+    });
+    expect(runFinalValidation(result).passed).toBe(true);
+    // The deterministic repair capitalized the continuation; the article now
+    // contains the grammatical "— That's the spirit ..." form (the apostrophe
+    // is entity-escaped in rendered HTML).
+    expect(result.blog).toContain("— That&#39;s the spirit of Hong Kong marketing");
+    expect(result.blog).not.toContain("— that's the spirit of Hong Kong marketing");
+  });
+});
+
+describe("editorial-H2 keyphrase is a soft SEO requirement", () => {
+  // Natural, section-grounding-compatible, but too long for the keyphrase to be
+  // appended naturally (>90 chars) — so no safe natural repair exists. This is
+  // the production-shaped satisfied=false case.
+  const UNREPAIRABLE_HEADING = "A practical guide for local business owners who want to grow and connect with customers";
+  async function runWithSection0Heading(heading: string, opts?: { keyphraseOnlyInFaq?: boolean; allEditorialUnrepairable?: boolean }) {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    doc.sections[0].heading = heading;
+    if (opts?.allEditorialUnrepairable) {
+      const words = ["measure", "plan", "test", "review", "share", "adjust"];
+      doc.sections
+        .filter((s) => s.sectionType !== "faq-heading" && s.sectionType !== "conclusion-heading")
+        .forEach((s, i) => {
+          s.heading = i === 0
+            ? UNREPAIRABLE_HEADING
+            : `${UNREPAIRABLE_HEADING} and ${words[i % words.length]} the results`;
+        });
+    }
+    if (opts?.keyphraseOnlyInFaq) {
+      doc.sections.find((s) => s.sectionType === "faq-heading")!.heading =
+        "Frequently Asked Questions About Threads Marketing Hong Kong";
+    }
+    const range = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "h2-soft-test",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    return runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => {
+        throw new Error("Unexpected AI call in deterministic end-to-end test");
+      },
+      makeTrackedChatForStage: () => async () => {
+        throw new Error("Unexpected tracked AI call in deterministic end-to-end test");
+      },
+      telemetry: {},
+      context: { research: [] },
+    });
+  }
+
+  it("no safe natural repair → the article still reaches final validation and saves", async () => {
+    // Every editorial heading is natural and section-grounding-compatible, but
+    // each is too long for the keyphrase to be appended naturally (>90 chars),
+    // so no safe natural repair exists — the production-shaped satisfied=false
+    // case where the exact keyphrase stays absent from all editorial H2s.
+    const result = await runWithSection0Heading(UNREPAIRABLE_HEADING, { allEditorialUnrepairable: true });
+    const validation = runFinalValidation(result);
+    expect(validation.passed).toBe(true);
+    // The enforce stage ran and was accepted (it is soft now, not a throw).
+    const enforce = result.stageOutputs.find((o) => o.stage === "editorial-h2-enforce")!;
+    expect(enforce.accepted).toBe(true);
+    // No forced/awkward heading: the original is preserved.
+    expect(result.articleDoc.sections[0].heading).toBe(UNREPAIRABLE_HEADING);
+    // The final SEO/validation layer still reports the H2 miss as soft.
+    expect(validation.reasons.some((r) => r.includes("[SOFT] no H2 keyphrase"))).toBe(true);
+  });
+
+  it("natural safe H2 repair is still committed when available", async () => {
+    const result = await runWithSection0Heading("A Practical Guide for Local Business Owners");
+    expect(runFinalValidation(result).passed).toBe(true);
+    const finalHeadings = extractH2Texts(result.blog).map((h) => h.toLowerCase());
+    expect(finalHeadings.some((h) => h.includes("threads marketing hong kong"))).toBe(true);
+    const enforce = result.stageOutputs.find((o) => o.stage === "editorial-h2-enforce")!;
+    expect(enforce.accepted).toBe(true);
+  });
+
+  it("FAQ H2 still does not count as an editorial H2 and does not block save", async () => {
+    // Keyphrase appears ONLY in the FAQ heading; the editorial heading is
+    // natural but unrepairable — the FAQ must not satisfy the requirement and
+    // the save must still proceed (soft).
+    const faqHeading = "Frequently Asked Questions About Threads Marketing Hong Kong";
+    const result = await runWithSection0Heading(UNREPAIRABLE_HEADING, { keyphraseOnlyInFaq: true, allEditorialUnrepairable: true });
+    expect(runFinalValidation(result).passed).toBe(true);
+    const faq = result.articleDoc.sections.find((s) => s.sectionType === "faq-heading")!;
+    expect(faq.heading).toBe(faqHeading);
+    // The editorial H2s still lack the exact keyphrase (FAQ excluded).
+    const editorialHeadings = result.articleDoc.sections
+      .filter((s) => s.sectionType !== "faq-heading" && s.sectionType !== "conclusion-heading")
+      .map((s) => s.heading);
+    expect(editorialHeadings.some((h) => h.toLowerCase().includes("threads marketing hong kong"))).toBe(false);
+  });
+
+  it("genuine heading-naturalness corruption remains a hard gate", async () => {
+    // A repeated-location heading is a real naturalness defect and must still
+    // fail the final QC gate (zero-write), independent of the soft H2 rule.
+    await expect(
+      runWithSection0Heading("Local Teams in Hong Kong Need a Plan in Hong Kong"),
+    ).rejects.toThrow();
+  });
+
+  it("the final SEO audit reports the missing H2 keyphrase as a soft point deduction", async () => {
+    const result = await runWithSection0Heading(UNREPAIRABLE_HEADING, { allEditorialUnrepairable: true });
+    const audit = runAudit({
+      title: result.title,
+      metaDescription: result.metaDescription,
+      keyword: "threads marketing hong kong",
+      blog: result.blog,
+      faq: [],
+      targetWordCount: 2500,
+      targetKeyphraseCount: 9,
+    });
+    const h2Check = audit.checks.find((c) => c.id === "keyphrase_h2");
+    expect(h2Check).toBeDefined();
+    expect(h2Check!.status).toBe("warning");
+    expect(h2Check!.score).toBe(60);
+  });
+});
+
+describe("malformed-prose repair boundary (production prose defects)", () => {
+  async function runWithInjectedProse(inject: (doc: ReturnType<typeof buildDeterministic2500WordDocument>["doc"]) => void) {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    inject(doc);
+    const range = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "prose-boundary-test",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    return runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => {
+        throw new Error("Unexpected AI call in deterministic end-to-end test");
+      },
+      makeTrackedChatForStage: () => async () => {
+        throw new Error("Unexpected tracked AI call in deterministic end-to-end test");
+      },
+      telemetry: {},
+      context: { research: [] },
+    });
+  }
+
+  it("scanner false positives do not block publication", async () => {
+    const result = await runWithInjectedProse((doc) => {
+      const section = doc.sections[2];
+      const last = section.blocks[section.blocks.length - 1];
+      if (last.type !== "paragraph") throw new Error("expected paragraph");
+      last.content = [{
+        type: "text",
+        text: `${last.content.map((n) => n.text).join("")} AI and AR are simply the means to get there. A 13" screen example helps local teams.`,
+      }];
+    });
+    expect(runFinalValidation(result).passed).toBe(true);
+    // The valid prose survives untouched.
+    expect(result.blog).toContain("AI and AR are simply the means to get there.");
+  });
+
+  it("a stray punctuation-only '.' sentence is cleaned before final QC", async () => {
+    const result = await runWithInjectedProse((doc) => {
+      const section = doc.sections[2];
+      const last = section.blocks[section.blocks.length - 1];
+      if (last.type !== "paragraph") throw new Error("expected paragraph");
+      last.content = [{
+        type: "text",
+        text: `${last.content.map((n) => n.text).join("")} Local teams share useful lessons. . Plan a small weekly routine.`,
+      }];
+    });
+    expect(runFinalValidation(result).passed).toBe(true);
+    // The lone "." residue is gone; both intact sentences remain.
+    expect(result.blog).toContain("useful lessons. Plan a small weekly routine.");
+    expect(result.blog).not.toContain("lessons. . Plan");
+  });
+
+  it("genuine unresolvable corruption fails at the repair boundary (zero writes)", async () => {
+    await expect(
+      runWithInjectedProse((doc) => {
+        doc.sections[2].blocks.push({
+          id: "section-2-wp-99",
+          type: "quote",
+          content: [{ type: "text", text: "Smart owners plan for." }],
+        });
+      }),
+    ).rejects.toThrow(/Unresolved malformed prose at repair boundary/);
   });
 });

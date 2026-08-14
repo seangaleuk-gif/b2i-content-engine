@@ -175,6 +175,25 @@ export function countRepeatedIdeaPairs(texts: string[], excludeWords?: ReadonlyS
   return findRepeatedIdeaPairs(texts, excludeWords).length;
 }
 
+/**
+ * A sentence ending with a dangling stop-word immediately before terminal
+ * punctuation ("Smart owners plan for.", "The budget is for.") is the residue
+ * of a deleted object and is malformed. Stranded-preposition constructions are
+ * legitimate English ("What are you waiting for?", "This is what we plan for.",
+ * "We have a lot to deal with."): the ending word has an implicit or fronted
+ * object, signalled by an interrogative/relative pronoun earlier in the
+ * sentence or by a preceding infinitive ("to deal with."). Those are never
+ * flagged, so valid prose cannot block publication.
+ */
+export function hasDanglingSentenceEnding(text: string): boolean {
+  if (!/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i.test(text)) {
+    return false;
+  }
+  if (/\b(?:what|which|who|whom|whose|where|how|why|when)\b/i.test(text)) return false;
+  if (/\bto\s+[a-z]{3,}\b/i.test(text)) return false;
+  return true;
+}
+
 export function findMalformedProseTextIssues(texts: string[]): MalformedProseTextIssue[] {
   const issues: MalformedProseTextIssue[] = [];
   const seen = new Set<string>();
@@ -194,17 +213,26 @@ export function findMalformedProseTextIssues(texts: string[]): MalformedProseTex
     const trimmed = text.trim();
     const openParens = (trimmed.match(/\(/g) ?? []).length;
     const closeParens = (trimmed.match(/\)/g) ?? []).length;
-    const straightQuotes = (trimmed.match(/"/g) ?? []).length;
+    // A straight double-quote immediately preceded by a digit is an inch mark
+    // ("a 13\" screen"), not a quotation mark, and never counts toward
+    // balance. Curly quotes count normally.
+    const quoteMarks = (trimmed.match(/(?<!\d)["”]/g) ?? []).length;
     if (openParens !== closeParens) {
       addIssue(index, "unmatched-parentheses", "unmatched parentheses", trimmed);
     }
-    if (straightQuotes % 2 !== 0) {
+    if (quoteMarks % 2 !== 0) {
       addIssue(index, "unmatched-quotation", "unmatched quotation mark", trimmed);
     }
-    if (/[.!?]\s*["”]\s+(?:instead|and|but|or|because)\b/i.test(trimmed)) {
+    // A period followed by a quote then a conjunction ("stop." and walked) is
+    // a legitimately CLOSED quote continuing the sentence. Only an unclosed
+    // quote (odd quote count) following the period is a broken fragment.
+    if (
+      quoteMarks % 2 !== 0
+      && /[.!?]\s*["”]\s+(?:instead|and|but|or|because)\b/i.test(trimmed)
+    ) {
       addIssue(index, "broken-quoted-fragment", "broken quoted fragment", trimmed);
     }
-    if (/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i.test(trimmed)) {
+    if (hasDanglingSentenceEnding(trimmed)) {
       addIssue(index, "incomplete-sentence-ending", "incomplete sentence ending", trimmed);
     }
     // A block reduced to punctuation only (".", "...", "—") is a leftover
@@ -219,6 +247,34 @@ export function findMalformedProseTextIssues(texts: string[]): MalformedProseTex
     }
   });
   return issues;
+}
+
+export type MalformedProseSeverity = "hard" | "soft";
+
+/**
+ * Severity classification for malformed-prose findings, used by the repair
+ * boundary policy. Every code emitted by the scanner is genuine
+ * publication-breaking corruption once the false-positive-prone patterns are
+ * narrowed at the scanner level (inches are not quotes, closed quotes are not
+ * broken fragments, stranded prepositions are not dangling endings, pure
+ * adverbs before determiners are not malformed noun phrases). The "soft"
+ * bucket is intentionally empty so an unresolved finding can never block
+ * publication on a scanner false positive.
+ */
+const HARD_MALFORMED_CODES: ReadonlySet<MalformedProseIssueCode> = new Set([
+  "corrupt-token",
+  "serialized-program-value",
+  "instruction-placeholder",
+  "replacement-character",
+  "punctuation-fragment",
+  "incomplete-sentence-ending",
+  "unmatched-parentheses",
+  "unmatched-quotation",
+  "broken-quoted-fragment",
+]);
+
+export function classifyMalformedIssue(code: MalformedProseIssueCode): MalformedProseSeverity {
+  return HARD_MALFORMED_CODES.has(code) ? "hard" : "soft";
 }
 
 export function detectMalformedProseTexts(texts: string[]): string[] {
