@@ -14,6 +14,10 @@ const SKIP_SELECTORS = [
   /<pre\b[^>]*>[\s\S]*?<\/pre>/gi,
   /<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi,
   /<script[\s\S]*?<\/script>/gi,
+  // Keyword matching runs over the rendered source string. Treat every tag
+  // and WordPress comment as non-visible so an attribute or block name can
+  // never win before the same keyword in editorial prose.
+  /<[^>]+>/g,
 ];
 
 function getSkipRanges(content: string): [number, number][] {

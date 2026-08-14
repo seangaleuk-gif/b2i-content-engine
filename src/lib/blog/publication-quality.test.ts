@@ -3,6 +3,7 @@ import {
   analyzePublicationQuality,
   countRepeatedIdeaPairs,
   keyphraseExclusionSet,
+  scanMalformedProseInDocument,
   trimConclusionToBudget,
 } from "./publication-quality";
 import {
@@ -70,6 +71,44 @@ function docWithConclusion(texts: string[]): ArticleDocument {
 }
 
 describe("publication-quality analysis", () => {
+  it("scans metadata, section headings and canonical FAQ text at the save boundary", () => {
+    const doc = docWithConclusion(["A complete conclusion closes the practical guide."]);
+    doc.metadata.title = "An unfinished “title";
+    doc.sections[0].heading = 'An unfinished "heading';
+    doc.visibleFaq = [{
+      question: "Why does the “plan work?",
+      answerHtml: "",
+      answerText: 'It starts with an unfinished "example.',
+    }];
+    const findings = scanMalformedProseInDocument(doc);
+    expect(findings.map((finding) => finding.blockId)).toEqual(expect.arrayContaining([
+      "metadata-title",
+      "section-1-heading",
+      "faq-0-question",
+      "faq-0-answer",
+    ]));
+  });
+
+  it("scans table cells independently instead of balancing quotes across cells", () => {
+    const doc = docWithConclusion(["A complete conclusion closes the practical guide."]);
+    doc.sections[0].blocks = [{
+      id: "table-1",
+      type: "table",
+      headers: [
+        [{ type: "text", text: 'Opening "label' }],
+        [{ type: "text", text: 'Closing label"' }],
+      ],
+      rows: [[
+        [{ type: "text", text: "A complete first cell." }],
+        [{ type: "text", text: "A complete second cell." }],
+      ]],
+    }];
+
+    const findings = scanMalformedProseInDocument(doc);
+    const tableFinding = findings.find((finding) => finding.blockId === "table-1");
+    expect(tableFinding?.issues.filter((issue) => issue.code === "unmatched-quotation")).toHaveLength(2);
+  });
+
   it("detects incompatible Hong Kong Threads audience figures", () => {
     const metrics = analyzePublicationQuality(article([
       "Threads has grown quickly in Hong Kong, with 4 million monthly active users.",

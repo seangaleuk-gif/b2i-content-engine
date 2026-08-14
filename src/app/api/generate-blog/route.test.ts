@@ -3,6 +3,7 @@ import type { ArticleDocument, ArticleSection, EditorialBlock } from "@/lib/blog
 import {
   renderFaqSchema,
   fingerprintHtml,
+  renderArticleDocument,
 } from "@/lib/blog/article-document";
 import { buildPolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState } from "@/lib/pipeline/blog-generation-pipeline";
@@ -12,9 +13,11 @@ import { CANONICAL_ENGLISH_CTA_HTML, CANONICAL_ENGLISH_CTA_FINGERPRINT } from "@
 import { pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
 
 const mocks = vi.hoisted(() => ({
-  createVersion: vi.fn(),
+  createEnglishVersionAtomically: vi.fn(),
+  deleteVersion: vi.fn(),
+  findVersionById: vi.fn(),
+  synchronizeProjectContentToLatestEnglish: vi.fn(),
   updateProject: vi.fn(),
-  getNextVersionNumber: vi.fn(),
   runBlogGeneration: vi.fn(),
 }));
 
@@ -32,11 +35,10 @@ vi.mock("@/lib/repositories", () => ({
     findByIdAndUser: vi.fn(),
   },
   blogVersionRepository: {
-    create: mocks.createVersion,
-    getNextVersionNumber: mocks.getNextVersionNumber,
-    findById: vi.fn(),
-    findByProject: vi.fn(),
-    delete: vi.fn(),
+    createEnglishVersionAtomically: mocks.createEnglishVersionAtomically,
+    delete: mocks.deleteVersion,
+    findById: mocks.findVersionById,
+    synchronizeProjectContentToLatestEnglish: mocks.synchronizeProjectContentToLatestEnglish,
   },
   aiLogRepository: { create: vi.fn() },
 }));
@@ -152,7 +154,7 @@ function parseIntroBlocks(html: string): EditorialBlock[] {
 const VALID_KEYPHRASE = "hong kong sme marketing";
 const VALID_SLUG = "hong-kong-sme-marketing-practical-local-guide";
 
-function buildValidArticle(options?: { faqClaim?: boolean; orphanTransition?: boolean; sentenceQualityViolation?: boolean; boilerplateViolation?: boolean }): {
+function buildValidArticle(options?: { faqClaim?: boolean; orphanTransition?: boolean; sentenceQualityViolation?: boolean; boilerplateViolation?: boolean; trailingFragmentViolation?: boolean }): {
   doc: ArticleDocument;
   pipelineState: ReturnType<typeof createPipelineState>;
 } {
@@ -211,6 +213,19 @@ function buildValidArticle(options?: { faqClaim?: boolean; orphanTransition?: bo
     sections: sections.map((section, index) => {
       if (section.sectionType === "faq-heading") return section;
       const blocks = parseIntroBlocks(Array.from({ length: 10 + (index % 2) }, () => proseBlock(3)).join("\n\n"));
+      const groundingSentences = [
+        "A practical plan gives an SME a clear direction for the coming month.",
+        "Simple steps turn a routine into work that a small team can maintain.",
+        "Measuring useful signals helps owners decide what to improve next.",
+        "Avoiding common mistakes protects time and keeps the message clear.",
+        "A consistent local voice makes each message easier to recognise.",
+        "Improving the plan over time keeps the routine useful as customer needs change.",
+      ];
+      blocks.unshift({
+        id: `grounding-${index}`,
+        type: "paragraph",
+        content: [{ type: "text", text: groundingSentences[index] }],
+      });
       if (options?.orphanTransition && index === 0) {
         blocks.unshift({
           id: "orphan-instead",
@@ -230,6 +245,15 @@ function buildValidArticle(options?: { faqClaim?: boolean; orphanTransition?: bo
           id: "copyright-note",
           type: "quote",
           content: [{ type: "text", text: "All rights belong to their respective owners." }],
+        });
+      }
+      if (options?.trailingFragmentViolation && index === 0) {
+        // The exact production trailing-fragment defect: complete sentences
+        // followed by an unmistakable fragment without terminal punctuation.
+        blocks.unshift({
+          id: "trailing-fragment",
+          type: "paragraph",
+          content: [{ type: "text", text: "Trust isn't built overnight. It comes from being transparent about what you collect, why you collect it, and how you protect it. A few practical habits can go a" }],
         });
       }
       return { ...section, blocks };
@@ -295,6 +319,36 @@ function buildValidArticle(options?: { faqClaim?: boolean; orphanTransition?: bo
 
 function ownershipViolationGenerationResult(): GenerationResult {
   const { doc, pipelineState } = buildValidArticle({ faqClaim: true });
+  return {
+    generated: {
+      title: doc.metadata.title,
+      slug: doc.metadata.slug,
+      metaDescription: doc.metadata.metaDescription,
+      excerpt: doc.metadata.excerpt,
+      blog: pipelineState.blog,
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
+      internalLinks: [],
+      externalLinks: [],
+      categories: [],
+      tags: [],
+      readingTime: "",
+      summary: "",
+    },
+    pipelineState,
+    qualityReport: null,
+    h2Headings: doc.sections.map((s) => s.heading),
+    wordMin: 2125,
+    wordMax: 2875,
+    retryCount: 0,
+    componentRegens: 0,
+    estimatedTokens: 0,
+    systemPrompt: "test",
+    userMessage: "test",
+  };
+}
+
+function trailingFragmentGenerationResult(): GenerationResult {
+  const { doc, pipelineState } = buildValidArticle({ trailingFragmentViolation: true });
   return {
     generated: {
       title: doc.metadata.title,
@@ -413,11 +467,82 @@ function boilerplateViolationGenerationResult(): GenerationResult {
   };
 }
 
+function validGenerationResult(): GenerationResult {
+  const { doc, pipelineState } = buildValidArticle();
+  return {
+    generated: {
+      title: doc.metadata.title,
+      slug: doc.metadata.slug,
+      metaDescription: doc.metadata.metaDescription,
+      excerpt: doc.metadata.excerpt,
+      blog: pipelineState.blog,
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
+      internalLinks: [],
+      externalLinks: [],
+      categories: [],
+      tags: [],
+      readingTime: "",
+      summary: "",
+    },
+    pipelineState,
+    qualityReport: null,
+    h2Headings: doc.sections.map((section) => section.heading),
+    wordMin: 2125,
+    wordMax: 2875,
+    retryCount: 0,
+    componentRegens: 0,
+    estimatedTokens: 0,
+    systemPrompt: "test",
+    userMessage: "test",
+  };
+}
+
+function malformedCanonicalGenerationResult(surface: "metadata" | "faq"): GenerationResult {
+  const { doc, pipelineState } = buildValidArticle();
+  if (surface === "metadata") {
+    doc.metadata.title += " “unfinished";
+    pipelineState.title = doc.metadata.title;
+  } else {
+    doc.visibleFaq[0].answerText += " “unfinished";
+    pipelineState.faq = doc.visibleFaq.map((entry) => ({
+      question: entry.question,
+      answer: entry.answerText,
+    }));
+  }
+  pipelineState.blog = renderArticleDocument(doc);
+  return {
+    generated: {
+      title: doc.metadata.title,
+      slug: doc.metadata.slug,
+      metaDescription: doc.metadata.metaDescription,
+      excerpt: doc.metadata.excerpt,
+      blog: pipelineState.blog,
+      faq: doc.visibleFaq.map((entry) => ({ question: entry.question, answer: entry.answerText })),
+      internalLinks: [],
+      externalLinks: [],
+      categories: [],
+      tags: [],
+      readingTime: "",
+      summary: "",
+    },
+    pipelineState,
+    qualityReport: null,
+    h2Headings: doc.sections.map((section) => section.heading),
+    wordMin: 2125,
+    wordMax: 2875,
+    retryCount: 0,
+    componentRegens: 0,
+    estimatedTokens: 0,
+    systemPrompt: "test",
+    userMessage: "test",
+  };
+}
+
 describe("generate-blog persistence boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.getNextVersionNumber.mockResolvedValue(1);
     mocks.runBlogGeneration.mockResolvedValue(invalidGenerationResult());
+    mocks.synchronizeProjectContentToLatestEnglish.mockResolvedValue({ versionId: 1, versionNumber: 1, blog: "saved" });
   });
 
   it("does not start any database write when final validation fails", async () => {
@@ -428,8 +553,7 @@ describe("generate-blog persistence boundary", () => {
     }));
 
     expect(response.status).toBe(422);
-    expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
-    expect(mocks.createVersion).not.toHaveBeenCalled();
+    expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
     expect(mocks.updateProject).not.toHaveBeenCalled();
   });
 
@@ -446,8 +570,7 @@ describe("generate-blog persistence boundary", () => {
 
     expect(response.status).toBe(422);
     expect(JSON.stringify(await response.json())).toContain("Canonical pre-save agreement failed");
-    expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
-    expect(mocks.createVersion).not.toHaveBeenCalled();
+    expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
     expect(mocks.updateProject).not.toHaveBeenCalled();
   });
 
@@ -462,8 +585,7 @@ describe("generate-blog persistence boundary", () => {
     expect(response.status).toBe(422);
     const body = await response.json();
     expect(JSON.stringify(body)).toContain("claim ownership violations");
-    expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
-    expect(mocks.createVersion).not.toHaveBeenCalled();
+    expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
     expect(mocks.updateProject).not.toHaveBeenCalled();
   });
 
@@ -478,8 +600,21 @@ describe("generate-blog persistence boundary", () => {
     expect(response.status).toBe(422);
     const body = await response.json();
     expect(JSON.stringify(body)).toContain("coherence violations");
-    expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
-    expect(mocks.createVersion).not.toHaveBeenCalled();
+    expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
+    expect(mocks.updateProject).not.toHaveBeenCalled();
+  });
+
+  it("an unresolved trailing-prose fragment blocks all database writes (zero writes on hard failure)", async () => {
+    mocks.runBlogGeneration.mockResolvedValue(trailingFragmentGenerationResult());
+    const response = await POST(new Request("http://localhost/api/generate-blog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: 1 }),
+    }));
+
+    expect(response.status).toBe(422);
+    expect(JSON.stringify(await response.json())).toContain("malformed prose blocks");
+    expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
     expect(mocks.updateProject).not.toHaveBeenCalled();
   });
 
@@ -494,8 +629,7 @@ describe("generate-blog persistence boundary", () => {
     expect(response.status).toBe(422);
     const body = await response.json();
     expect(JSON.stringify(body)).toContain("sentence quality violations");
-    expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
-    expect(mocks.createVersion).not.toHaveBeenCalled();
+    expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
     expect(mocks.updateProject).not.toHaveBeenCalled();
   });
 
@@ -510,8 +644,101 @@ describe("generate-blog persistence boundary", () => {
     expect(response.status).toBe(422);
     const body = await response.json();
     expect(JSON.stringify(body)).toContain("source boilerplate blocks");
-    expect(mocks.getNextVersionNumber).not.toHaveBeenCalled();
-    expect(mocks.createVersion).not.toHaveBeenCalled();
+    expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
     expect(mocks.updateProject).not.toHaveBeenCalled();
+  });
+
+  it.each(["metadata", "faq"] as const)(
+    "unmatched quotation in canonical %s copy blocks all database writes",
+    async (surface) => {
+      mocks.runBlogGeneration.mockResolvedValue(malformedCanonicalGenerationResult(surface));
+      const response = await POST(new Request("http://localhost/api/generate-blog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: 1 }),
+      }));
+
+      expect(response.status).toBe(422);
+      expect(JSON.stringify(await response.json())).toContain("malformed prose blocks");
+      expect(mocks.createEnglishVersionAtomically).not.toHaveBeenCalled();
+      expect(mocks.updateProject).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses the atomic save boundary and returns its database-allocated version number", async () => {
+    const generated = validGenerationResult();
+    mocks.runBlogGeneration.mockResolvedValue(generated);
+    mocks.createEnglishVersionAtomically.mockResolvedValue({
+      id: 22,
+      versionNumber: 2,
+      title: generated.generated.title,
+      slug: generated.generated.slug,
+      blog: generated.generated.blog,
+    });
+    mocks.findVersionById.mockResolvedValue({
+      id: 22,
+      versionNumber: 2,
+      title: generated.generated.title,
+      slug: generated.generated.slug,
+      metaDescription: generated.generated.metaDescription,
+      blog: generated.generated.blog,
+    });
+
+    const response = await POST(new Request("http://localhost/api/generate-blog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: 1 }),
+    }));
+
+    expect(response.status).toBe(201);
+    expect(mocks.createEnglishVersionAtomically).toHaveBeenCalledTimes(1);
+    expect(mocks.createEnglishVersionAtomically.mock.calls[0][0]).not.toHaveProperty("versionNumber");
+    expect(mocks.synchronizeProjectContentToLatestEnglish).not.toHaveBeenCalled();
+    expect((await response.json()).version).toBe(2);
+  });
+
+  it("never searches for or deletes an ambiguous row when the atomic save fails before returning an ID", async () => {
+    mocks.runBlogGeneration.mockResolvedValue(validGenerationResult());
+    mocks.createEnglishVersionAtomically.mockRejectedValue({ code: "XX000", message: "connection lost" });
+
+    const response = await POST(new Request("http://localhost/api/generate-blog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: 1 }),
+    }));
+
+    expect(response.status).toBe(500);
+    expect(mocks.deleteVersion).not.toHaveBeenCalled();
+    expect(mocks.synchronizeProjectContentToLatestEnglish).not.toHaveBeenCalled();
+  });
+
+  it("deletes only its own returned version ID and re-synchronizes after a save failure", async () => {
+    const generated = validGenerationResult();
+    mocks.runBlogGeneration.mockResolvedValue(generated);
+    mocks.createEnglishVersionAtomically.mockResolvedValue({
+      id: 31,
+      versionNumber: 1,
+      title: generated.generated.title,
+      slug: generated.generated.slug,
+      blog: generated.generated.blog,
+    });
+    mocks.findVersionById.mockRejectedValue(new Error("readback failed"));
+    mocks.synchronizeProjectContentToLatestEnglish.mockResolvedValue({
+      versionId: null,
+      versionNumber: null,
+      blog: "previous",
+    });
+
+    const response = await POST(new Request("http://localhost/api/generate-blog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: 1 }),
+    }));
+
+    expect(response.status).toBe(500);
+    expect(mocks.deleteVersion).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteVersion).toHaveBeenCalledWith(31);
+    expect(mocks.synchronizeProjectContentToLatestEnglish).toHaveBeenCalledTimes(1);
+    expect(mocks.synchronizeProjectContentToLatestEnglish).toHaveBeenCalledWith(1, "user-1", "previous");
   });
 });

@@ -26,6 +26,7 @@ import {
   fingerprintHtml,
   parseArticleDocumentFromHtml,
   parseWordPressEditorialBlocks,
+  parseCompleteEditorialRegion,
 } from "@/lib/blog/article-document";
 
 export interface ClaimOwnershipEntry extends EvidenceLedgerEntry {
@@ -463,8 +464,8 @@ export function enforceClaimOwnership(
         preserveSentenceTexts: preserveByKey.get(`${componentId}:${blockIndex}`) ?? [],
       });
       const parsed = repaired.html.trim()
-        ? parseWordPressEditorialBlocks(repaired.html, `${componentId}-claim-ownership-repair`)
-        : { blocks: [], errors: [], warnings: [] };
+        ? parseCompleteEditorialRegion(repaired.html, `${componentId}-claim-ownership-repair`)
+        : { blocks: [], errors: [] };
       if (parsed.errors.length > 0 || (repaired.html.trim() && parsed.blocks.length === 0)) {
         for (const claim of claims) {
           result.unresolved.push({ componentId, evidenceId: claim.evidenceId ?? "unknown", sentenceText: claim.sentenceText ?? claim.text });

@@ -1,5 +1,14 @@
 export const SEO_TITLE_MIN = 50;
 
+/**
+ * Deployment build identifier for the English generation pipeline. Every
+ * generation log line should reference this value so the exact deployed
+ * pipeline version can be verified against the source tree after a run.
+ * Bump this on every change to the generation/pipeline code shipped to
+ * production.
+ */
+export const GENERATION_BUILD_ID = "b2i-english-2026-08-20-1";
+
 import { AppError } from "./errors";
 export const SEO_TITLE_MAX = 70;
 export const META_MIN = 155;

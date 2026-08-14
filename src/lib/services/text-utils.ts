@@ -1,6 +1,7 @@
 import { AppError } from "./errors";
 import { findSentenceBoundaryOffsets, splitSentences } from "@/lib/seo/seo-text-utils";
 import { parseWordpressBlockStructure, type WordpressBlockRange } from "@/lib/blog/wordpress-block-structure";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 export function countReadableWords(html: string): number {
   // Strip non-readable content first
@@ -62,6 +63,28 @@ export function cleanBodyText(text: string): string {
     .replace(/```[\s\S]*?```/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * Normalize a model-produced metadata field to plain text. Metadata is never
+ * an HTML or WordPress surface. Two passes also remove markup that was encoded
+ * once by the model (for example `&lt;script&gt;`).
+ */
+export function normalizeModelPlainText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  let text = value;
+  for (let pass = 0; pass < 2; pass++) {
+    text = text
+      .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#(?:39|x27);/gi, "'")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">");
+  }
+  return text.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 export function robustJsonParse(raw: string, stage?: string): unknown {
@@ -241,10 +264,20 @@ export function repairMetaDescription(meta: string, min: number, max: number): s
   }
 
   const truncated = meta.substring(0, max);
+  const candidates: string[] = [];
   const lastPeriod = truncated.lastIndexOf(".");
-  if (lastPeriod > min) return truncated.substring(0, lastPeriod + 1);
-  const lastSpace = truncated.lastIndexOf(" ");
-  return lastSpace > 0 ? truncated.substring(0, lastSpace) + "\u2026" : truncated + "\u2026";
+  if (lastPeriod >= min) candidates.push(truncated.substring(0, lastPeriod + 1));
+
+  // Try word boundaries from right to left. Never commit a truncation that
+  // cuts through a quotation; a long but balanced original is safer than a
+  // short metadata value that the publication gate must reject as malformed.
+  for (let boundary = truncated.lastIndexOf(" "); boundary >= min; boundary = truncated.lastIndexOf(" ", boundary - 1)) {
+    candidates.push(`${truncated.substring(0, boundary).trimEnd()}\u2026`);
+  }
+  const safe = candidates.find((candidate) =>
+    candidate.length <= max && analyzeQuotationIntegrity(candidate).balanced,
+  );
+  return safe ?? meta;
 }
 
 /** Split validated, top-level WordPress paragraph blocks only. */
@@ -408,23 +441,75 @@ function splitParagraphBlock(
   const sentenceCount = splitSentences(scan.visibleText).length;
   if (sentenceCount <= maxSentences) return { replacement: original, splitCount: 0 };
 
-  const rawBoundaries: number[] = [];
-  for (let sentenceIndex = maxSentences; sentenceIndex < sentenceCount; sentenceIndex += maxSentences) {
-    const visibleBoundary = boundaries[sentenceIndex - 1];
-    if (visibleBoundary === undefined) return { replacement: original, splitCount: 0 };
+  const quotation = analyzeQuotationIntegrity(scan.visibleText);
+  // Paragraph normalization is not a repair stage. If the incoming paragraph
+  // is already ambiguous, preserve it byte-for-byte for the owning malformed-
+  // prose boundary instead of multiplying one defect across new blocks.
+  if (!quotation.balanced) return { replacement: original, splitCount: 0 };
+
+  const extendPastClosingDelimiters = (offset: number): number => {
+    let extended = offset;
+    while (/["\u201D\u2019)\]]/.test(scan.visibleText[extended] ?? "")) extended++;
+    return extended;
+  };
+  const isQuotationSafeBoundary = (offset: number): boolean =>
+    !quotation.spans.some((span) => offset > span.start && offset < span.end);
+
+  const visibleBoundaryForSentence = (sentenceBoundaryIndex: number): number | null => {
+    const baseBoundary = boundaries[sentenceBoundaryIndex];
+    if (baseBoundary === undefined) return null;
+    const visibleBoundary = extendPastClosingDelimiters(baseBoundary);
+    if (!isQuotationSafeBoundary(visibleBoundary)) return null;
+    return visibleBoundary;
+  };
+
+  const rawBoundaryForSentence = (
+    sentenceBoundaryIndex: number,
+    visibleBoundary: number,
+  ): number | null => {
     let nextVisible = visibleBoundary;
     while (nextVisible < scan.visibleText.length && /\s/.test(scan.visibleText[nextVisible])) nextVisible++;
-    if (nextVisible >= scan.visibleText.length) break;
-    const punctuationVisibleIndex = visibleBoundary - 1;
-    const rawBoundary = findSafeRawBoundary(
+    if (nextVisible >= scan.visibleText.length) return null;
+    const boundaryVisibleIndex = Math.max(0, visibleBoundary - 1);
+    return findSafeRawBoundary(
       content,
-      scan.rawIndexByVisibleIndex[punctuationVisibleIndex],
+      scan.rawIndexByVisibleIndex[boundaryVisibleIndex],
       scan.rawIndexByVisibleIndex[nextVisible],
-      scan.stackAtVisibleIndex[punctuationVisibleIndex],
+      scan.stackAtVisibleIndex[boundaryVisibleIndex],
       scan.tags,
     );
-    if (rawBoundary === null) return { replacement: original, splitCount: 0 };
-    rawBoundaries.push(rawBoundary);
+  };
+
+  const rawBoundaries: number[] = [];
+  let firstSentenceInChunk = 0;
+  while (sentenceCount - firstSentenceInChunk > maxSentences) {
+    const preferredBoundaryIndex = firstSentenceInChunk + maxSentences - 1;
+    const searchOrder: number[] = [];
+    // Prefer a shorter quotation-safe chunk. If a quotation began at the
+    // paragraph start and spans the preferred boundary, take the first safe
+    // boundary after it; semantic atomicity is more important than the target.
+    for (let index = preferredBoundaryIndex; index >= firstSentenceInChunk; index--) searchOrder.push(index);
+    for (let index = preferredBoundaryIndex + 1; index < boundaries.length; index++) searchOrder.push(index);
+
+    let selectedIndex = -1;
+    let selectedVisibleBoundary: number | null = null;
+    for (const index of searchOrder) {
+      const visibleBoundary = visibleBoundaryForSentence(index);
+      if (visibleBoundary === null) continue;
+      selectedIndex = index;
+      selectedVisibleBoundary = visibleBoundary;
+      break;
+    }
+    if (selectedIndex < 0 || selectedVisibleBoundary === null) {
+      return { replacement: original, splitCount: 0 };
+    }
+    // Inline markup has its own stricter policy: if the chosen sentence
+    // boundary crosses an element, preserve the whole paragraph. Searching a
+    // later inline boundary would silently change this established behaviour.
+    const selectedRawBoundary = rawBoundaryForSentence(selectedIndex, selectedVisibleBoundary);
+    if (selectedRawBoundary === null) return { replacement: original, splitCount: 0 };
+    rawBoundaries.push(selectedRawBoundary);
+    firstSentenceInChunk = selectedIndex + 1;
   }
 
   const chunks: string[] = [];

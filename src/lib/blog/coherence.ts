@@ -20,6 +20,11 @@ import { renderComponentHtml, countCanonicalVisibleWords } from "@/lib/blog/arti
 import { countReadableWords } from "@/lib/services/text-utils";
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { isSourceBoilerplate } from "@/lib/blog/source-boilerplate";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import {
+  isSentenceComplete,
+  type SentenceCompletenessKind,
+} from "@/lib/blog/sentence-completeness";
 
 export type CoherenceViolationType =
   | "unfinished-example"
@@ -127,11 +132,28 @@ export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
       const { block, text } = paragraphs[i];
       const next = paragraphs[i + 1];
 
-      // 1. Incomplete sentence / fragment: no terminal punctuation at the end
-      //    (a paragraph ending with a colon or dash is a setup, not a sentence).
-      const trimmedEnd = text.replace(/["”’)\]]+$/, "");
-      const hasTerminal = /[.!?]$/.test(trimmedEnd);
-      if (!hasTerminal || SETUP_ENDING_RE.test(trimmedEnd)) {
+      // 1. Incomplete sentence / fragment. Uses the SAME shared
+      //    block-type-aware sentence-completeness validator as AI block
+      //    acceptance, malformed-prose scanning/repair, trim/compaction
+      //    candidate validation and the final QC/pre-save gates, so no
+      //    scanner can disagree about a truncated block. Paragraphs, quotes
+      //    and FAQ answers require complete prose; list items and table
+      //    cells are structural and only unmistakable fragments count.
+      const incomplete = ((): boolean => {
+        if (block.type === "list") {
+          return block.items.some((item) =>
+            !isSentenceComplete(item.map((node) => node.text).join("").trim(), "list-item"),
+          );
+        }
+        if (block.type === "table") {
+          const cells = [...block.headers, ...block.rows.flat()]
+            .map((cell) => cell.map((node) => node.text).join("").trim());
+          return cells.some((cell) => !isSentenceComplete(cell, "table-cell"));
+        }
+        const kind: SentenceCompletenessKind = block.type === "quote" ? "quote" : "paragraph";
+        return !isSentenceComplete(text, kind);
+      })();
+      if (incomplete) {
         violations.push({
           componentId,
           blockId: block.id,
@@ -365,6 +387,12 @@ export function compressDocumentStructureAware(
         const block = section.blocks[blockIndex];
         if (block.type !== "paragraph") continue;
         const text = plainBlockText(block).replace(/\s+/g, " ").trim();
+        const quotation = analyzeQuotationIntegrity(text);
+        // Sentence-level removal cannot safely edit a quotation that spans a
+        // sentence boundary. Preserve any paragraph containing quotation
+        // syntax as one unit; whole-paragraph removal above remains allowed
+        // when every existing dependency/protection rule permits it.
+        if (!quotation.balanced || quotation.spans.length > 0) continue;
         if (EXAMPLE_MARKERS.test(text)) continue;
         if (ORPHAN_TRANSITION_RE.test(text) || ORPHAN_TRANSITION_PHRASES.test(text)) continue;
         if (block.content.some((node) => node.type === "link")) continue;

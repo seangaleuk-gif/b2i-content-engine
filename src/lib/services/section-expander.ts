@@ -1,13 +1,14 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
 import { countReadableWords, robustJsonParse, splitLongParagraphs } from "@/lib/services/text-utils";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
+import {
+  extractPlainTextFromEditorialBlocks,
+  parseWordPressEditorialBlocks,
+} from "@/lib/blog/article-document";
+import { scanMalformedProseInBlocks } from "@/lib/blog/publication-quality";
+import { extractReadableText } from "@/lib/seo/seo-text-utils";
 import { MAX_SECTION_EXPANSIONS, MAX_SECTION_TRIMS } from "@/lib/services/generation-constants";
 import { paragraphSentenceLimit } from "@/lib/content-standards";
-
-const stripMainH2Blocks = (html: string): string =>
-  html
-    .replace(/<!--\s*wp:heading\s*\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*<h2[^>]*>[\s\S]*?<\/h2>\s*<!--\s*\/wp:heading\s*-->/gi, "")
-    .replace(/<h2[^>]*>[\s\S]*?<\/h2>/gi, "");
 
 export interface SectionExpansionContext {
   chatWithRetry: (messages: ChatMessage[], options?: ChatOptions) => Promise<ChatResult>;
@@ -40,9 +41,41 @@ function validateEditorialFragment(html: string): { valid: boolean; reason?: str
     return { valid: false, reason: "fragment-introduced-h2" };
   }
   const wp = validateWordpressBlockPairs(html);
-  return wp.valid
-    ? { valid: true }
-    : { valid: false, reason: `invalid-wordpress-fragment:${wp.issues.join(";")}` };
+  if (!wp.valid) {
+    return { valid: false, reason: `invalid-wordpress-fragment:${wp.issues.join(";")}` };
+  }
+  const openingTypes = [...html.matchAll(/<!--\s*wp:([\w/-]+)/gi)]
+    .map((match) => match[1].toLowerCase());
+  const supportedTypes = new Set(["paragraph", "heading", "list", "quote", "table"]);
+  const unsupportedType = openingTypes.find((type) => !supportedTypes.has(type));
+  if (unsupportedType) {
+    return { valid: false, reason: `unsupported-editorial-block:${unsupportedType}` };
+  }
+  const parsed = parseWordPressEditorialBlocks(html, "section-transform-candidate");
+  if (parsed.errors.length > 0) {
+    return { valid: false, reason: `unparseable-editorial-fragment:${parsed.errors.join(";")}` };
+  }
+  if (parsed.blocks.length === 0 || parsed.blocks.length !== openingTypes.length) {
+    return {
+      valid: false,
+      reason: `incomplete-editorial-parse:opened=${openingTypes.length}:parsed=${parsed.blocks.length}`,
+    };
+  }
+  const sourceText = extractReadableText(html).replace(/\s+/g, " ").trim();
+  const canonicalText = extractPlainTextFromEditorialBlocks(parsed.blocks).replace(/\s+/g, " ").trim();
+  if (sourceText !== canonicalText) {
+    return { valid: false, reason: "editorial-text-roundtrip-mismatch" };
+  }
+  const malformed = scanMalformedProseInBlocks(parsed.blocks);
+  if (malformed.length > 0) {
+    return {
+      valid: false,
+      reason: `malformed-editorial-fragment:${malformed.map((finding) =>
+        `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}]`
+      ).join(";")}`,
+    };
+  }
+  return { valid: true };
 }
 
 function orderedHrefs(html: string): string[] {
@@ -119,8 +152,7 @@ export async function expandToMinimum(
         { responseFormat: { type: "json_object" }, maxTokens: 8192 }
       );
 
-      let aiBody = (robustJsonParse(res.content) as Record<string, string>).body || "";
-      aiBody = stripMainH2Blocks(aiBody);
+      const aiBody = (robustJsonParse(res.content) as Record<string, string>).body || "";
 
       const beforeWC = countReadableWords(target.body);
       const additionWC = countReadableWords(aiBody);
@@ -232,8 +264,7 @@ export async function trimToMaximum(
         { responseFormat: { type: "json_object" }, maxTokens: 8192 }
       );
 
-      let newBody = (robustJsonParse(res.content) as Record<string, string>).body || target.body;
-      newBody = stripMainH2Blocks(newBody);
+      const newBody = (robustJsonParse(res.content) as Record<string, string>).body || target.body;
       const beforeSectionWords = countReadableWords(target.body);
       const afterSectionWords = countReadableWords(newBody);
       const fragmentValidation = validateEditorialFragment(newBody);

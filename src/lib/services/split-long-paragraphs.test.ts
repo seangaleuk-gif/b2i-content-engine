@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
-import { splitLongParagraphs } from "@/lib/services/text-utils";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import { repairMetaDescription, splitLongParagraphs } from "@/lib/services/text-utils";
 
 const CTA = '<!-- wp:html --><div class="cta"><p class="outer">before <p>inner</p> after</p><a href="https://app.b2ihub.com/signup">Go</a></div><!-- /wp:html -->';
 const SWITCHER = '<!-- wp:html --><div class="b2i-language-switcher"><a href="/blog/example-zh">中文</a></div><!-- /wp:html -->';
@@ -73,10 +74,49 @@ describe("splitLongParagraphs structural safety", () => {
     expect(validateWordpressBlockPairs(result.html).valid).toBe(true);
   });
 
+  it("is idempotent after the first safe split", () => {
+    const html = '<!-- wp:paragraph --><p>First sentence. Second sentence. Third sentence. Fourth sentence. Fifth sentence.</p><!-- /wp:paragraph -->';
+    const first = splitLongParagraphs(html, 3);
+    const second = splitLongParagraphs(first.html, 3);
+
+    expect(first.splitCount).toBe(1);
+    expect(second).toEqual({ html: first.html, splitCount: 0 });
+    expect(validateWordpressBlockPairs(second.html).valid).toBe(true);
+  });
+
+  it.each([
+    ['"First quoted sentence. Second quoted sentence. Third quoted sentence. Fourth quoted sentence." A final sentence follows.'],
+    ['“First quoted sentence. Second quoted sentence. Third quoted sentence. Fourth quoted sentence.” A final sentence follows.'],
+  ])("never splits a paired multi-sentence quotation across paragraph blocks", (text) => {
+    const html = `<!-- wp:paragraph --><p>${text}</p><!-- /wp:paragraph -->`;
+    const result = splitLongParagraphs(html, 3);
+    const paragraphTexts = [...result.html.matchAll(/<p>([\s\S]*?)<\/p>/gi)].map((match) => match[1]);
+
+    expect(paragraphTexts.length).toBeGreaterThan(0);
+    expect(paragraphTexts.every((paragraph) => analyzeQuotationIntegrity(paragraph).balanced)).toBe(true);
+    expect(paragraphTexts.join(" ").replace(/\s+/g, " ")).toBe(text);
+    expect(validateWordpressBlockPairs(result.html).valid).toBe(true);
+  });
+
+  it("preserves an unmatched source paragraph byte-for-byte for the repair owner", () => {
+    const html = '<!-- wp:paragraph --><p>He said "First sentence. Second sentence. Third sentence. Fourth sentence.</p><!-- /wp:paragraph -->';
+    expect(splitLongParagraphs(html, 3)).toEqual({ html, splitCount: 0 });
+  });
+
   it("rejects nested paragraphs and malformed inline HTML", () => {
     const nested = '<!-- wp:paragraph --><p>Outer <p>inner</p></p><!-- /wp:paragraph -->';
     const malformedLink = '<!-- wp:paragraph --><p>One. <a href="/x">Two. Three. Four.</p><!-- /wp:paragraph -->';
     expect(() => splitLongParagraphs(nested, 3)).toThrow(/block-level <p>/);
     expect(() => splitLongParagraphs(malformedLink, 3)).toThrow(/unclosed inline HTML tag <a>/);
+  });
+});
+
+describe("metadata truncation safety", () => {
+  it("never cuts a paired quotation in half", () => {
+    const meta = 'A practical guide explains "a deliberately long quoted recommendation that must remain a complete semantic unit" before adding several useful details for Hong Kong business teams and their publishing workflow.';
+    const repaired = repairMetaDescription(meta, 80, 150);
+
+    expect(analyzeQuotationIntegrity(repaired).balanced).toBe(true);
+    expect(repaired.length === meta.length || repaired.length <= 150).toBe(true);
   });
 });

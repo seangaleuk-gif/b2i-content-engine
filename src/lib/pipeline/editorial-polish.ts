@@ -21,6 +21,7 @@ import { computeKeyphraseDensity } from "@/lib/content-standards";
 import { extractReadableText, splitSentences } from "@/lib/seo/seo-text-utils";
 import { createNumberExpressionRegex } from "@/lib/services/translation-number-grammar";
 import type { ChatMessage, ChatOptions } from "@/lib/services/deepseek";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 import {
   countRepeatedIdeaPairs,
   editableTextsFromDocument,
@@ -33,6 +34,11 @@ import {
   type MalformedProseIssueCode,
 } from "@/lib/blog/publication-quality";
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
+import {
+  analyzeSentenceCompleteness,
+  hasUnmistakableFragmentEnding,
+  type SentenceCompletenessKind,
+} from "@/lib/blog/sentence-completeness";
 
 export function isEditorialPolishEnabled(): boolean {
   return process.env.ENABLE_EDITORIAL_POLISH === "true";
@@ -820,17 +826,25 @@ function repeatedIdeaPairs(doc: ArticleDocument, excludeWords?: ReadonlySet<stri
   return countRepeatedIdeaPairs(editableTextsFromDocument(doc), excludeWords);
 }
 
-function malformedTextsForBlock(block: EditorialBlock): string[] {
+function malformedTextsForBlock(block: EditorialBlock): {
+  texts: string[];
+  kinds: SentenceCompletenessKind[];
+} {
   if (block.type === "list") {
-    return block.items.map((item) => item.map((inline) => inline.text).join(""));
+    const texts = block.items.map((item) => item.map((inline) => inline.text).join(""));
+    return { texts, kinds: texts.map(() => "list-item" as const) };
   }
-  return [textFromBlock(block)];
+  if (block.type === "subheading") {
+    return { texts: [textFromBlock(block)], kinds: ["subheading"] };
+  }
+  return { texts: [textFromBlock(block)], kinds: ["paragraph"] };
 }
 
 /** Resolve canonical malformed-prose findings to stable editable block IDs. */
 export function findMalformedEditableBlocks(doc: ArticleDocument): MalformedEditableBlock[] {
   return createEditableTargets(doc).flatMap((target) => {
-    const issues = findMalformedProseTextIssues(malformedTextsForBlock(target.originalBlock));
+    const { texts, kinds } = malformedTextsForBlock(target.originalBlock);
+    const issues = findMalformedProseTextIssues(texts, kinds);
     if (issues.length === 0) return [];
     return [{
       blockId: target.publicBlock.blockId,
@@ -865,6 +879,36 @@ function trimTrailingMalformedSentence(text: string): string | null {
   if (trailingStart <= 0) return null;
   const prefix = text.slice(0, trailingStart).trim();
   if (!prefix || findMalformedProseTextIssues([prefix]).length > 0) return null;
+  return prefix;
+}
+
+/**
+ * Deterministic trailing-fragment removal for prose blocks. A paragraph that
+ * contains complete sentences followed by an unmistakable trailing fragment
+ * ("...protect it. A few practical habits can go a") may drop ONLY that
+ * fragment, and only when the sentence boundaries are unambiguous. The
+ * fragment must itself be an unmistakable fragment (bare determiner, dangling
+ * preposition/conjunction or ≤2-word tail) so a complete-but-unpunctuated
+ * sentence is never destroyed by this pass — that case belongs to the bounded
+ * AI correction path. The remaining prefix must scan clean.
+ */
+export function trimTrailingProseFragment(text: string): string | null {
+  const analysis = analyzeSentenceCompleteness(text, "paragraph");
+  if (analysis.complete || !analysis.trailingFragment) return null;
+  const fragment = analysis.trailingFragment;
+  // The fragment must start after at least one complete sentence so the
+  // boundaries are unambiguous, and must itself be unmistakable.
+  if (fragment.start <= 0) return null;
+  if (
+    !hasUnmistakableFragmentEnding(fragment.text)
+    && fragment.text.trim().split(/\s+/).filter(Boolean).length > 2
+  ) {
+    return null;
+  }
+  const prefix = text.slice(0, fragment.start).replace(/\s+$/, "");
+  if (!prefix) return null;
+  // The remaining prefix must be complete prose with no other malformed issue.
+  if (findMalformedProseTextIssues([prefix]).length > 0) return null;
   return prefix;
 }
 
@@ -997,6 +1041,7 @@ export function repairDeterministicMalformedProse(
   minimumWordCount: number,
   protectedSentencesByBlockId: Record<string, string[]> = {},
   allowBlockRemoval = false,
+  keyphrase = "",
 ): DeterministicMalformedRepairResult {
   const repairedBlockIds: string[] = [];
   const removedBlockIds: string[] = [];
@@ -1023,10 +1068,55 @@ export function repairDeterministicMalformedProse(
     const block = component.blocks[currentIndex];
 
     if (
-      issueBlock.issueCodes.every((code) => code === "incomplete-sentence-ending")
+      issueBlock.issueCodes.some((code) =>
+        code === "incomplete-sentence-ending" || code === "missing-terminal-punctuation"
+      )
       && canRebuildAsPlainText(block)
     ) {
-      const trimmed = trimTrailingMalformedSentence(textFromBlock(block));
+      const originalText = textFromBlock(block);
+      // First try the trailing-fragment trim: complete sentences followed by
+      // an unmistakable fragment ("...protect it. A few practical habits can
+      // go a") lose ONLY the fragment. The fragment must not carry facts,
+      // the keyphrase, a protected claim or part of a quotation, and the
+      // article must stay above its word minimum.
+      const analysis = analyzeSentenceCompleteness(originalText, "paragraph");
+      const fragment = analysis.trailingFragment;
+      const fragmentText = fragment?.text ?? "";
+      if (
+        fragment
+        && fragment.start > 0
+        && !/\d/.test(fragmentText)
+        && !(keyphrase.trim() && fragmentText.toLowerCase().includes(keyphrase.toLowerCase()))
+        && !(protectedSentencesByBlockId[issueBlock.blockId] ?? [])
+          .some((sentence) => fragmentText.includes(sentence))
+        && analyzeQuotationIntegrity(originalText).spans
+          .every((span) => span.end <= fragment.start)
+      ) {
+        const trimmedFragment = trimTrailingProseFragment(originalText);
+        if (trimmedFragment) {
+          const candidate = cloneDoc(doc);
+          const candidateTarget = createEditableTargets(candidate)
+            .find((item) => item.publicBlock.blockId === issueBlock.blockId);
+          if (candidateTarget) {
+            const candidateComponent = resolveComponent(candidate, candidateTarget);
+            const candidateBlock = candidateComponent.blocks
+              .find((candidateBlock) => candidateBlock.id === candidateTarget.originalBlock.id);
+            if (
+              candidateBlock
+              && candidateBlock.type === "paragraph"
+              && countCanonicalVisibleWords(candidate) >= minimumWordCount
+            ) {
+              block.content = [{ type: "text", text: trimmedFragment }];
+              component.status = "normalized";
+              repairedBlockIds.push(issueBlock.blockId);
+              continue;
+            }
+          }
+        }
+      }
+      // Existing deterministic sentence-level trim for punctuation-terminated
+      // dangling endings ("...plan for.").
+      const trimmed = trimTrailingMalformedSentence(originalText);
       if (trimmed) {
         block.content = [{ type: "text", text: trimmed }];
         component.status = "normalized";

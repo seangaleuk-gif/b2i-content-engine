@@ -18,6 +18,8 @@ import { parseWordPressEditorialBlocks } from "@/lib/blog/article-document";
 import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, computeWordCountTolerance, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { scanSentenceQualityText } from "@/lib/blog/sentence-quality";
 import { findMalformedProseTextIssues } from "@/lib/blog/publication-quality";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 
 // ── Types ──
 
@@ -624,6 +626,10 @@ function sentenceRemovalIsSafe(
   kpLower: string,
 ): boolean {
   if (sentences.length < 2) return false;
+  // A quotation is one semantic/evidentiary unit even when it contains
+  // multiple sentences. Removing an interior sentence could leave balanced
+  // punctuation while silently altering the attributed quotation.
+  if (analyzeQuotationIntegrity(block.visibleText).spans.length > 0) return false;
   const index = sentences.indexOf(sentence);
   if (index < 0) return false;
   // Links never travel with a removed sentence.
@@ -685,114 +691,6 @@ function validateRemovalCandidate(
     reasons.push("candidate does not parse as a paragraph");
   }
   return { ok: reasons.length === 0, reasons };
-}
-
-// ── Fix 3: Add missing keyphrase occurrences ──
-
-function fixMissingKeyphrase(html: string, keyphrase: string, targetCount: number, changes: SeoNormalizationChange[]): string {
-  const readableText = extractReadableText(html);
-  const currentCount = countExactPhrase(readableText, keyphrase);
-  if (currentCount >= targetCount) return html;
-
-  const deficit = targetCount - currentCount;
-
-  const paraBlocks = extractWpParagraphBlocks(html);
-  const first100Words = readableText.split(/\s+/).slice(0, 100).join(" ").toLowerCase();
-  const hasFirst100 = first100Words.includes(keyphrase.toLowerCase());
-
-  // Sort paragraphs into insertion-priority order, then reverse for safe position-based replacement
-  const candidates = paraBlocks
-    .map((b, i) => {
-      const kpCount = countExactPhrase(b.visibleText, keyphrase);
-      const isFirst100 = !hasFirst100 && first100Words.includes(b.visibleText.toLowerCase().substring(0, Math.min(50, b.visibleText.length)));
-      return { block: b, kpCount, isFirst100 };
-    })
-    .filter((c) => c.block.visibleText.length > 20)
-    .sort((a, b) => {
-      if (a.isFirst100 && !b.isFirst100) return 1; // Process first-100 para last (it's at the bottom when reversed)
-      if (!a.isFirst100 && b.isFirst100) return -1;
-      return a.kpCount - b.kpCount;
-    })
-    .reverse(); // Process from end to start
-
-  let inserted = 0;
-  let resultHtml = html;
-  const processed = new Set<number>();
-
-  for (const c of [...candidates].sort((a, b) => b.block.start - a.block.start)) {
-    if (inserted >= deficit) break;
-    if (c.kpCount >= 2) continue;
-
-    const newText = insertKeyphraseNaturally(c.block.visibleText, keyphrase);
-
-    if (newText !== c.block.visibleText) {
-      resultHtml = replaceWpParagraphBlock(resultHtml, c.block, newText);
-      processed.add(c.block.start);
-      inserted++;
-      changes.push({
-        type: "keyphrase_inserted",
-        description: `Inserted keyphrase into paragraph`,
-        before: c.block.visibleText.substring(0, 60),
-        after: newText.substring(0, 60),
-      });
-    }
-  }
-
-  // If still deficit, try concluding paragraphs (reversed)
-  if (inserted < deficit) {
-    const lastParas = extractWpParagraphBlocks(resultHtml)
-      .filter((block) => countExactPhrase(block.visibleText, keyphrase) === 0)
-      .sort((a, b) => b.start - a.start)
-      .slice(0, 3);
-    for (const block of lastParas) {
-      if (inserted >= deficit) break;
-      if (processed.has(block.start)) continue;
-      const newText = insertKeyphraseNaturally(block.visibleText, keyphrase);
-      if (newText !== block.visibleText) {
-        resultHtml = replaceWpParagraphBlock(resultHtml, block, newText);
-        inserted++;
-        changes.push({
-          type: "keyphrase_inserted",
-          description: `Inserted keyphrase into concluding paragraph`,
-          before: block.visibleText.substring(0, 60),
-          after: newText.substring(0, 60),
-        });
-      }
-    }
-  }
-
-  console.log(`[SEO-NORMALIZER] keyphrase insertions=${inserted}`);
-  return resultHtml;
-}
-
-function insertKeyphraseNaturally(text: string, keyphrase: string): string {
-  if (text.toLowerCase().includes(keyphrase.toLowerCase())) return text;
-
-  const sentences = text.split(/(?<=[.!?])\s+/);
-  if (sentences.length === 0) return `${keyphrase.charAt(0).toUpperCase() + keyphrase.slice(1)}. ${text}`;
-
-  // Insert into the middle of the paragraph
-  const insertionTemplates = [
-    `When considering ${keyphrase}, `,
-    `In the context of ${keyphrase}, `,
-    `As ${keyphrase} continues to evolve, `,
-    `For businesses navigating ${keyphrase}, `,
-    `Understanding ${keyphrase} is essential. `,
-  ];
-
-  const template = insertionTemplates[Math.floor(Math.random() * insertionTemplates.length)];
-
-  if (sentences.length === 1) {
-    // For single-sentence paragraphs, add as a new sentence
-    return `${text} ${template.charAt(0).toUpperCase() + template.slice(1)}`;
-  }
-
-  // Insert after the first sentence
-  const insertPos = Math.floor(sentences.length / 2);
-  const prefix = sentences.slice(0, insertPos).join(" ");
-  const suffix = sentences.slice(insertPos).join(" ");
-
-  return `${prefix}. ${template}${suffix.charAt(0).toLowerCase() + suffix.slice(1)}`;
 }
 
 // ── Fix 4: Word count expansion ──
@@ -879,6 +777,10 @@ Return as JSON: {"expanded": "the full paragraph with expansion included (keepin
       }
 
       if (!expanded || expanded === target.visibleText) continue;
+      if (!expanded.replace(/\s+/g, " ").includes(target.visibleText.replace(/\s+/g, " "))) {
+        console.log(`[SEO-NORMALIZER] Expansion rewrote or removed existing paragraph text — rejected`);
+        continue;
+      }
 
       // Check for unsupported statistics
       if (hasUnsupportedStatistics(expanded, html)) {
@@ -933,7 +835,10 @@ Return as JSON: {"expanded": "complete paragraph with new sentences appended"}`;
         let expanded: string;
         try { expanded = JSON.parse(res.content).expanded || longestParagraph.visibleText; } catch { expanded = longestParagraph.visibleText; }
 
-        if (expanded !== longestParagraph.visibleText) {
+        if (
+          expanded !== longestParagraph.visibleText
+          && expanded.replace(/\s+/g, " ").includes(longestParagraph.visibleText.replace(/\s+/g, " "))
+        ) {
           if (hasUnsupportedStatistics(expanded, html)) {
             expanded = replaceStatisticsWithQualitative(expanded);
           }
@@ -1033,6 +938,13 @@ async function fixReadability(
   // Score each paragraph, sort worst-to-best, then process from end to start
   const scored = paraBlocks
     .filter((b) => !protectedRanges.some(([s, e]) => b.start >= s && b.start < e))
+    .filter((b) => {
+      const quotation = analyzeQuotationIntegrity(b.visibleText);
+      if (!quotation.balanced || quotation.spans.length > 0) return false;
+      if (/<a\b/i.test(b.fullMatch) || /\d/.test(b.visibleText)) return false;
+      if (/according to|research (?:from|by)|data (?:from|shows)|study (?:from|by)/i.test(b.visibleText)) return false;
+      return scanFactualRisks(b.fullMatch, keyphrase, []).claims.length === 0;
+    })
     .map((b) => ({
       block: b,
       score: Math.round(fleschOnParagraph(b.visibleText)),
@@ -1070,6 +982,14 @@ Return as JSON: {"rewritten": "the rewritten paragraph text (plain text, no HTML
       try { rewritten = JSON.parse(res.content).rewritten || s.block.visibleText; } catch { rewritten = s.block.visibleText; }
 
       if (!rewritten || rewritten === s.block.visibleText) continue;
+
+      if (
+        findMalformedProseTextIssues([rewritten]).length > 0
+        || scanSentenceQualityText(rewritten).length > 0
+      ) {
+        console.log(`[SEO-NORMALIZER] Readability rewrite introduced malformed prose — rejected`);
+        continue;
+      }
 
       // Validate keyphrase count unchanged
       const kpCountAfter = countExactPhrase(rewritten, keyphrase);
@@ -1191,8 +1111,11 @@ export async function normalizeFinalSeo(
   if (kpBefore > kpMax) {
     currentHtml = fixExcessiveKeyphrase(currentHtml, focusKeyphrase, effectiveTarget, changes);
   } else if (kpBefore === 0 && effectiveTarget > 0) {
-    // Density below minimum — try one natural insertion
-    currentHtml = fixMissingKeyphrase(currentHtml, focusKeyphrase, Math.max(1, effectiveTarget), changes);
+    // Missing/low keyphrase density is explicitly soft. Do not inject stock
+    // prose into a factually approved paragraph: the former insertion could
+    // split quotations, duplicate punctuation and add unsupported positioning.
+    // The audit reports the miss; no content mutation is warranted.
+    console.log("[SEO-NORMALIZER] keyphrase absent — soft diagnostic, no body mutation");
   }
 
   // Step 6: Expand body to target word count
@@ -1285,6 +1208,8 @@ export async function normalizeFinalSeo(
   const policy = buildPolicy(targetWordCount, undefined, undefined, focusKeyphrase);
   const policyResult = evaluatePolicy(after, policy);
   const kpDensityOk = policyResult.passed || kpCountOk;
+  const malformedNoRegression = (after.malformedProseCount ?? 0)
+    <= (beforeRaw.malformedProseCount ?? 0);
   const tolerance = computeWordCountTolerance(targetWordCount);
   const wcOk = policyResult.passed || (after.readableWordCount >= tolerance.min && after.readableWordCount <= tolerance.max);
   const h2Ok = after.exactKeyphraseInH2;
@@ -1316,13 +1241,17 @@ export async function normalizeFinalSeo(
   const { valid: structValid, issues: structIssues, faqPresent, switcherPresent, ctaPresent } = verifyStructuralIntegrity(currentHtml);
   warnings.push(...structIssues);
 
-  const passed = kpDensityOk && wcOk && parasOk && blocksUnchanged && linksUnchanged && structValid && internalLinksOk;
+  const passed = kpDensityOk && wcOk && parasOk && malformedNoRegression
+    && blocksUnchanged && linksUnchanged && structValid && internalLinksOk;
   if (!passed) {
     const failures: string[] = [];
     if (!kpDensityOk) failures.push("kpDensityOk");
     if (!wcOk) failures.push(`wcOk(wc=${after.readableWordCount})`);
     if (!h2Ok) failures.push("h2Ok");
     if (!parasOk) failures.push(`parasOk(paras=${after.longParagraphCount})`);
+    if (!malformedNoRegression) {
+      failures.push(`malformedNoRegression(${beforeRaw.malformedProseCount ?? 0}->${after.malformedProseCount ?? 0})`);
+    }
     if (!blocksUnchanged) failures.push("blocksUnchanged");
     if (!linksUnchanged) failures.push("linksUnchanged");
     if (!structValid) failures.push(`structValid(${structIssues.join("; ")})`);

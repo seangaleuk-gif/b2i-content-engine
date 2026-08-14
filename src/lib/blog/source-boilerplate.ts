@@ -7,6 +7,7 @@
 // final-validation failure.
 
 import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 const BOILERPLATE_PATTERNS: RegExp[] = [
   // Legal disclaimers and author-opinion notices
@@ -117,11 +118,47 @@ export function countBoilerplateInDocument(doc: ArticleDocument): Array<{
 /** Filter boilerplate sentences out of a research snippet so they can never
  *  become evidence or be quoted into generated content. */
 export function stripSourceBoilerplate(text: string): string {
-  const sentences = text
-    .replace(/\s+/g, " ")
-    .split(/(?<=[.!?])\s+/)
-    .map((sentence) => sentence.trim())
-    .filter(Boolean);
-  const kept = sentences.filter((sentence) => !isSourceBoilerplate(sentence));
-  return kept.join(" ");
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+
+  const ranges: Array<{ start: number; end: number }> = [];
+  let start = 0;
+  for (let index = 0; index < normalized.length; index++) {
+    if (!/[.!?]/.test(normalized[index])) continue;
+    let end = index + 1;
+    while (/[.!?]/.test(normalized[end] ?? "")) end++;
+    while (/["\u201D\u2019)\]]/.test(normalized[end] ?? "")) end++;
+    if (normalized.slice(start, end).trim()) ranges.push({ start, end });
+    while (/\s/.test(normalized[end] ?? "")) end++;
+    start = end;
+    index = end - 1;
+  }
+  if (start < normalized.length && normalized.slice(start).trim()) {
+    ranges.push({ start, end: normalized.length });
+  }
+
+  const rejected = new Set<number>();
+  ranges.forEach((range, index) => {
+    if (isSourceBoilerplate(normalized.slice(range.start, range.end))) rejected.add(index);
+  });
+  if (rejected.size === 0) return normalized;
+
+  const quotation = analyzeQuotationIntegrity(normalized);
+  if (!quotation.balanced) return "";
+  for (const span of quotation.spans) {
+    const touchesRejectedSentence = [...rejected].some((index) => {
+      const range = ranges[index];
+      return range.start < span.end && span.start < range.end;
+    });
+    if (!touchesRejectedSentence) continue;
+    ranges.forEach((range, index) => {
+      if (range.start < span.end && span.start < range.end) rejected.add(index);
+    });
+  }
+
+  return ranges
+    .filter((_range, index) => !rejected.has(index))
+    .map((range) => normalized.slice(range.start, range.end).trim())
+    .filter(Boolean)
+    .join(" ");
 }

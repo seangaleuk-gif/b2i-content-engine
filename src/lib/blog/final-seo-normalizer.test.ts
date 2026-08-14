@@ -260,6 +260,32 @@ describe("final-seo-normalizer (deterministic)", () => {
       // After reduction, should be closer to 5 (but first-100-words and H2 are protected)
       expect(result.after.exactKeyphraseCount).toBeLessThan(result.before.exactKeyphraseCount);
     });
+
+    it("never removes an interior sentence from a multi-sentence quotation", async () => {
+      const prefix = Array.from({ length: 120 }, (_, index) => `context${index}`).join(" ") + ".";
+      const quotations = ["adviser", "editor", "reviewer"].map((speaker) =>
+        `The ${speaker} said “Begin with customer needs. ${keyphrase} guides the middle step. Finish with evidence.” Teams then review the complete plan.`,
+      );
+      const html = wrapInArticle(makeArticle(
+        [prefix, ...quotations],
+        ["A practical planning method"],
+      ));
+
+      const result = await normalizeFinalSeo({
+        html,
+        focusKeyphrase: keyphrase,
+        targetWordCount: 100,
+        targetKeyphraseCount: 0,
+        minReadingEase: 60,
+        maxReadingEase: 70,
+      });
+
+      for (const quotation of quotations) {
+        expect(extractReadableText(result.html)).toContain(quotation);
+      }
+      expect(result.before.exactKeyphraseCount).toBeGreaterThan(1);
+      expect(result.changes.some((change) => change.type === "keyphrase_removed")).toBe(false);
+    });
   });
 
   describe("keyphrase count increase", () => {
@@ -282,6 +308,26 @@ describe("final-seo-normalizer (deterministic)", () => {
 
     // Single occurrence is adequate density for a short article; doesn't force extra
     expect(result.after.exactKeyphraseCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("treats a completely absent keyphrase as a soft diagnostic without mutating body prose", async () => {
+    const html = wrapInArticle(makeArticle([
+      'The adviser said "Keep each recommendation grounded. Preserve the reader\'s trust."',
+      "Teams can review the plan carefully. They can improve it after useful feedback.",
+    ], ["A practical editorial workflow"]));
+
+    const result = await normalizeFinalSeo({
+      html,
+      focusKeyphrase: "absent focus phrase",
+      targetWordCount: 40,
+      targetKeyphraseCount: 2,
+      minReadingEase: 60,
+      maxReadingEase: 70,
+    });
+
+    expect(result.html).toBe(html);
+    expect(result.after.exactKeyphraseCount).toBe(0);
+    expect(result.changes.some((change) => change.type === "keyphrase_inserted")).toBe(false);
   });
 });
 
@@ -910,6 +956,26 @@ describe("final-seo-normalizer (with mock AI)", () => {
   }
 
   describe("word count expansion", () => {
+    it("rejects an expansion that replaces instead of appending to the original paragraph", async () => {
+      const paraContent = "Hong Kong teams start with a complete plan and review it with the people responsible for delivery.";
+      const html = wrapInArticle(makeArticle(
+        [paraContent],
+        [`How ${keyphrase} Affect Business`],
+      ));
+      const mockChat = makeMockChat(() => JSON.stringify({
+        expanded: "A different paragraph silently removes the approved original meaning and replaces it with generic filler.",
+      }));
+      const result = await normalizeFinalSeo({
+        html,
+        focusKeyphrase: keyphrase,
+        targetWordCount: 100,
+        targetKeyphraseCount: 1,
+        minReadingEase: 60,
+        maxReadingEase: 70,
+      }, mockChat as any);
+      expect(extractReadableText(result.html)).toContain(paraContent);
+    });
+
     it("expands short article toward target word count", async () => {
       const paraContent = "Hong Kong is a dynamic market. Businesses face many challenges.";
       const html = wrapInArticle(makeArticle(
@@ -961,6 +1027,27 @@ describe("final-seo-normalizer (with mock AI)", () => {
   });
 
   describe("readability improvement", () => {
+    it("never rewrites a factual paragraph merely to improve readability", async () => {
+      const factual = "According to the approved report, 65% of surveyed teams retained the complete planning process during 2026 implementation.";
+      const html = wrapInArticle(makeArticle(
+        [factual],
+        [`How ${keyphrase} Affect Business`],
+      ));
+      const mockChat = makeMockChat(() => JSON.stringify({
+        rewritten: "Teams used a simpler process.",
+      }));
+      const result = await normalizeFinalSeo({
+        html,
+        focusKeyphrase: keyphrase,
+        targetWordCount: 10,
+        targetKeyphraseCount: 1,
+        minReadingEase: 60,
+        maxReadingEase: 70,
+      }, mockChat as any);
+      expect(extractReadableText(result.html)).toContain("65%");
+      expect(extractReadableText(result.html)).toContain("approved report");
+    });
+
     it("attempts to improve readability for complex text (mock)", async () => {
       const complexPara = "The multifaceted implementation of sophisticated marketing automation paradigms necessitates comprehensive understanding of intricate organizational dynamics and their consequential implications for strategic resource allocation methodologies.";
       const html = wrapInArticle(makeArticle(

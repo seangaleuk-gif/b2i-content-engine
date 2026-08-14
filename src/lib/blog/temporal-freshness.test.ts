@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ArticleDocument, EditorialBlock } from "./article-document";
 import { renderComponentHtml } from "./article-document";
 import { repairTemporalFreshnessDocument, scanTemporalFreshness } from "./temporal-freshness";
+import { analyzeQuotationIntegrity } from "./quotation-integrity";
 
 const REFERENCE_DATE = new Date("2026-07-30T00:00:00Z");
 
@@ -146,5 +147,21 @@ describe("temporal freshness gate", () => {
     expect(html).not.toContain("expected to expand later in 2025");
     expect(html).toContain("Threads gives SMEs another place");
     expect(html).toContain("Start by testing useful conversations");
+  });
+
+  it("never removes only one sentence from a multi-sentence quotation", () => {
+    const source = 'The analyst said, "Teams reviewed the launch. Advertising features are expected to expand later in 2025. Teams should plan carefully."';
+    const doc = makeDoc(source);
+    const result = repairTemporalFreshnessDocument(doc, REFERENCE_DATE);
+    const retained = doc.introduction.blocks[0];
+    const retainedText = retained.type === "paragraph"
+      ? retained.content.map((node) => node.text).join("")
+      : "";
+
+    expect(result.removedSentences).toBe(0);
+    expect(result.rewrittenSentences).toBe(0);
+    expect(result.unresolved.length).toBeGreaterThan(0);
+    expect(retainedText).toBe(source);
+    expect(analyzeQuotationIntegrity(retainedText).balanced).toBe(true);
   });
 });

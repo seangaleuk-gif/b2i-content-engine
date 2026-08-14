@@ -136,6 +136,43 @@ describe("publication-quality regression (blog 13, version 15 fixture)", () => {
     expect(sectionText).not.toContain("Simple examples help busy owners");
   });
 
+  it("sentence-level deterministic compression never splits a multi-sentence quotation", () => {
+    const quoted =
+      "The owner said “Start with one complete customer question before planning the campaign. " +
+      "Keep the follow-up explanation inside the same quotation so its meaning remains clear.” " +
+      "The team then reviews the complete response before deciding what to publish next.";
+    const doc: ArticleDocument = {
+      metadata: {
+        title: "Complete Test Article",
+        slug: "complete-test-article",
+        metaDescription: "A complete description.",
+        excerpt: "",
+        targetWordCount: 100,
+        focusKeyphrase: KEYPHRASE,
+      },
+      languageSwitcher: null,
+      introduction: { id: "intro", blocks: [], status: "generated" },
+      sections: [{
+        id: "quoted-section",
+        heading: "Quoted guidance",
+        headingLevel: 2,
+        sectionType: "main",
+        blocks: [paragraph("quoted-paragraph", quoted)],
+        status: "generated",
+      }],
+      visibleFaq: [],
+      conclusion: { id: "conclusion", blocks: [], status: "generated" },
+      cta: null,
+      faqSchema: null,
+      insertedLinks: [],
+    };
+    const before = renderArticleDocument(doc);
+    const words = countCanonicalVisibleWords(doc);
+    const result = compressDocumentStructureAware(doc, words - 10, 1, KEYPHRASE, []);
+    expect(result.shortenedSentences).toBe(0);
+    expect(renderArticleDocument(doc)).toBe(before);
+  });
+
   it("an orphan \u201cInstead\u201d opening a section is rejected by coherence validation", () => {
     const doc = parseFixture();
     const section = doc.sections.find((s) => s.sectionType === "main")!;
@@ -297,6 +334,13 @@ describe("publication-quality regression (blog 13, version 15 fixture)", () => {
     const stripped = stripSourceBoilerplate(`Useful trend data. ${hsbcDisclaimer} More useful trend data.`);
     expect(stripped).not.toContain("views, information");
     expect(stripped).toContain("Useful trend data");
+
+    // Never alter attributed speech by deleting only an interior boilerplate
+    // sentence while retaining the rest of the quotation.
+    const quoted = stripSourceBoilerplate(
+      'The footer says “Useful context. Subscribe to our newsletter. More quoted context.” Independent evidence remains.',
+    );
+    expect(quoted).toBe("Independent evidence remains.");
   });
 
   // ── Market-wide claims ──

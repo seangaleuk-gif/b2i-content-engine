@@ -127,6 +127,21 @@ function buildRequestMock(overrides: StageResponse[]) {
 }
 
 describe("normalizeOutlineHeadings", () => {
+  it("rejects an unmatched quotation in an editorial or FAQ heading", () => {
+    expect(() => normalizeOutlineHeadings(
+      ['An unfinished "heading', "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions"],
+      2500,
+      "Test",
+      "test keyphrase",
+    )).toThrow(OutlineHeadingValidationError);
+    expect(() => normalizeOutlineHeadings(
+      ["S1", "S2", "S3", "S4", "S5", "S6", "Frequently Asked “Questions"],
+      2500,
+      "Test",
+      "test keyphrase",
+    )).toThrow(OutlineHeadingValidationError);
+  });
+
   it("adds the missing editorial H2 before the final FAQ heading for a 2500-word article", () => {
     const headings = normalizeOutlineHeadings(
       ["S1", "S2", "S3", "S4", "S5", "Frequently Asked Questions About Test"],
@@ -283,6 +298,20 @@ describe("runBlogGeneration — section failure", () => {
 // ── Section successful retry ──
 
 describe("runBlogGeneration — section successful retry", () => {
+  it("routes an unmatched quotation through the existing targeted section repair", async () => {
+    const stages: string[] = [];
+    const base = buildRequestMock([
+      { stage: "section_0", content: para('The model emitted an unfinished "quotation.') },
+      { stage: "section_0_repair", content: para("The repaired section contains complete professional prose.") },
+    ]);
+    const request = async (stage: string) => {
+      stages.push(stage);
+      return base(stage);
+    };
+    await expect(runBlogGeneration("u", 1, { requestDeepSeek: request })).resolves.toBeDefined();
+    expect(stages.filter((stage) => stage === "section_0_repair")).toHaveLength(1);
+  });
+
   it("invalid first then valid retry succeeds", async () => {
     const mock = buildRequestMock([
       { stage: "section_0", content: para("<!-- wp:paragraph -->bad") },
@@ -366,6 +395,66 @@ describe("runBlogGeneration — conclusion successful retry", () => {
 // ─── Successful flow ──
 
 describe("runBlogGeneration — successful flow", () => {
+  it("repairs unmatched outline metadata before drafting", async () => {
+    vi.mocked(createPipelineState).mockClear();
+    const stages: string[] = [];
+    const base = buildRequestMock([
+      {
+        stage: "outline",
+        content: JSON.stringify({
+          title: 'An unfinished "title',
+          slug: "test",
+          metaDescription: "A complete practical description for professional teams.",
+          excerpt: "A complete excerpt.",
+          h2Headings: ["S1", "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions About Test"],
+        }),
+      },
+      {
+        stage: "outline_metadata_repair",
+        content: JSON.stringify({
+          title: "A Complete Test Title",
+          slug: "complete-test-title",
+          metaDescription: "A complete practical description for professional teams.",
+          excerpt: "A complete excerpt.",
+        }),
+      },
+    ]);
+    const request = async (stage: string) => {
+      stages.push(stage);
+      return base(stage);
+    };
+    await runBlogGeneration("u", 1, { requestDeepSeek: request });
+    expect(stages.filter((stage) => stage === "outline_metadata_repair")).toHaveLength(1);
+    const doc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+    expect(doc.metadata.title).toBe("A Complete Test Title");
+  });
+
+  it("repairs an unmatched quotation in canonical FAQ copy before assembly", async () => {
+    const stages: string[] = [];
+    const validEntries = [
+      { question: "What is this?", answer: "This is a practical planning approach." },
+      { question: "How does it work?", answer: "It follows a clear process." },
+      { question: "Who is it for?", answer: "It is for professional teams." },
+      { question: "When should I begin?", answer: "Begin when the plan is ready." },
+    ];
+    const base = buildRequestMock([
+      {
+        stage: "faq",
+        content: JSON.stringify({ entries: [
+          { question: "What is this?", answer: 'It starts with an unfinished "example.' },
+          ...validEntries.slice(1),
+        ] }),
+      },
+      { stage: "faq_repair", content: JSON.stringify({ entries: validEntries }) },
+    ]);
+    const request = async (stage: string) => {
+      stages.push(stage);
+      return base(stage);
+    };
+    await expect(runBlogGeneration("u", 1, { requestDeepSeek: request })).resolves.toBeDefined();
+    expect(stages.filter((stage) => stage === "faq_repair")).toHaveLength(1);
+  });
+
   it("completes without errors", async () => {
     const mock = buildRequestMock([]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();

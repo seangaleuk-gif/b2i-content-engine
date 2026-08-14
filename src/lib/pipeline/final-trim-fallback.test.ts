@@ -87,12 +87,14 @@ const RESEARCH = [
   },
 ];
 
-// The corrupted paragraph: a quotation attribution left without terminal
-// punctuation. It survives the deterministic trim (it carries a supported
-// market-wide claim, so the trim treats it as factual content) and is flagged
-// by the coherence gate as an incomplete sentence.
+// The corrupted paragraph: an unfinished example — a single sentence that
+// introduces a pending action ("plans to") with no resolution. It is complete
+// prose (terminal punctuation present), so the malformed-prose scanner and
+// the shared sentence-completeness validator do NOT flag it; only the
+// coherence gate sees the unfinished-example violation. It survives the
+// deterministic trim as the first block of its section.
 const INCOMPLETE_QUOTE_PARAGRAPH =
-  "The strategy for the year ahead puts marketing first, and everyone is watching what happens next";
+  "Consider a local boutique that plans to test weekly video posts to grow its audience.";
 const QUOTE_TEXT =
   "Influencer content is the fuel for engagement, storytelling, and B2C growth, and it is a top priority for Hong Kong marketers.";
 const ORPHAN_PARAGRAPH =
@@ -311,11 +313,14 @@ describe("final-trim bounded fallback (incomplete quotation + orphan transition)
     expect(result).toBeUndefined();
     // The compaction fallback was attempted for the affected sections.
     expect(compactedHeadings.some((h) => h.includes("AI and Personalisation"))).toBe(true);
-    // The truncated quotation candidate was rejected; the coherence failure
-    // remains a hard failure.
+    // The truncated quotation candidate was rejected (it is malformed —
+    // missing terminal punctuation — and incoherent), the complete prior
+    // snapshot was restored, and the coherence failure remains a hard
+    // failure. The rejection never leaks a damaged candidate into the article.
     expect(thrown).toBeDefined();
     expect(String(thrown!.message)).toMatch(/Coherence violations after final trim/);
-    expect(errors.join("\n")).toContain("quote-integrity");
+    expect(errors.join("\n")).toContain("malformed-prose");
+    expect(errors.join("\n")).toContain("coherence:incomplete-sentence");
   });
 });
 

@@ -2,7 +2,14 @@
 // The single source of truth for article structure, protected blocks, and rendering.
 // Editorial content stores structured blocks; WordPress HTML is generated only at render time.
 
-import { type EditorialBlock, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, extractPlainTextFromEditorialBlocks } from "@/lib/blog/article-content";
+import {
+  type EditorialBlock,
+  renderEditorialBlocksToWordPress,
+  parseWordPressEditorialBlocks,
+  extractPlainTextFromEditorialBlocks,
+  validateEditorialBlocks,
+} from "@/lib/blog/article-content";
+import { parseWordpressBlockStructure } from "@/lib/blog/wordpress-block-structure";
 
 export type { EditorialBlock };
 export { renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, extractPlainTextFromEditorialBlocks };
@@ -1063,6 +1070,70 @@ export interface ParseResult {
   errors: string[];
 }
 
+const EDITORIAL_WORDPRESS_BLOCK_TYPES = new Set([
+  "wp:paragraph",
+  "wp:heading",
+  "wp:list",
+  "wp:quote",
+  "wp:table",
+]);
+
+/**
+ * Parse a canonical editorial region without accepting a subset of it. The
+ * generic block parser intentionally recovers useful inline text, but a full
+ * document mutation boundary must additionally prove that every top-level
+ * WordPress block and every non-whitespace byte was represented.
+ */
+export function parseCompleteEditorialRegion(
+  html: string,
+  componentId: string,
+): { blocks: EditorialBlock[]; errors: string[] } {
+  const errors: string[] = [];
+  const structure = parseWordpressBlockStructure(html);
+  if (!structure.valid) {
+    errors.push(...structure.issues.map((issue) => `${componentId}: ${issue}`));
+    return { blocks: [], errors };
+  }
+
+  const topLevelRanges = structure.ranges.filter((range) => range.depth === 0);
+  const nestedRanges = structure.ranges.filter((range) => range.depth > 0);
+  if (nestedRanges.length > 0) {
+    errors.push(
+      `${componentId}: nested WordPress blocks cannot be represented canonically: `
+      + nestedRanges.map((range) => range.type).join(", "),
+    );
+  }
+  const unsupported = topLevelRanges.filter(
+    (range) => !EDITORIAL_WORDPRESS_BLOCK_TYPES.has(range.type),
+  );
+  if (unsupported.length > 0) {
+    errors.push(
+      `${componentId}: unsupported top-level WordPress block type(s): `
+      + unsupported.map((range) => range.type).join(", "),
+    );
+  }
+
+  let residue = html;
+  for (const range of [...topLevelRanges].sort((left, right) => right.start - left.start)) {
+    residue = residue.slice(0, range.start) + residue.slice(range.end);
+  }
+  if (residue.trim().length > 0) {
+    errors.push(`${componentId}: raw content exists outside top-level WordPress blocks`);
+  }
+
+  const parsed = parseWordPressEditorialBlocks(html, componentId);
+  errors.push(...parsed.errors);
+  errors.push(...validateEditorialBlocks(parsed.blocks).map((issue) => `${componentId}: ${issue}`));
+  if (parsed.blocks.length !== topLevelRanges.length) {
+    errors.push(
+      `${componentId}: parsed ${parsed.blocks.length} editorial block(s) from `
+      + `${topLevelRanges.length} top-level WordPress block(s)`,
+    );
+  }
+
+  return { blocks: parsed.blocks, errors };
+}
+
 /**
  * Parse rendered HTML back into an ArticleDocument. Fully reconstructs
  * every mutable part from the HTML — headings, section bodies, conclusion,
@@ -1074,6 +1145,11 @@ export function parseArticleDocumentFromHtml(
   existingDoc: ArticleDocument,
 ): ParseResult {
   const errors: string[] = [];
+
+  const documentStructure = parseWordpressBlockStructure(html);
+  if (!documentStructure.valid) {
+    return { doc: null, errors: documentStructure.issues };
+  }
 
   // Extract language switcher (first wp:html with b2i-language-switcher)
   const switcherMatch = html.match(/<!--\s*wp:html\s*-->[\s\S]*?b2i-language-switcher[\s\S]*?<!--\s*\/wp:html\s*-->/i);
@@ -1136,7 +1212,15 @@ export function parseArticleDocumentFromHtml(
     : 0;
   const introEnd = headingMatches[0].index;
   const introductionHtml = html.substring(introStart, introEnd).trim();
-  const introParse = parseWordPressEditorialBlocks(introductionHtml, "intro");
+  const introParse = parseCompleteEditorialRegion(introductionHtml, "intro");
+  const introductionRequired = (existingDoc.introduction?.blocks.length ?? 0) > 0;
+  if (introParse.errors.length > 0 || (introductionRequired && introParse.blocks.length === 0)) {
+    errors.push(...introParse.errors);
+    if (introductionRequired && introParse.blocks.length === 0) {
+      errors.push("Introduction has no editorial blocks");
+    }
+    return { doc: null, errors };
+  }
   const introduction: ArticleComponent = {
     id: existingDoc.introduction?.id ?? "intro",
     blocks: introParse.blocks.length > 0 ? introParse.blocks : [],
@@ -1170,14 +1254,22 @@ export function parseArticleDocumentFromHtml(
       return { doc: null, errors };
     }
 
-    const sectionParse = parseWordPressEditorialBlocks(bodyHtml, `section-${i}`);
-
     const markerWindow = html.substring(Math.max(0, headingMatches[i].index - FAQ_HEADING_MARKER.length - 20), headingMatches[i].index);
     const sectionType: ArticleSection["sectionType"] = markerWindow.includes(FAQ_HEADING_MARKER)
       || /^(frequently asked questions|faq|常見問題)/i.test(headingMatches[i].heading.trim())
       || existing?.sectionType === "faq-heading"
       ? "faq-heading"
       : (existing?.sectionType ?? "main");
+    const sectionParse = sectionType === "faq-heading"
+      ? { blocks: [] as EditorialBlock[], errors: [] as string[] }
+      : parseCompleteEditorialRegion(bodyHtml, `section-${i}`);
+    if (sectionParse.errors.length > 0 || (sectionType !== "faq-heading" && sectionParse.blocks.length === 0)) {
+      errors.push(...sectionParse.errors);
+      if (sectionType !== "faq-heading" && sectionParse.blocks.length === 0) {
+        errors.push(`Section ${i} has no editorial blocks`);
+      }
+      return { doc: null, errors };
+    }
     newSections.push({
       id: existing?.id ?? `section-${i}`,
       heading: headingMatches[i].heading,
@@ -1202,7 +1294,15 @@ export function parseArticleDocumentFromHtml(
   }
 
   // Parse conclusion HTML into blocks
-  const conclusionParse = parseWordPressEditorialBlocks(conclusionHtml, "conc");
+  const conclusionParse = parseCompleteEditorialRegion(conclusionHtml, "conc");
+  const conclusionRequired = (existingDoc.conclusion?.blocks.length ?? 0) > 0;
+  if (conclusionParse.errors.length > 0 || (conclusionRequired && conclusionParse.blocks.length === 0)) {
+    errors.push(...conclusionParse.errors);
+    if (conclusionRequired && conclusionParse.blocks.length === 0) {
+      errors.push("Conclusion has no editorial blocks");
+    }
+    return { doc: null, errors };
+  }
 
   const doc: ArticleDocument = {
     metadata: { ...existingDoc.metadata },
@@ -1214,10 +1314,18 @@ export function parseArticleDocumentFromHtml(
     },
     sections: newSections,
     visibleFaq: (() => {
+      // FAQ is protected canonical data during pipeline HTML round-trips. A
+      // legacy HTML extractor can include adjacent WordPress markers in
+      // answerHtml; preferring that reconstruction over an existing canonical
+      // FAQ can make the next render structurally invalid. Reconstruct only
+      // when parsing a persisted document with no canonical FAQ seed.
+      if (existingDoc.visibleFaq.length > 0) return existingDoc.visibleFaq;
       const parsedFaq = extractVisibleFaqFromArticle(html);
-      return parsedFaq.length > 0
-        ? parsedFaq.map((entry) => ({ question: entry.question, answerHtml: entry.answerHtml, answerText: entry.answerText }))
-        : existingDoc.visibleFaq;
+      return parsedFaq.map((entry) => ({
+        question: entry.question,
+        answerHtml: entry.answerHtml,
+        answerText: entry.answerText,
+      }));
     })(),
     conclusion: {
       id: existingDoc.conclusion?.id ?? "conc",

@@ -33,6 +33,8 @@ import {
   createPipelineState,
   evaluateEditorialStageCandidate,
   guardStageOutput,
+  runTrackedHtmlStage,
+  snapshotState,
   sanitizeFaqFactualClaims,
   trimResidualSafeProseToMaximum,
   shouldAcceptSeoNormalization,
@@ -228,6 +230,23 @@ describe("pipeline: canonical state invariants", () => {
       },
     } as any);
     expect(accepted).toBe(true);
+  });
+
+  it("rejects SEO normalization that introduces malformed prose", () => {
+    const accepted = shouldAcceptSeoNormalization({
+      passed: true,
+      before: { malformedProseCount: 0 },
+      after: { malformedProseCount: 1 },
+      safety: {
+        protectedBlocksUnchanged: true,
+        linkDestinationsUnchanged: true,
+        wordpressBlocksValid: true,
+        faqSchemaPreserved: true,
+        languageSwitcherPreserved: true,
+        ctaPreserved: false,
+      },
+    } as any);
+    expect(accepted).toBe(false);
   });
 
   it("allows a damaged CTA to be replaced by the canonical signup CTA", () => {
@@ -456,6 +475,84 @@ describe("pipeline: rendered article integrity", () => {
     expect(parseResult.doc.sections.length).toBe(doc.sections.length);
   });
 
+  it("E. rejects raw prose outside canonical WordPress blocks instead of accepting a parsed subset", () => {
+    const doc = makeArticleDoc();
+    const html = renderArticleDocument(doc).replace(
+      "<!-- wp:paragraph -->",
+      "unwrapped model prose\n<!-- wp:paragraph -->",
+    );
+
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+
+    expect(parsed.doc).toBeNull();
+    expect(parsed.errors.join(" ")).toContain("raw content exists outside top-level WordPress blocks");
+  });
+
+  it("E. rejects unsupported editorial WordPress blocks instead of dropping them", () => {
+    const doc = makeArticleDoc();
+    const html = renderArticleDocument(doc).replace(
+      "<!-- wp:paragraph -->",
+      "<!-- wp:image /-->\n<!-- wp:paragraph -->",
+    );
+
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+
+    expect(parsed.doc).toBeNull();
+    expect(parsed.errors.join(" ")).toContain("raw content exists outside top-level WordPress blocks");
+  });
+
+  it("E. rejects nested editorial WordPress blocks instead of flattening them", () => {
+    const doc = makeArticleDoc();
+    const html = renderArticleDocument(doc).replace(
+      "This is the introduction",
+      "Before <!-- wp:quote --><blockquote><p>nested</p></blockquote><!-- /wp:quote --> after",
+    );
+
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+
+    expect(parsed.doc).toBeNull();
+    expect(parsed.errors.join(" ")).toMatch(/cannot be nested|nested WordPress blocks cannot be represented canonically/);
+  });
+
+  it("E. rejects inline markup that would be silently discarded on canonical render", () => {
+    const doc = makeArticleDoc();
+    const html = renderArticleDocument(doc).replace(
+      "This is the introduction",
+      'This is the introduction <img src="https://example.com/lost.png">',
+    );
+
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+
+    expect(parsed.doc).toBeNull();
+    expect(parsed.errors.join(" ")).toContain("unsupported inline element <img>");
+  });
+
+  it("E. rejects executable markup reported by an editorial block parser", () => {
+    const doc = makeArticleDoc();
+    const html = renderArticleDocument(doc).replace(
+      "This is the introduction",
+      "This is the introduction<script>alert(1)</script>",
+    );
+
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+
+    expect(parsed.doc).toBeNull();
+    expect(parsed.errors.join(" ")).toContain("executable element <script> rejected");
+  });
+
+  it("E. rejects crossed WordPress markers before component extraction", () => {
+    const doc = makeArticleDoc();
+    const html = renderArticleDocument(doc).replace(
+      "<!-- /wp:paragraph -->",
+      "<!-- /wp:quote -->",
+    );
+
+    const parsed = parseArticleDocumentFromHtml(html, doc);
+
+    expect(parsed.doc).toBeNull();
+    expect(parsed.errors.join(" ")).toContain("WordPress block type mismatch");
+  });
+
   it("E. no nested paragraphs in rendered output", () => {
     const doc = makeArticleDoc();
     const html = renderArticleDocument(doc);
@@ -619,6 +716,43 @@ describe("pipeline: pre-stage validation", () => {
     const worseHtml = html.replace(/<!--\s*\/wp:paragraph\s*-->/g, "");
     // Both invalid → guardStageOutput throws
     expect(() => guardStageOutput(badHtml, worseHtml, createArticleIntegrityBaseline(html), "pre-val-stage")).toThrow();
+  });
+
+  it("C. compares a pre-mutated canonical candidate against the true snapshot baseline", () => {
+    const doc = makeArticleDoc();
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "snapshot-baseline",
+      keyphrase: "test keyphrase",
+      requestedWordCount: 500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((section) => section.heading),
+      intro: "",
+      conclusion: "",
+      wordsPerSection: 100,
+      exactKeyphraseTarget: 2,
+      policy: buildPolicy(500),
+      ctx: { research: [] },
+      wordMin: 425,
+      wordMax: 575,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    const snapshot = snapshotState(state);
+    const originalCta = state.articleDoc.cta;
+    expect(originalCta).not.toBeNull();
+
+    state.articleDoc.cta = null;
+    state.blog = renderArticleDocument(state.articleDoc);
+    runTrackedHtmlStage(state, "pre-mutated-candidate", (html) => html, snapshot);
+
+    expect(state.articleDoc.cta).toEqual(originalCta);
+    expect(state.blog).toContain("app.b2ihub.com/signup");
+    expect(state.stageOutputs.at(-1)).toMatchObject({
+      stage: "pre-mutated-candidate",
+      accepted: false,
+      fallbackSource: "pre-stage-restore",
+    });
   });
 });
 

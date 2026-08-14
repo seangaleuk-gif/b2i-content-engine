@@ -13,6 +13,7 @@ import {
 } from "@/lib/blog/article-document";
 import { isSourceBoilerplate, stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 import { hasDanglingSentenceEnding } from "@/lib/blog/publication-quality";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 // ── Types ──
 
@@ -619,7 +620,8 @@ const DEPENDENT_REFERENCE_PATTERNS: RegExp[] = [
 ];
 
 function isDependentReference(sentence: string): boolean {
-  return DEPENDENT_REFERENCE_PATTERNS.some((pattern) => pattern.test(sentence));
+  const normalized = sentence.replace(/^\s*["\u201C'\u2018(]+\s*/, "");
+  return DEPENDENT_REFERENCE_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 function isSourceCitationParagraph(text: string): boolean {
@@ -687,7 +689,7 @@ export function removeUnsupportedSentences(
     );
     if (safeRanges.length === 0) continue;
 
-    const removalRanges = [...safeRanges].sort((a, b) => a.start - b.start);
+    let removalRanges = [...safeRanges].sort((a, b) => a.start - b.start);
 
     // Same-paragraph dependency handling: a sentence immediately following the
     // removed claim that refers back to it ("That's a striking number", "this
@@ -727,6 +729,29 @@ export function removeUnsupportedSentences(
       }
     }
 
+    // A quotation is one semantic/evidentiary unit even when it spans several
+    // sentences. Removing only the sentence containing the unsupported claim
+    // can delete the opening mark while leaving later quoted prose and its
+    // closing mark behind. Expand any intersected quotation to every sentence
+    // that participates in that quotation. Abort this paragraph when the
+    // source is already unbalanced, the atomic unit carries a protected link
+    // or preserved owner sentence, or the resulting prose is not balanced.
+    const quotationSafeRanges = expandRangesToWholeQuotations(text, removalRanges);
+    if (!quotationSafeRanges) continue;
+    if (quotationSafeRanges.some((range) =>
+      linkedRanges.some((link) => rangesOverlap(range, link)),
+    )) {
+      continue;
+    }
+    const allSentenceRanges = sentenceRanges(text);
+    if (allSentenceRanges.some((sentenceRange) =>
+      quotationSafeRanges.some((range) => rangesOverlap(range, sentenceRange))
+      && preservedSentences.has(normalizeForMatch(text.slice(sentenceRange.start, sentenceRange.end))),
+    )) {
+      continue;
+    }
+    removalRanges = quotationSafeRanges;
+
     // Merge overlapping ranges (dependent sentence may touch the claim range).
     removalRanges.sort((a, b) => a.start - b.start);
     const merged: TextRange[] = [];
@@ -761,6 +786,11 @@ export function removeUnsupportedSentences(
       const nextLinked = inlineLinkRanges(nextBlock);
       const nextRanges = sentenceRanges(nextText);
       const firstRange = nextRanges[0];
+      const nextQuotation = analyzeQuotationIntegrity(nextText);
+      const touchesQuotation = !nextQuotation.balanced || (
+        firstRange
+        && nextQuotation.spans.some((span) => rangesOverlap(span, firstRange))
+      );
       const dependentLinked = firstRange
         && nextLinked.some((link) => rangesOverlap(link, firstRange));
       const nextKeepsSentence = nextRanges.length > 1;
@@ -774,7 +804,7 @@ export function removeUnsupportedSentences(
         && !nextHasOwnClaims
         && !/\d/.test(nextText)
         && (nextText.split(/\s+/).filter(Boolean).length <= 30);
-      if (dependentLinked || nextHasOwnClaims || (!nextKeepsSentence && !wholeParagraphDependent)) {
+      if (touchesQuotation || dependentLinked || nextHasOwnClaims || (!nextKeepsSentence && !wholeParagraphDependent)) {
         // The dependent sentence cannot be removed safely — abort the claim
         // removal so the reference is never left dangling.
         plan.ranges = [];
@@ -1020,6 +1050,48 @@ function sentenceRanges(text: string): TextRange[] {
   return ranges;
 }
 
+function mergeTextRanges(ranges: TextRange[]): TextRange[] {
+  const merged: TextRange[] = [];
+  for (const range of [...ranges].sort((left, right) => left.start - right.start)) {
+    const last = merged[merged.length - 1];
+    if (last && range.start <= last.end) {
+      last.end = Math.max(last.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
+/**
+ * Expand sentence-removal ranges so no paired quotation can be cut in half.
+ * The returned ranges cover complete sentences participating in every touched
+ * quotation; `null` means the input or candidate is structurally ambiguous and
+ * must be left for regeneration/rejection rather than mutated.
+ */
+function expandRangesToWholeQuotations(
+  text: string,
+  ranges: TextRange[],
+): TextRange[] | null {
+  const quotation = analyzeQuotationIntegrity(text);
+  if (!quotation.balanced) return null;
+  const sentences = sentenceRanges(text);
+  let expanded = mergeTextRanges(ranges);
+
+  for (const span of quotation.spans) {
+    if (!expanded.some((range) => rangesOverlap(range, span))) continue;
+    const participatingSentences = sentences.filter((sentence) => rangesOverlap(sentence, span));
+    if (participatingSentences.length === 0) return null;
+    expanded = mergeTextRanges([...expanded, ...participatingSentences]);
+  }
+
+  let retained = text;
+  for (const range of [...expanded].sort((left, right) => right.start - left.start)) {
+    retained = retained.slice(0, range.start) + retained.slice(range.end);
+  }
+  return analyzeQuotationIntegrity(retained).balanced ? expanded : null;
+}
+
 function inlineLinkRanges(paragraph: Extract<EditorialBlock, { type: "paragraph" }>): TextRange[] {
   const ranges: TextRange[] = [];
   let cursor = 0;
@@ -1089,15 +1161,25 @@ function finalizeRemovedParagraph(
   if (PUNCTUATION_ONLY_RE.test(text)) return null;
 
   if (hasDanglingSentenceEnding(text)) {
-    // Remove the trailing dangling stop-word + period residue. Use a regex that
-    // drops the malformed tail, then re-check: if nothing substantive remains,
-    // the paragraph is removed.
-    const stripped = text.replace(/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i, "").trim();
-    if (!stripped || PUNCTUATION_ONLY_RE.test(stripped)) return null;
-    // Only commit a plain-text rewrite; never rebuild link/anchor-bearing
-    // paragraphs with a textual splice that could break an anchor.
+    // Remove the whole trailing dangling sentence ATOMICALLY (its preceding
+    // words AND its stop-word + period), never a mid-sentence slice: stripping
+    // only "to." from "Brands allocate budget to." would leave "Brands
+    // allocate budget" — a trailing fragment without terminal punctuation.
+    // The complete dangling sentence is malformed anyway, so dropping it as
+    // one unit is the only meaning-preserving deterministic action.
     if (paragraph.content.every((node) => node.type === "text")) {
-      return { ...paragraph, content: [{ type: "text", text: stripped }] };
+      const ranges = sentenceRanges(text);
+      const lastRange = ranges[ranges.length - 1];
+      if (lastRange) {
+        const prefix = text.slice(0, lastRange.start).trimEnd();
+        if (prefix && /[.!?]$/.test(prefix.replace(/["”’)]]+$/, ""))) {
+          return { ...paragraph, content: [{ type: "text", text: prefix }] };
+        }
+        // The dangling sentence was the whole paragraph (or the prefix is
+        // itself incomplete): removing it empties the block, which the caller
+        // renders as no block at all.
+        return null;
+      }
     }
   }
   return paragraph;

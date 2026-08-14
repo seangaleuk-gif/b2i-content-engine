@@ -3,7 +3,6 @@ import { getCurrentUserId } from "@/lib/services/auth";
 import { requireProjectAccess } from "@/lib/services/project-authorization";
 import { toErrorResponse, AppError } from "@/lib/services/errors";
 import {
-  projectRepository,
   blogVersionRepository,
   aiLogRepository,
 } from "@/lib/repositories";
@@ -81,14 +80,13 @@ export async function POST(request: Request) {
       );
     }
 
-    const nextVersion = await blogVersionRepository.getNextVersionNumber(Number(projectId));
     const previousProjectContent = project.content ?? "";
     let savedVersionId: number | null = null;
-    let projectUpdateAttempted = false;
+    let savedVersionNumber: number | null = null;
 
     try {
-      const created = await blogVersionRepository.create({
-        projectId: Number(projectId), userId, versionNumber: nextVersion,
+      const created = await blogVersionRepository.createEnglishVersionAtomically({
+        projectId: Number(projectId), userId,
         title: finalTitle, slug: result.generated.slug,
         metaDescription: result.generated.metaDescription,
         excerpt: result.generated.excerpt || "",
@@ -128,27 +126,23 @@ export async function POST(request: Request) {
         },
         status: "draft",
       });
-      savedVersionId = Number((created as any).id);
-      if (!Number.isFinite(savedVersionId)) {
+      savedVersionId = Number(created.id);
+      savedVersionNumber = created.versionNumber;
+      if (savedVersionId === null || !Number.isFinite(savedVersionId)) {
         throw new Error("Created blog version did not return a valid ID");
       }
+      if (savedVersionNumber === null || !Number.isFinite(savedVersionNumber)) {
+        throw new Error("Created blog version did not return a valid version number");
+      }
 
-      projectUpdateAttempted = true;
-      await projectRepository.update(Number(projectId), { content: finalBlogHtml });
-
-      const [readbackVersion, readbackProject] = await Promise.all([
-        blogVersionRepository.findById(savedVersionId),
-        projectRepository.findByIdAndUser(Number(projectId), userId),
-      ]);
+      const readbackVersion = await blogVersionRepository.findById(savedVersionId);
       if (
         !readbackVersion
         || readbackVersion.blog !== finalBlogHtml
         || readbackVersion.title !== finalTitle
         || readbackVersion.slug !== result.generated.slug
-        || !readbackProject
-        || readbackProject.content !== finalBlogHtml
       ) {
-        throw new Error(`Post-save readback did not match generated version ${savedVersionId} and project ${projectId}`);
+        throw new Error(`Post-save readback did not match generated version ${savedVersionId}`);
       }
 
       const wordCountRecheck = countCanonicalVisibleWords(result.pipelineState.articleDoc);
@@ -176,32 +170,20 @@ export async function POST(request: Request) {
       }
     } catch (saveErr) {
       const rollbackErrors: string[] = [];
-      if (projectUpdateAttempted) {
+      if (savedVersionId !== null && Number.isFinite(savedVersionId)) {
         try {
-          await projectRepository.update(Number(projectId), { content: previousProjectContent });
-        } catch (rollbackError) {
-          rollbackErrors.push(`Project rollback failed: ${String(rollbackError)}`);
-        }
-      }
-      let rollbackVersionId = savedVersionId;
-      if (rollbackVersionId === null) {
-        try {
-          const candidates = await blogVersionRepository.findByProject(Number(projectId));
-          const ambiguousCreate = candidates.find((version: any) =>
-            version.versionNumber === nextVersion
-            && version.slug === result.generated.slug
-            && version.blog === finalBlogHtml
-          );
-          rollbackVersionId = ambiguousCreate ? Number((ambiguousCreate as any).id) : null;
-        } catch (lookupError) {
-          rollbackErrors.push(`Version rollback lookup failed: ${String(lookupError)}`);
-        }
-      }
-      if (rollbackVersionId !== null && Number.isFinite(rollbackVersionId)) {
-        try {
-          await blogVersionRepository.delete(rollbackVersionId);
+          await blogVersionRepository.delete(savedVersionId);
         } catch (rollbackError) {
           rollbackErrors.push(`Version rollback failed: ${String(rollbackError)}`);
+        }
+        try {
+          await blogVersionRepository.synchronizeProjectContentToLatestEnglish(
+            Number(projectId),
+            userId,
+            previousProjectContent,
+          );
+        } catch (rollbackError) {
+          rollbackErrors.push(`Project-content reconciliation failed: ${String(rollbackError)}`);
         }
       }
       const suffix = rollbackErrors.length > 0 ? `; ${rollbackErrors.join("; ")}` : "";
@@ -221,7 +203,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
-      version: nextVersion,
+      version: savedVersionNumber,
       title: finalTitle,
       slug: result.generated.slug,
       metaDescription: result.generated.metaDescription,

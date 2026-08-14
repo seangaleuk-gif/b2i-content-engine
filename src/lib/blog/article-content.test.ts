@@ -14,7 +14,7 @@ import {
 
 describe("normalizeAiEditorialPayload", () => {
   it("normalizes paragraph block", () => {
-    const input = { blocks: [{ type: "paragraph", text: "Hello world" }] };
+    const input = { blocks: [{ type: "paragraph", text: "Hello world." }] };
     const result = normalizeAiEditorialPayload(input, "sec-0");
     expect(result.errors.length).toBe(0);
     expect(result.blocks.length).toBe(1);
@@ -72,6 +72,13 @@ describe("normalizeAiEditorialPayload", () => {
     expect(result.blocks[0]).toMatchObject({ id: "sec-4-quote-0", type: "quote" });
   });
 
+  it("rejects an AI block with an unmatched quotation before rendering", () => {
+    const result = normalizeAiEditorialPayload({
+      blocks: [{ type: "quote", text: "The source says “this quotation never closes." }],
+    }, "sec-unmatched-quote");
+    expect(result.errors).toContain("Block 0 quote: contains an unmatched quotation mark");
+  });
+
   it("normalizes table block", () => {
     const input = {
       blocks: [
@@ -92,7 +99,7 @@ describe("normalizeAiEditorialPayload", () => {
   });
 
   it("accepts direct array for defensive compatibility", () => {
-    const input = [{ type: "paragraph", text: "Direct array item" }];
+    const input = [{ type: "paragraph", text: "Direct array item." }];
     const result = normalizeAiEditorialPayload(input, "sec-6");
     expect(result.errors.length).toBe(0);
     expect(result.blocks.length).toBe(1);
@@ -233,11 +240,11 @@ describe("normalizeAiEditorialPayload", () => {
   });
 
   it("normalizes whitespace without destroying meaning", () => {
-    const input = { blocks: [{ type: "paragraph", text: "Hello    world\n\nnew para" }] };
+    const input = { blocks: [{ type: "paragraph", text: "Hello    world.\n\nNew para." }] };
     const result = normalizeAiEditorialPayload(input, "sec");
     expect(result.errors.length).toBe(0);
     if (result.blocks[0].type !== "paragraph") throw new Error("expected paragraph");
-    expect(result.blocks[0].content).toEqual([{ type: "text", text: "Hello world new para" }]);
+    expect(result.blocks[0].content).toEqual([{ type: "text", text: "Hello world. New para." }]);
   });
 
   it("rejects non-object input", () => {
@@ -649,6 +656,34 @@ describe("cloneEditorialBlocks", () => {
 // ── Parser regression: inline content duplication ──
 
 describe("parser inline-content duplication", () => {
+  it("accepts only a structurally consistent H3 editorial heading", () => {
+    const parsed = parseWordPressEditorialBlocks(
+      '<!-- wp:heading {"level":3} --><h3>Practical steps</h3><!-- /wp:heading -->',
+      "h3-test",
+    );
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.blocks[0]).toMatchObject({ type: "subheading", level: 3 });
+  });
+
+  it.each([
+    '<!-- wp:heading {"level":4} --><h4>Silently coerced before</h4><!-- /wp:heading -->',
+    '<!-- wp:heading --><h2>Implicit WordPress H2</h2><!-- /wp:heading -->',
+    '<!-- wp:heading {"level":3} --><h4>Mismatched levels</h4><!-- /wp:heading -->',
+  ])("rejects unsupported or inconsistent editorial heading markup", (html) => {
+    const parsed = parseWordPressEditorialBlocks(html, "unsafe-heading");
+    expect(parsed.blocks).toEqual([]);
+    expect(parsed.errors.length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    '<!-- wp:paragraph --><p>Text <img src="https://example.com/a.png"> after.</p><!-- /wp:paragraph -->',
+    '<!-- wp:paragraph --><p>Text <span class="model-mark">inside</span> after.</p><!-- /wp:paragraph -->',
+    '<!-- wp:paragraph --><p>Text<br>after.</p><!-- /wp:paragraph -->',
+  ])("reports inline markup that the canonical renderer cannot preserve", (html) => {
+    const parsed = parseWordPressEditorialBlocks(html, "unsupported-inline");
+    expect(parsed.errors.join(" ")).toContain("unsupported inline element");
+  });
+
   it("link creates one node without duplicate text node", () => {
     const parsed = parseWordPressEditorialBlocks(
       `<!-- wp:paragraph --><p><a href="https://example.com">Click here</a></p><!-- /wp:paragraph -->`,

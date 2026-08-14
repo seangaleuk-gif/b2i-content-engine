@@ -107,10 +107,17 @@ export function findSentenceBoundaryOffsets(text: string): number[] {
     if (!/[.!?！？。]/.test(char)) continue;
     const current = text.slice(sentenceStart, i + 1);
     if (char === "." && NO_SPLIT_BEFORE.test(current)) continue;
-    const restContent = text.slice(i + 1).trimStart();
+    // Closing quotation marks/brackets belong to the sentence that ends at
+    // this punctuation. Returning a boundary before them can strand a closing
+    // quote as its own sentence and lets downstream paragraph splitters or
+    // sentence removers separate a valid quotation pair.
+    let boundaryEnd = i + 1;
+    while (/["\u201D\u2019)\]}]/.test(text[boundaryEnd] ?? "")) boundaryEnd++;
+    const restContent = text.slice(boundaryEnd).trimStart();
     if (restContent.length > 0 && /^[A-Z\u4e00-\u9fff("'「\u201C]/.test(restContent)) {
-      boundaries.push(i + 1);
-      sentenceStart = i + 1;
+      boundaries.push(boundaryEnd);
+      sentenceStart = boundaryEnd;
+      i = boundaryEnd - 1;
     }
   }
   return boundaries;

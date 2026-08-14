@@ -1,10 +1,16 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
 import { buildSystemPrompt, STAGE_SYSTEM_PROMPTS, type BlogContext } from "@/lib/services/prompt-builder";
-import { cleanBodyText, countWords, robustJsonParse } from "@/lib/services/text-utils";
+import {
+  cleanBodyText,
+  countWords,
+  normalizeModelPlainText,
+  robustJsonParse,
+} from "@/lib/services/text-utils";
 import { FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
 import { englishTitleRange, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount } from "@/lib/content-standards";
 import { formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
 import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 // ── Types ──
 
@@ -244,8 +250,12 @@ export async function regenerateTitle(
     { responseFormat: { type: "json_object" }, maxTokens: 512 }
   );
 
-  const data = robustJsonParse(res.content) as Record<string, string[]>;
-  const alternatives: string[] = data.alternatives || [];
+  const data = robustJsonParse(res.content) as Record<string, unknown>;
+  const alternatives = Array.isArray(data?.alternatives)
+    ? data.alternatives
+      .map(normalizeModelPlainText)
+      .filter((value) => value.length > 0 && analyzeQuotationIntegrity(value).balanced)
+    : [];
   const kpLower = keyphrase.toLowerCase();
 
   for (const alt of alternatives) {
@@ -254,7 +264,7 @@ export async function regenerateTitle(
     }
   }
 
-  return alternatives[0] || currentTitle;
+  return currentTitle;
 }
 
 export async function regenerateMeta(
@@ -270,14 +280,18 @@ export async function regenerateMeta(
     { responseFormat: { type: "json_object" }, maxTokens: 1024 }
   );
 
-  const data = robustJsonParse(res.content) as Record<string, string[]>;
-  const alternatives: string[] = data.alternatives || [];
+  const data = robustJsonParse(res.content) as Record<string, unknown>;
+  const alternatives = Array.isArray(data?.alternatives)
+    ? data.alternatives
+      .map(normalizeModelPlainText)
+      .filter((value) => value.length > 0 && analyzeQuotationIntegrity(value).balanced)
+    : [];
 
   for (const alt of alternatives) {
     if (alt.length >= metaMin && alt.length <= metaMax) return alt;
   }
 
-  return alternatives[0] || currentMeta;
+  return currentMeta;
 }
 
 export async function regenerateIntroduction(

@@ -4,6 +4,12 @@
 // content inside sections: paragraphs, H3 subheadings, lists, quotes,
 // and tables.
 
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import {
+  analyzeSentenceCompleteness,
+  type SentenceCompletenessKind,
+} from "@/lib/blog/sentence-completeness";
+
 // ── Structured internal model ──
 
 export type InlineContent =
@@ -111,7 +117,13 @@ function idFor(componentId: string, blockIndex: number, blockType: string): stri
 
 export const CTA_CONTENT_RE = /create your free profile|ready to grow your brand|app\.b2ihub\.com\/signup/i;
 
-function checkForDisallowedContent(text: string, errors: string[], context: string, opts?: NormalizationOptions): void {
+function checkForDisallowedContent(
+  text: string,
+  errors: string[],
+  context: string,
+  opts?: NormalizationOptions,
+  kind: SentenceCompletenessKind = "paragraph",
+): void {
   if (WP_COMMENT_RE.test(text)) {
     errors.push(`${context}: contains WordPress block comment syntax`);
   }
@@ -120,6 +132,18 @@ function checkForDisallowedContent(text: string, errors: string[], context: stri
   }
   if (opts?.disallowCtaContent && CTA_CONTENT_RE.test(text)) {
     errors.push(`${context}: contains prohibited CTA content`);
+  }
+  if (!analyzeQuotationIntegrity(text).balanced) {
+    errors.push(`${context}: contains an unmatched quotation mark`);
+  }
+  // Shared block-type-aware sentence-completeness contract, identical to the
+  // malformed-prose scanner, coherence, trim/compaction validation and the
+  // final QC/pre-save gates. Incomplete model prose is rejected HERE at the
+  // producer boundary so the owning producer's bounded correction retry runs
+  // before any deterministic stage can carry the fragment downstream.
+  const completeness = analyzeSentenceCompleteness(text, kind);
+  if (!completeness.complete) {
+    errors.push(`${context}: ${completeness.issues[0]?.message ?? "incomplete prose"}`);
   }
 }
 
@@ -175,7 +199,7 @@ export function normalizeAiEditorialPayload(
           errors.push(`Block ${i}: paragraph has empty text`);
           continue;
         }
-        checkForDisallowedContent(text, errors, `Block ${i} paragraph`, opts);
+        checkForDisallowedContent(text, errors, `Block ${i} paragraph`, opts, "paragraph");
         blocks.push({ id, type: "paragraph", content: textToInlineContent(text) });
         break;
       }
@@ -189,7 +213,7 @@ export function normalizeAiEditorialPayload(
           errors.push(`Block ${i}: subheading requests disallowed level 2`);
           continue;
         }
-        checkForDisallowedContent(text, errors, `Block ${i} subheading`, opts);
+        checkForDisallowedContent(text, errors, `Block ${i} subheading`, opts, "subheading");
         blocks.push({ id, type: "subheading", level: 3, content: textToInlineContent(text) });
         break;
       }
@@ -212,7 +236,7 @@ export function normalizeAiEditorialPayload(
           errors.push(`Block ${i}: heading requests unsupported level ${String(rb.level)}`);
           continue;
         }
-        checkForDisallowedContent(text, errors, `Block ${i} heading`, opts);
+        checkForDisallowedContent(text, errors, `Block ${i} heading`, opts, "subheading");
         blocks.push({ id, type: "subheading", level: 3, content: textToInlineContent(text) });
         break;
       }
@@ -230,7 +254,7 @@ export function normalizeAiEditorialPayload(
             errors.push(`Block ${i}: list item ${j} is empty`);
             continue;
           }
-          checkForDisallowedContent(itemText, errors, `Block ${i} list item ${j}`, opts);
+          checkForDisallowedContent(itemText, errors, `Block ${i} list item ${j}`, opts, "list-item");
           items.push(textToInlineContent(itemText));
         }
         if (items.length === 0) {
@@ -246,7 +270,7 @@ export function normalizeAiEditorialPayload(
           errors.push(`Block ${i}: quote has empty text`);
           continue;
         }
-        checkForDisallowedContent(text, errors, `Block ${i} quote`, opts);
+        checkForDisallowedContent(text, errors, `Block ${i} quote`, opts, "quote");
         blocks.push({ id, type: "quote", content: textToInlineContent(text) });
         break;
       }
@@ -269,7 +293,7 @@ export function normalizeAiEditorialPayload(
             errors.push(`Block ${i}: table header ${j} is empty`);
             continue;
           }
-          checkForDisallowedContent(h, errors, `Block ${i} table header ${j}`, opts);
+          checkForDisallowedContent(h, errors, `Block ${i} table header ${j}`, opts, "table-cell");
           parsedHeaders.push(textToInlineContent(h));
         }
         if (parsedHeaders.length === 0) {
@@ -290,7 +314,7 @@ export function normalizeAiEditorialPayload(
               errors.push(`Block ${i}: table row ${j} cell ${k} is empty`);
               continue;
             }
-            checkForDisallowedContent(cell, errors, `Block ${i} table row ${j} cell ${k}`, opts);
+            checkForDisallowedContent(cell, errors, `Block ${i} table row ${j} cell ${k}`, opts, "table-cell");
             parsedRow.push(textToInlineContent(cell));
           }
           if (parsedRow.length === headerCols) {
@@ -666,17 +690,35 @@ export function parseWordPressEditorialBlocks(
           break;
         }
         case "heading": {
-          // Determine heading level from wp:heading attributes or HTML tag
-          const levelMatch = bm[0].match(/"level"\s*:\s*(\d+)/);
-          const level = levelMatch ? parseInt(levelMatch[1], 10) : 3;
-          if (level === 2) {
-            errors.push(`${id}: H2 heading not allowed in editorial content`);
+          const attributeLevelMatch = bm[0].match(/"level"\s*:\s*(\d+)/);
+          const elementLevelMatch = innerHtml.match(/^\s*<h([1-6])\b/i);
+          const attributeLevel = attributeLevelMatch
+            ? parseInt(attributeLevelMatch[1], 10)
+            : null;
+          const elementLevel = elementLevelMatch
+            ? parseInt(elementLevelMatch[1], 10)
+            : null;
+          if (elementLevel === null) {
+            errors.push(`${id}: heading block has no h1-h6 element`);
+            blockIndex++;
+            continue;
+          }
+          if (attributeLevel !== null && attributeLevel !== elementLevel) {
+            errors.push(
+              `${id}: WordPress heading level ${attributeLevel} does not match h${elementLevel} element`,
+            );
+            blockIndex++;
+            continue;
+          }
+          const level = attributeLevel ?? elementLevel;
+          if (level !== 3) {
+            errors.push(`${id}: heading level ${level} not allowed in editorial content; expected H3`);
             blockIndex++;
             continue;
           }
           const content = parseInlineContent(innerHtml, errors, warnings, id);
           if (content.length > 0) {
-            blocks.push({ id, type: "subheading", level: level === 3 ? 3 : 3, content });
+            blocks.push({ id, type: "subheading", level: 3, content });
           }
           break;
         }
@@ -724,7 +766,10 @@ function parseInlineContent(html: string, errors: string[], warnings: string[], 
       if (text) content.push({ type: "text", text });
       return;
     }
-    if (node.nodeName === "#comment" || node.nodeName === "br") return;
+    if (node.nodeName === "#comment" || node.nodeName === "br") {
+      errors.push(`${blockId}: unsupported inline element ${node.nodeName === "br" ? "<br>" : "comment"}`);
+      return;
+    }
     if (node.nodeName === "script" || node.nodeName === "style" || node.nodeName === "iframe") {
       errors.push(`${blockId}: executable element <${node.nodeName}> rejected`);
       return;
@@ -752,6 +797,11 @@ function parseInlineContent(html: string, errors: string[], warnings: string[], 
         }
       }
       return;
+    }
+
+    const canonicalContainers = new Set(["p", "h3", "blockquote", "li", "th", "td"]);
+    if (!canonicalContainers.has(node.nodeName)) {
+      errors.push(`${blockId}: unsupported inline element <${node.nodeName}>`);
     }
 
     for (const child of node.childNodes || []) appendNode(child);

@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
-import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, countCanonicalVisibleWords, extractVisibleFaqFromArticle, extractPlainTextFromEditorialBlocks, validateFaqParity } from "@/lib/blog/article-document";
+import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, parseCompleteEditorialRegion, countCanonicalVisibleWords, extractVisibleFaqFromArticle, extractPlainTextFromEditorialBlocks, validateFaqParity } from "@/lib/blog/article-document";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import { type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { normalizeFinalSeo } from "@/lib/blog/final-seo-normalizer";
@@ -23,7 +23,7 @@ import {
 import type { FinalArticlePolicy, FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countReadableWords, containsExactPhrase, countEditorialExternalLinks, extractEditorialExternalLinkUrls } from "@/lib/seo/seo-text-utils";
-import { FLESCH_MAX, FLESCH_MIN, GENERATION_WORD_BUFFER, MAX_SENTENCES_PER_PARAGRAPH, WORD_ALLOCATION } from "@/lib/services/generation-constants";
+import { FLESCH_MAX, FLESCH_MIN, GENERATION_BUILD_ID, GENERATION_WORD_BUFFER, MAX_SENTENCES_PER_PARAGRAPH, WORD_ALLOCATION } from "@/lib/services/generation-constants";
 import { normalizeEnglishTitleCasing } from "@/lib/services/text-utils";
 import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
@@ -61,8 +61,14 @@ import {
   MIN_SECTION_WORDS,
   type CoherenceViolation,
 } from "@/lib/blog/coherence";
+import { isSentenceComplete } from "@/lib/blog/sentence-completeness";
 import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
-import { scanMalformedProseInDocument, classifyMalformedIssue } from "@/lib/blog/publication-quality";
+import {
+  scanMalformedProseInBlocks,
+  scanMalformedProseInDocument,
+  classifyMalformedIssue,
+} from "@/lib/blog/publication-quality";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 import { countBoilerplateInDocument } from "@/lib/blog/source-boilerplate";
 import {
   assessSourceSectionRelevance,
@@ -218,6 +224,7 @@ function evaluateEditorialH2Status(state: PipelineState): {
 export function shouldAcceptSeoNormalization(result: FinalSeoNormalizerResult): boolean {
   const safety = result.safety;
   return result.passed === true
+    && (result.after?.malformedProseCount ?? 0) <= (result.before?.malformedProseCount ?? 0)
     && safety.protectedBlocksUnchanged
     && safety.linkDestinationsUnchanged
     && safety.wordpressBlocksValid
@@ -399,7 +406,13 @@ function replaceComponentHtml(
   html: string,
   status?: ArticleDocument["introduction"]["status"],
 ): void {
-  const parsed = parseWordPressEditorialBlocks(html, component.id);
+  const parsed = parseCompleteEditorialRegion(html, component.id);
+  if (parsed.errors.length > 0 || (html.trim().length > 0 && parsed.blocks.length === 0)) {
+    throw new Error(
+      `Component ${component.id} rejected invalid editorial HTML: ` +
+      `${parsed.errors.join("; ") || "no supported editorial blocks"}`,
+    );
+  }
   component.blocks = parsed.blocks;
   if (status) component.status = status;
 }
@@ -735,7 +748,7 @@ export function assertFinalEditorialBoundary(state: PipelineState): void {
 
 // ── State snapshot (articleDoc is the canonical source) ──
 
-interface PipelineSnapshot {
+export interface PipelineSnapshot {
   articleDoc: string;
   title: string;
   slug: string;
@@ -751,7 +764,7 @@ interface PipelineSnapshot {
   fullDocumentEditorial: FullDocumentEditorialOutcome | null;
 }
 
-function snapshotState(state: PipelineState): PipelineSnapshot {
+export function snapshotState(state: PipelineState): PipelineSnapshot {
   return {
     articleDoc: JSON.stringify(state.articleDoc),
     title: state.title,
@@ -805,8 +818,15 @@ function applyHtmlToDocument(state: PipelineState, html: string, existingDoc: Ar
   return true;
 }
 
-function runTrackedHtmlStage(state: PipelineState, stageName: string, fn: (html: string) => string, preSnapshot?: PipelineSnapshot): PipelineState {
-  const preHtml = state.blog;
+export function runTrackedHtmlStage(state: PipelineState, stageName: string, fn: (html: string) => string, preSnapshot?: PipelineSnapshot): PipelineState {
+  // Several structured stages mutate a cloned/canonical candidate before they
+  // enter this common guard. When a snapshot is supplied, the comparison
+  // baseline must be that true pre-stage document rather than the already
+  // mutated render; otherwise protected-content loss can compare equal to
+  // itself and bypass rollback.
+  const preHtml = preSnapshot
+    ? renderArticleDocument(JSON.parse(preSnapshot.articleDoc) as ArticleDocument)
+    : state.blog;
   const inputFp = fp(preHtml);
   const stageBaseline = createArticleIntegrityBaseline(preHtml);
   const snap = preSnapshot ?? snapshotState(state);
@@ -1145,6 +1165,9 @@ export async function runPostAssemblyPipeline(
 ): Promise<PipelineState> {
   const weakenedComponentIds = new Set<string>();
   assertRenderedCacheMatchesDocument(state);
+  console.log(
+    `[pipeline] build=${GENERATION_BUILD_ID} assembly words=${countCanonicalVisibleWords(state.articleDoc)}`,
+  );
   state.baseline = createArticleIntegrityBaseline(state.blog);
   state.stageOutputs.push({ stage: "assembly", inputFingerprint: fp(state.blog), outputFingerprint: fp(state.blog), accepted: true });
 
@@ -1380,28 +1403,9 @@ export async function runPostAssemblyPipeline(
       state.wordMin,
       protectedSentencesByBlockId,
       true,
+      state.keyphrase,
     );
     syncBlogFromDocument(state);
-    recordStage(
-      state,
-      "malformed-prose-repair",
-      inputFingerprint,
-      fp(state.blog),
-      true,
-      undefined,
-      {
-        repairedBlockIds: deterministic.repairedBlockIds,
-        removedBlockIds: deterministic.removedBlockIds,
-        unresolvedBlockIds: deterministic.unresolved.map((issue) => issue.blockId),
-      },
-    );
-    if (deterministic.repairedBlockIds.length > 0 || deterministic.removedBlockIds.length > 0) {
-      console.log(
-        `[malformed-prose-repair] deterministic repaired=${deterministic.repairedBlockIds.length}` +
-        ` removed=${deterministic.removedBlockIds.length}` +
-        ` unresolved=${deterministic.unresolved.length}`,
-      );
-    }
     // Boundary policy: scan the FULL document (all block types, matching the
     // final gate) after the repair. Genuine publication-breaking corruption
     // that could not be repaired or safely removed fails HERE; the stage must
@@ -1410,10 +1414,33 @@ export async function runPostAssemblyPipeline(
     const hardUnresolved = remainingMalformed.filter((finding) =>
       finding.issues.some((issue) => classifyMalformedIssue(issue.code) === "hard"),
     );
+    const candidateFingerprint = fp(state.blog);
+    const stageMetadata = {
+      repairedBlockIds: deterministic.repairedBlockIds,
+      removedBlockIds: deterministic.removedBlockIds,
+      unresolvedEditableBlockIds: deterministic.unresolved.map((issue) => issue.blockId),
+      unresolvedDocumentBlockIds: hardUnresolved.map((issue) => issue.blockId),
+      candidateFingerprint,
+    };
+    console.log(
+      `[malformed-prose-repair] deterministic repaired=${deterministic.repairedBlockIds.length}` +
+      ` removed=${deterministic.removedBlockIds.length}` +
+      ` unresolvedEditable=${deterministic.unresolved.length}` +
+      ` unresolvedDocument=${hardUnresolved.length}`,
+    );
     if (hardUnresolved.length > 0) {
       // Rejected repair restores the exact pre-stage canonical snapshot, then
       // the pipeline fails closed (zero writes) at this repair boundary.
       restoreSnapshot(state, snap);
+      recordStage(
+        state,
+        "malformed-prose-repair",
+        inputFingerprint,
+        fp(state.blog),
+        false,
+        "pre-stage-restore",
+        stageMetadata,
+      );
       throw new Error(
         `Unresolved malformed prose at repair boundary (${hardUnresolved.length}): ` +
         hardUnresolved
@@ -1423,6 +1450,15 @@ export async function runPostAssemblyPipeline(
           .join("; "),
       );
     }
+    recordStage(
+      state,
+      "malformed-prose-repair",
+      inputFingerprint,
+      candidateFingerprint,
+      true,
+      undefined,
+      stageMetadata,
+    );
   }
 
   // Editorial polish: improves coherence, flow and natural language without
@@ -1660,6 +1696,7 @@ export async function runPostAssemblyPipeline(
           state.wordMin,
           protectedSentencesByBlockId,
           true,
+          state.keyphrase,
         );
         const fallbackChanged = malformedFallback.repairedBlockIds.length > 0
           || malformedFallback.removedBlockIds.length > 0;
@@ -1722,7 +1759,7 @@ export async function runPostAssemblyPipeline(
       );
       const docClone = structuredClone(workingDoc);
       const lastResort = repairDeterministicMalformedProse(
-        docClone, state.wordMin, protectedSentencesByBlockId, true,
+        docClone, state.wordMin, protectedSentencesByBlockId, true, state.keyphrase,
       );
       const resolved = lastResort.repairedBlockIds.length + lastResort.removedBlockIds.length;
       if (resolved > 0 && lastResort.unresolved.length === 0) {
@@ -2257,20 +2294,20 @@ export async function runPostAssemblyPipeline(
       state.wordMin,
       protectedSentencesByBlockId,
       true,
+      state.keyphrase,
     );
-    if (repair.repairedBlockIds.length > 0 || repair.removedBlockIds.length > 0) {
-      console.log(
-        `[final-preflight] deterministic malformed repair repaired=${repair.repairedBlockIds.length}` +
-        ` removed=${repair.removedBlockIds.length}` +
-        ` unresolved=${repair.unresolved.length}`,
-      );
-    }
     // Boundary policy: scan the full document (all block types) after the
     // repair; genuine corruption that still cannot be repaired or safely
     // removed fails closed HERE, at the last repair boundary.
     const remainingMalformed = scanMalformedProseInDocument(state.articleDoc);
     const hardUnresolved = remainingMalformed.filter((finding) =>
       finding.issues.some((issue) => classifyMalformedIssue(issue.code) === "hard"),
+    );
+    console.log(
+      `[final-preflight] deterministic malformed repair repaired=${repair.repairedBlockIds.length}` +
+      ` removed=${repair.removedBlockIds.length}` +
+      ` unresolvedEditable=${repair.unresolved.length}` +
+      ` unresolvedDocument=${hardUnresolved.length}`,
     );
     if (hardUnresolved.length > 0) {
       restoreSnapshot(state, snap);
@@ -2926,15 +2963,18 @@ function extractLinkHrefsFromHtml(html: string): string[] {
   return hrefs;
 }
 
-function extractQuoteTextsFromHtml(html: string): string[] {
-  const quotes: string[] = [];
-  const re =
-    /<!--\s*wp:quote\s*-->[\s\S]*?<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>[\s\S]*?<!--\s*\/wp:quote\s*-->/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    quotes.push(m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim());
+function extractProtectedQuotationTexts(blocks: EditorialBlock[]): string[] {
+  const quotes = new Set<string>();
+  for (const block of blocks) {
+    const text = extractPlainTextFromEditorialBlocks([block]).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    if (block.type === "quote") quotes.add(text);
+    for (const span of analyzeQuotationIntegrity(text).spans) {
+      const quoted = text.slice(span.start + 1, span.end - 1).trim();
+      if (quoted) quotes.add(quoted);
+    }
   }
-  return quotes;
+  return [...quotes];
 }
 
 function protectedSectionStructureSignature(blocks: EditorialBlock[]): string[] {
@@ -2982,6 +3022,7 @@ export type CompactionRejectionReason =
   | "ownership"
   | "unsupported-claim"
   | "quote-integrity"
+  | "malformed-prose"
   | `coherence:${CoherenceViolation["type"]}`
   | "source-relevance"
   | "wordpress-integrity"
@@ -3024,10 +3065,12 @@ function supportedClaimSentences(
 }
 
 /** A block whose prose is the corruption being repaired (incomplete sentence
- *  or orphan-transition opening) is not required evidence. */
+ *  or orphan-transition opening) is not required evidence. Uses the shared
+ *  sentence-completeness validator so trim/compaction validation can never
+ *  disagree with AI acceptance, malformed-prose scanning or the final QC and
+ *  pre-save gates. */
 function isCorruptBlockText(text: string): boolean {
-  const trimmed = text.replace(/["”’)\]]+$/, "");
-  if (!/[.!?]$/.test(trimmed)) return true;
+  if (!isSentenceComplete(text, "paragraph")) return true;
   if (
     /^\s*(?:instead|however|therefore|meanwhile|moreover|furthermore|nevertheless|nonetheless|consequently|additionally|likewise|similarly|hence|thus|yet|so|but|and)\s*[,:]|^\s*(?:as a result|on the other hand|that said|in addition|for example|for instance)\s*[,:]/i.test(text)
   ) {
@@ -3141,7 +3184,7 @@ async function runBoundedSectionCompaction(
   const originalClaims = options?.targetSectionIds && options.targetSectionIds.length > 0
     ? supportedClaimsInCoherentBlocks(originalHtml, state.keyphrase, research)
     : supportedClaimSentences(originalHtml, state.keyphrase, research);
-  const originalQuotes = extractQuoteTextsFromHtml(originalHtml);
+  const originalQuotes = extractProtectedQuotationTexts(target.blocks);
   const sectionIndex = state.articleDoc.sections.findIndex((section) => section.id === target.id);
   const neighbourContext = sectionIndex >= 0
     ? buildCompactionNeighbourContext(state.articleDoc, sectionIndex)
@@ -3238,16 +3281,12 @@ async function runBoundedSectionCompaction(
     candidateClaims.some((candidateSentence) => candidateSentence.includes(sentence) || sentence.includes(candidateSentence)),
   );
   // Quotations: preserved verbatim or removed as a whole — never truncated.
-  const candidateQuotes = extractQuoteTextsFromHtml(candidateHtml);
-  const quoteIntegrity = originalQuotes.every((quote) => {
-    const head = quote.slice(0, 30);
-    if (candidateQuotes.some((candidateQuote) => candidateQuote === quote)) return true;
-    if (!candidateQuotes.some((candidateQuote) => candidateQuote.startsWith(head))) return true;
-    return false;
-  });
-  const candidateSectionText = candidateHtml.replace(/<[^>]+>/g, " ");
-  const unmatchedQuotes = (candidateSectionText.match(/[“"]/g) ?? []).length
-    !== (candidateSectionText.match(/[”"]/g) ?? []).length;
+  const candidateQuotes = extractProtectedQuotationTexts(parsed.blocks);
+  const quoteIntegrity = candidateQuotes.every((quote) => originalQuotes.includes(quote));
+  const candidateMalformed = scanMalformedProseInBlocks(parsed.blocks);
+  const unmatchedQuotes = candidateMalformed.some((finding) =>
+    finding.issues.some((issue) => issue.code === "unmatched-quotation"),
+  );
   const ownershipViolations = ledger
     ? validateClaimOwnership(candidate, ledger, state.keyphrase, research)
       .filter((violation) => violation.componentId === target.id)
@@ -3270,6 +3309,7 @@ async function runBoundedSectionCompaction(
     && claimEquivalence
     && quoteIntegrity
     && !unmatchedQuotes
+    && candidateMalformed.length === 0
     && ownershipViolations.length === 0
     && candidateUnsupported.length === 0
     && sectionCoherence.length === 0
@@ -3289,6 +3329,7 @@ async function runBoundedSectionCompaction(
     if (ownershipViolations.length > 0) reasons.push("ownership");
     if (candidateUnsupported.length > 0) reasons.push("unsupported-claim");
     if (!quoteIntegrity || unmatchedQuotes) reasons.push("quote-integrity");
+    if (candidateMalformed.length > 0 && !unmatchedQuotes) reasons.push("malformed-prose");
     for (const violation of sectionCoherence) reasons.push(`coherence:${violation.type}`);
     if (relevanceViolations.length > 0) reasons.push("source-relevance");
     if (!wpStructureValid || !structurallyValid) reasons.push("wordpress-integrity");

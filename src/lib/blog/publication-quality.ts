@@ -18,6 +18,11 @@ import {
   extractReadableText,
 } from "@/lib/seo/seo-text-utils";
 import { createNumberExpressionRegex } from "@/lib/services/translation-number-grammar";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import {
+  analyzeSentenceCompleteness,
+  type SentenceCompletenessKind,
+} from "@/lib/blog/sentence-completeness";
 
 export interface PublicationQualityMetrics {
   claimConflictCount: number;
@@ -57,6 +62,8 @@ export type MalformedProseIssueCode =
   | "unmatched-quotation"
   | "broken-quoted-fragment"
   | "incomplete-sentence-ending"
+  | "missing-terminal-punctuation"
+  | "trailing-fragment"
   | "corrupt-token"
   | "serialized-program-value"
   | "instruction-placeholder"
@@ -194,7 +201,10 @@ export function hasDanglingSentenceEnding(text: string): boolean {
   return true;
 }
 
-export function findMalformedProseTextIssues(texts: string[]): MalformedProseTextIssue[] {
+export function findMalformedProseTextIssues(
+  texts: string[],
+  kinds?: SentenceCompletenessKind[],
+): MalformedProseTextIssue[] {
   const issues: MalformedProseTextIssue[] = [];
   const seen = new Set<string>();
   const addIssue = (
@@ -210,24 +220,22 @@ export function findMalformedProseTextIssues(texts: string[]): MalformedProseTex
   };
 
   texts.forEach((text, index) => {
+    const kind: SentenceCompletenessKind = kinds?.[index] ?? "paragraph";
     const trimmed = text.trim();
     const openParens = (trimmed.match(/\(/g) ?? []).length;
     const closeParens = (trimmed.match(/\)/g) ?? []).length;
-    // A straight double-quote immediately preceded by a digit is an inch mark
-    // ("a 13\" screen"), not a quotation mark, and never counts toward
-    // balance. Curly quotes count normally.
-    const quoteMarks = (trimmed.match(/(?<!\d)["”]/g) ?? []).length;
+    const quotation = analyzeQuotationIntegrity(trimmed);
     if (openParens !== closeParens) {
       addIssue(index, "unmatched-parentheses", "unmatched parentheses", trimmed);
     }
-    if (quoteMarks % 2 !== 0) {
+    if (!quotation.balanced) {
       addIssue(index, "unmatched-quotation", "unmatched quotation mark", trimmed);
     }
     // A period followed by a quote then a conjunction ("stop." and walked) is
     // a legitimately CLOSED quote continuing the sentence. Only an unclosed
     // quote (odd quote count) following the period is a broken fragment.
     if (
-      quoteMarks % 2 !== 0
+      !quotation.balanced
       && /[.!?]\s*["”]\s+(?:instead|and|but|or|because)\b/i.test(trimmed)
     ) {
       addIssue(index, "broken-quoted-fragment", "broken quoted fragment", trimmed);
@@ -239,6 +247,20 @@ export function findMalformedProseTextIssues(texts: string[]): MalformedProseTex
     // fragment from a deterministic sentence removal and is always malformed.
     if (/^[\s\p{P}\p{S}]+$/u.test(trimmed) && /[.!?—–…]/.test(trimmed)) {
       addIssue(index, "punctuation-fragment", "block contains only punctuation", trimmed);
+    }
+    // Shared block-type-aware sentence-completeness contract: prose kinds
+    // (paragraph/quote/FAQ answer) must end with complete sentences; heading,
+    // list-item, table-cell, title, meta and excerpt kinds are structural and
+    // reject only unmistakable fragments. This is the same validator used by
+    // AI acceptance, coherence, trim/compaction validation and the final QC
+    // and pre-save gates, so scanners can never disagree.
+    const completeness = analyzeSentenceCompleteness(trimmed, kind);
+    for (const issue of completeness.issues) {
+      if (issue.code === "missing-terminal-punctuation") {
+        addIssue(index, "missing-terminal-punctuation", issue.message, trimmed);
+      } else if (issue.code === "trailing-fragment") {
+        addIssue(index, "trailing-fragment", issue.message, trimmed);
+      }
     }
     for (const pattern of CORRUPT_TEXT_PATTERNS) {
       if (pattern.regex.test(trimmed)) {
@@ -268,6 +290,8 @@ const HARD_MALFORMED_CODES: ReadonlySet<MalformedProseIssueCode> = new Set([
   "replacement-character",
   "punctuation-fragment",
   "incomplete-sentence-ending",
+  "missing-terminal-punctuation",
+  "trailing-fragment",
   "unmatched-parentheses",
   "unmatched-quotation",
   "broken-quoted-fragment",
@@ -283,11 +307,45 @@ export function detectMalformedProseTexts(texts: string[]): string[] {
   );
 }
 
-function malformedTextsForBlock(block: EditorialBlock): string[] {
+function malformedTextsForBlock(block: EditorialBlock): {
+  texts: string[];
+  kinds: SentenceCompletenessKind[];
+} {
   if (block.type === "list") {
-    return block.items.map((item) => item.map((inline) => inline.text).join(""));
+    const texts = block.items.map((item) => item.map((inline) => inline.text).join(""));
+    // List items are structural labels: punctuation is not required, but
+    // unmistakable fragments are still rejected.
+    return { texts, kinds: texts.map(() => "list-item" as const) };
   }
-  return [extractPlainTextFromEditorialBlocks([block])];
+  if (block.type === "table") {
+    // Table cells are independent language units. Flattening a whole table can
+    // let an opening quote in one cell falsely balance a closing quote in an
+    // unrelated cell, hiding two malformed cells from the publication gate.
+    const texts = [...block.headers, ...block.rows.flat()]
+      .map((cell) => cell.map((inline) => inline.text).join(""));
+    return { texts, kinds: texts.map(() => "table-cell" as const) };
+  }
+  if (block.type === "quote") {
+    return { texts: [extractPlainTextFromEditorialBlocks([block])], kinds: ["quote"] };
+  }
+  if (block.type === "subheading") {
+    return { texts: [extractPlainTextFromEditorialBlocks([block])], kinds: ["subheading"] };
+  }
+  return { texts: [extractPlainTextFromEditorialBlocks([block])], kinds: ["paragraph"] };
+}
+
+/** Authoritative malformed-prose scan for a normalized editorial block set. */
+export function scanMalformedProseInBlocks(blocks: EditorialBlock[]): Array<{
+  blockId: string;
+  issues: MalformedProseTextIssue[];
+}> {
+  const findings: Array<{ blockId: string; issues: MalformedProseTextIssue[] }> = [];
+  for (const block of blocks) {
+    const { texts, kinds } = malformedTextsForBlock(block);
+    const issues = findMalformedProseTextIssues(texts, kinds);
+    if (issues.length > 0) findings.push({ blockId: block.id, issues });
+  }
+  return findings;
 }
 
 /**
@@ -302,19 +360,30 @@ export function scanMalformedProseInDocument(doc: ArticleDocument): Array<{
   issues: MalformedProseTextIssue[];
 }> {
   const findings: Array<{ componentId: string; blockId: string; issues: MalformedProseTextIssue[] }> = [];
+  const checkTextUnit = (componentId: string, blockId: string, texts: string[], kinds?: SentenceCompletenessKind[]) => {
+    const issues = findMalformedProseTextIssues(texts, kinds);
+    if (issues.length > 0) findings.push({ componentId, blockId, issues });
+  };
   const checkComponent = (componentId: string, blocks: EditorialBlock[]) => {
-    for (const block of blocks) {
-      const issues = findMalformedProseTextIssues(malformedTextsForBlock(block));
-      if (issues.length > 0) {
-        findings.push({ componentId, blockId: block.id, issues });
-      }
+    for (const finding of scanMalformedProseInBlocks(blocks)) {
+      findings.push({ componentId, ...finding });
     }
   };
+  checkTextUnit("metadata", "metadata-title", [doc.metadata.title], ["title"]);
+  checkTextUnit("metadata", "metadata-description", [doc.metadata.metaDescription], ["meta-description"]);
+  if (doc.metadata.excerpt) checkTextUnit("metadata", "metadata-excerpt", [doc.metadata.excerpt], ["excerpt"]);
   checkComponent(doc.introduction.id, doc.introduction.blocks);
   for (const section of doc.sections) {
+    checkTextUnit(section.id, `${section.id}-heading`, [section.heading], ["heading"]);
     if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
     checkComponent(section.id, section.blocks);
   }
+  doc.visibleFaq.forEach((entry, index) => {
+    // FAQ questions are structural short labels; FAQ answers are full prose
+    // and must be complete sentences.
+    checkTextUnit(`faq-${index}`, `faq-${index}-question`, [entry.question], ["heading"]);
+    checkTextUnit(`faq-${index}`, `faq-${index}-answer`, [entry.answerText], ["faq-answer"]);
+  });
   checkComponent(doc.conclusion.id, doc.conclusion.blocks);
   return findings;
 }

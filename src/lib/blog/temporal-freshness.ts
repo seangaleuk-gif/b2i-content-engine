@@ -6,6 +6,7 @@ import type {
 } from "./article-document";
 import { renderComponentHtml } from "./article-document";
 import { splitSentences } from "@/lib/seo/seo-text-utils";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 export type TemporalIssueType =
   | "expired_prediction"
@@ -189,6 +190,27 @@ function repairPlainText(
   referenceDate: Date,
   allowWholeSentenceRemoval: boolean,
 ): { value: string; removed: number; rewritten: number; unresolved: TemporalFreshnessIssue[] } {
+  const sourceQuotation = analyzeQuotationIntegrity(source);
+  if (!sourceQuotation.balanced) {
+    return {
+      value: source,
+      removed: 0,
+      rewritten: 0,
+      unresolved: scanTemporalFreshness(source, referenceDate),
+    };
+  }
+  const sourceIssues = scanTemporalFreshness(source, referenceDate);
+  if (sourceQuotation.spans.length > 0 && sourceIssues.length > 0) {
+    // Do not rewrite or delete only part of attributed speech. A middle
+    // sentence can be removed while both quotation marks remain, yielding
+    // syntactically balanced but materially altered evidence.
+    return {
+      value: source,
+      removed: 0,
+      rewritten: 0,
+      unresolved: sourceIssues,
+    };
+  }
   const sentences = splitSentences(source);
   if (sentences.length === 0) {
     return { value: source, removed: 0, rewritten: 0, unresolved: scanTemporalFreshness(source, referenceDate) };
@@ -233,6 +255,18 @@ function repairPlainText(
   }
 
   const value = output.join(" ").replace(/\s+/g, " ").trim();
+  if (!analyzeQuotationIntegrity(value || source).balanced) {
+    // A stale clause/sentence inside a multi-sentence quotation may not be
+    // removed independently. Restore the exact source and let the guarded
+    // temporal stage fail closed rather than carrying a broken quote into the
+    // malformed-prose boundary.
+    return {
+      value: source,
+      removed: 0,
+      rewritten: 0,
+      unresolved: scanTemporalFreshness(source, referenceDate),
+    };
+  }
   return {
     value: value || source,
     removed,

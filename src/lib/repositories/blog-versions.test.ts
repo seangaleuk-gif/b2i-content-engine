@@ -1,5 +1,15 @@
-import { describe, expect, it } from "vitest";
-import { normalizeBlogVersionRow } from "./blog-versions";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { blogVersionRepository, normalizeBlogVersionRow } from "./blog-versions";
+
+const rpc = vi.hoisted(() => vi.fn());
+
+vi.mock("@/db", () => ({
+  getDb: () => ({ rpc }),
+}));
+
+beforeEach(() => {
+  rpc.mockReset();
+});
 
 describe("normalizeBlogVersionRow", () => {
   it("normalizes raw Supabase snake_case rows to the BlogVersion contract", () => {
@@ -102,4 +112,89 @@ describe("normalizeBlogVersionRow", () => {
     expect(row.categories).toEqual(["Resources"]);
   });
 
+});
+
+describe("createEnglishVersionAtomically", () => {
+  it("delegates allocation, insertion, and project promotion to one database transaction", async () => {
+    rpc.mockResolvedValue({
+      data: {
+        id: 17,
+        project_id: 9,
+        user_id: "11111111-1111-1111-1111-111111111111",
+        version_number: 4,
+        title: "Title",
+        slug: "title",
+        blog: "<p>Saved</p>",
+        faq: [],
+        internal_links: [],
+        external_links: [],
+        categories: [],
+        tags: [],
+        status: "draft",
+        created_at: "2026-08-14T00:00:00.000Z",
+      },
+      error: null,
+    });
+
+    const input = {
+      projectId: 9,
+      userId: "11111111-1111-1111-1111-111111111111",
+      title: "Title",
+      slug: "title",
+      blog: "<p>Saved</p>",
+      status: "draft",
+    };
+    await expect(blogVersionRepository.createEnglishVersionAtomically(input)).resolves.toMatchObject({
+      id: 17,
+      projectId: 9,
+      versionNumber: 4,
+      blog: "<p>Saved</p>",
+    });
+    expect(rpc).toHaveBeenCalledWith("save_generated_english_blog_version", {
+      p_project_id: 9,
+      p_user_id: "11111111-1111-1111-1111-111111111111",
+      p_payload: input,
+    });
+  });
+
+  it("fails closed when the atomic save returns no created row", async () => {
+    rpc.mockResolvedValue({ data: null, error: null });
+
+    await expect(blogVersionRepository.createEnglishVersionAtomically({
+      projectId: 9,
+      userId: "11111111-1111-1111-1111-111111111111",
+      slug: "title",
+      blog: "<p>Saved</p>",
+    })).rejects.toThrow("invalid result");
+  });
+});
+
+describe("synchronizeProjectContentToLatestEnglish", () => {
+  it("calls the atomic database boundary and normalizes its result", async () => {
+    rpc.mockResolvedValue({
+      data: [{ version_id: 17, version_number: 4, blog: "<p>Latest</p>" }],
+      error: null,
+    });
+
+    await expect(
+      blogVersionRepository.synchronizeProjectContentToLatestEnglish(9, "user-1", "<p>Fallback</p>"),
+    ).resolves.toEqual({
+      versionId: 17,
+      versionNumber: 4,
+      blog: "<p>Latest</p>",
+    });
+    expect(rpc).toHaveBeenCalledWith("sync_project_content_to_latest_english_blog_version", {
+      p_project_id: 9,
+      p_user_id: "user-1",
+      p_fallback_content: "<p>Fallback</p>",
+    });
+  });
+
+  it("fails closed when the database boundary returns no validated row", async () => {
+    rpc.mockResolvedValue({ data: [], error: null });
+
+    await expect(
+      blogVersionRepository.synchronizeProjectContentToLatestEnglish(9, "user-1", ""),
+    ).rejects.toThrow("invalid result");
+  });
 });

@@ -3,6 +3,14 @@ import type { BlogFaqItem, BlogVersion, NewBlogVersion } from "@/db/schema/blog-
 
 type BlogVersionRow = Record<string, unknown>;
 
+export interface ProjectContentSyncResult {
+  versionId: number | null;
+  versionNumber: number | null;
+  blog: string;
+}
+
+export type AtomicEnglishBlogVersion = Omit<NewBlogVersion, "versionNumber" | "createdAt">;
+
 function toStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -145,6 +153,33 @@ export const blogVersionRepository = {
     return normalizeBlogVersionRow(created);
   },
 
+  /**
+   * Saves a generated English version and promotes projects.content in the
+   * same database transaction. Version allocation happens while the project
+   * row is locked, so concurrent English generations cannot allocate or
+   * promote out of order.
+   */
+  async createEnglishVersionAtomically(data: AtomicEnglishBlogVersion): Promise<BlogVersion> {
+    const db = getDb() as unknown as {
+      rpc: (
+        name: string,
+        args: Record<string, unknown>,
+      ) => Promise<{ data: unknown; error: unknown }>;
+    };
+    const { data: created, error } = await db.rpc("save_generated_english_blog_version", {
+      p_project_id: data.projectId,
+      p_user_id: data.userId,
+      p_payload: data,
+    });
+    if (error) throw error;
+
+    const rawRow = Array.isArray(created) ? created[0] : created;
+    if (!rawRow || typeof rawRow !== "object") {
+      throw new Error("Atomic English blog-version save returned an invalid result");
+    }
+    return normalizeBlogVersionRow(rawRow);
+  },
+
   async update(id: number, data: Partial<NewBlogVersion>): Promise<BlogVersion> {
     const db = getDb() as any;
     const snakeData = toSnakeCase(data as unknown as Record<string, unknown>);
@@ -178,5 +213,49 @@ export const blogVersionRepository = {
     const maxVersion = versions.length > 0 ? Math.max(...versions) : 0;
     console.log(`[blog-versions] getNextVersionNumber for project ${projectId}: existing=${JSON.stringify(versions)}, max=${maxVersion}, next=${maxVersion + 1}`);
     return maxVersion + 1;
+  },
+
+  /**
+   * Atomically points projects.content at the latest committed version.
+   *
+   * The database function locks the project row before selecting the latest
+   * version, so two generation requests cannot leave projects.content pointing
+   * at an older version merely because their HTTP handlers completed out of
+   * order. The fallback is used only when the project has no saved version.
+   */
+  async synchronizeProjectContentToLatestEnglish(
+    projectId: number,
+    userId: string,
+    fallbackContent: string,
+  ): Promise<ProjectContentSyncResult> {
+    const db = getDb() as unknown as {
+      rpc: (
+        name: string,
+        args: Record<string, unknown>,
+      ) => Promise<{ data: unknown; error: unknown }>;
+    };
+    const { data, error } = await db.rpc("sync_project_content_to_latest_english_blog_version", {
+      p_project_id: projectId,
+      p_user_id: userId,
+      p_fallback_content: fallbackContent,
+    });
+    if (error) throw error;
+
+    const rawRow = Array.isArray(data) ? data[0] : data;
+    const row = rawRow && typeof rawRow === "object"
+      ? rawRow as Record<string, unknown>
+      : null;
+    if (!row || typeof row.blog !== "string") {
+      throw new Error("Project content synchronization returned an invalid result");
+    }
+    return {
+      versionId: row.version_id === null || row.version_id === undefined
+        ? null
+        : toFiniteNumber(row.version_id, "synchronized version id"),
+      versionNumber: row.version_number === null || row.version_number === undefined
+        ? null
+        : toFiniteNumber(row.version_number, "synchronized version number"),
+      blog: row.blog,
+    };
   },
 };

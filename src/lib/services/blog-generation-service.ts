@@ -10,23 +10,30 @@ import { buildBlogPrompt, buildOutlineBrief, type BlogContext } from "@/lib/serv
 import { getCompiledBundle } from "@/lib/services/prompt-compiler";
 import { AiService, type ChatMessage, type ChatOptions } from "@/lib/services/deepseek";
 import { AppError } from "@/lib/services/errors";
-import { countReadableWords, robustJsonParse, repairMetaDescription, containsExactPhrase } from "@/lib/services/text-utils";
+import {
+  countReadableWords,
+  robustJsonParse,
+  repairMetaDescription,
+  containsExactPhrase,
+  normalizeModelPlainText,
+} from "@/lib/services/text-utils";
 import { extractEditorialExternalLinkUrls } from "@/lib/seo/seo-text-utils";
 import { runBraveResearchWithRetry } from "@/lib/services/brave";
-import { WORD_ALLOCATION, GENERATION_WORD_BUFFER } from "@/lib/services/generation-constants";
+import { GENERATION_BUILD_ID, WORD_ALLOCATION, GENERATION_WORD_BUFFER } from "@/lib/services/generation-constants";
 import { englishWordTolerance, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount, dynamicH2Range, dynamicFaqRange } from "@/lib/content-standards";
 import { runComponentRegeneration, regenerateIntroduction, regenerateSection, regenerateConclusion, type GenContext } from "@/lib/services/component-regenerator";
 import { buildGenerationReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry } from "@/lib/services/generation-telemetry";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
-import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords } from "@/lib/blog/article-document";
+import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords, parseCompleteEditorialRegion } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
 import { pairedSlugs, sanitizeSectionUrls, isEligibleExternalSourceUrl, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
-import { CTA_CONTENT_RE, normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks } from "@/lib/blog/article-content";
+import { CTA_CONTENT_RE, normalizeAiEditorialPayload, renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
 import { buildClaimOwnershipLedger, formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
 import { stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 import { repairHeadingNaturalness } from "@/lib/blog/content-relevance";
+import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 export class OutlineHeadingValidationError extends Error {
   constructor(message: string) {
@@ -69,6 +76,11 @@ export function normalizeOutlineHeadings(
   for (const [index, heading] of unique
     .filter((candidate) => !faqPattern.test(candidate) && !conclusionPattern.test(candidate))
     .entries()) {
+    if (!analyzeQuotationIntegrity(heading).balanced) {
+      throw new OutlineHeadingValidationError(
+        `Outline H2 ${index + 1} contains an unmatched quotation mark — "${heading}"`,
+      );
+    }
     const repair = repairHeadingNaturalness(heading, keyphrase, `outline-${index}`);
     if (!repair.resolved) {
       throw new OutlineHeadingValidationError(
@@ -114,7 +126,20 @@ export function normalizeOutlineHeadings(
   }
 
   const faqHeading = existingFaq || `Frequently Asked Questions About ${topic}`;
+  if (!analyzeQuotationIntegrity(faqHeading).balanced) {
+    throw new OutlineHeadingValidationError(
+      `FAQ H2 contains an unmatched quotation mark — "${faqHeading}"`,
+    );
+  }
   return [...editorial, faqHeading];
+}
+
+function malformedOutlineMetadataFields(outline: Record<string, unknown>): string[] {
+  return ["title", "metaDescription", "excerpt"].filter((field) => {
+    const value = outline[field];
+    return typeof value === "string" && value.length > 0
+      && !analyzeQuotationIntegrity(value).balanced;
+  });
 }
 
 function extractOutlineHeadings(outline: unknown): string[] {
@@ -131,25 +156,6 @@ function extractOutlineHeadings(outline: unknown): string[] {
       return typeof item.heading === "string" ? item.heading : typeof item.title === "string" ? item.title : "";
     })
     .filter(Boolean);
-}
-
-/** Model-produced metadata is plain text, never an HTML or WordPress surface. */
-function normalizeOutlinePlainText(value: unknown): string {
-  if (typeof value !== "string") return "";
-  let text = value;
-  // Two passes also remove tags that were entity-encoded once.
-  for (let pass = 0; pass < 2; pass++) {
-    text = text
-      .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
-      .replace(/<!--[\s\S]*?-->/g, " ")
-      .replace(/<[^>]*>/g, " ")
-      .replace(/&amp;/gi, "&")
-      .replace(/&quot;/gi, '"')
-      .replace(/&#(?:39|x27);/gi, "'")
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">");
-  }
-  return text.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 interface AcceptedFaqPayload {
@@ -189,6 +195,12 @@ function validateFaqPayload(raw: unknown, min: number, max: number): AcceptedFaq
     }
     if (/\p{Script=Han}/u.test(question) || /\p{Script=Han}/u.test(answer)) {
       errors.push(`entry ${index + 1} is not English-only`);
+    }
+    if (!analyzeQuotationIntegrity(question).balanced) {
+      errors.push(`entry ${index + 1} question contains an unmatched quotation mark`);
+    }
+    if (!analyzeQuotationIntegrity(answer).balanced) {
+      errors.push(`entry ${index + 1} answer contains an unmatched quotation mark`);
     }
     entries.push({ question, answer });
   }
@@ -275,6 +287,17 @@ export async function runGenerationTasksWithConcurrency<T>(
   return results;
 }
 
+function requireCompleteGeneratedBlocks(html: string, componentId: string) {
+  const parsed = parseCompleteEditorialRegion(html, componentId);
+  if (parsed.errors.length > 0 || parsed.blocks.length === 0) {
+    throw AppError.internal(new Error(
+      `Generated component ${componentId} failed canonical assembly: `
+      + `${parsed.errors.join("; ") || "no editorial blocks"}`,
+    ));
+  }
+  return parsed.blocks;
+}
+
 /**
  * Deterministic research-dispatch decision for a normal blog generation.
  *
@@ -333,6 +356,9 @@ export async function runBlogGeneration(
 ): Promise<GenerationResult> {
   const telemetry = new GenerationTelemetry();
   telemetry.startTimer("total");
+  console.log(
+    `[blog-generation] build=${GENERATION_BUILD_ID} start project=${projectId} userId=${userId}`,
+  );
 
   const project = await projectRepository.findById(Number(projectId));
   if (!project) throw AppError.internal();
@@ -470,9 +496,33 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     throw AppError.internal(new Error("Outline response must be a JSON object"));
   }
 
-  outline.title = normalizeOutlinePlainText(outline?.title) || "Untitled";
-  outline.metaDescription = normalizeOutlinePlainText(outline?.metaDescription);
-  outline.excerpt = normalizeOutlinePlainText(outline?.excerpt);
+  outline.title = normalizeModelPlainText(outline?.title) || "Untitled";
+  outline.metaDescription = normalizeModelPlainText(outline?.metaDescription);
+  outline.excerpt = normalizeModelPlainText(outline?.excerpt);
+
+  const malformedMetadata = malformedOutlineMetadataFields(outline);
+  if (malformedMetadata.length > 0) {
+    const metadataRepairPrompt = `${outlinePrompt}\n\nYour previous outline metadata contained unmatched quotation marks in: ${malformedMetadata.join(", ")}. Return ONLY corrected JSON with title, slug, metaDescription and optional excerpt. Preserve the topic and meaning. Use only complete, balanced quotations. Do not include article body content or markup. Previous metadata: ${JSON.stringify({ title: outline.title, slug: outline.slug, metaDescription: outline.metaDescription, excerpt: outline.excerpt })}`;
+    const repairRes = await trackedChat("outline_metadata_repair",
+      [{ role: "system", content: outlineSystemPrompt }, { role: "user", content: metadataRepairPrompt }],
+      { responseFormat: { type: "json_object" }, maxTokens: 2048, timeoutMs: 60_000 },
+    );
+    const repairedMetadata = robustJsonParse(repairRes.content, "outline-metadata-repair");
+    if (!repairedMetadata || typeof repairedMetadata !== "object" || Array.isArray(repairedMetadata)) {
+      throw AppError.internal(new Error("Outline metadata repair must return a JSON object"));
+    }
+    const repairedRecord = repairedMetadata as Record<string, unknown>;
+    outline.title = normalizeModelPlainText(repairedRecord.title) || outline.title;
+    outline.metaDescription = normalizeModelPlainText(repairedRecord.metaDescription) || outline.metaDescription;
+    outline.excerpt = normalizeModelPlainText(repairedRecord.excerpt) || outline.excerpt;
+    if (typeof repairedRecord.slug === "string") outline.slug = repairedRecord.slug;
+    const unresolvedMetadata = malformedOutlineMetadataFields(outline);
+    if (unresolvedMetadata.length > 0) {
+      throw AppError.internal(new Error(
+        `Outline metadata failed quotation acceptance after one targeted retry: ${unresolvedMetadata.join(", ")}`,
+      ));
+    }
+  }
 
   let h2Headings = extractOutlineHeadings(outline);
   if (h2Headings.length === 0) {
@@ -739,7 +789,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       heading: s.heading,
       headingLevel: 2 as const,
       sectionType: "main" as const,
-      blocks: parseWordPressEditorialBlocks(s.body, `section-${s.index}`).blocks,
+      blocks: requireCompleteGeneratedBlocks(s.body, `section-${s.index}`),
       status: s.status as any,
     }));
   // Add the FAQ heading section (empty blocks, rendered from visibleFaq)
@@ -762,14 +812,14 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   const articleDoc: ArticleDocument = {
     metadata: { title: outline.title || "Untitled", slug: slugs.englishSlug, metaDescription: repairedMeta, excerpt: outline.excerpt || "", targetWordCount: requestedWordCount, focusKeyphrase: keyphrase },
     languageSwitcher: { id: "language-switcher", type: "language-switcher", html: languageSwitcherHtml, fingerprint: fingerprintHtml(languageSwitcherHtml) },
-    introduction: { id: "intro", blocks: parseWordPressEditorialBlocks(intro, "intro").blocks, status: "generated" },
+    introduction: { id: "intro", blocks: requireCompleteGeneratedBlocks(intro, "intro"), status: "generated" },
     sections: docSections,
     visibleFaq: faqEntries.map((e) => ({
       question: e.question,
       answerHtml: "",
       answerText: e.answer,
     })),
-    conclusion: { id: "conc", blocks: parseWordPressEditorialBlocks(conclusion, "conc").blocks, status: "generated" },
+    conclusion: { id: "conc", blocks: requireCompleteGeneratedBlocks(conclusion, "conc"), status: "generated" },
     cta: null,
     faqSchema: null,
     insertedLinks: [],
