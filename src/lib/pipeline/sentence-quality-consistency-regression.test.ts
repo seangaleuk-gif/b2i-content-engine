@@ -13,6 +13,8 @@ import {
   lowercaseStartValidTokensFromKeyphrase,
 } from "@/lib/blog/sentence-quality";
 import { repairDeterministicMalformedProse } from "@/lib/pipeline/editorial-polish";
+import { validateArticleIntegrityContract } from "@/lib/blog/article-integrity-contract";
+import { PipelineDebugTrace, traceContextFor } from "@/lib/pipeline/pipeline-debug-trace";
 import { compressDocumentStructureAware } from "@/lib/blog/coherence";
 import { reduceProtectedKeyphraseOccurrences } from "@/lib/blog/final-seo-normalizer";
 import { reconcilePostOwnershipKeyphrase } from "@/lib/blog/post-ownership-seo-reconcile";
@@ -264,6 +266,92 @@ describe("preflight and final sentence-quality QC share the same authoritative r
     const wp3 = doc.sections[0].blocks.find((block) => block.id === "section-3-wp-3") as Extract<EditorialBlock, { type: "paragraph" }>;
     expect(wp3.content).toContainEqual({ type: "link", text: "full guide", href: "/blog/hk-guide", sourceType: "internal" });
     expect(wp3.content.map((node) => node.text).join("")).not.toMatch(/^\s*\./);
+  });
+});
+
+describe("sentence-quality boundary visibility: final-QC violations are seen by preflight/contract/trace first", () => {
+  it("a genuine sentence-quality violation that survives deterministic repair is caught at the repair boundaries and by the contract, and the trace reports it as present", () => {
+    // Production-shaped corruption class: a raw keyphrase-substitution damage
+    // noun phrase. The deterministic malformed-prose repair must NOT resolve it
+    // (it is not a malformed-prose code), so both repair boundaries — and the
+    // contract — must see it with the SAME authoritative scanner final QC uses.
+    const doc = makeDoc([
+      paragraph("wp-0", "Local teams share useful lessons every week."),
+      paragraph("wp-1", "This is part of the broader these market changes picture and it keeps growing."),
+      paragraph("wp-2", "Simple examples help busy owners understand the idea and take a practical next step."),
+    ]);
+
+    // 1. Final-QC scanner sees it.
+    const finalQc = scanSentenceQualityInDocument(doc);
+    expect(finalQc.flatMap((f) => f.issues.map((i) => i.code))).toContain("malformed-noun-phrase");
+
+    // 2. The deterministic repair cannot resolve it, so the malformed-prose-
+    //    repair and final-preflight absolute gates see the same violation.
+    const repair = repairDeterministicMalformedProse(doc, 1, {}, true, KEYPHRASE);
+    expect(repair.repairedBlockIds).not.toContain("wp-1");
+    expect(
+      scanSentenceQualityInDocument(doc).flatMap((f) => f.issues.map((i) => i.code)),
+    ).toContain("malformed-noun-phrase");
+
+    // 3. The integrity contract reports the same sentence-quality category
+    //    (the violation is introduced vs the clean snapshot, so it is an
+    //    unowned violation, not masked by the delta filter).
+    const clean = makeDoc([
+      paragraph("wp-0", "Local teams share useful lessons every week."),
+      paragraph("wp-1", "Simple examples help busy owners understand the idea and take a practical next step."),
+      paragraph("wp-2", "Regular replies also show customers that a real person is listening to their needs."),
+    ]);
+    const contract = validateArticleIntegrityContract(doc, {
+      keyphrase: KEYPHRASE,
+      research: [],
+      previous: clean,
+      wordMin: 1,
+      wordMax: 100000,
+      ownedCategories: new Set(),
+    });
+    expect(contract.valid).toBe(false);
+    expect(
+      contract.violations.some((v) => v.category === "sentence-quality"),
+    ).toBe(true);
+
+    // 4. The debug trace reports the violation as PRESENT at the earliest
+    //    stage where it is observed (pre-existing corruption is not silently
+    //    carried; it is visible at the earliest applicable debug boundary).
+    const trace = new PipelineDebugTrace();
+    const ctx = traceContextFor({ keyphrase: KEYPHRASE, ctx: { research: [] } });
+    trace.beginStage("claim-check", JSON.stringify(doc), ctx);
+    trace.endStage("claim-check", doc, ctx, true, false);
+    const record = trace.recordsFor("claim-check")[0];
+    expect(
+      record.present.some((v) => v.category === "sentence-quality" && v.type === "malformed-noun-phrase"),
+    ).toBe(true);
+    // The trace never hides it as "introduced later" — it was already present
+    // when the pipeline began.
+    expect(record.introduced.some((v) => v.category === "sentence-quality")).toBe(false);
+  });
+
+  it("introduced sentence-quality corruption is attributed to the introducing stage by the trace, not reported as present", () => {
+    const clean = makeDoc([
+      paragraph("wp-0", "Local teams share useful lessons every week."),
+      paragraph("wp-1", "Simple examples help busy owners understand the idea and take a practical next step."),
+    ]);
+    const trace = new PipelineDebugTrace();
+    const ctx = traceContextFor({ keyphrase: KEYPHRASE, ctx: { research: [] } });
+    trace.beginStage("regeneration", JSON.stringify(clean), ctx);
+    const corrupted = makeDoc([
+      paragraph("wp-0", "Local teams share useful lessons every week."),
+      paragraph("wp-1", "The this shift landscape keeps changing every quarter."),
+      paragraph("wp-2", "Simple examples help busy owners understand the idea and take a practical next step."),
+    ]);
+    trace.endStage("regeneration", corrupted, ctx, true, false);
+    const record = trace.recordsFor("regeneration")[0];
+    expect(
+      record.introduced.some((v) => v.category === "sentence-quality" && v.type === "duplicated-determiner"),
+    ).toBe(true);
+    // No sentence-quality violation was pre-existing at this stage (other
+    // categories — protected content, FAQ parity — may legitimately be present
+    // in the assembled fixture).
+    expect(record.present.some((v) => v.category === "sentence-quality")).toBe(false);
   });
 });
 

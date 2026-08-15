@@ -81,6 +81,12 @@ export interface TraceStageRecord {
   postViolations: TraceViolationKey[];
   introduced: TraceViolationKey[];
   resolved: TraceViolationKey[];
+  /** Violations present in the PRE-doc that were never introduced by any
+   *  traced stage — pre-existing damage already in the document when the
+   *  pipeline (or this stage) began. Emitted at the earliest stage where
+   *  observed so a violation final QC would reject is visible at the
+   *  earliest applicable debug boundary, not silently carried. */
+  present: TraceViolationKey[];
   firstIntroduced: TraceViolationKey[];
   changedBlocks: TraceBlockChange[];
   accepted: boolean;
@@ -330,16 +336,30 @@ export class PipelineDebugTrace {
 
   beginStage(stage: string, preDocJson: string, ctx: TraceContext): void {
     const preDoc = JSON.parse(preDocJson) as ArticleDocument;
+    const preViolations = violationsFor(preDoc, ctx);
+    // Pre-existing violations: present in the pre-doc and never introduced by
+    // an earlier traced stage. Emitted once at the earliest stage where the
+    // trace observes them, so damage final QC would reject is visible at the
+    // earliest applicable debug boundary even when no stage introduced it.
+    const present: TraceViolationKey[] = [];
+    for (const violation of preViolations) {
+      const key = keyOf(violation);
+      if (!this.firstSeen.has(key)) {
+        this.firstSeen.set(key, stage);
+        present.push(violation);
+      }
+    }
     this.current = {
       preDoc,
       record: {
         stage,
         pre: metricsFor(preDoc, ctx.keyphrase),
         post: { fp: "", wordCount: 0, occurrences: 0, density: 0 },
-        preViolations: violationsFor(preDoc, ctx),
+        preViolations,
         postViolations: [],
         introduced: [],
         resolved: [],
+        present,
         firstIntroduced: [],
         changedBlocks: [],
         accepted: true,
@@ -439,6 +459,9 @@ export class PipelineDebugTrace {
     }
     for (const violation of record.introduced) {
       emit(`  introduced ${violation.category}:${violation.key}`);
+    }
+    for (const violation of record.present) {
+      emit(`  present ${violation.category}:${violation.key}`);
     }
     for (const violation of record.resolved) {
       emit(`  resolved ${violation.category}:${violation.key}`);

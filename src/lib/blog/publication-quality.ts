@@ -203,11 +203,17 @@ export function countRepeatedIdeaPairs(texts: string[], excludeWords?: ReadonlyS
  * flagged, so valid prose cannot block publication.
  */
 export function hasDanglingSentenceEnding(text: string): boolean {
-  if (!/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i.test(text)) {
+  // Structural apostrophe normalization: the typographic apostrophe (U+2019)
+  // is the same token as the ASCII apostrophe for every pattern in this
+  // detector ("Let’s dive in." must behave exactly like "Let's dive in.").
+  // The opening single-quote mark (U+2018) is normalized the same way so a
+  // sentence quoted with curly quotes still matches its straight-quote form.
+  const normalized = text.replace(/[’‘]/g, "'");
+  if (!/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i.test(normalized)) {
     return false;
   }
-  if (/\b(?:what|which|who|whom|whose|where|how|why|when)\b/i.test(text)) return false;
-  if (/\bto\s+[a-z]{3,}\b/i.test(text)) return false;
+  if (/\b(?:what|which|who|whom|whose|where|how|why|when)\b/i.test(normalized)) return false;
+  if (/\bto\s+[a-z]{3,}\b/i.test(normalized)) return false;
   // A "worth <gerund>" construction licenses a stranded object ("worth aiming
   // for", "worth fighting for", "worth investing in") ONLY when the stranded
   // particle immediately follows the gerund: the complement is the fronted
@@ -215,7 +221,7 @@ export function hasDanglingSentenceEnding(text: string): boolean {
   // cannot license a later dangling ending ("This is worth considering, but
   // the budget is for." is still dangling).
   if (
-    /\bworth\s+[a-z]+\w*ing\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(text)
+    /\bworth\s+[a-z]+\w*ing\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(normalized)
   ) {
     return false;
   }
@@ -225,7 +231,7 @@ export function hasDanglingSentenceEnding(text: string): boolean {
   // must IMMEDIATELY follow the verb: "Let's discuss the budget for." has the
   // dangling "for." after an intervening object, so it is still flagged.
   if (
-    /\blet(?:'s|\sus)\s+[a-z]+\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(text)
+    /\blet(?:'s|\sus)\s+[a-z]+\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(normalized)
   ) {
     return false;
   }

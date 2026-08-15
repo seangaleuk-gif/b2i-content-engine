@@ -9,6 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { PipelineDebugTrace, isPipelineDebugTraceEnabled, traceContextFor } from "@/lib/pipeline/pipeline-debug-trace";
+import { captureIntegrityRejection, updateIntegrityRejectionRollback } from "@/lib/pipeline/pipeline-failure-snapshot";
 import type { ArticleDocument, ArticleSection, EditorialBlock } from "@/lib/blog/article-document";
 import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, parseCompleteEditorialRegion, countCanonicalVisibleWords, extractVisibleFaqFromArticle, extractPlainTextFromEditorialBlocks, validateFaqParity, decodeHtmlEntities } from "@/lib/blog/article-document";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
@@ -229,10 +230,42 @@ function enforceIntegrityContract(
       state.articleDoc,
       traceCtx!,
     );
-    restoreSnapshot(state, snap);
-    syncBlogFromDocument(state);
+    // Quarantine the rejected candidate BEFORE rollback destroys it. The
+    // artifact is diagnostic-only (debug/pipeline-failures/): it is never
+    // written to blog_versions or project content, and a write failure only
+    // logs a warning — it can never mask the integrity failure below or
+    // change generation behaviour.
+    const quarantinePath = captureIntegrityRejection({
+      projectId: state.projectId,
+      stage: label,
+      previous,
+      rejected: state.articleDoc,
+      violations: result.violations.map((v) => `${v.category}:${v.message}`),
+      ownedViolations: result.ownedViolations.map((v) => `${v.category}:${v.message}`),
+      keyphrase: state.keyphrase,
+      trace,
+    });
+    // Roll back to the exact pre-stage snapshot. If rollback itself throws, we
+    // still record "failed" on the artifact best-effort and then re-throw the
+    // ORIGINAL integrity-contract failure (never the rollback error) so the
+    // pipeline stays fail-closed.
+    let rollbackFailed = false;
+    try {
+      restoreSnapshot(state, snap);
+      syncBlogFromDocument(state);
+    } catch (rollbackError) {
+      rollbackFailed = true;
+      console.error(
+        `[${label}] integrity contract rollback FAILED — ` +
+        (rollbackError instanceof Error ? rollbackError.message : String(rollbackError)),
+      );
+    }
+    if (quarantinePath) {
+      // Best-effort: the rollback update must never mask the original failure.
+      updateIntegrityRejectionRollback(quarantinePath, rollbackFailed ? "failed" : "success");
+    }
     console.error(
-      `[${label}] integrity contract rejected — rollback=success` +
+      `[${label}] integrity contract rejected — rollback=${rollbackFailed ? "failed" : "success"}` +
       ` violations=${JSON.stringify(result.violations.map((v) => `${v.category}:${v.message}`))}` +
       ` restoredFp=${fp(state.blog)}`,
     );
@@ -1636,26 +1669,34 @@ export async function runPostAssemblyPipeline(
     // Boundary policy: scan the FULL document (all block types, matching the
     // final gate) after the repair. Genuine publication-breaking corruption
     // that could not be repaired or safely removed fails HERE; the stage must
-    // never carry known corruption downstream.
+    // never carry known corruption downstream. The sentence-quality scanner
+    // (the same authoritative scanner final QC uses) is an absolute hard gate
+    // here too: duplicated determiners, malformed noun phrases, repeated
+    // adjacent words, broken punctuation and fragments are never carried past
+    // this repair boundary.
     const remainingMalformed = scanMalformedProseInDocument(state.articleDoc);
     const hardUnresolved = remainingMalformed.filter((finding) =>
       finding.issues.some((issue) => classifyMalformedIssue(issue.code) === "hard"),
     );
+    const remainingSentenceQuality = scanSentenceQualityInDocument(state.articleDoc);
+    const sentenceQualityUnresolved = remainingSentenceQuality.length;
     const candidateFingerprint = fp(state.blog);
     const stageMetadata = {
       repairedBlockIds: deterministic.repairedBlockIds,
       removedBlockIds: deterministic.removedBlockIds,
       unresolvedEditableBlockIds: deterministic.unresolved.map((issue) => issue.blockId),
       unresolvedDocumentBlockIds: hardUnresolved.map((issue) => issue.blockId),
+      unresolvedSentenceQualityBlockIds: remainingSentenceQuality.map((issue) => issue.blockId),
       candidateFingerprint,
     };
     console.log(
       `[malformed-prose-repair] deterministic repaired=${deterministic.repairedBlockIds.length}` +
       ` removed=${deterministic.removedBlockIds.length}` +
       ` unresolvedEditable=${deterministic.unresolved.length}` +
-      ` unresolvedDocument=${hardUnresolved.length}`,
+      ` unresolvedDocument=${hardUnresolved.length}` +
+      ` unresolvedSentenceQuality=${sentenceQualityUnresolved}`,
     );
-    if (hardUnresolved.length > 0) {
+    if (hardUnresolved.length > 0 || sentenceQualityUnresolved > 0) {
       // Rejected repair restores the exact pre-stage canonical snapshot, then
       // the pipeline fails closed (zero writes) at this repair boundary.
       trace?.endStage("malformed-prose-repair", state.articleDoc, traceCtx!, false, true);
@@ -1675,7 +1716,15 @@ export async function runPostAssemblyPipeline(
           .map((finding) =>
             `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] component=${finding.componentId}`,
           )
-          .join("; "),
+          .join("; ")
+        + (sentenceQualityUnresolved > 0
+          ? ` | unresolved sentence-quality (${sentenceQualityUnresolved}): ` +
+            remainingSentenceQuality
+              .map((finding) =>
+                `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] component=${finding.componentId}`,
+              )
+              .join("; ")
+          : ""),
       );
     }
     // Stage-aware integrity contract: the repair owns malformed/sentence
@@ -2668,18 +2717,26 @@ export async function runPostAssemblyPipeline(
     );
     // Boundary policy: scan the full document (all block types) after the
     // repair; genuine corruption that still cannot be repaired or safely
-    // removed fails closed HERE, at the last repair boundary.
+    // removed fails closed HERE, at the last repair boundary. The
+    // sentence-quality scanner (the same authoritative scanner final QC uses)
+    // is an absolute hard gate here too — a duplicated determiner, malformed
+    // noun phrase, repeated adjacent word, broken punctuation or fragment that
+    // survives every prior stage must fail at this boundary, never reach
+    // final QC unseen.
     const remainingMalformed = scanMalformedProseInDocument(state.articleDoc);
     const hardUnresolved = remainingMalformed.filter((finding) =>
       finding.issues.some((issue) => classifyMalformedIssue(issue.code) === "hard"),
     );
+    const remainingSentenceQuality = scanSentenceQualityInDocument(state.articleDoc);
+    const sentenceQualityUnresolved = remainingSentenceQuality.length;
     console.log(
       `[final-preflight] deterministic malformed repair repaired=${repair.repairedBlockIds.length}` +
       ` removed=${repair.removedBlockIds.length}` +
       ` unresolvedEditable=${repair.unresolved.length}` +
-      ` unresolvedDocument=${hardUnresolved.length}`,
+      ` unresolvedDocument=${hardUnresolved.length}` +
+      ` unresolvedSentenceQuality=${sentenceQualityUnresolved}`,
     );
-    if (hardUnresolved.length > 0) {
+    if (hardUnresolved.length > 0 || sentenceQualityUnresolved > 0) {
       restoreSnapshot(state, snap);
       throw new Error(
         `Unresolved malformed prose at final repair boundary (${hardUnresolved.length}): ` +
@@ -2687,7 +2744,15 @@ export async function runPostAssemblyPipeline(
           .map((finding) =>
             `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] component=${finding.componentId}`,
           )
-          .join("; "),
+          .join("; ")
+        + (sentenceQualityUnresolved > 0
+          ? ` | unresolved sentence-quality (${sentenceQualityUnresolved}): ` +
+            remainingSentenceQuality
+              .map((finding) =>
+                `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] component=${finding.componentId}`,
+              )
+              .join("; ")
+          : ""),
       );
     }
     // The deterministic malformed repair above can remove non-keyphrase words,

@@ -48,4 +48,6 @@ tmp/structured-translation-production-evidence/
 # dev-only shadow preview exports
 /.tmp/
 
+# pipeline failure quarantine artifacts
 debug/
+debug/pipeline-failures/

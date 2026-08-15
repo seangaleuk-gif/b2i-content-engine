@@ -124,15 +124,30 @@ describe("sentence-quality and malformed-scanner false positives", () => {
     expect(scanSentenceQualityText("AI and AR are simply the means to get there.")).toEqual([]);
   });
 
+  it("accepts the production 'most this year' sentence: a degree adverb before a time adjunct, not an adjective modifying the determiner-headed NP", () => {
+    expect(
+      scanSentenceQualityText("Before you set a single dollar aside, decide what matters most this year."),
+    ).toEqual([]);
+    // Same construction with "more" (degree adverb) and with a predeterminer
+    // "such a" that legitimately precedes a/an.
+    expect(scanSentenceQualityText("Decide what matters more these days.")).toEqual([]);
+    expect(scanSentenceQualityText("It was such a great day for the whole team.")).toEqual([]);
+  });
+
   it("still catches genuine malformed noun phrases", () => {
-    expect(
-      scanSentenceQualityText("This is part of the broader these market changes picture and it keeps growing.")
-        .some((i) => i.code === "malformed-noun-phrase"),
-    ).toBe(true);
-    expect(
-      scanSentenceQualityText("The higher the stakes the smaller the room for error.")
-        .some((i) => i.code === "malformed-noun-phrase"),
-    ).toBe(true);
+    for (const sentence of [
+      "This is part of the broader these market changes picture and it keeps growing.",
+      "The higher the stakes the smaller the room for error.",
+      "The wider these gaps look the harder the climb becomes.",
+      "The larger those budgets grow the more the plan changes.",
+      "Teams that plan around the same the week see steadier results.",
+      "The entire the team budget was reallocated to creator-led campaigns.",
+    ]) {
+      expect(
+        scanSentenceQualityText(sentence).some((i) => i.code === "malformed-noun-phrase"),
+        sentence,
+      ).toBe(true);
+    }
   });
 
   it("accepts stranded-preposition sentence endings", () => {
@@ -146,6 +161,7 @@ describe("sentence-quality and malformed-scanner false positives", () => {
       "This is a goal worth fighting for.",
       "This is worth investing in.",
       "Let's dive in.",
+      "Let’s dive in.",
       "Let's move on.",
       "Let us check in.",
     ]) {
@@ -154,12 +170,13 @@ describe("sentence-quality and malformed-scanner false positives", () => {
     }
   });
 
-  it("still catches genuine dangling sentence endings", () => {
+  it("still catches genuine dangling sentence endings, including typographic-apostrophe forms", () => {
     for (const sentence of [
       "Smart owners plan for.",
       "The budget is for.",
       "Marketing teams invest in.",
       "Let's discuss the budget for.",
+      "Let’s discuss the budget for.",
       "Let us prepare a strategy for.",
       "This is worth considering, but the budget is for.",
       "This is worth reviewing, and teams invest in.",

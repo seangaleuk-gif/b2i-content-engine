@@ -50,9 +50,15 @@ const REPEATED_ADJACENT_WORD_RE =
  *  ("simply", "clearly", "really", "quite") legitimately precede determiners
  *  ("simply the best", "clearly the winner", "quite a challenge") and must
  *  never be flagged — "AI and AR are simply the means to get there." is valid
- *  English. */
+ *  English. The degree adverbs "more"/"most" are excluded for the same reason:
+ *  "what matters most this year" is a degree adverb modifying the verb
+ *  "matters" followed by the time adjunct "this year" — not an adjective
+ *  modifying the determiner-headed noun phrase ("what matters most" + "this
+ *  year", "what matters more these days"). "such" is a predeterminer that
+ *  legitimately precedes "a/an" ("such a challenge", "such an opportunity")
+ *  and "that" in "in a way such that ...", so it is excluded too. */
 const MALFORMED_NOUN_PHRASE_RE =
-  /\b(?:broader|wider|larger|bigger|smaller|higher|lower|greater|lesser|more|most|other|same|such|whole|entire)\s+(?:the|this|that|these|those|a|an)\b/i;
+  /\b(?:broader|wider|larger|bigger|smaller|higher|lower|greater|lesser|other|same|whole|entire)\s+(?:the|this|that|these|those|a|an)\b/i;
 
 /** Broken punctuation: two or more consecutive sentence-end marks, a sentence
  *  ending with a dangling determiner, or stray double spaces. */
