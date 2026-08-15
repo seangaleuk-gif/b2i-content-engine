@@ -142,6 +142,12 @@ describe("sentence-quality and malformed-scanner false positives", () => {
       "We have a lot to deal with.",
       "It's something to build on.",
       "That's what it comes down to.",
+      "That is the balance worth aiming for.",
+      "This is a goal worth fighting for.",
+      "This is worth investing in.",
+      "Let's dive in.",
+      "Let's move on.",
+      "Let us check in.",
     ]) {
       expect(hasDanglingSentenceEnding(sentence), sentence).toBe(false);
       expect(findMalformedProseTextIssues([sentence]), sentence).toEqual([]);
@@ -149,7 +155,15 @@ describe("sentence-quality and malformed-scanner false positives", () => {
   });
 
   it("still catches genuine dangling sentence endings", () => {
-    for (const sentence of ["Smart owners plan for.", "The budget is for.", "Marketing teams invest in."]) {
+    for (const sentence of [
+      "Smart owners plan for.",
+      "The budget is for.",
+      "Marketing teams invest in.",
+      "Let's discuss the budget for.",
+      "Let us prepare a strategy for.",
+      "This is worth considering, but the budget is for.",
+      "This is worth reviewing, and teams invest in.",
+    ]) {
       expect(hasDanglingSentenceEnding(sentence), sentence).toBe(true);
       expect(
         findMalformedProseTextIssues([sentence]).some((i) => i.code === "incomplete-sentence-ending"),

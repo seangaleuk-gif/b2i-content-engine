@@ -208,6 +208,27 @@ export function hasDanglingSentenceEnding(text: string): boolean {
   }
   if (/\b(?:what|which|who|whom|whose|where|how|why|when)\b/i.test(text)) return false;
   if (/\bto\s+[a-z]{3,}\b/i.test(text)) return false;
+  // A "worth <gerund>" construction licenses a stranded object ("worth aiming
+  // for", "worth fighting for", "worth investing in") ONLY when the stranded
+  // particle immediately follows the gerund: the complement is the fronted
+  // theme, not a deleted object. A worth phrase elsewhere in the sentence
+  // cannot license a later dangling ending ("This is worth considering, but
+  // the budget is for." is still dangling).
+  if (
+    /\bworth\s+[a-z]+\w*ing\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(text)
+  ) {
+    return false;
+  }
+  // A "let's / let us <verb>" directive clause is complete when its final
+  // particle is an intransitive phrasal-verb particle bound to the verb
+  // ("Let's dive in.", "Let's move on.", "Let us check in."). The particle
+  // must IMMEDIATELY follow the verb: "Let's discuss the budget for." has the
+  // dangling "for." after an intervening object, so it is still flagged.
+  if (
+    /\blet(?:'s|\sus)\s+[a-z]+\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(text)
+  ) {
+    return false;
+  }
   return true;
 }
 
