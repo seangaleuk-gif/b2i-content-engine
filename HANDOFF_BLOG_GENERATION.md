@@ -654,3 +654,19 @@ The English pipeline should be considered finished when:
 After that:
 
 **Stop English pipeline work.**
+
+## 13. 2026-08-14 producer-contract repair (`b2i-english-2026-08-20-2`)
+
+A controlled production run exposed a new hard producer-boundary defect in section 3: a paragraph ending with a colon was followed by four `list` blocks whose singleton content was not in the canonical `items: string[]` shape. The first response and its one targeted repair were both rejected as an unfinished setup plus four empty lists.
+
+Root fixes:
+
+- added one shared, explicit JSON block contract for initial generation, targeted repair and component regeneration;
+- bounded normalization now accepts only unambiguous singleton list aliases (`text`, `item`, or string-valued `items`), rejects conflicting/opaque content, and merges adjacent lists of the same ordering;
+- normalization recoveries are logged without article text;
+- colon-led paragraphs are valid only when immediately followed by a genuinely non-empty canonical list/table;
+- the same contextual rule is used by producer acceptance, malformed-prose selection, deterministic repair, coherence, expansion/compaction validation, final QC and pre-save scanning;
+- dash-ended prose, standalone colon setups, truly empty lists and conflicting list fields remain hard failures;
+- build ID advanced to `b2i-english-2026-08-20-2`.
+
+Verification: 1,159 offline English-path tests passed, focused final tests passed (169/169), TypeScript passed, production build passed with inert build-only Supabase placeholders, and lint remained exactly at the input baseline (269 errors / 175 warnings; no new lint findings). No live DeepSeek generation was performed.

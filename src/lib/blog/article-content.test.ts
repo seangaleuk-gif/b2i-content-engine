@@ -64,6 +64,74 @@ describe("normalizeAiEditorialPayload", () => {
     });
   });
 
+  it("accepts a colon-led paragraph only when a non-empty list immediately follows", () => {
+    const result = normalizeAiEditorialPayload({
+      blocks: [
+        { type: "paragraph", text: "Use these safeguards:" },
+        { type: "list", ordered: false, items: ["Collect only necessary data", "Document consent"] },
+      ],
+    }, "sec-list-setup");
+
+    expect(result.errors).toEqual([]);
+    expect(result.blocks.map((block) => block.type)).toEqual(["paragraph", "list"]);
+  });
+
+  it("rejects a colon-led paragraph when no structured continuation follows", () => {
+    const result = normalizeAiEditorialPayload({
+      blocks: [{ type: "paragraph", text: "Use these safeguards:" }],
+    }, "sec-dangling-setup");
+
+    expect(result.errors.join(" ")).toContain("unfinished setup");
+  });
+
+  it("normalizes and merges unambiguous singleton list aliases", () => {
+    const result = normalizeAiEditorialPayload({
+      blocks: [
+        { type: "paragraph", text: "Use these safeguards:" },
+        { type: "list", ordered: false, text: "Collect only necessary data" },
+        { type: "list", ordered: false, item: "Document consent" },
+        { type: "list", ordered: false, items: "Review access regularly" },
+      ],
+    }, "sec-singletons");
+
+    expect(result.errors).toEqual([]);
+    expect(result.recoveries).toHaveLength(5);
+    expect(result.blocks).toHaveLength(2);
+    const list = result.blocks[1];
+    expect(list.type).toBe("list");
+    if (list.type !== "list") throw new Error("expected list");
+    expect(list.items.map((item) => item.map((node) => node.text).join(""))).toEqual([
+      "Collect only necessary data",
+      "Document consent",
+      "Review access regularly",
+    ]);
+    const html = renderEditorialBlocksToWordPress(result.blocks);
+    expect(html.match(/<!-- wp:list /g)).toHaveLength(1);
+    const roundTrip = parseWordPressEditorialBlocks(html, "sec-singletons-roundtrip");
+    expect(roundTrip.errors).toEqual([]);
+    expect(roundTrip.blocks.map((block) => block.type)).toEqual(["paragraph", "list"]);
+  });
+
+  it("rejects conflicting canonical and singleton list content", () => {
+    const result = normalizeAiEditorialPayload({
+      blocks: [{ type: "list", ordered: false, items: ["Canonical"], text: "Different" }],
+    }, "sec-conflict");
+
+    expect(result.blocks).toEqual([]);
+    expect(result.errors.join(" ")).toContain("both 'items' and singleton");
+  });
+
+  it("does not treat a dash-ended paragraph as a valid list setup", () => {
+    const result = normalizeAiEditorialPayload({
+      blocks: [
+        { type: "paragraph", text: "Use these safeguards —" },
+        { type: "list", ordered: false, items: ["Collect only necessary data"] },
+      ],
+    }, "sec-dash");
+
+    expect(result.errors.join(" ")).toContain("unfinished setup");
+  });
+
   it("normalizes quote block", () => {
     const input = { blocks: [{ type: "quote", text: "A wise statement." }] };
     const result = normalizeAiEditorialPayload(input, "sec-4");

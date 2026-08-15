@@ -8,10 +8,13 @@ const migration = readFileSync(
 );
 
 describe("blog-version atomicity migration contract", () => {
-  it("enforces one version number per project without deleting saved versions", () => {
+  it("enforces one version number per ENGLISH version without deleting saved versions", () => {
     expect(migration).toMatch(
-      /CREATE UNIQUE INDEX IF NOT EXISTS blog_versions_project_version_unique\s+ON blog_versions \(project_id, version_number\)/,
+      /CREATE UNIQUE INDEX IF NOT EXISTS blog_versions_project_version_english_unique\s+ON blog_versions \(project_id, version_number\)\s+WHERE slug IS NULL OR slug !~\*? '-zh\$'/,
     );
+    // A Chinese version may share its English source version number, so the
+    // uniqueness check must exclude -zh rows.
+    expect(migration).toMatch(/WHERE slug IS NULL OR slug !~\*? '-zh\$'/);
     expect(migration).not.toMatch(/DELETE\s+FROM\s+blog_versions/i);
     expect(migration).toContain("Cannot enforce blog version uniqueness");
   });
@@ -28,6 +31,12 @@ describe("blog-version atomicity migration contract", () => {
     expect(migration).toMatch(/SELECT COALESCE\(MAX\(version_number\), 0\) \+ 1[\s\S]*INSERT INTO blog_versions/);
     expect(migration).toMatch(/INSERT INTO blog_versions[\s\S]*UPDATE projects[\s\S]*RETURN to_jsonb\(saved\)/);
     expect(migration).toContain("English generation cannot save a Traditional Chinese slug");
+  });
+
+  it("computes the next English version number ignoring -zh rows", () => {
+    expect(migration).toMatch(
+      /SELECT COALESCE\(MAX\(version_number\), 0\) \+ 1[\s\S]*WHERE project_id = p_project_id[\s\S]*slug IS NULL OR slug !~\*? '-zh\$'/,
+    );
   });
 
   it("exposes the synchronization boundary only to the server service role", () => {

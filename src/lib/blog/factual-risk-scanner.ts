@@ -619,6 +619,32 @@ const DEPENDENT_REFERENCE_PATTERNS: RegExp[] = [
   /^\s*the point is\b/i,
 ];
 
+/**
+ * Sentence-initial transition openers that require an antecedent paragraph.
+ * Mirrors the coherence validator's orphan-transition patterns so a removal
+ * producer can never disagree with the final gate about whether "Instead,",
+ * "However,", "Therefore,", "This means", etc. now dangle after an antecedent
+ * removal. Includes demonstrative "This means/This shows/That is" openers used
+ * as paragraph transitions.
+ */
+const ORPHAN_TRANSITION_OPENER_RE =
+  /^\s*(?:instead|however|therefore|meanwhile|moreover|furthermore|nevertheless|nonetheless|consequently|additionally|likewise|similarly|hence|thus|yet|so|but|and)\s*[,:]/i;
+
+const ORPHAN_TRANSITION_PHRASE_OPENER_RE =
+  /^\s*(?:as a result|on the other hand|that said|in addition|at the same time|for this reason|for that reason|in other words)\s*[,:]/i;
+
+const DEMONSTRATIVE_TRANSITION_OPENER_RE =
+  /^\s*(?:this|that|these|those)\s+(?:means?|shows?|suggests?|indicates?|reflects?|is|are|was|were)\b/i;
+
+/** True when the sentence opens with a transition that depends on the
+ *  immediately preceding paragraph as its antecedent. */
+function isOrphanTransitionOpener(sentence: string): boolean {
+  const normalized = sentence.replace(/^\s*["\u201C'\u2018(]+\s*/, "");
+  return ORPHAN_TRANSITION_OPENER_RE.test(normalized)
+    || ORPHAN_TRANSITION_PHRASE_OPENER_RE.test(normalized)
+    || DEMONSTRATIVE_TRANSITION_OPENER_RE.test(normalized);
+}
+
 function isDependentReference(sentence: string): boolean {
   const normalized = sentence.replace(/^\s*["\u201C'\u2018(]+\s*/, "");
   return DEPENDENT_REFERENCE_PATTERNS.some((pattern) => pattern.test(normalized));
@@ -650,6 +676,11 @@ export function removeUnsupportedSentences(
     ranges: TextRange[];
     // True when the whole paragraph becomes empty and should be removed.
     removeWhole: boolean;
+    // True when only a leading transition opener ("Instead, " / "However, ")
+    // is stripped from the paragraph's first sentence, preserving the rest of
+    // the sentence. The opener is replaced by nothing and the first alpha of
+    // the remainder is capitalised so the sentence stays complete.
+    stripTransitionOpener?: boolean;
   }> = [];
 
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
@@ -769,9 +800,12 @@ export function removeUnsupportedSentences(
 
   // Cross-paragraph dependency handling: when a paragraph loses claim
   // sentences, the next non-source paragraph must not open with a reference to
-  // the removed antecedent ("That's a striking number..."). The dependent
-  // first sentence is removed when safe; otherwise the claim removal is
-  // aborted so no dangling reference is ever left behind.
+  // the removed antecedent ("That's a striking number...") or with an orphaned
+  // transition ("Instead, ...", "However, ...", "Therefore, ...", "This means
+  // ..."). A dependent first sentence is removed when safe; an orphaned
+  // transition opener is stripped from the paragraph (preserving the rest of
+  // the sentence) when safe; otherwise the claim removal is aborted so no
+  // dangling reference or orphan transition is ever left behind.
   for (const plan of [...plans]) {
     if (plan.ranges.length === 0) continue;
     for (let nextIndex = plan.paragraphIndex + 1; nextIndex < paragraphs.length; nextIndex++) {
@@ -782,7 +816,8 @@ export function removeUnsupportedSentences(
       const nextText = nextBlock.content.map((node) => node.text).join("");
       if (isSourceCitationParagraph(nextText)) continue;
       const nextFirstSentence = nextText.split(/(?<=[.!?])\s+/)[0] ?? nextText;
-      if (!isDependentReference(nextFirstSentence)) break;
+      const transitionOpener = isOrphanTransitionOpener(nextFirstSentence);
+      if (!isDependentReference(nextFirstSentence) && !transitionOpener) break;
       const nextLinked = inlineLinkRanges(nextBlock);
       const nextRanges = sentenceRanges(nextText);
       const firstRange = nextRanges[0];
@@ -797,6 +832,39 @@ export function removeUnsupportedSentences(
       const nextHasOwnClaims = unsupportedClaims.some((claim) =>
         normalizeForMatch(nextText).includes(normalizeForMatch(claim.text)),
       );
+
+      if (transitionOpener) {
+        // An orphaned transition opener can be STRIPPED from the paragraph's
+        // first sentence node-preservingly, keeping the substantive sentence
+        // intact ("Instead, successful brands plan..." → "Successful brands
+        // plan..."). This is structurally justified: the transition word is the
+        // orphan; the sentence after it carries no reference to the removed
+        // claim. Strip only when the opener is leading plain text (no link,
+        // no number, no quotation) so the rest of the sentence survives.
+        const openerText = nextFirstSentence.match(
+          /^\s*(?:instead|however|therefore|meanwhile|moreover|furthermore|nevertheless|nonetheless|consequently|additionally|likewise|similarly|hence|thus|yet|so|but|and)\s*[,:]\s*|^\s*(?:as a result|on the other hand|that said|in addition|at the same time|for this reason|for that reason|in other words)\s*[,:]\s*|^\s*(?:this|that|these|those)\s+(?:means?|shows?|suggests?|indicates?|reflects?|is|are|was|were)\s+/i,
+        )?.[0];
+        if (openerText && !touchesQuotation) {
+          const openerLength = nextText.length - nextText.trimStart().length + openerText.length;
+          const openerEnd = Math.min(openerLength, nextText.length);
+          const openerLinked = nextLinked.some((link) => rangesOverlap(link, { start: 0, end: openerEnd }));
+          const openerStartsBlock = nextBlock.content[0]?.type === "text";
+          if (!openerLinked && openerStartsBlock && openerEnd > 0 && openerEnd < nextText.length) {
+            plans.push({
+              paragraphIndex: nextIndex,
+              ranges: [{ start: 0, end: openerEnd }],
+              removeWhole: false,
+              stripTransitionOpener: true,
+            });
+            break;
+          }
+        }
+        // The opener cannot be stripped safely — abort the claim removal so
+        // the transition is never left orphaned.
+        plan.ranges = [];
+        break;
+      }
+
       // A single-sentence dependent paragraph is still removable when it is
       // pure reference prose (no links, no numbers, no claims of its own).
       const wholeParagraphDependent = !nextKeepsSentence
@@ -833,11 +901,40 @@ export function removeUnsupportedSentences(
     const parsed = parseWordPressEditorialBlocks(paragraphHtml, `factual-apply-${plan.paragraphIndex}`);
     const paragraph = parsed.blocks[0];
     if (parsed.errors.length > 0 || paragraph?.type !== "paragraph") continue;
-    const repaired = removeTextRanges(paragraph, plan.ranges);
+    let repaired = removeTextRanges(paragraph, plan.ranges);
+    if (plan.stripTransitionOpener) {
+      // Capitalise the first alpha of the remainder so the sentence stays
+      // complete after the orphaned opener ("Instead, " / "However, ") goes.
+      const firstText = repaired.content.find((node) => node.type === "text");
+      if (firstText) {
+        const alphaMatch = firstText.text.match(/[a-zA-Z]/);
+        if (alphaMatch && alphaMatch.index !== undefined) {
+          const index = alphaMatch.index;
+          repaired = {
+            ...repaired,
+            content: repaired.content.map((node) =>
+              node.type === "text" && node === firstText
+                ? {
+                    ...node,
+                    text: node.text.slice(0, index) + node.text[index].toUpperCase() + node.text.slice(index + 1),
+                  }
+                : node,
+            ),
+          };
+        }
+      }
+    }
     const finalized = finalizeRemovedParagraph(repaired);
     const repairedText = finalized
       ? finalized.content.map((node) => node.text).join("").trim()
       : "";
+    // A removal that would consume the whole block to fix a dangling ending
+    // must not delete protected inline content (links/emphasis). Abort this
+    // paragraph's removal instead — the unsupported claim stays and the
+    // deterministic producer never commits an incomplete textual remainder.
+    if (finalized === null && paragraph.content.some((node) => node.type !== "text")) {
+      continue;
+    }
     const replacement = repairedText
       ? renderEditorialBlocksToWordPress([finalized!])
       : "";
@@ -991,6 +1088,17 @@ function normalizeForMatch(text: string): string {
   return decodeHtmlEntities(text).replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+/**
+ * Public normalized-sentence form used by callers that pass sentences through
+ * `preserveSentenceTexts`. Identical to the producer's internal
+ * `normalizeForMatch`, so a caller can compute which section sentences a claim
+ * removal would touch and decide whether the section keeps a grounding
+ * carrier without it.
+ */
+export function normalizeSentenceForPreservation(text: string): string {
+  return normalizeForMatch(text);
+}
+
 function decodeHtmlEntities(text: string): string {
   const named: Record<string, string> = {
     amp: "&",
@@ -1048,6 +1156,31 @@ function sentenceRanges(text: string): TextRange[] {
     ranges.push({ start, end: text.length });
   }
   return ranges;
+}
+
+/**
+ * Normalized complete-sentence texts of a rendered editorial region, using
+ * EXACTLY the same sentence-range splitting and normalization the removal
+ * producer applies when matching `preserveSentenceTexts`. Callers that want a
+ * sentence to survive removal (e.g. a section's last topic-grounding carrier)
+ * must pass these exact normalized texts, otherwise the producer's own
+ * sentence ranges will not match and the sentence stays removable.
+ */
+export function normalizedSentenceTextsOfSectionHtml(sectionHtml: string): string[] {
+  const paragraphRe =
+    /<!--\s*wp:paragraph\s*-->\s*\n?<p\b[^>]*>[\s\S]*?<\/p>\s*\n?<!--\s*\/wp:paragraph\s*-->/gi;
+  const texts: string[] = [];
+  for (const match of sectionHtml.matchAll(paragraphRe)) {
+    const parsed = parseWordPressEditorialBlocks(match[0], "sentence-text-extraction");
+    const paragraph = parsed.blocks[0];
+    if (parsed.errors.length > 0 || paragraph?.type !== "paragraph") continue;
+    const text = paragraph.content.map((node) => node.text).join("");
+    for (const range of sentenceRanges(text)) {
+      const sentence = normalizeForMatch(text.slice(range.start, range.end));
+      if (sentence) texts.push(sentence);
+    }
+  }
+  return texts;
 }
 
 function mergeTextRanges(ranges: TextRange[]): TextRange[] {
@@ -1149,7 +1282,10 @@ function removeTextRanges(
  * - a trailing dangling `stop-word.` residue is stripped so the paragraph ends
  *   cleanly; if that empties it, the block is removed.
  *
- * This never deletes substantive prose and never touches links or numbers.
+ * The dangling-ending trim is NODE-PRESERVING: it removes the trailing dangling
+ * SENTENCE as one unit across inline nodes, so links/strong/emphasis in the
+ * kept prefix survive. This never deletes substantive prose and never touches
+ * links or numbers outside the dangling sentence itself.
  */
 const PUNCTUATION_ONLY_RE = /^[\s\p{P}\p{S}]+$/u;
 
@@ -1167,19 +1303,40 @@ function finalizeRemovedParagraph(
     // allocate budget" — a trailing fragment without terminal punctuation.
     // The complete dangling sentence is malformed anyway, so dropping it as
     // one unit is the only meaning-preserving deterministic action.
-    if (paragraph.content.every((node) => node.type === "text")) {
-      const ranges = sentenceRanges(text);
-      const lastRange = ranges[ranges.length - 1];
-      if (lastRange) {
-        const prefix = text.slice(0, lastRange.start).trimEnd();
-        if (prefix && /[.!?]$/.test(prefix.replace(/["”’)]]+$/, ""))) {
-          return { ...paragraph, content: [{ type: "text", text: prefix }] };
+    const ranges = sentenceRanges(text);
+    const lastRange = ranges[ranges.length - 1];
+    if (lastRange) {
+      const prefix = text.slice(0, lastRange.start).trimEnd();
+      if (prefix && /[.!?]$/.test(prefix.replace(/["”’)\]]+$/, ""))) {
+        // The dangling sentence is the trailing sentence and a complete prefix
+        // exists. Remove only that sentence node-preservingly so inline links
+        // and emphasis inside the prefix survive. The dangling sentence itself
+        // must carry no link — deleting a link to fix the ending is never
+        // acceptable, so the caller aborts the removal in that case.
+        const danglingLinked = inlineLinkRanges(paragraph)
+          .some((link) => rangesOverlap(link, lastRange));
+        if (!danglingLinked) {
+          const trimmed = removeTextRanges(paragraph, [lastRange]);
+          const trimmedText = trimmed.content.map((node) => node.text).join("").trim();
+          if (
+            trimmedText
+            && !hasDanglingSentenceEnding(trimmedText)
+            && !PUNCTUATION_ONLY_RE.test(trimmedText)
+          ) {
+            return trimmed;
+          }
+          // The node-preserving trim left a residue it could not clean: the
+          // paragraph must not be committed in that state.
+          return null;
         }
-        // The dangling sentence was the whole paragraph (or the prefix is
-        // itself incomplete): removing it empties the block, which the caller
-        // renders as no block at all.
+        // The dangling sentence carries a link — removing it would delete
+        // protected content. The caller aborts the whole removal.
         return null;
       }
+      // The dangling sentence was the whole paragraph (or the prefix is
+      // itself incomplete): removing it empties the block, which the caller
+      // renders as no block at all.
+      return null;
     }
   }
   return paragraph;

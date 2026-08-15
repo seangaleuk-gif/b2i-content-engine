@@ -56,7 +56,10 @@ import {
   runPostAssemblyPipeline,
   trimResidualSafeProseToMaximum,
 } from "@/lib/pipeline/blog-generation-pipeline";
-import { repairDeterministicMalformedProse } from "@/lib/pipeline/editorial-polish";
+import {
+  findMalformedEditableBlocks,
+  repairDeterministicMalformedProse,
+} from "@/lib/pipeline/editorial-polish";
 import { buildPolicy } from "@/lib/blog/final-article-policy";
 import { englishWordTolerance } from "@/lib/content-standards";
 import { removeUnsupportedSentences, type ScannedClaim } from "@/lib/blog/factual-risk-scanner";
@@ -263,6 +266,43 @@ describe("trailing-fragment regression: the exact production paragraph", () => {
 });
 
 describe("block-type-aware completeness: no false positives on structural surfaces", () => {
+  it("accepts a colon-led paragraph followed immediately by its non-empty list", () => {
+    const doc = makeDoc([]);
+    doc.sections = [{
+      id: "section-0",
+      heading: "Privacy Safeguards",
+      headingLevel: 2,
+      sectionType: "main",
+      blocks: [
+        { id: "s0-0", type: "paragraph", content: [{ type: "text", text: "Use these safeguards:" }] },
+        { id: "s0-1", type: "list", ordered: false, items: [[{ type: "text", text: "Collect only necessary data" }], [{ type: "text", text: "Document consent" }]] },
+      ],
+      status: "generated",
+    }];
+
+    expect(scanMalformedProseInDocument(doc)).toEqual([]);
+    expect(findMalformedEditableBlocks(doc)).toEqual([]);
+    expect(validateCoherence(doc).some((issue) => issue.type === "incomplete-sentence")).toBe(false);
+  });
+
+  it("rejects the same colon-led paragraph if its structured continuation is removed", () => {
+    const doc = makeDoc([]);
+    doc.sections = [{
+      id: "section-0",
+      heading: "Privacy Safeguards",
+      headingLevel: 2,
+      sectionType: "main",
+      blocks: [
+        { id: "s0-0", type: "paragraph", content: [{ type: "text", text: "Use these safeguards:" }] },
+      ],
+      status: "generated",
+    }];
+
+    expect(scanMalformedProseInDocument(doc).length).toBeGreaterThan(0);
+    expect(findMalformedEditableBlocks(doc).length).toBeGreaterThan(0);
+    expect(validateCoherence(doc).some((issue) => issue.type === "incomplete-sentence")).toBe(true);
+  });
+
   it("headings, list items and table cells without punctuation are valid", () => {
     const doc = makeDoc([]);
     doc.metadata.title = "Threads Marketing Hong Kong 2026";

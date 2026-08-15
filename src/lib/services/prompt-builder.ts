@@ -1,5 +1,6 @@
 import { FACTUALITY_INSTRUCTION } from "./generation-constants";
 import type { ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
+import { EDITORIAL_BLOCK_JSON_CONTRACT } from "@/lib/blog/editorial-block-contract";
 import {
   englishTitleRange,
   englishMetaRange,
@@ -248,7 +249,7 @@ The article is being generated on ${generationDate}.
   } else if (stage === "faq") {
     parts.push(`CRITICAL OUTPUT CONTRACT: Return one valid JSON object with {"heading":"...","entries":[{"question":"...","answer":"..."}]}. Do not return HTML, WordPress comments, Markdown, CTA content or precise research claims.`);
   } else if (stage === "introduction" || stage === "section" || stage === "conclusion") {
-    parts.push(`CRITICAL OUTPUT CONTRACT: Return one valid JSON object containing structured editorial blocks. Supported block types are paragraph, subheading (H3 only), list, quote and table. Do not return HTML, WordPress comments, Markdown, H2 headings, CTA or schema. The application renders canonical WordPress blocks.`);
+    parts.push(`CRITICAL OUTPUT CONTRACT: ${EDITORIAL_BLOCK_JSON_CONTRACT} Supported block types are paragraph, subheading (H3 only), list, quote and table. Do not return HTML, WordPress comments, Markdown, H2 headings, CTA or schema. The application renders canonical WordPress blocks.`);
   } else {
     parts.push(`CRITICAL FORMAT REQUIREMENT: Full-article HTML must use canonical WordPress blocks. Every heading, paragraph, list, quote and table must have balanced WordPress comments. Custom HTML is application-owned. Never use Markdown or bare HTML outside a wp:html block.`);
   }

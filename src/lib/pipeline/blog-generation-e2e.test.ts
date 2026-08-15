@@ -67,7 +67,11 @@ import {
   runFinalValidation,
   runPostAssemblyPipeline,
 } from "@/lib/pipeline/blog-generation-pipeline";
+import { canonicalKeyphraseMetrics } from "@/lib/blog/final-seo-reconcile";
 import { analyzeFinalArticle, buildPolicy } from "@/lib/blog/final-article-policy";
+import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
+import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
+import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { englishWordTolerance } from "@/lib/content-standards";
 import { extractH2Texts } from "@/lib/seo/seo-text-utils";
 import { runAudit } from "@/lib/services/seo-auditor";
@@ -241,8 +245,10 @@ describe("2500-word post-assembly generation pipeline", () => {
       result.title,
       result.metaDescription,
       2500,
+      finalReadableWordCount(result),
     );
     const finalTrim = result.stageOutputs.find((output) => output.stage === "final-trim");
+    const finalReconcile = result.stageOutputs.find((output) => output.stage === "final-seo-reconcile");
 
     expect(validation.passed).toBe(true);
     expect(finalReadableWordCount(result)).toBeGreaterThanOrEqual(range.min);
@@ -256,7 +262,274 @@ describe("2500-word post-assembly generation pipeline", () => {
     expect((result.blog.match(/b2i-conclusion-start/g) ?? []).length).toBe(1);
     expect(finalTrim).toBeDefined();
     expect(finalTrim!.inputFingerprint).not.toBe(finalTrim!.outputFingerprint);
+    // The deterministic post-final-trim reconciliation stage must run and be
+    // accepted, and the canonical density at the final gate must never cross
+    // the hard 3% limit.
+    expect(finalReconcile).toBeDefined();
+    expect(finalReconcile!.accepted).toBe(true);
+    expect(canonicalKeyphraseMetrics(result.articleDoc, keyphrase).density).toBeLessThanOrEqual(3);
     expect(result.stageOutputs.every((output) => output.accepted)).toBe(true);
+  });
+
+  it("the punctuation-only fragment cannot recur through the exact stage sequence (malformed-prose-repair → links → post-ownership → CTA → final-trim → final-seo-reconcile → faq-recovery → final-preflight)", async () => {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    const range = englishWordTolerance(2500);
+    // section-3-wp-2: inject the production-shaped punctuation-only residue —
+    // a "." residue sentence inside a plain paragraph that loses the removal
+    // competition AND inside a linked paragraph whose link must survive.
+    const section3 = doc.sections[3];
+    section3.blocks[2] = {
+      id: "section-3-wp-2",
+      type: "paragraph",
+      content: [{ type: "text", text: "Local teams share useful lessons every week. . Plan a small weekly routine that keeps the work steady and the team consistent." }],
+    };
+    section3.blocks[3] = {
+      id: "section-3-wp-3",
+      type: "paragraph",
+      content: [
+        { type: "text", text: ". Consistency matters more than a single perfect post. Read the " },
+        { type: "link", text: "full guide", href: "/blog/threads-hk-guide", sourceType: "internal" },
+        { type: "text", text: " before you start." },
+      ],
+    };
+
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "fragment-stage-sequence",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+
+    const result = await runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => { throw new Error("Unexpected AI call"); },
+      makeTrackedChatForStage: () => async () => { throw new Error("Unexpected tracked AI call"); },
+      telemetry: {},
+      context: { research: [] },
+    });
+
+    assertRenderedCacheMatchesDocument(result);
+    const validation = runFinalValidation(result);
+    expect(validation.passed).toBe(true);
+    // The mid-pipeline repair and the final-trim producer both clean residue;
+    // final-preflight and final validation must agree the document is clean.
+    expect(scanMalformedProseInDocument(result.articleDoc)).toEqual([]);
+    expect(scanSentenceQualityInDocument(result.articleDoc)).toEqual([]);
+    // The protected internal link injected before final-trim survives.
+    expect(result.blog).toContain("/blog/threads-hk-guide");
+    expect(result.stageOutputs.every((output) => output.accepted)).toBe(true);
+  });
+
+  it("FAQ answers with quotes and ampersands survive the factual/ownership cleanup with canonical/rendered/schema parity intact", async () => {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    const range = englishWordTolerance(2500);
+    // Production-shaped FAQ answer: contains a double quote and an ampersand,
+    // plus a precise claim that factual/ownership cleanup will target.
+    doc.visibleFaq[1] = {
+      question: doc.visibleFaq[1].question,
+      answerHtml: "",
+      answerText: 'Start with a "small" routine & keep the plan weekly. About 35% of teams do this weekly.',
+    };
+    doc.faqSchema = null;
+
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "faq-parity-e2e",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [{ title: "Team Routines", snippet: "About 35% of teams do this weekly.", url: "https://example.com/routines" }] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+
+    const result = await runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => { throw new Error("Unexpected AI call"); },
+      makeTrackedChatForStage: () => async () => { throw new Error("Unexpected tracked AI call"); },
+      telemetry: {},
+      context: { research: [{ title: "Team Routines", snippet: "About 35% of teams do this weekly.", url: "https://example.com/routines" }] },
+    });
+
+    const validation = runFinalValidation(result);
+    expect(validation.passed).toBe(true);
+    // The quote and ampersand survive every FAQ-touching stage.
+    expect(result.articleDoc.visibleFaq[1].answerText).toContain('"small"');
+    expect(result.articleDoc.visibleFaq[1].answerText).toContain("&");
+    // The precise claim was removed from the synthesis-only FAQ.
+    expect(result.articleDoc.visibleFaq[1].answerText).not.toContain("35%");
+    // The final-preflight parity gate ran and passed.
+    const preflight = result.stageOutputs.find((output) => output.stage === "final-preflight");
+    expect(preflight).toBeDefined();
+    expect(preflight!.accepted).toBe(true);
+    expect(result.stageOutputs.every((output) => output.accepted)).toBe(true);
+  });
+
+  it("factual removal of a keyphrase-bearing sentence commits at its owner and is restored by post-ownership reconciliation", async () => {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    const range = englishWordTolerance(2500);
+    // Production shape: an unsupported precise claim whose sentence ALSO
+    // contains the focus keyphrase. factual-scan removes the sentence, which
+    // drops the keyphrase occurrence count as a DERIVED side effect — this
+    // must commit at the factual-scan boundary and be restored downstream by
+    // post-ownership-seo-reconcile, never rejected as a direct SEO mutation.
+    doc.sections[0].blocks[0] = {
+      id: "section-0-wp-0",
+      type: "paragraph",
+      content: [
+        { type: "text", text: "Local teams share useful lessons every week. " },
+        { type: "text", text: "About 35% of teams doing threads marketing hong kong report better engagement." },
+      ],
+    };
+
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "kp-drift-e2e",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [{ title: "Team Routines", snippet: "Teams report steady engagement over time.", url: "https://example.com/routines" }] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+
+    const result = await runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => { throw new Error("Unexpected AI call"); },
+      makeTrackedChatForStage: () => async () => { throw new Error("Unexpected tracked AI call"); },
+      telemetry: {},
+      context: { research: [{ title: "Team Routines", snippet: "Teams report steady engagement over time.", url: "https://example.com/routines" }] },
+    });
+
+    assertRenderedCacheMatchesDocument(result);
+    // The derived keyphrase drift was accepted at factual-scan (not rejected
+    // as direct SEO mutation), and the ownership stage completed.
+    const factualStage = result.stageOutputs.find((output) => output.stage === "factual-scan");
+    expect(factualStage).toBeDefined();
+    expect(factualStage!.accepted).toBe(true);
+    const ownershipStage = result.stageOutputs.find((output) => output.stage === "claim-ownership");
+    expect(ownershipStage).toBeDefined();
+    expect(ownershipStage!.accepted).toBe(true);
+    // post-ownership-seo-reconcile ran and was accepted — it owns the SEO
+    // restoration the removal stage deferred to it.
+    const reconcile = result.stageOutputs.find((output) => output.stage === "post-ownership-seo-reconcile");
+    expect(reconcile).toBeDefined();
+    expect(reconcile!.accepted).toBe(true);
+    // The unsupported claim was removed.
+    expect(scanFactualRisks(result.blog, keyphrase, [{ title: "Team Routines", snippet: "Teams report steady engagement over time.", url: "https://example.com/routines" }]).claims
+      .some((claim) => claim.text.includes("35%"))).toBe(false);
+    // Final validation unchanged and fail-closed: still passes on valid
+    // content, still rejects stuffing (checked in the unit regression).
+    const validation = runFinalValidation(result);
+    expect(validation.passed).toBe(true);
+    expect(result.stageOutputs.every((output) => output.accepted)).toBe(true);
+  });
+
+  it("factual removal cannot silently unground a grounded section through the full pipeline", async () => {
+    const keyphrase = "threads marketing hong kong";
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    const range = englishWordTolerance(2500);
+    // Production shape: section-0's ONLY heading-word carrier is an unsupported
+    // claim sentence ("threads marketing" inside the claim). All other body
+    // sentences use generic words only. The factual producer must preserve the
+    // essential grounding carrier so the section never becomes ungrounded at
+    // final QC — and the stage-aware contract must reject any stage that would
+    // have turned it ungrounded.
+    doc.sections[0].blocks[0] = {
+      id: "section-0-wp-0",
+      type: "paragraph",
+      content: [
+        { type: "text", text: "Local teams share useful lessons from daily work with clear and honest words. " },
+        { type: "text", text: "About 35% of teams doing threads marketing hong kong report better engagement." },
+      ],
+    };
+    for (let index = 1; index < doc.sections[0].blocks.length; index++) {
+      doc.sections[0].blocks[index] = {
+        id: `section-0-wp-${index}`,
+        type: "paragraph",
+        content: [{ type: "text", text: "Local teams share useful lessons from daily work with clear and honest words. Simple examples help busy owners understand the idea and take a practical next step." }],
+      };
+    }
+    // Give section-0 a NON-claim grounding paragraph: the claim ("…threads
+    // marketing…") may be removed, but this sentence keeps the section
+    // grounded with the heading's content word.
+    doc.sections[0].blocks[1] = {
+      id: "section-0-wp-1",
+      type: "paragraph",
+      content: [{ type: "text", text: "Threads marketing for small local brands starts with a clear weekly routine." }],
+    };
+
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "grounding-e2e",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [{ title: "Team Routines", snippet: "Teams report steady engagement over time.", url: "https://example.com/routines" }] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+
+    const result = await runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => { throw new Error("Unexpected AI call"); },
+      makeTrackedChatForStage: () => async () => { throw new Error("Unexpected tracked AI call"); },
+      telemetry: {},
+      context: { research: [{ title: "Team Routines", snippet: "Teams report steady engagement over time.", url: "https://example.com/routines" }] },
+    });
+
+    assertRenderedCacheMatchesDocument(result);
+    // Every stage accepted — no mutating stage turned section-0 ungrounded.
+    expect(result.stageOutputs.every((output) => output.accepted)).toBe(true);
+    const factualStage = result.stageOutputs.find((output) => output.stage === "factual-scan");
+    expect(factualStage).toBeDefined();
+    expect(factualStage!.accepted).toBe(true);
+    const qc = result.stageOutputs.find((output) => output.stage === "final-qc-scan");
+    expect(qc).toBeDefined();
+    expect(qc!.accepted).toBe(true);
+    const validation = runFinalValidation(result);
+    expect(validation.passed).toBe(true);
+    // section-0 stays grounded: its body still shares a content word with its
+    // own H2 ("Threads Marketing Hong Kong for Small Local Brands").
+    expect(result.articleDoc.sections[0].blocks.some((b) =>
+      b.type === "paragraph"
+      && /threads|marketing|brands|local/.test(b.content.map((n) => n.text).join("").toLowerCase())
+    )).toBe(true);
   });
 });
 
@@ -733,5 +1006,76 @@ describe("malformed-prose repair boundary (production prose defects)", () => {
         });
       }),
     ).rejects.toThrow(/Unresolved malformed prose at repair boundary/);
+  });
+});
+
+describe("opt-in pipeline debug tracing: observational only", () => {
+  async function runOnce(enabled: boolean, traceConsumer?: (trace: unknown) => void) {
+    if (enabled) process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    else delete process.env.ENABLE_PIPELINE_DEBUG_TRACE;
+    const { doc, introHtml, conclusionHtml } = buildDeterministic2500WordDocument();
+    const keyphrase = "threads marketing hong kong";
+    const { min: wordMin, max: wordMax } = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "trace-equivalence",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: conclusionHtml,
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, wordMin, wordMax, keyphrase),
+      ctx: { research: [] },
+      wordMin,
+      wordMax,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+    if (enabled) expect(state.debugTrace).toBeDefined();
+    if (!enabled) expect(state.debugTrace).toBeUndefined();
+    const result = await runPostAssemblyPipeline(state, {
+      chatWithRetry: async () => { throw new Error("Unexpected AI call"); },
+      makeTrackedChatForStage: () => async () => { throw new Error("Unexpected tracked AI call"); },
+      telemetry: {},
+      context: { research: [] },
+    });
+    traceConsumer?.(state.debugTrace);
+    return result;
+  }
+
+  it("enabled tracing produces no pipeline/output differences vs disabled", async () => {
+    const disabled = await runOnce(false);
+    const enabled = await runOnce(true, (trace) => {
+      expect(trace).toBeDefined();
+      // Every mutating stage recorded a stage line with a contract record.
+      const stages = (trace as { recordsFor(): Array<{ stage: string; contract?: unknown }> }).recordsFor();
+      expect(stages.length).toBeGreaterThan(10);
+      expect(stages.some((s) => s.stage === "factual-scan")).toBe(true);
+      expect(stages.some((s) => s.stage === "claim-ownership")).toBe(true);
+      expect(stages.some((s) => s.stage === "final-trim")).toBe(true);
+      // Contract-guarded stages carry their integrity-contract result when
+      // their guard actually ran (stages that skip early — e.g. no research,
+      // no ledger — never reach the contract, which is correct).
+      for (const guarded of ["malformed-prose-repair", "final-trim", "final-preflight"]) {
+        const record = stages.find((s) => s.stage === guarded);
+        expect(record, `trace record for ${guarded}`).toBeDefined();
+        expect(record!.contract, `contract for ${guarded}`).toBeDefined();
+      }
+      // Stages that ran the guard record a contract result (valid or not).
+      expect(stages.filter((s) => s.contract).length).toBeGreaterThanOrEqual(3);
+    });
+
+    // Stage outputs identical (accepted/fingerprints/metadata).
+    expect(JSON.stringify(enabled.stageOutputs)).toBe(JSON.stringify(disabled.stageOutputs));
+    // Canonical document byte-identical.
+    expect(JSON.stringify(enabled.articleDoc)).toBe(JSON.stringify(disabled.articleDoc));
+    // Rendered cache identical.
+    expect(enabled.blog).toBe(disabled.blog);
+    // Final validation identical.
+    expect(JSON.stringify(runFinalValidation(enabled))).toBe(JSON.stringify(runFinalValidation(disabled)));
+    delete process.env.ENABLE_PIPELINE_DEBUG_TRACE;
   });
 });

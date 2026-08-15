@@ -8,11 +8,17 @@ import {
   parseWordPressEditorialBlocks,
   extractPlainTextFromEditorialBlocks,
   validateEditorialBlocks,
+  isNonEmptyStructuredContinuation,
 } from "@/lib/blog/article-content";
 import { parseWordpressBlockStructure } from "@/lib/blog/wordpress-block-structure";
 
 export type { EditorialBlock };
-export { renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, extractPlainTextFromEditorialBlocks };
+export {
+  renderEditorialBlocksToWordPress,
+  parseWordPressEditorialBlocks,
+  extractPlainTextFromEditorialBlocks,
+  isNonEmptyStructuredContinuation,
+};
 
 export type ComponentStatus = "generated" | "regenerated" | "expanded" | "normalized" | "trimmed" | "missing";
 
@@ -324,15 +330,46 @@ export interface FaqParityIssue {
  * Validate that visible FAQ entries match the FAQ schema JSON-LD.
  * Both must derive from the same FaqEntry[] source.
  */
-function decodeHtmlEntities(text: string): string {
+export function decodeHtmlEntities(text: string): string {
   return text
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
     .replace(/&#39;/g, "'")
     .replace(/&#x27;/g, "'")
     .replace(/&#x2F;/g, "/");
+}
+
+/** Unescape a JSON string literal captured by the schema extractor (\" \\ \n
+ *  \r \t \uXXXX), so schema answers compare as the same semantic text. */
+function unescapeJsonStringLiteral(text: string): string {
+  return text
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/\\(["\\/bfnrt])/g, (_, char: string) => {
+      switch (char) {
+        case "n": return "\n";
+        case "r": return "\r";
+        case "t": return "\t";
+        case "b": return "\b";
+        case "f": return "\f";
+        default: return char;
+      }
+    });
+}
+
+/** THE authoritative FAQ semantic-text normalization shared by the parity
+ *  validator and the integrity contract: HTML entities decoded, JSON string
+ *  escapes unescaped, whitespace collapsed, trimmed and lowercased. Applied
+ *  IDENTICALLY to canonical answers, rendered answers and schema answers, so
+ *  the comparison can never invent a mismatch from entity/escape/whitespace
+ *  representation — while real wording differences still fail. */
+export function normalizeFaqSemanticText(text: string): string {
+  return decodeHtmlEntities(unescapeJsonStringLiteral(text))
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 export function validateFaqParity(
@@ -350,10 +387,10 @@ export function validateFaqParity(
   let am: RegExpExecArray | null;
 
   while ((qm = qRe.exec(schemaHtml)) !== null) {
-    schemaQuestions.push(qm[1].replace(/\\"/g, '"').replace(/\\n/g, "\n"));
+    schemaQuestions.push(qm[1]);
   }
   while ((am = aRe.exec(schemaHtml)) !== null) {
-    schemaAnswers.push(am[1].replace(/\\"/g, '"').replace(/\\n/g, "\n"));
+    schemaAnswers.push(am[1]);
   }
 
   if (schemaQuestions.length !== entries.length) {
@@ -366,8 +403,8 @@ export function validateFaqParity(
 
   const maxQuestions = Math.min(schemaQuestions.length, entries.length);
   for (let i = 0; i < maxQuestions; i++) {
-    const entryText = decodeHtmlEntities(entries[i].question.toLowerCase().trim());
-    const schemaText = schemaQuestions[i].toLowerCase().trim();
+    const entryText = normalizeFaqSemanticText(entries[i].question);
+    const schemaText = normalizeFaqSemanticText(schemaQuestions[i]);
 
     if (!entryText || !schemaText) {
       issues.push({
@@ -384,11 +421,13 @@ export function validateFaqParity(
     }
   }
 
-  // Compare answers (visible answerText vs schema answerText)
-  // Both must be non-empty and identical for the entry to be valid.
+  // Compare answers (visible answerText vs schema answerText) using the SAME
+  // semantic normalization on both sides. HTML entities and JSON escapes are
+  // equivalent representations of the same character; a difference in wording
+  // still fails.
   for (let i = 0; i < maxQuestions; i++) {
-    const entryAnswer = decodeHtmlEntities((entries[i].answerText || "").toLowerCase().trim());
-    const schemaAnswer = (schemaAnswers[i] || "").toLowerCase().trim();
+    const entryAnswer = normalizeFaqSemanticText(entries[i].answerText || "");
+    const schemaAnswer = normalizeFaqSemanticText(schemaAnswers[i] || "");
 
     if (!entryAnswer) {
       issues.push({

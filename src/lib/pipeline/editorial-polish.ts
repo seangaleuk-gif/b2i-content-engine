@@ -14,6 +14,7 @@ import {
   renderArticleDocument,
   renderEditorialBlocksToWordPress,
   extractPlainTextFromEditorialBlocks,
+  isNonEmptyStructuredContinuation,
 } from "@/lib/blog/article-document";
 import type { InlineContent } from "@/lib/blog/article-content";
 import { validateEditorialBlocks } from "@/lib/blog/article-content";
@@ -39,6 +40,13 @@ import {
   hasUnmistakableFragmentEnding,
   type SentenceCompletenessKind,
 } from "@/lib/blog/sentence-completeness";
+import {
+  dropPunctuationOnlyResidueFromContent,
+  isAuthoritativeLowercaseSentenceStart,
+  isAuthoritativePunctuationOnlyResidue,
+  lowercaseStartValidTokensFromKeyphrase,
+  sentenceTextRanges,
+} from "@/lib/blog/sentence-quality";
 
 export function isEditorialPolishEnabled(): boolean {
   return process.env.ENABLE_EDITORIAL_POLISH === "true";
@@ -840,11 +848,26 @@ function malformedTextsForBlock(block: EditorialBlock): {
   return { texts: [textFromBlock(block)], kinds: ["paragraph"] };
 }
 
-/** Resolve canonical malformed-prose findings to stable editable block IDs. */
+/** Resolve canonical malformed-prose findings to stable editable block IDs.
+ *  Uses the same authoritative lowercase-start and punctuation-only-residue
+ *  rules as the final sentence-quality QC, with the focus keyphrase supplied
+ *  as the valid-lowercase-token context. */
 export function findMalformedEditableBlocks(doc: ArticleDocument): MalformedEditableBlock[] {
+  const validLowercaseTokens = lowercaseStartValidTokensFromKeyphrase(doc.metadata.focusKeyphrase);
   return createEditableTargets(doc).flatMap((target) => {
     const { texts, kinds } = malformedTextsForBlock(target.originalBlock);
-    const issues = findMalformedProseTextIssues(texts, kinds);
+    const component = resolveComponent(doc, target);
+    const next = component.blocks[target.blockIndex + 1];
+    const hasStructuredContinuation = isNonEmptyStructuredContinuation(next);
+    const issues = findMalformedProseTextIssues(
+      texts,
+      kinds,
+      texts.map(() => ({
+        allowColonBeforeStructuredContinuation:
+          target.originalBlock.type === "paragraph" && hasStructuredContinuation,
+      })),
+      validLowercaseTokens,
+    );
     if (issues.length === 0) return [];
     return [{
       blockId: target.publicBlock.blockId,
@@ -963,46 +986,12 @@ function repairDashSentenceStarts(
 }
 
 /**
- * Deterministic first aid after factual/ownership sentence deletion.
- * It trims only a trailing broken sentence from plain-text paragraphs. If that
- * is impossible, a short evidence-free malformed paragraph may be removed as
- * a last-resort fallback, provided the article remains above its word minimum.
- */
-/**
- * Sentence boundaries identical to the sentence-quality scanner (split at every
- * [.!?], consuming runs of marks and closing quotes, skipping decimal points)
- * so a punctuation-only sentence found here is exactly what the final gate
- * would flag.
- */
-function splitScannerSentences(text: string): string[] {
-  const sentences: string[] = [];
-  let start = 0;
-  for (let index = 0; index < text.length; index++) {
-    const char = text[index];
-    if (char !== "." && char !== "!" && char !== "?") continue;
-    if (char === "." && /\d/.test(text[index - 1] ?? "") && /\d/.test(text[index + 1] ?? "")) continue;
-    let end = index + 1;
-    while (/[.!?]/.test(text[end] ?? "")) end++;
-    while (/["”’)]/.test(text[end] ?? "")) end++;
-    if (text.slice(start, end).trim()) sentences.push(text.slice(start, end).trim());
-    start = end;
-    index = end - 1;
-  }
-  if (start < text.length && text.slice(start).trim()) {
-    sentences.push(text.slice(start).trim());
-  }
-  return sentences;
-}
-
-const PUNCTUATION_ONLY_SENTENCE_RE = /^[\s\p{P}\p{S}]+$/u;
-const PUNCTUATION_MARK_RE = /[.!?—–…]/;
-
-/**
- * Deterministic cleanup for stray punctuation-only sentences inside plain-text
- * paragraphs ("Local teams share lessons. . Plan a weekly routine."). A lone
- * "." or "…" sentence is the residue of a deleted sentence and carries no
- * content, so removing it and rejoining the intact sentences preserves meaning.
- * Meaningful punctuation inside normal prose is never touched.
+ * Deterministic cleanup for stray punctuation-only sentences inside paragraphs
+ * ("Local teams share lessons. . Plan a weekly routine."). A lone "." or "…"
+ * sentence is the residue of a deleted sentence and carries no content, so
+ * removing it and rejoining the intact sentences preserves meaning. Works for
+ * plain-text paragraphs AND paragraphs with inline links/emphasis: the shared
+ * node-preserving residue drop keeps link/strong/emphasis nodes byte-identical.
  */
 function stripPunctuationOnlySentences(
   doc: ArticleDocument,
@@ -1013,18 +1002,78 @@ function stripPunctuationOnlySentences(
     blocks: EditorialBlock[],
   ) => {
     for (const block of blocks) {
-      if (block.type !== "paragraph" || !canRebuildAsPlainText(block)) continue;
-      const original = textFromBlock(block);
-      const sentences = splitScannerSentences(original);
-      const kept = sentences.filter((sentence) =>
-        !(PUNCTUATION_ONLY_SENTENCE_RE.test(sentence) && PUNCTUATION_MARK_RE.test(sentence)),
-      );
-      if (kept.length === sentences.length) continue;
-      const repaired = kept.join(" ").replace(/\s+/g, " ").trim();
-      if (!repaired || repaired === original) continue;
-      block.content = [{ type: "text", text: repaired }];
+      if (block.type !== "paragraph") continue;
+      const originalText = block.content.map((node) => node.text).join("").replace(/\s+/g, " ").trim();
+      const cleaned = dropPunctuationOnlyResidueFromContent(block.content);
+      if (!cleaned) continue;
+      const repairedText = cleaned.map((node) => node.text).join("").replace(/\s+/g, " ").trim();
+      if (!repairedText || repairedText === originalText) continue;
+      block.content = cleaned;
       component.status = "normalized";
       repairedBlockIds.push(block.id);
+    }
+  };
+  checkComponent(doc.introduction, doc.introduction.blocks);
+  for (const section of doc.sections) {
+    if (section.sectionType === "faq-heading" || section.sectionType === "conclusion-heading") continue;
+    checkComponent(section, section.blocks);
+  }
+  checkComponent(doc.conclusion, doc.conclusion.blocks);
+  return { repairedBlockIds };
+}
+
+/**
+ * Deterministic repair for genuine lowercase sentence starts: a sentence whose
+ * first alpha is lowercase and is NOT an allowed opener, a brand-style word,
+ * an abbreviation/acronym, a number or the exact focus keyphrase gets its first
+ * alpha capitalized. Uses the same authoritative rule as the final
+ * sentence-quality QC (and the malformed-prose scanner), so the repair can
+ * never alter the keyphrase, brands, acronyms or intentional styling — and the
+ * two gates can never disagree after the repair. Inline links/emphasis are
+ * preserved; only the first alpha character of a flagged sentence changes.
+ */
+function capitalizeLowercaseSentenceStarts(
+  doc: ArticleDocument,
+  keyphrase: string,
+): { repairedBlockIds: string[] } {
+  const repairedBlockIds: string[] = [];
+  const validLowercaseTokens = lowercaseStartValidTokensFromKeyphrase(keyphrase);
+  const checkComponent = (
+    component: Pick<ArticleComponent, "status">,
+    blocks: EditorialBlock[],
+  ) => {
+    for (const block of blocks) {
+      if (block.type !== "paragraph") continue;
+      const content = block.content;
+      const text = content.map((node) => node.text).join("");
+      const ranges = sentenceTextRanges(text).filter((range) =>
+        isAuthoritativeLowercaseSentenceStart(range.text, { validLowercaseTokens }),
+      );
+      if (ranges.length === 0) continue;
+      let changed = false;
+      for (const range of ranges) {
+        const firstAlpha = text.slice(range.start, range.end).match(/[a-zA-Z]/);
+        if (!firstAlpha || firstAlpha.index === undefined) continue;
+        const offset = range.start + firstAlpha.index;
+        const upper = firstAlpha[0].toUpperCase();
+        if (upper === firstAlpha[0]) continue;
+        let nodeCursor = 0;
+        for (const node of content) {
+          const nodeStart = nodeCursor;
+          const nodeEnd = nodeCursor + node.text.length;
+          nodeCursor = nodeEnd;
+          if (offset >= nodeStart && offset < nodeEnd) {
+            const local = offset - nodeStart;
+            node.text = node.text.slice(0, local) + upper + node.text.slice(local + 1);
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (changed) {
+        component.status = "normalized";
+        repairedBlockIds.push(block.id);
+      }
     }
   };
   checkComponent(doc.introduction, doc.introduction.blocks);
@@ -1049,8 +1098,15 @@ export function repairDeterministicMalformedProse(
   // any other malformed-prose work: a sentence that opens with an em-dash is
   // grammatical once capitalized, and no block removal is needed.
   repairedBlockIds.push(...repairDashSentenceStarts(doc).repairedBlockIds);
-  // Stray punctuation-only sentences (a lone "." residue) are removed so the
-  // block never reaches the final sentence-quality gate as a fragment.
+  // Genuine lowercase sentence starts (first alpha lowercase, not the focus
+  // keyphrase, not an allowed opener/brand/acronym/number) get their first
+  // alpha capitalized. Uses the same authoritative rule as the final
+  // sentence-quality QC, so the repair can never alter the keyphrase, brands,
+  // acronyms or intentional styling, and preflight and final QC agree.
+  repairedBlockIds.push(...capitalizeLowercaseSentenceStarts(doc, keyphrase).repairedBlockIds);
+  // Stray punctuation-only sentences (a lone "." residue) are removed — even
+  // inside paragraphs that carry inline links/emphasis — so the block never
+  // reaches the final sentence-quality gate as a fragment.
   repairedBlockIds.push(...stripPunctuationOnlySentences(doc).repairedBlockIds);
   const initial = findMalformedEditableBlocks(doc)
     .sort((left, right) =>
@@ -1249,6 +1305,10 @@ export function applyDeterministicRepetitionFallback(
     for (const sentence of splitEditorialSentences(text)) {
       const normalized = normalizeProtectedSentence(sentence);
       if (!normalized) continue;
+      // Punctuation-only residue (".") is a deleted-sentence leftover, never
+      // content: it is dropped so the fallback can never leave standalone
+      // punctuation behind.
+      if (isAuthoritativePunctuationOnlyResidue(sentence.trim())) continue;
       const carriesProtectedContent = extractNumbers(sentence).length > 0
         || new RegExp(ATTRIBUTION_RE.source, "i").test(sentence)
         || /["“”'‘’]/.test(sentence)

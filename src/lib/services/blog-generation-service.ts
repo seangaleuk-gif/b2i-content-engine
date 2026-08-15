@@ -6,7 +6,12 @@ import {
   projectRepository, researchRepository, knowledgeRepository,
   promptSectionRepository,
 } from "@/lib/repositories";
-import { buildBlogPrompt, buildOutlineBrief, type BlogContext } from "@/lib/services/prompt-builder";
+import {
+  buildBlogPrompt,
+  buildOutlineBrief,
+  type BlogContext,
+} from "@/lib/services/prompt-builder";
+import { EDITORIAL_BLOCK_JSON_CONTRACT } from "@/lib/blog/editorial-block-contract";
 import { getCompiledBundle } from "@/lib/services/prompt-compiler";
 import { AiService, type ChatMessage, type ChatOptions } from "@/lib/services/deepseek";
 import { AppError } from "@/lib/services/errors";
@@ -156,6 +161,11 @@ function extractOutlineHeadings(outline: unknown): string[] {
       return typeof item.heading === "string" ? item.heading : typeof item.title === "string" ? item.title : "";
     })
     .filter(Boolean);
+}
+
+function logEditorialRecoveries(componentId: string, recoveries: string[]): void {
+  if (recoveries.length === 0) return;
+  console.warn(`[editorial-payload-normalization] component=${componentId} recoveries=${JSON.stringify(recoveries)}`);
 }
 
 interface AcceptedFaqPayload {
@@ -624,11 +634,13 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       parsed = robustJsonParse(retryRes.content, "intro-retry");
     }
     const normalized = normalizeAiEditorialPayload(parsed, "intro");
+    logEditorialRecoveries("intro", normalized.recoveries);
     if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}.\n\nReturn ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences.\n\nOriginal request and approved evidence:\n${introUserMsg}`;
+      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments or Markdown fences.\n\nOriginal request and approved evidence:\n${introUserMsg}`;
       const repairRes = await trackedChat("intro_repair", [{ role: "system", content: bundle.introSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "intro-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "intro");
+      logEditorialRecoveries("intro-repair", repairedNorm.recoveries);
       if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
         throw AppError.internal(new Error(`Introduction generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
       }
@@ -690,11 +702,13 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       taskFactories.push(() => trackedChat(`section_${i}`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: msg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 90_000 }).then(async (res: any) => {
         const raw = robustJsonParse(res.content, `section_${i}`);
         const normalized = normalizeAiEditorialPayload(raw, `section-${i}`);
+        logEditorialRecoveries(`section-${i}`, normalized.recoveries);
         if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-          const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}. Return ONLY valid JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Supported types: paragraph, subheading, list, quote, table. No HTML. No WordPress comments. No Markdown fences. Do NOT include H2 headings.\n\nOriginal request and approved evidence:\n${msg}`;
+          const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments, Markdown fences or H2 headings.\n\nOriginal request and approved evidence:\n${msg}`;
           const repairRes = await trackedChat(`section_${i}_repair`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
           const repaired = robustJsonParse(repairRes.content, `section-${i}-repair`);
           const repairedNorm = normalizeAiEditorialPayload(repaired, `section-${i}`);
+          logEditorialRecoveries(`section-${i}-repair`, repairedNorm.recoveries);
           if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
             throw AppError.internal(new Error(`Section ${i} ("${h2Text}"): generation failed after retry — ${repairedNorm.errors.join("; ") || "empty blocks"}`));
           }
@@ -718,11 +732,13 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       parsed = robustJsonParse(retryRes.content, "conclusion-retry");
     }
     const normalized = normalizeAiEditorialPayload(parsed, "conclusion", { disallowCtaContent: true });
+    logEditorialRecoveries("conclusion", normalized.recoveries);
     if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
       const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ") || "empty blocks"}. Return ONLY valid conclusion JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA content. No signup buttons. No HTML.\n\nOriginal request and approved evidence:\n${concUserMsg}`;
       const repairRes = await trackedChat("conclusion_repair", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "conclusion-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "conclusion", { disallowCtaContent: true });
+      logEditorialRecoveries("conclusion-repair", repairedNorm.recoveries);
       if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
         throw AppError.internal(new Error(`Conclusion generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
       }

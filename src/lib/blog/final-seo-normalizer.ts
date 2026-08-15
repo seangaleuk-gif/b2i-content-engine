@@ -16,7 +16,7 @@ import { splitLongParagraphs } from "@/lib/services/text-utils";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { parseWordPressEditorialBlocks } from "@/lib/blog/article-document";
 import { buildPolicy, evaluatePolicy, analyzeFinalArticle, countUniqueInternalLinks, computeWordCountTolerance, type FinalArticlePolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
-import { scanSentenceQualityText } from "@/lib/blog/sentence-quality";
+import { scanSentenceQualityText, dropPunctuationOnlySentences } from "@/lib/blog/sentence-quality";
 import { findMalformedProseTextIssues } from "@/lib/blog/publication-quality";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
@@ -487,6 +487,54 @@ function extractTopic(heading: string): string {
 // malformed-prose checks. When no safe removal exists, the occurrence is kept
 // — density is verified against the stuffing maximum by the caller.
 
+/** Number of exact keyphrase occurrences inside editable paragraph blocks of
+ *  the given HTML. Protected blocks (script/schema, wp:html switcher and CTA,
+ *  wp:buttons, images, media, links) are tokenized first, so occurrences
+ *  inside them are invisible to the sentence-level reducer. This is the same
+ *  count the reducer itself uses, so callers can target removal precisely. */
+export function countEditableKeyphraseOccurrences(html: string, keyphrase: string): number {
+  const { content: tokenizedHtml } = tokenizeProtectedBlocks(html);
+  return countExactPhrase(extractReadableText(tokenizedHtml), keyphrase);
+}
+
+export interface ProtectedKeyphraseReductionResult {
+  html: string;
+  /** Number of complete sentences removed from editable paragraphs. */
+  removed: number;
+  /** Editable-paragraph occurrences the reducer observed before removal. */
+  countBefore: number;
+  changes: SeoNormalizationChange[];
+}
+
+/**
+ * Deterministic, protected-block-safe keyphrase reduction on complete HTML.
+ * Script/FAQ schema, wp:html (language switcher, CTA), wp:buttons, images,
+ * media and link blocks are tokenized and restored byte-for-byte; only
+ * complete sentences inside editable paragraph blocks that carry the exact
+ * keyphrase are removed, each gated by the shared sentence-removal safety and
+ * validation rules (links, numbers, claims, quotation integrity, sentence
+ * quality, malformed prose, terminal punctuation). This is the single
+ * protected keyphrase-removal implementation reused by the SEO normalizer, the
+ * density-aware final trim and the post-final-trim reconciliation stage.
+ */
+export function reduceProtectedKeyphraseOccurrences(
+  html: string,
+  keyphrase: string,
+  targetParagraphOccurrences: number,
+): ProtectedKeyphraseReductionResult {
+  const changes: SeoNormalizationChange[] = [];
+  const { content: tokenizedHtml, tokens } = tokenizeProtectedBlocks(html);
+  const countBefore = countExactPhrase(extractReadableText(tokenizedHtml), keyphrase);
+  const reduced = fixExcessiveKeyphrase(tokenizedHtml, keyphrase, targetParagraphOccurrences, changes);
+  const restored = detokenizeProtectedBlocks(reduced, tokens);
+  return {
+    html: restored,
+    removed: changes.filter((change) => change.type === "keyphrase_removed").length,
+    countBefore,
+    changes,
+  };
+}
+
 function fixExcessiveKeyphrase(html: string, keyphrase: string, targetCount: number, changes: SeoNormalizationChange[]): string {
   const readableText = extractReadableText(html);
   const currentCount = countExactPhrase(readableText, keyphrase);
@@ -568,8 +616,15 @@ function reduceInBlocks(
     );
     if (sentenceIndex < 0) continue;
 
-    const remainingSentences = splitParagraphSentences(candidate.block.visibleText)
-      .filter((sentence, index) => index !== sentenceIndex);
+    const remainingSentences = dropPunctuationOnlySentences(
+      splitParagraphSentences(candidate.block.visibleText).filter(
+        (sentence, index) => index !== sentenceIndex,
+      ),
+    );
+    if (remainingSentences.length === 0) {
+      rejected.add(blockKey);
+      continue;
+    }
     const newText = remainingSentences.join(" ");
 
     // Clone-and-commit validation: the candidate paragraph must remain
@@ -1211,7 +1266,13 @@ export async function normalizeFinalSeo(
   const malformedNoRegression = (after.malformedProseCount ?? 0)
     <= (beforeRaw.malformedProseCount ?? 0);
   const tolerance = computeWordCountTolerance(targetWordCount);
-  const wcOk = policyResult.passed || (after.readableWordCount >= tolerance.min && after.readableWordCount <= tolerance.max);
+  // Stage ownership: only a word count BELOW the minimum fails this stage. A
+  // count still ABOVE the maximum is owned by the later deterministic final
+  // trim (which runs density-aware after this stage), so an otherwise-safe
+  // candidate — including a keyphrase-density reduction — must never be rolled
+  // back solely because trimming has not happened yet. The exact-keyphrase H2
+  // and first-100-word placements are soft signals and never gate acceptance.
+  const wcOk = policyResult.passed || after.readableWordCount >= tolerance.min;
   const h2Ok = after.exactKeyphraseInH2;
   const parasOk = policyResult.passed
     || after.longParagraphCount === 0
@@ -1247,7 +1308,6 @@ export async function normalizeFinalSeo(
     const failures: string[] = [];
     if (!kpDensityOk) failures.push("kpDensityOk");
     if (!wcOk) failures.push(`wcOk(wc=${after.readableWordCount})`);
-    if (!h2Ok) failures.push("h2Ok");
     if (!parasOk) failures.push(`parasOk(paras=${after.longParagraphCount})`);
     if (!malformedNoRegression) {
       failures.push(`malformedNoRegression(${beforeRaw.malformedProseCount ?? 0}->${after.malformedProseCount ?? 0})`);

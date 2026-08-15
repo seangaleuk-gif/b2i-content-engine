@@ -8,6 +8,7 @@
 
 import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
 import { extractPlainTextFromEditorialBlocks } from "@/lib/blog/article-document";
+import type { InlineContent } from "@/lib/blog/article-content";
 
 export type SentenceQualityIssueCode =
   | "duplicated-determiner"
@@ -79,28 +80,183 @@ function isLowercaseSentenceStart(sentence: string): boolean {
   return true;
 }
 
-function splitSentences(text: string): string[] {
-  const sentences: string[] = [];
+// ── Authoritative shared rules ──
+// Final sentence-quality QC, the malformed-prose scanner (and therefore the
+// final-preflight repair boundary), the final article gate and every
+// sentence-removal producer MUST agree on these two rules. They are exported
+// from here (the sentence-quality owner) and reused by the malformed-prose
+// scanner, so the two gates can never disagree about the same canonical
+// document.
+
+/** Valid lowercase token sequences that may legitimately open a sentence.
+ *  The exact focus keyphrase is written in lowercase throughout SEO content,
+ *  so a sentence that begins with the full keyphrase is a valid lowercase
+ *  start, never a defect. */
+export function lowercaseStartValidTokensFromKeyphrase(keyphrase: string): ReadonlySet<string> {
+  const normalized = keyphrase.toLowerCase().trim().replace(/\s+/g, " ");
+  return normalized ? new Set([normalized]) : new Set<string>();
+}
+
+export interface AuthoritativeLowercaseStartOptions {
+  validLowercaseTokens?: ReadonlySet<string>;
+}
+
+/** THE authoritative lowercase-sentence-start rule. A sentence is a defect
+ *  only when it is a lowercase start AND does not begin with a valid
+ *  lowercase token sequence (the exact focus keyphrase), an allowed opener,
+ *  a brand-style word ("iPhone", "eBay"), an abbreviation/acronym or a number.
+ *  The underlying scanner excludes those already; the token check adds the
+ *  keyphrase so the rule is identical at preflight and at final QC. */
+export function isAuthoritativeLowercaseSentenceStart(
+  sentence: string,
+  options?: AuthoritativeLowercaseStartOptions,
+): boolean {
+  if (!isLowercaseSentenceStart(sentence)) return false;
+  const lower = sentence.toLowerCase();
+  for (const token of options?.validLowercaseTokens ?? []) {
+    // The sentence begins with the exact keyphrase (valid lowercase token),
+    // followed by a word boundary, punctuation or nothing at all.
+    if (lower === token) return false;
+    if (lower.startsWith(token + " ")) return false;
+    if (lower.startsWith(token) && /^[.,;:!?—–]/.test(lower.slice(token.length))) return false;
+  }
+  return true;
+}
+
+const AUTHORITATIVE_PUNCTUATION_ONLY_RE = /^[\s\p{P}\p{S}]+$/u;
+const AUTHORITATIVE_PUNCTUATION_MARK_RE = /[.!?—–…]/;
+
+/** THE authoritative punctuation-only-residue rule: text that is nothing but
+ *  punctuation/symbols while still carrying a terminal or ellipsis mark. A
+ *  block (or a sentence inside a paragraph) reduced to "." is the residue of
+ *  a deleted sentence and is always malformed. */
+export function isAuthoritativePunctuationOnlyResidue(text: string): boolean {
+  return AUTHORITATIVE_PUNCTUATION_ONLY_RE.test(text) && AUTHORITATIVE_PUNCTUATION_MARK_RE.test(text);
+}
+
+export interface SentenceTextRange {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** A period after a known abbreviation is NOT a sentence boundary
+ *  ("Dr. Smith", "9 a.m. and", "e.g. this", "U.S. brands"). The interior dot
+ *  of a multi-part abbreviation ("a.m.", "e.g.", "U.S.") is handled by
+ *  `isInteriorAbbreviationDot`. */
+const ABBREVIATION_DOT_RE =
+  /(?:^|\s)(?:dr|mr|mrs|ms|st|vs|etc|e\.g|i\.e|u\.s|u\.k|a\.m|p\.m|no|fig|vol|pp|inc|ltd|co|jr|sr|prof|gen|gov|est|min|max|avg|approx)\.$/i;
+
+/** Interior dot of a multi-part abbreviation: "." followed immediately by a
+ *  single letter and another dot ("a.m.", "p.m.", "e.g.", "U.S."). */
+function isInteriorAbbreviationDot(text: string, index: number): boolean {
+  return /^[a-zA-Z]\./.test(text.slice(index + 1));
+}
+
+/** Character-by-character sentence ranges (offsets into `text`) using the same
+ *  splitter as `splitSentences`, shared by the scanners and the repair passes
+ *  so they remove exactly the sentences the scanners flag. Periods after known
+ *  abbreviations are never treated as boundaries. */
+export function sentenceTextRanges(text: string): SentenceTextRange[] {
+  const ranges: SentenceTextRange[] = [];
   let start = 0;
   for (let index = 0; index < text.length; index++) {
     const char = text[index];
     if (char !== "." && char !== "!" && char !== "?") continue;
     if (char === "." && /\d/.test(text[index - 1] ?? "") && /\d/.test(text[index + 1] ?? "")) continue;
+    if (char === "." && ABBREVIATION_DOT_RE.test(text.slice(0, index + 1))) continue;
+    if (char === "." && isInteriorAbbreviationDot(text, index)) continue;
     let end = index + 1;
     while (/[.!?]/.test(text[end] ?? "")) end++;
     while (/["”’)]/.test(text[end] ?? "")) end++;
-    if (text.slice(start, end).trim()) sentences.push(text.slice(start, end).trim());
+    const raw = text.slice(start, end);
+    const trimmed = raw.trim();
+    if (trimmed) {
+      const inner = raw.indexOf(trimmed);
+      ranges.push({ start: start + inner, end: start + inner + trimmed.length, text: trimmed });
+    }
     start = end;
     index = end - 1;
   }
-  if (start < text.length && text.slice(start).trim()) {
-    sentences.push(text.slice(start).trim());
+  if (start < text.length) {
+    const trailing = text.slice(start).trim();
+    if (trailing) {
+      const inner = text.slice(start).indexOf(trailing);
+      ranges.push({ start: start + inner, end: start + inner + trailing.length, text: trailing });
+    }
   }
-  return sentences;
+  return ranges;
 }
 
-/** Scan plain prose text (a paragraph) for sentence-quality violations. */
-export function scanSentenceQualityText(text: string): SentenceQualityIssue[] {
+/** Punctuation-only residue sentences inside a paragraph text. */
+export function findAuthoritativePunctuationOnlySentences(text: string): string[] {
+  return sentenceTextRanges(text)
+    .filter((range) => isAuthoritativePunctuationOnlyResidue(range.text))
+    .map((range) => range.text);
+}
+
+/** Drop punctuation-only residue sentences from a remainder after a sentence
+ *  removal, so a removal can never leave standalone punctuation behind. */
+export function dropPunctuationOnlySentences(sentences: string[]): string[] {
+  return sentences.filter((sentence) => !isAuthoritativePunctuationOnlyResidue(sentence));
+}
+
+/** Remove punctuation-only residue ranges from inline content, node-preserving
+ *  (link/strong/emphasis nodes keep their type and href); each removed segment
+ *  is replaced with a single space so neighbouring sentences never glue
+ *  together and empty nodes are dropped. Returns null when the content has no
+ *  residue. This is the single implementation used by the malformed-prose
+ *  repair (preflight) and by the sentence-removal producers (final trim,
+ *  keyphrase reduction), so a producer can never commit punctuation-only
+ *  residue, including inside linked/inline-node paragraphs. */
+export function dropPunctuationOnlyResidueFromContent(
+  content: InlineContent[],
+): InlineContent[] | null {
+  const text = content.map((node) => node.text).join("");
+  const ranges = sentenceTextRanges(text).filter((range) =>
+    isAuthoritativePunctuationOnlyResidue(range.text),
+  );
+  if (ranges.length === 0) return null;
+
+  const kept: InlineContent[] = [];
+  let cursor = 0;
+  for (const node of content) {
+    const nodeStart = cursor;
+    const nodeEnd = cursor + node.text.length;
+    cursor = nodeEnd;
+    let retained = "";
+    let local = nodeStart;
+    for (const range of ranges) {
+      if (!(nodeStart < range.end && range.start < nodeEnd)) continue;
+      const keepUntil = Math.max(nodeStart, range.start);
+      if (keepUntil > local) {
+        retained += node.text.slice(local - nodeStart, keepUntil - nodeStart);
+      }
+      local = Math.max(local, Math.min(nodeEnd, range.end));
+      retained += " ";
+    }
+    if (local < nodeEnd) retained += node.text.slice(local - nodeStart);
+    retained = retained.replace(/\s+/g, " ");
+    if (retained.trim()) kept.push({ ...node, text: retained });
+  }
+  if (kept.length === 0) return null;
+  kept[0].text = kept[0].text.trimStart();
+  kept[kept.length - 1].text = kept[kept.length - 1].text.trimEnd();
+  return kept;
+}
+
+function splitSentences(text: string): string[] {
+  return sentenceTextRanges(text).map((range) => range.text);
+}
+
+/** Scan plain prose text (a paragraph) for sentence-quality violations. Uses
+ *  the same authoritative lowercase-start and punctuation-only-residue rules
+ *  as the malformed-prose scanner, so the final sentence-quality QC and the
+ *  final-preflight repair boundary can never disagree on the same document. */
+export function scanSentenceQualityText(
+  text: string,
+  options?: { validLowercaseTokens?: ReadonlySet<string> },
+): SentenceQualityIssue[] {
   const issues: SentenceQualityIssue[] = [];
   const seen = new Set<string>();
   const add = (code: SentenceQualityIssueCode, sentence: string, message: string) => {
@@ -112,6 +268,9 @@ export function scanSentenceQualityText(text: string): SentenceQualityIssue[] {
 
   for (const sentence of splitSentences(text)) {
     const normalized = sentence.replace(/\s+/g, " ").trim();
+    if (isAuthoritativePunctuationOnlyResidue(normalized)) {
+      add("fragment", normalized, "punctuation-only residue from a removed sentence");
+    }
     if (DUPLICATED_DETERMINER_RE.test(normalized) || DUPLICATED_THOSE_RE.test(normalized)) {
       add("duplicated-determiner", normalized, "duplicated determiner or demonstrative");
     }
@@ -124,11 +283,11 @@ export function scanSentenceQualityText(text: string): SentenceQualityIssue[] {
     if (BROKEN_PUNCTUATION_RE.test(normalized)) {
       add("broken-punctuation", normalized, "broken punctuation");
     }
-    if (isLowercaseSentenceStart(normalized)) {
+    if (isAuthoritativeLowercaseSentenceStart(normalized, options)) {
       add("lowercase-sentence-start", normalized, "sentence starts with a lowercase letter");
     }
     const wordCount = normalized.split(/\s+/).filter(Boolean).length;
-    if (wordCount <= 2 && !/^[A-Z]/.test(normalized)) {
+    if (wordCount <= 2 && !/^[A-Z]/.test(normalized) && !isAuthoritativePunctuationOnlyResidue(normalized)) {
       add("fragment", normalized, "sentence fragment (two words or fewer)");
     }
   }
@@ -152,11 +311,14 @@ export function scanSentenceQualityInDocument(doc: ArticleDocument): Array<{
   issues: SentenceQualityIssue[];
 }> {
   const findings: Array<{ componentId: string; blockId: string; issues: SentenceQualityIssue[] }> = [];
+  const options = {
+    validLowercaseTokens: lowercaseStartValidTokensFromKeyphrase(doc.metadata.focusKeyphrase),
+  };
   const checkComponent = (componentId: string, blocks: EditorialBlock[]) => {
     for (const block of blocks) {
       if (block.type === "subheading") continue;
       const text = extractPlainTextFromEditorialBlocks([block]);
-      const issues = scanSentenceQualityText(text);
+      const issues = scanSentenceQualityText(text, options);
       if (issues.length > 0) {
         findings.push({ componentId, blockId: block.id, issues });
       }

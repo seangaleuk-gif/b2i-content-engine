@@ -16,11 +16,20 @@
 //    coherence damage blocks saving.
 
 import type { ArticleDocument, ArticleSection, EditorialBlock } from "@/lib/blog/article-document";
-import { renderComponentHtml, countCanonicalVisibleWords } from "@/lib/blog/article-document";
+import {
+  renderComponentHtml,
+  countCanonicalVisibleWords,
+  isNonEmptyStructuredContinuation,
+} from "@/lib/blog/article-document";
 import { countReadableWords } from "@/lib/services/text-utils";
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { isSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import { countSectionGroundingCarriers, textCarriesHeadingContentWord } from "@/lib/blog/content-relevance";
+import {
+  dropPunctuationOnlyResidueFromContent,
+  dropPunctuationOnlySentences,
+} from "@/lib/blog/sentence-quality";
 import {
   isSentenceComplete,
   type SentenceCompletenessKind,
@@ -151,7 +160,11 @@ export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
           return cells.some((cell) => !isSentenceComplete(cell, "table-cell"));
         }
         const kind: SentenceCompletenessKind = block.type === "quote" ? "quote" : "paragraph";
-        return !isSentenceComplete(text, kind);
+        const hasStructuredContinuation = isNonEmptyStructuredContinuation(next?.block);
+        return !isSentenceComplete(text, kind, {
+          allowColonBeforeStructuredContinuation:
+            block.type === "paragraph" && hasStructuredContinuation,
+        });
       })();
       if (incomplete) {
         violations.push({
@@ -343,6 +356,32 @@ export function compressDocumentStructureAware(
   let removedParagraphs = 0;
   let shortenedSentences = 0;
 
+  // Pass 0: punctuation-only residue (".") is deleted-sentence debris. The
+  // trim producer owns the final compaction boundary: it must NEVER commit
+  // punctuation-only residue, including inside linked/inline-node paragraphs.
+  // Every editorial paragraph is cleaned of residue sentences first — even
+  // when the paragraph would not otherwise be shortened — using the shared
+  // node-preserving residue drop, so a residue paragraph can never be carried
+  // past final trim into the final-preflight repair boundary.
+  for (const section of editorialSections(doc)) {
+    for (const block of section.blocks) {
+      if (block.type !== "paragraph") continue;
+      const originalText = block.content.map((node) => node.text).join("").replace(/\s+/g, " ").trim();
+      const cleaned = dropPunctuationOnlyResidueFromContent(block.content);
+      if (!cleaned) continue;
+      const cleanedText = cleaned.map((node) => node.text).join("").replace(/\s+/g, " ").trim();
+      if (!cleanedText || cleanedText === originalText) continue;
+      block.content = cleaned;
+      section.status = "trimmed";
+      removedWords += Math.max(
+        0,
+        originalText.split(/\s+/).filter(Boolean).length
+        - cleanedText.split(/\s+/).filter(Boolean).length,
+      );
+      shortenedSentences++;
+    }
+  }
+
   // Pass 1: whole-paragraph removal (low-value detail first).
   for (let guard = 0; guard < 30 && countCanonicalVisibleWords(doc) > wordMax; guard++) {
     const candidates: Array<{ section: ArticleSection; blockIndex: number; wordCount: number; score: number }> = [];
@@ -354,6 +393,18 @@ export function compressDocumentStructureAware(
         const blockWords = countReadableWords(renderComponentHtml({ id: section.id, blocks: [block], status: section.status }));
         if (sectionWords - blockWords < MIN_SECTION_WORDS) continue;
         if (countCanonicalVisibleWords(doc) - blockWords < wordMin) continue;
+        // Section topic grounding is a hard invariant: never remove the last
+        // paragraph carrying a heading content word, or the section becomes
+        // ungrounded and fails final QC. This guard only applies to sections
+        // that are CURRENTLY grounded — a section that was already ungrounded
+        // (pre-existing damage) may still be trimmed; the grounding delta
+        // belongs to its introducer, not to the trim producer.
+        if (
+          countSectionGroundingCarriers(section) > 0
+          && countSectionGroundingCarriers(section, blockIndex) === 0
+        ) {
+          continue;
+        }
         candidates.push({
           section,
           blockIndex,
@@ -404,8 +455,10 @@ export function compressDocumentStructureAware(
 
         // Prefer dropping the first sentence (topic restatement); fall back to
         // the last sentence only when the remainder still closes cleanly.
-        const firstRemainder = sentences.slice(1).join(" ");
-        const lastRemainder = sentences.slice(0, -1).join(" ");
+        // Punctuation-only residue (".") is never kept in a remainder, so a
+        // sentence removal can never leave standalone punctuation behind.
+        const firstRemainder = dropPunctuationOnlySentences(sentences.slice(1)).join(" ");
+        const lastRemainder = dropPunctuationOnlySentences(sentences.slice(0, -1)).join(" ");
         const firstWords = countReadableWords(firstRemainder);
         const lastWords = countReadableWords(lastRemainder);
         const firstDrops = countReadableWords(sentences[0]);
@@ -425,6 +478,20 @@ export function compressDocumentStructureAware(
         if (nextBlock) {
           const nextText = plainBlockText(nextBlock).replace(/\s+/g, " ").trim();
           if (ORPHAN_TRANSITION_RE.test(nextText) || ORPHAN_TRANSITION_PHRASES.test(nextText)) continue;
+        }
+
+        // Section topic grounding is a hard invariant: never shorten away the
+        // last sentence carrying a heading content word. When this paragraph
+        // is the section's only grounding carrier (and the section is
+        // CURRENTLY grounded), the shortened remainder must still share a
+        // heading content word (or the section becomes ungrounded and fails
+        // final QC — choose another safe removal).
+        if (
+          countSectionGroundingCarriers(section) > 0
+          && countSectionGroundingCarriers(section, blockIndex) === 0
+          && !textCarriesHeadingContentWord(section, candidate.newText)
+        ) {
+          continue;
         }
 
         if (!best || candidate.removedWords > best.removedWords) {

@@ -176,7 +176,11 @@ function headingAlreadyCoversTopic(heading: string, keyphrase: string): boolean 
 }
 
 /** Insert the exact keyphrase naturally at the start of the introduction's
- *  first paragraph so it appears inside the first 100 readable words. */
+ *  first paragraph so it appears inside the first 100 readable words. Inline
+ *  content (links, emphasis, strong) is preserved node-for-node: only a
+ *  leading text node is prepended and the first alpha of the first sentence is
+ *  lowercased in place, so an injected internal link in the opening paragraph
+ *  can never be lost by the reconciliation. */
 function insertKeyphraseInIntroduction(
   doc: ArticleDocument,
   keyphrase: string,
@@ -196,11 +200,38 @@ function insertKeyphraseInIntroduction(
   const firstSentence = fullText.match(/^[^.!?]+[.!?]+/)?.[0];
   if (!firstSentence) return { changed: false };
   const lead = `When it comes to ${keyphrase}, `;
-  const replacement = lead + firstSentence.charAt(0).toLowerCase() + firstSentence.slice(1);
-  const rest = fullText.slice(firstSentence.length);
+
+  let newContent = [...block.content];
+  // Lowercase the first alpha of the first sentence in place (node-aware), so
+  // the lead reads naturally without rebuilding the paragraph as one text node.
+  const alphaMatch = fullText.match(/[a-zA-Z]/);
+  if (alphaMatch && alphaMatch.index !== undefined) {
+    let cursor = 0;
+    for (let index = 0; index < newContent.length; index++) {
+      const node = newContent[index];
+      const nodeEnd = cursor + node.text.length;
+      if (alphaMatch.index >= cursor && alphaMatch.index < nodeEnd) {
+        const local = alphaMatch.index - cursor;
+        newContent[index] = {
+          ...node,
+          text: node.text.slice(0, local) + node.text[local].toLowerCase() + node.text.slice(local + 1),
+        };
+        break;
+      }
+      cursor = nodeEnd;
+    }
+  }
+  // Prepend the lead as a text node (merging into an existing leading text
+  // node when possible). Link/strong/emphasis nodes are never replaced.
+  if (newContent[0].type === "text") {
+    newContent[0] = { ...newContent[0], text: lead + newContent[0].text };
+  } else {
+    newContent = [{ type: "text", text: lead }, ...newContent];
+  }
+
   const newBlock: Extract<EditorialBlock, { type: "paragraph" }> = {
     ...block,
-    content: [{ type: "text", text: `${replacement}${rest}` }],
+    content: newContent,
   };
   intro.blocks[target] = newBlock;
   return { changed: true };

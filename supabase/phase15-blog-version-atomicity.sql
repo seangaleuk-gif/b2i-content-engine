@@ -4,8 +4,13 @@
 --
 -- Run once in the Supabase SQL editor before deploying the matching code.
 -- This migration is idempotent and never deletes or rewrites saved versions.
--- If duplicate version numbers already exist, it fails closed and reports the
--- affected projects so an operator can resolve them deliberately.
+--
+-- Uniqueness is enforced for ENGLISH versions only. A Traditional Chinese
+-- (-zh) version is allowed to share the version number of its English source,
+-- so a global (project_id, version_number) unique index is wrong for the
+-- bilingual model. If genuine duplicate ENGLISH version numbers already exist,
+-- it fails closed and reports the affected projects so an operator can resolve
+-- them deliberately.
 -- ============================================================================
 
 DO $$
@@ -17,20 +22,27 @@ BEGIN
   FROM (
     SELECT project_id
     FROM blog_versions
+    WHERE slug IS NULL OR slug !~* '-zh$'
     GROUP BY project_id, version_number
     HAVING COUNT(*) > 1
   ) duplicates;
 
   IF duplicate_projects IS NOT NULL THEN
     RAISE EXCEPTION
-      'Cannot enforce blog version uniqueness: duplicate (project_id, version_number) rows exist for project(s): %',
+      'Cannot enforce blog version uniqueness: duplicate English (project_id, version_number) rows exist for project(s): %',
       duplicate_projects;
   END IF;
 END
 $$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS blog_versions_project_version_unique
-  ON blog_versions (project_id, version_number);
+-- Remove the old global uniqueness index if it was ever applied. It is wrong
+-- for the bilingual model because it treats a Chinese version sharing its
+-- English source's version number as a duplicate.
+DROP INDEX IF EXISTS blog_versions_project_version_unique;
+
+CREATE UNIQUE INDEX IF NOT EXISTS blog_versions_project_version_english_unique
+  ON blog_versions (project_id, version_number)
+  WHERE slug IS NULL OR slug !~* '-zh$';
 
 CREATE OR REPLACE FUNCTION save_generated_english_blog_version(
   p_project_id integer,
@@ -66,7 +78,8 @@ BEGIN
   SELECT COALESCE(MAX(version_number), 0) + 1
   INTO next_version
   FROM blog_versions
-  WHERE project_id = p_project_id;
+  WHERE project_id = p_project_id
+    AND (slug IS NULL OR slug !~* '-zh$');
 
   INSERT INTO blog_versions (
     project_id,

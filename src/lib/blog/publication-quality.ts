@@ -8,6 +8,7 @@ import {
   type EditorialBlock,
   detectClaimConflicts,
   extractPlainTextFromEditorialBlocks,
+  isNonEmptyStructuredContinuation,
 } from "@/lib/blog/article-document";
 import {
   CONCLUSION_END_MARKER,
@@ -21,8 +22,16 @@ import { createNumberExpressionRegex } from "@/lib/services/translation-number-g
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 import {
   analyzeSentenceCompleteness,
+  type SentenceCompletenessOptions,
   type SentenceCompletenessKind,
 } from "@/lib/blog/sentence-completeness";
+import {
+  isAuthoritativeLowercaseSentenceStart,
+  isAuthoritativePunctuationOnlyResidue,
+  findAuthoritativePunctuationOnlySentences,
+  lowercaseStartValidTokensFromKeyphrase,
+  sentenceTextRanges,
+} from "@/lib/blog/sentence-quality";
 
 export interface PublicationQualityMetrics {
   claimConflictCount: number;
@@ -68,7 +77,8 @@ export type MalformedProseIssueCode =
   | "serialized-program-value"
   | "instruction-placeholder"
   | "replacement-character"
-  | "punctuation-fragment";
+  | "punctuation-fragment"
+  | "lowercase-sentence-start";
 
 export interface MalformedProseTextIssue {
   textIndex: number;
@@ -204,6 +214,8 @@ export function hasDanglingSentenceEnding(text: string): boolean {
 export function findMalformedProseTextIssues(
   texts: string[],
   kinds?: SentenceCompletenessKind[],
+  completenessOptions?: SentenceCompletenessOptions[],
+  validLowercaseTokens?: ReadonlySet<string>,
 ): MalformedProseTextIssue[] {
   const issues: MalformedProseTextIssue[] = [];
   const seen = new Set<string>();
@@ -245,8 +257,28 @@ export function findMalformedProseTextIssues(
     }
     // A block reduced to punctuation only (".", "...", "—") is a leftover
     // fragment from a deterministic sentence removal and is always malformed.
-    if (/^[\s\p{P}\p{S}]+$/u.test(trimmed) && /[.!?—–…]/.test(trimmed)) {
+    // The same authoritative rule also flags a punctuation-only SENTENCE
+    // inside an otherwise readable paragraph (". Plan a weekly routine."), so
+    // the malformed-prose scanner and the final sentence-quality QC agree on
+    // punctuation-only residue wherever it appears.
+    if (isAuthoritativePunctuationOnlyResidue(trimmed)) {
       addIssue(index, "punctuation-fragment", "block contains only punctuation", trimmed);
+    } else {
+      for (const residue of findAuthoritativePunctuationOnlySentences(trimmed)) {
+        addIssue(index, "punctuation-fragment", "block contains punctuation-only residue", residue);
+      }
+    }
+    // Lowercase sentence starts are checked only when the caller supplies the
+    // valid-lowercase-token context (the focus keyphrase): sentences beginning
+    // with the exact keyphrase are valid lowercase tokens, not defects. This
+    // is the SAME authoritative rule the final sentence-quality QC uses, so
+    // the final-preflight repair boundary and final QC can never disagree.
+    if (validLowercaseTokens !== undefined) {
+      for (const range of sentenceTextRanges(trimmed)) {
+        if (isAuthoritativeLowercaseSentenceStart(range.text, { validLowercaseTokens })) {
+          addIssue(index, "lowercase-sentence-start", "sentence starts with a lowercase letter", range.text);
+        }
+      }
     }
     // Shared block-type-aware sentence-completeness contract: prose kinds
     // (paragraph/quote/FAQ answer) must end with complete sentences; heading,
@@ -254,7 +286,7 @@ export function findMalformedProseTextIssues(
     // reject only unmistakable fragments. This is the same validator used by
     // AI acceptance, coherence, trim/compaction validation and the final QC
     // and pre-save gates, so scanners can never disagree.
-    const completeness = analyzeSentenceCompleteness(trimmed, kind);
+    const completeness = analyzeSentenceCompleteness(trimmed, kind, completenessOptions?.[index]);
     for (const issue of completeness.issues) {
       if (issue.code === "missing-terminal-punctuation") {
         addIssue(index, "missing-terminal-punctuation", issue.message, trimmed);
@@ -289,6 +321,7 @@ const HARD_MALFORMED_CODES: ReadonlySet<MalformedProseIssueCode> = new Set([
   "instruction-placeholder",
   "replacement-character",
   "punctuation-fragment",
+  "lowercase-sentence-start",
   "incomplete-sentence-ending",
   "missing-terminal-punctuation",
   "trailing-fragment",
@@ -334,15 +367,28 @@ function malformedTextsForBlock(block: EditorialBlock): {
   return { texts: [extractPlainTextFromEditorialBlocks([block])], kinds: ["paragraph"] };
 }
 
-/** Authoritative malformed-prose scan for a normalized editorial block set. */
-export function scanMalformedProseInBlocks(blocks: EditorialBlock[]): Array<{
+/** Authoritative malformed-prose scan for a normalized editorial block set.
+ *  `validLowercaseTokens` (the focus keyphrase) enables the authoritative
+ *  lowercase-sentence-start rule for prose blocks; without it only the rules
+ *  that need no keyphrase context apply. */
+export function scanMalformedProseInBlocks(
+  blocks: EditorialBlock[],
+  validLowercaseTokens?: ReadonlySet<string>,
+): Array<{
   blockId: string;
   issues: MalformedProseTextIssue[];
 }> {
   const findings: Array<{ blockId: string; issues: MalformedProseTextIssue[] }> = [];
-  for (const block of blocks) {
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+    const block = blocks[blockIndex];
     const { texts, kinds } = malformedTextsForBlock(block);
-    const issues = findMalformedProseTextIssues(texts, kinds);
+    const next = blocks[blockIndex + 1];
+    const hasStructuredContinuation = isNonEmptyStructuredContinuation(next);
+    const completenessOptions = texts.map(() => ({
+      allowColonBeforeStructuredContinuation:
+        block.type === "paragraph" && hasStructuredContinuation,
+    }));
+    const issues = findMalformedProseTextIssues(texts, kinds, completenessOptions, validLowercaseTokens);
     if (issues.length > 0) findings.push({ blockId: block.id, issues });
   }
   return findings;
@@ -360,12 +406,13 @@ export function scanMalformedProseInDocument(doc: ArticleDocument): Array<{
   issues: MalformedProseTextIssue[];
 }> {
   const findings: Array<{ componentId: string; blockId: string; issues: MalformedProseTextIssue[] }> = [];
+  const validLowercaseTokens = lowercaseStartValidTokensFromKeyphrase(doc.metadata.focusKeyphrase);
   const checkTextUnit = (componentId: string, blockId: string, texts: string[], kinds?: SentenceCompletenessKind[]) => {
     const issues = findMalformedProseTextIssues(texts, kinds);
     if (issues.length > 0) findings.push({ componentId, blockId, issues });
   };
   const checkComponent = (componentId: string, blocks: EditorialBlock[]) => {
-    for (const finding of scanMalformedProseInBlocks(blocks)) {
+    for (const finding of scanMalformedProseInBlocks(blocks, validLowercaseTokens)) {
       findings.push({ componentId, ...finding });
     }
   };

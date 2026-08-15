@@ -29,10 +29,12 @@ import { wordCountRange } from "@/lib/services/generation-constants";
 import {
   assertFinalWordCountParity,
   assertRenderedCacheMatchesDocument,
+  applyEditorialH2WithDensityGuard,
   chooseEditorialCommitDoc,
   createPipelineState,
   evaluateEditorialStageCandidate,
   guardStageOutput,
+  runFinalTrimStage,
   runTrackedHtmlStage,
   snapshotState,
   sanitizeFaqFactualClaims,
@@ -42,6 +44,8 @@ import {
   validateTemporalCandidate,
   writeEditorialFailureArtifact,
 } from "@/lib/pipeline/blog-generation-pipeline";
+import { canonicalKeyphraseMetrics } from "@/lib/blog/final-seo-reconcile";
+import { compressDocumentStructureAware } from "@/lib/blog/coherence";
 import { findMalformedEditableBlocks } from "@/lib/pipeline/editorial-polish";
 import { enforceInternalLinkLimit, analyzeFinalArticle, evaluatePolicy, buildPolicy, type FinalArticleMetrics } from "@/lib/blog/final-article-policy";
 import { countCtaHeadingTags } from "@/lib/seo/seo-text-utils";
@@ -247,6 +251,56 @@ describe("pipeline: canonical state invariants", () => {
       },
     } as any);
     expect(accepted).toBe(false);
+  });
+
+  it("editorial-H2 density guard rolls back a heading repair that would cross the hard stuffing limit", () => {
+    const doc = makeArticleDoc();
+    // Two exact keyphrase occurrences in body prose, none in an editorial H2.
+    doc.introduction.blocks.push({
+      id: "kp-a",
+      type: "paragraph",
+      content: [{ type: "text", text: "A test keyphrase plan keeps local teams consistent. Simple examples help busy owners understand the idea and take a practical next step." }],
+    });
+    doc.sections[0].blocks.push({
+      id: "kp-b",
+      type: "paragraph",
+      content: [{ type: "text", text: "Many owners apply a test keyphrase routine every week. Regular replies show customers that a real person is listening to their needs." }],
+    });
+    const before = canonicalKeyphraseMetrics(doc, "test keyphrase");
+    expect(before.density).toBeLessThanOrEqual(3);
+    expect(before.density).toBeGreaterThan(2);
+    const renderBefore = renderArticleDocument(doc);
+
+    const result = applyEditorialH2WithDensityGuard(doc, "test keyphrase");
+
+    // The heading repair would add a third occurrence and push density past
+    // 3%; the change must be rolled back so no later stage reintroduces
+    // stuffing, and the exact document is restored.
+    expect(result.rolledBack).toBe(true);
+    expect(result.satisfied).toBe(false);
+    expect(result.densityAfter).toBeGreaterThan(3);
+    expect(renderArticleDocument(doc)).toBe(renderBefore);
+  });
+
+  it("editorial-H2 density guard commits the repair when density stays inside the hard limit", () => {
+    const doc = makeArticleDoc();
+    doc.sections[0].blocks.push({
+      id: "kp-c",
+      type: "paragraph",
+      content: [{ type: "text", text: "A test keyphrase plan keeps local teams consistent. Simple examples help busy owners understand the idea and take a practical next step." }],
+    });
+    const before = canonicalKeyphraseMetrics(doc, "test keyphrase");
+    expect(before.density).toBeLessThanOrEqual(3);
+
+    const result = applyEditorialH2WithDensityGuard(doc, "test keyphrase");
+
+    expect(result.rolledBack).toBe(false);
+    expect(canonicalKeyphraseMetrics(doc, "test keyphrase").density).toBeLessThanOrEqual(3);
+    // A natural editorial H2 now carries the exact keyphrase.
+    const editorialHeadings = doc.sections
+      .filter((section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading")
+      .map((section) => section.heading.toLowerCase());
+    expect(editorialHeadings.some((heading) => heading.includes("test keyphrase"))).toBe(true);
   });
 
   it("allows a damaged CTA to be replaced by the canonical signup CTA", () => {
@@ -1132,6 +1186,166 @@ describe("FAQ generation guarantees", () => {
     })();
     expect(result).not.toBeNull();
     if (result) expect((result as any).intro).toContain("favourite coffee");
+  });
+
+  it("final-trim is density-aware: a trim candidate that raises density past the hard limit is resolved deterministically before acceptance", async () => {
+    const keyphrase = "threads marketing hong kong";
+    const fillers = [
+      "Local teams can share useful lessons from daily work with clear and honest words.",
+      "Simple examples help busy owners understand the idea and take a practical next step.",
+      "Regular replies also show customers that a real person is listening to their needs.",
+      "A small weekly plan keeps the work steady without adding stress to the whole team.",
+      "Owners can note common questions and turn those questions into helpful future posts.",
+      "This approach builds trust slowly and gives the business a clear voice in Hong Kong.",
+    ];
+    const kpSentences = [
+      "Threads marketing hong kong gives local teams a clear place to start.",
+      "Many brands use threads marketing hong kong to build steady routines.",
+      "Threads marketing hong kong works best when the routine stays small.",
+      "Owners can apply threads marketing hong kong without a large budget.",
+      "Threads marketing hong kong works well with a steady weekly schedule.",
+      "A small team can practice threads marketing hong kong every single week.",
+      "Threads marketing hong kong helps a business stay visible and honest.",
+      "Readers trust brands that explain threads marketing hong kong with simple words.",
+      "Threads marketing hong kong turns common questions into useful daily posts.",
+      "Starting threads marketing hong kong takes less time than most owners expect.",
+      "Threads marketing hong kong pairs well with a short weekly review routine.",
+      "Every local owner can make threads marketing hong kong part of the week.",
+      "Threads marketing hong kong keeps the brand voice natural and consistent.",
+      "Teams that try threads marketing hong kong usually see steady replies.",
+      "Threads marketing hong kong makes the daily plan easier to keep.",
+      "Threads marketing hong kong is easiest to learn with one small topic.",
+      "Most owners notice threads marketing hong kong working within a few weeks.",
+      "Threads marketing hong kong stays useful when the advice is practical.",
+    ];
+    const paragraph = (sentences: string[]): string =>
+      `<!-- wp:paragraph --><p>${sentences.join(" ")}</p><!-- /wp:paragraph -->`;
+    // Keyphrase sentence placed LAST so deterministic compression removes
+    // non-keyphrase words (raising density) rather than keyphrase occurrences.
+    const kpParagraph = (index: number): string =>
+      paragraph([
+        fillers[index % fillers.length],
+        fillers[(index + 1) % fillers.length],
+        kpSentences[index % kpSentences.length],
+      ]);
+    const fillerParagraph = (index: number): string =>
+      paragraph([
+        fillers[index % fillers.length],
+        fillers[(index + 1) % fillers.length],
+        fillers[(index + 2) % fillers.length],
+      ]);
+
+    const introHtml = [
+      paragraph(["This guide gives local owners a clear and honest starting point."]),
+      kpParagraph(0),
+      kpParagraph(1),
+      fillerParagraph(0),
+      fillerParagraph(1),
+      fillerParagraph(2),
+    ].join("\n\n");
+    const sections = [
+      sectionFromHtml("section-0", "Understand the People You Want to Reach",
+        [kpParagraph(2), kpParagraph(3), kpParagraph(4), kpParagraph(5),
+          ...Array.from({ length: 14 }, (_, i) => fillerParagraph(3 + i))].join("\n\n")),
+      sectionFromHtml("section-1", "Build a Simple Weekly Content Routine",
+        [kpParagraph(6), kpParagraph(7), kpParagraph(8), kpParagraph(9),
+          ...Array.from({ length: 14 }, (_, i) => fillerParagraph(17 + i))].join("\n\n")),
+      sectionFromHtml("section-2", "Measure Results and Improve the Next Post",
+        [kpParagraph(10), kpParagraph(11), kpParagraph(12), kpParagraph(13),
+          ...Array.from({ length: 14 }, (_, i) => fillerParagraph(31 + i))].join("\n\n")),
+      sectionFromHtml("section-3", "Common Mistakes Hong Kong SMEs Should Avoid",
+        [kpParagraph(14), kpParagraph(15), kpParagraph(16), kpParagraph(17),
+          ...Array.from({ length: 14 }, (_, i) => fillerParagraph(45 + i))].join("\n\n")),
+      sectionFromHtml("faq-section", "Frequently Asked Questions", "", "faq-heading"),
+    ];
+    const doc = makeArticleDoc({
+      introduction: componentFromHtml("intro", introHtml),
+      sections,
+      languageSwitcher: {
+        id: "language-switcher",
+        type: "language-switcher",
+        html: `<!-- wp:html --><div class="b2i-language-switcher" data-language="en"><span>English</span> | <a href="/blog/test-article-zh">繁體中文</a></div><!-- /wp:html -->`,
+        fingerprint: fingerprintHtml(`<!-- wp:html --><div class="b2i-language-switcher" data-language="en"><span>English</span> | <a href="/blog/test-article-zh">繁體中文</a></div><!-- /wp:html -->`),
+      },
+      cta: {
+        id: "cta",
+        type: "cta",
+        html: `<!-- wp:html --><div class="cta-block"><h2>Ready to Start?</h2><p><a href="https://app.b2ihub.com/signup">Create Free Account</a></p></div><!-- /wp:html -->`,
+        fingerprint: fingerprintHtml(`<!-- wp:html --><div class="cta-block"><h2>Ready to Start?</h2><p><a href="https://app.b2ihub.com/signup">Create Free Account</a></p></div><!-- /wp:html -->`),
+      },
+      faqSchema: {
+        id: "faq-schema",
+        type: "faq-schema",
+        html: renderFaqSchema([1, 2, 3, 4].map((index) => ({
+          question: `What should a Hong Kong SME know first ${index}?`,
+          answerHtml: "",
+          answerText: "Start with a small and useful routine. Listen to real customer questions and reply in a natural voice.",
+        }))),
+        fingerprint: fingerprintHtml(renderFaqSchema([1, 2, 3, 4].map((index) => ({
+          question: `What should a Hong Kong SME know first ${index}?`,
+          answerHtml: "",
+          answerText: "Start with a small and useful routine. Listen to real customer questions and reply in a natural voice.",
+        })))),
+      },
+      visibleFaq: [1, 2, 3, 4].map((index) => ({
+        question: `What should a Hong Kong SME know first ${index}?`,
+        answerHtml: "",
+        answerText: "Start with a small and useful routine. Listen to real customer questions and reply in a natural voice.",
+      })),
+    });
+
+    const wordMax = 2300;
+    const wordMin = 2125;
+    const before = canonicalKeyphraseMetrics(doc, keyphrase);
+    expect(before.density).toBeLessThanOrEqual(3);
+    expect(before.occurrences).toBe(18);
+    expect(before.wordCount).toBeGreaterThan(wordMax);
+
+    // Prove the fixture: the deterministic compression alone (the trim
+    // candidate) removes non-keyphrase words and pushes density past 3%,
+    // exactly like the reported 2.91% → 3.16% production crossing.
+    const compressionProbe = structuredClone(doc);
+    compressDocumentStructureAware(compressionProbe, wordMax, wordMin, keyphrase, []);
+    const probe = canonicalKeyphraseMetrics(compressionProbe, keyphrase);
+    expect(probe.wordCount).toBeLessThanOrEqual(wordMax);
+    expect(probe.density).toBeGreaterThan(3);
+
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "density-trim",
+      keyphrase,
+      requestedWordCount: 2200,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((item) => item.heading),
+      intro: introHtml,
+      conclusion: renderComponentHtml(doc.conclusion),
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2200, wordMin, wordMax, keyphrase),
+      ctx: { research: [] },
+      wordMin,
+      wordMax,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+
+    const result = await runFinalTrimStage(state, {
+      chatWithRetry: async () => {
+        throw new Error("Unexpected AI call in deterministic density-trim test");
+      },
+      makeTrackedChatForStage: () => async () => {
+        throw new Error("Unexpected tracked AI call in deterministic density-trim test");
+      },
+      telemetry: {},
+      context: { research: [] },
+    });
+
+    assertRenderedCacheMatchesDocument(result);
+    const after = canonicalKeyphraseMetrics(result.articleDoc, keyphrase);
+    expect(after.wordCount).toBeGreaterThanOrEqual(wordMin);
+    expect(after.wordCount).toBeLessThanOrEqual(wordMax);
+    expect(after.density).toBeLessThanOrEqual(3);
+    expect(result.stageOutputs.some((output) => output.stage === "final-trim" && output.accepted)).toBe(true);
   });
 
   it("enforceInternalLinkLimit keeps max 4 unique destinations", () => {

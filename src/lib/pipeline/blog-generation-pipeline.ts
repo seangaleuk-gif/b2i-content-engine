@@ -8,8 +8,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
-import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, parseCompleteEditorialRegion, countCanonicalVisibleWords, extractVisibleFaqFromArticle, extractPlainTextFromEditorialBlocks, validateFaqParity } from "@/lib/blog/article-document";
+import { PipelineDebugTrace, isPipelineDebugTraceEnabled, traceContextFor } from "@/lib/pipeline/pipeline-debug-trace";
+import type { ArticleDocument, ArticleSection, EditorialBlock } from "@/lib/blog/article-document";
+import { renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, parseArticleDocumentFromHtml, renderComponentHtml, renderEditorialBlocksToWordPress, parseWordPressEditorialBlocks, parseCompleteEditorialRegion, countCanonicalVisibleWords, extractVisibleFaqFromArticle, extractPlainTextFromEditorialBlocks, validateFaqParity, decodeHtmlEntities } from "@/lib/blog/article-document";
 import { extractFaqBlock } from "@/lib/blog/protected-block-extractor";
 import { type FinalSeoNormalizerResult } from "@/lib/blog/final-seo-normalizer";
 import { normalizeFinalSeo } from "@/lib/blog/final-seo-normalizer";
@@ -25,7 +26,7 @@ import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/fin
 import { extractReadableText, getFirstNReadableWords, extractH2Texts, extractParagraphTexts, countSentences, countReadableWords, containsExactPhrase, countEditorialExternalLinks, extractEditorialExternalLinkUrls } from "@/lib/seo/seo-text-utils";
 import { FLESCH_MAX, FLESCH_MIN, GENERATION_BUILD_ID, GENERATION_WORD_BUFFER, MAX_SENTENCES_PER_PARAGRAPH, WORD_ALLOCATION } from "@/lib/services/generation-constants";
 import { normalizeEnglishTitleCasing } from "@/lib/services/text-utils";
-import { insertExternalResearchLinks, deduplicateEditorialExternalLinks, pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
+import { insertExternalResearchLinksIntoDocument, deduplicateEditorialExternalLinks, pairedSlugs, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
 import { expandToMinimum, trimToMaximum, normalizeParagraphs } from "@/lib/services/section-expander";
 import {
   runEditorialPolish,
@@ -53,6 +54,14 @@ import {
   validateClaimOwnership,
 } from "@/lib/blog/claim-ownership";
 import { reconcilePostOwnershipKeyphrase, enforceEditorialH2Keyphrase } from "@/lib/blog/post-ownership-seo-reconcile";
+import {
+  reconcileFinalKeyphraseDensity,
+  canonicalKeyphraseMetrics,
+} from "@/lib/blog/final-seo-reconcile";
+import {
+  validateArticleIntegrityContract,
+  type ContractCategory,
+} from "@/lib/blog/article-integrity-contract";
 import { scanEnglishLanguageConsistency, formatLanguageConsistencyViolations } from "@/lib/blog/language-consistency";
 import {
   compressDocumentStructureAware,
@@ -77,6 +86,8 @@ import {
   removeOffTopicSourceCitations,
   collectOffTopicSourceCitationBlockIds,
   formatRelevanceViolations,
+  essentialGroundingCarrierSentenceTexts,
+  countSectionGroundingCarriers,
 } from "@/lib/blog/content-relevance";
 import { repairTemporalFreshnessDocument, findTemporalFreshnessIssues } from "@/lib/blog/temporal-freshness";
 import {
@@ -89,7 +100,7 @@ import {
   CANONICAL_ENGLISH_CTA_FINGERPRINT,
   CANONICAL_ENGLISH_CTA_HTML,
 } from "@/lib/blog/canonical-cta";
-import { dynamicFaqRange } from "@/lib/content-standards";
+import { dynamicFaqRange, englishKeyphraseDensity } from "@/lib/content-standards";
 
 // ── Types ──
 
@@ -145,6 +156,10 @@ export interface PipelineState {
   expansionAttempts: number;
   trimAttempts: number;
   fullDocumentEditorial?: FullDocumentEditorialOutcome | null;
+  /** Opt-in stage-by-stage debug tracing (observational only; created only
+   *  when ENABLE_PIPELINE_DEBUG_TRACE=true). Never present in production
+   *  unless explicitly enabled, and never mutated by pipeline stages. */
+  debugTrace?: PipelineDebugTrace;
 }
 
 // ── Pipeline dependencies ──
@@ -159,6 +174,88 @@ export interface PipelineDependencies {
 // ── Helpers ──
 
 function fp(html: string): string { return fingerprintHtml(html); }
+
+/**
+ * Trace the canonical keyphrase-density trajectory across the mutating tail
+ * stages. Uses the identical canonical calculation as the final validation
+ * gate (occurrences on the rendered readable text, divided by the canonical
+ * visible word count), so the logs and the gate can never disagree.
+ */
+function traceKeyphraseDensity(label: string, state: PipelineState): void {
+  const metrics = canonicalKeyphraseMetrics(state.articleDoc, state.keyphrase);
+  console.log(
+    `[kp-density] ${label} wc=${metrics.wordCount} occ=${metrics.occurrences}` +
+    ` density=${metrics.density.toFixed(2)}% fp=${fp(state.blog)}`,
+  );
+}
+
+/**
+ * The single stage-aware integrity contract enforcement point for the
+ * post-editorial deterministic tail. The stage declares the categories it
+ * legitimately owns; ANY violation the candidate introduced OUTSIDE that
+ * ownership restores the exact pre-mutation snapshot and fails closed, so the
+ * final preflight/QC can never discover damage an earlier boundary should
+ * have rejected.
+ */
+function enforceIntegrityContract(
+  state: PipelineState,
+  deps: PipelineDependencies,
+  snap: PipelineSnapshot,
+  ownedCategories: ReadonlySet<ContractCategory>,
+  label: string,
+  options?: { allowRemovalAttributedSeoDrift?: boolean },
+): void {
+  const previous = JSON.parse(snap.articleDoc) as ArticleDocument;
+  const result = validateArticleIntegrityContract(state.articleDoc, {
+    keyphrase: state.keyphrase,
+    research: deps.context?.research || [],
+    ledger: deps.context?.claimOwnership,
+    wordMin: state.wordMin,
+    wordMax: state.wordMax,
+    previous,
+    ownedCategories,
+    allowRemovalAttributedSeoDrift: options?.allowRemovalAttributedSeoDrift,
+  });
+  const trace = state.debugTrace;
+  const traceCtx = trace ? traceContextFor(state) : undefined;
+  if (!result.valid) {
+    // Observational trace: finalize the failing stage against the REJECTED
+    // candidate (before restore) so the introduced violations and the first
+    // corrupting stage are preserved in the diagnostics.
+    trace?.rejectContract(
+      label,
+      result.violations.map((v) => `${v.category}:${v.message}`),
+      result.ownedViolations.map((v) => `${v.category}:${v.message}`),
+      state.articleDoc,
+      traceCtx!,
+    );
+    restoreSnapshot(state, snap);
+    syncBlogFromDocument(state);
+    console.error(
+      `[${label}] integrity contract rejected — rollback=success` +
+      ` violations=${JSON.stringify(result.violations.map((v) => `${v.category}:${v.message}`))}` +
+      ` restoredFp=${fp(state.blog)}`,
+    );
+    throw new Error(
+      `${label} integrity contract violated: ` +
+      result.violations.map((v) => `${v.category}: ${v.message}`).join("; "),
+    );
+  }
+  if (result.ownedViolations.length > 0) {
+    trace?.recordContract(
+      label,
+      true,
+      [],
+      result.ownedViolations.map((v) => `${v.category}:${v.message}`),
+    );
+    console.log(
+      `[${label}] integrity contract owned-violations=` +
+      JSON.stringify(result.ownedViolations.map((v) => `${v.category}:${v.message}`)),
+    );
+  } else {
+    trace?.recordContract(label, true, [], []);
+  }
+}
 
 /** THE ONLY place state.blog is assigned. No other code may assign state.blog directly. */
 function syncBlogFromDocument(state: PipelineState): void {
@@ -230,6 +327,37 @@ export function shouldAcceptSeoNormalization(result: FinalSeoNormalizerResult): 
     && safety.wordpressBlocksValid
     && safety.faqSchemaPreserved
     && safety.languageSwitcherPreserved;
+}
+
+/**
+ * Editorial-H2 keyphrase repair bounded by the hard density limit. The H2
+ * keyphrase placement is a soft signal; keyphrase stuffing is a hard gate. A
+ * heading repair that would push density above 3% is rolled back so no later
+ * stage can reintroduce density above the hard limit. Returns the rollback
+ * decision so the caller can log it.
+ */
+export function applyEditorialH2WithDensityGuard(
+  doc: ArticleDocument,
+  keyphrase: string,
+): { satisfied: boolean; rolledBack: boolean; densityAfter: number } {
+  const snapshot = JSON.stringify(doc);
+  const result = enforceEditorialH2Keyphrase(doc, keyphrase);
+  const { stuffingAbove } = englishKeyphraseDensity();
+  const densityAfter = canonicalKeyphraseMetrics(doc, keyphrase).density;
+  if (result.satisfied && densityAfter > stuffingAbove) {
+    const restored = JSON.parse(snapshot) as ArticleDocument;
+    doc.sections = restored.sections;
+    doc.introduction = restored.introduction;
+    doc.conclusion = restored.conclusion;
+    doc.visibleFaq = restored.visibleFaq;
+    doc.languageSwitcher = restored.languageSwitcher;
+    doc.cta = restored.cta;
+    doc.faqSchema = restored.faqSchema;
+    doc.metadata = restored.metadata;
+    doc.insertedLinks = restored.insertedLinks;
+    return { satisfied: false, rolledBack: true, densityAfter };
+  }
+  return { satisfied: result.satisfied, rolledBack: false, densityAfter };
 }
 
 /** Compute the exact readable word count used by final validation. */
@@ -384,7 +512,17 @@ export function sanitizeFaqFactualClaims(
       );
     }
 
-    let answerText = extractReadableText(cleanup.html).trim();
+    // The answer text is canonical plain text: strip the paragraph wrapper and
+    // tags WITHOUT destroying entities (extractReadableText would replace
+    // letter entities with spaces), then decode the entities the scan HTML
+    // introduced. The schema is rendered from this same text, so the canonical
+    // answer and the schema answer are always the same semantic string.
+    const cleanedText = cleanup.html
+      .replace(/<!--\s*wp:paragraph\s*-->[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>[\s\S]*?<!--\s*\/wp:paragraph\s*-->/i, "$1")
+      .replace(/<[^>]+>/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    let answerText = decodeHtmlEntities(cleanedText);
     if (!answerText) {
       answerText =
         "Use the practical guidance in the relevant section and adapt it to your audience and goals.";
@@ -830,6 +968,9 @@ export function runTrackedHtmlStage(state: PipelineState, stageName: string, fn:
   const inputFp = fp(preHtml);
   const stageBaseline = createArticleIntegrityBaseline(preHtml);
   const snap = preSnapshot ?? snapshotState(state);
+  const trace = state.debugTrace;
+  const traceCtx = trace ? traceContextFor(state) : undefined;
+  trace?.beginStage(stageName, snap.articleDoc, traceCtx!);
 
   assertValidStageInput(preHtml, stageBaseline, stageName);
 
@@ -840,6 +981,7 @@ export function runTrackedHtmlStage(state: PipelineState, stageName: string, fn:
   if (!applyHtmlToDocument(state, resultHtml, state.articleDoc)) {
     console.warn(`[PIPELINE:${stageName}] HTML-to-document parse failed — restoring pre-stage state`);
     restoreSnapshot(state, snap);
+    trace?.endStage(stageName, state.articleDoc, traceCtx!, false, true);
     recordStage(state, stageName, inputFp, inputFp, false, "parse-failure");
     return state;
   }
@@ -850,6 +992,7 @@ export function runTrackedHtmlStage(state: PipelineState, stageName: string, fn:
   }
   assertRenderedCacheMatchesDocument(state);
   const outputFp = fp(state.blog);
+  trace?.endStage(stageName, state.articleDoc, traceCtx!, guard.accepted, !guard.accepted);
   recordStage(state, stageName, inputFp, outputFp, guard.accepted, guard.accepted ? undefined : "pre-stage-restore");
   return state;
 }
@@ -884,6 +1027,7 @@ export function createPipelineState(params: {
     estimatedTokens: 0, systemPrompt: params.systemPrompt, userMessage: params.userMessage,
     currentWordCount: 0, expansionAttempts: 0, trimAttempts: 0,
     fullDocumentEditorial: null,
+    debugTrace: isPipelineDebugTraceEnabled() ? new PipelineDebugTrace() : undefined,
   };
 }
 
@@ -896,7 +1040,7 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
     "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
     "language-switcher", "internal-links", "external-links", "external-dedup",
     "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve", "final-trim",
-    "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
+    "final-seo-reconcile", "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
     "final-document-editorial", "editorial-h2-save-assert", "final-validation",
   ];
   if (isEditorialPolishEnabled()) {
@@ -919,7 +1063,7 @@ export function validatePipelineOrder(state: PipelineState): Array<{ code: strin
     ...(isEditorialPolishEnabled() ? ["editorial-polish"] : []),
     "claim-ownership-final", "language-switcher", "internal-links", "external-links",
     "external-dedup",     "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve",
-    "final-trim", "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
+    "final-trim", "final-seo-reconcile", "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
     ...(isFullDocumentEditorialEnabled() ? ["final-document-editorial"] : []),
     "editorial-h2-save-assert",
     "final-validation",
@@ -1015,12 +1159,16 @@ function runTemporalFreshnessStage(
 ): PipelineState {
   const inputFingerprint = fp(state.blog);
   const snap = snapshotState(state);
+  const trace = state.debugTrace;
+  const traceCtx = trace ? traceContextFor(state) : undefined;
+  trace?.beginStage("temporal-freshness", snap.articleDoc, traceCtx!);
   const referenceDate = deps.context?.generationDate
     ? new Date(deps.context.generationDate)
     : new Date();
   const initialIssues = findTemporalFreshnessIssues(state.articleDoc, referenceDate);
 
   if (initialIssues.length === 0) {
+    trace?.endStage("temporal-freshness", state.articleDoc, traceCtx!, true, false);
     recordStage(state, "temporal-freshness", inputFingerprint, inputFingerprint, true, undefined, {
       detected: 0,
       rewrittenSentences: 0,
@@ -1044,6 +1192,7 @@ function runTemporalFreshnessStage(
   }
 
   if (reasons.length > 0) {
+    trace?.endStage("temporal-freshness", state.articleDoc, traceCtx!, false, true);
     restoreSnapshot(state, snap);
     recordStage(state, "temporal-freshness", inputFingerprint, inputFingerprint, false, "pre-stage-restore", {
       detected: initialIssues.length,
@@ -1059,6 +1208,7 @@ function runTemporalFreshnessStage(
     );
   }
 
+  trace?.endStage("temporal-freshness", state.articleDoc, traceCtx!, true, false);
   recordStage(state, "temporal-freshness", inputFingerprint, fp(state.blog), true, undefined, {
     detected: initialIssues.length,
     rewrittenSentences: repair.rewrittenSentences,
@@ -1090,10 +1240,14 @@ export function runSourceRelevanceRepairStage(
   const inputFingerprint = fp(state.blog);
   const preRemovalHtml = state.blog;
   const snap = snapshotState(state);
+  const trace = state.debugTrace;
+  const traceCtx = trace ? traceContextFor(state) : undefined;
+  trace?.beginStage("source-relevance-repair", snap.articleDoc, traceCtx!);
   const stageBaseline = createArticleIntegrityBaseline(preRemovalHtml);
   const initial = assessSourceSectionRelevance(state.articleDoc, research);
 
   if (initial.length === 0) {
+    trace?.endStage("source-relevance-repair", state.articleDoc, traceCtx!, true, false);
     recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, true, undefined, {
       detected: 0,
       removedBlockIds: [],
@@ -1108,6 +1262,7 @@ export function runSourceRelevanceRepairStage(
   const removedUrls = targets.map((target) => target.url);
   const removed = removeOffTopicSourceCitations(state.articleDoc, initial);
   if (removed !== targets.length) {
+    trace?.endStage("source-relevance-repair", state.articleDoc, traceCtx!, false, true);
     restoreSnapshot(state, snap);
     recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, false, "pre-stage-restore", {
       detected: initial.length,
@@ -1128,6 +1283,7 @@ export function runSourceRelevanceRepairStage(
   );
   const remaining = assessSourceSectionRelevance(state.articleDoc, research);
   if (!guard.accepted || remaining.length > 0) {
+    trace?.endStage("source-relevance-repair", state.articleDoc, traceCtx!, false, true);
     restoreSnapshot(state, snap);
     recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, false, "pre-stage-restore", {
       detected: initial.length,
@@ -1143,6 +1299,7 @@ export function runSourceRelevanceRepairStage(
     );
   }
 
+  trace?.endStage("source-relevance-repair", state.articleDoc, traceCtx!, true, false);
   recordStage(state, "source-relevance-repair", inputFingerprint, fp(state.blog), true, undefined, {
     detected: initial.length,
     removedBlockIds,
@@ -1230,6 +1387,7 @@ export async function runPostAssemblyPipeline(
 
   // Factual-risk scan and repair: HTML-returning
   state = runTrackedHtmlStage(state, "factual-scan", (html) => {
+    const snap = snapshotState(state);
     const research = deps.context?.research || [];
     const editableComponents: Array<{
       label: string;
@@ -1255,7 +1413,24 @@ export async function runPostAssemblyPipeline(
       if (!risk.hasHighRisk) continue;
 
       const unsupported = risk.claims.filter((claim) => !claim.supported);
-      const cleanup = removeUnsupportedSentences(componentHtmlBefore, unsupported);
+      // Section topic grounding is a hard invariant: a claim removal must
+      // never delete the section's LAST sentence carrying a heading content
+      // word (that would silently unground the section and fail final QC).
+      // When a single paragraph is the section's only grounding carrier, its
+      // sentences are preserved so other unsupported claims are still removed
+      // — the producer chooses another safe removal instead of destroying the
+      // section's grounded substance. Only main sections carry a heading;
+      // intro and conclusion have no grounding requirement.
+      const groundingCarriers = "sectionType" in component && component.sectionType === "main"
+        ? essentialGroundingCarrierSentenceTexts(component as ArticleSection)
+        : [];
+      const cleanup = removeUnsupportedSentences(
+        componentHtmlBefore,
+        unsupported,
+        groundingCarriers.length > 0
+          ? { preserveSentenceTexts: groundingCarriers }
+          : undefined,
+      );
       const cleanupWouldEmpty = cleanup.sentencesRemoved > 0 && !cleanup.html.trim();
       if (cleanupWouldEmpty) {
         state.warnings.push(
@@ -1298,11 +1473,40 @@ export async function runPostAssemblyPipeline(
     state.articleDoc.visibleFaq = faqCleanup.entries;
     if (faqCleanup.unsupportedSentencesRemoved > 0 || faqCleanup.citationsAdded > 0) {
       repaired = true;
+      if (state.articleDoc.visibleFaq.length > 0) {
+        const schemaHtml = renderFaqSchema(state.articleDoc.visibleFaq);
+        state.articleDoc.faqSchema = {
+          id: "faq-schema",
+          type: "faq-schema",
+          html: schemaHtml,
+          fingerprint: fingerprintHtml(schemaHtml),
+        };
+      }
       console.log(
         `[factual-scan:faq] removed ${faqCleanup.unsupportedSentencesRemoved} precise factual sentence(s)`,
       );
     }
     if (repaired) syncBlogFromDocument(state);
+    // Stage-aware integrity contract: factual removal owns the factual claims
+    // it removes, the word count and the FAQ entries it corrects; everything
+    // else — malformed prose, sentence quality, links, WordPress structure,
+    // FAQ parity, protected content outside the FAQ — must be untouched, or
+    // the exact snapshot is restored and the pipeline fails closed here. A
+    // sentence removal that would leave an incomplete remainder is therefore
+    // rejected at ITS owner, never carried to malformed-prose-repair.
+    //
+    // A removed sentence may legitimately contain the focus keyphrase; that
+    // derived occurrence decrease is mechanically attributable to the removal
+    // and is restored downstream by post-ownership-seo-reconcile. Direct SEO
+    // mutation (insertion, rewrite, heading edit) still fails closed.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["factual", "word-count", "protected-content"]),
+      "factual-scan",
+      { allowRemovalAttributedSeoDrift: true },
+    );
     return state.blog;
   });
 
@@ -1320,6 +1524,7 @@ export async function runPostAssemblyPipeline(
   state = runTrackedHtmlStage(state, "claim-ownership", () => {
     const research = deps.context?.research || [];
     const ledger = deps.context?.claimOwnership;
+    const snap = snapshotState(state);
     if (!ledger || ledger.entries.length === 0) return state.blog;
     const verified = enforceOwnershipAndVerify(
       state.articleDoc,
@@ -1345,6 +1550,25 @@ export async function runPostAssemblyPipeline(
     }
     state.articleDoc = verified.doc;
     syncBlogFromDocument(state);
+    // Stage-aware integrity contract: ownership enforcement owns factual and
+    // ownership changes, the canonical visible-FAQ entries it corrects, and
+    // the word count; everything else — FAQ parity (the corrected answers
+    // must still match the rendered block and the schema), links, WordPress
+    // structure — must be untouched, or the exact snapshot is restored and
+    // the pipeline fails closed here.
+    //
+    // A removed outside-owner occurrence may legally contain the focus
+    // keyphrase; that derived occurrence decrease is mechanically attributable
+    // to the ownership removal and is restored downstream by
+    // post-ownership-seo-reconcile. Direct SEO mutation still fails closed.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["factual", "ownership", "word-count", "protected-content"]),
+      "claim-ownership",
+      { allowRemovalAttributedSeoDrift: true },
+    );
     console.log(
       `[claim-ownership] removed=${verified.repair.removedSentences}` +
       ` outside-owner=${verified.repair.removedOutOfOwnerOccurrences}` +
@@ -1398,6 +1622,9 @@ export async function runPostAssemblyPipeline(
   {
     const inputFingerprint = fp(state.blog);
     const snap = snapshotState(state);
+    const trace = state.debugTrace;
+    const traceCtx = trace ? traceContextFor(state) : undefined;
+    trace?.beginStage("malformed-prose-repair", snap.articleDoc, traceCtx!);
     const deterministic = repairDeterministicMalformedProse(
       state.articleDoc,
       state.wordMin,
@@ -1431,6 +1658,7 @@ export async function runPostAssemblyPipeline(
     if (hardUnresolved.length > 0) {
       // Rejected repair restores the exact pre-stage canonical snapshot, then
       // the pipeline fails closed (zero writes) at this repair boundary.
+      trace?.endStage("malformed-prose-repair", state.articleDoc, traceCtx!, false, true);
       restoreSnapshot(state, snap);
       recordStage(
         state,
@@ -1450,6 +1678,20 @@ export async function runPostAssemblyPipeline(
           .join("; "),
       );
     }
+    // Stage-aware integrity contract: the repair owns malformed/sentence
+    // quality, the word count and coherence changes it makes; it must never
+    // damage links, facts, FAQ parity, protected content or structure. Its
+    // bounded whole-block removal may remove a block that contained the focus
+    // keyphrase; that derived occurrence decrease is mechanically attributable
+    // to the removal and is restored downstream by post-ownership-seo-reconcile.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["malformed", "sentence-quality", "word-count", "coherence"]),
+      "malformed-prose-repair",
+      { allowRemovalAttributedSeoDrift: true },
+    );
     recordStage(
       state,
       "malformed-prose-repair",
@@ -1459,6 +1701,7 @@ export async function runPostAssemblyPipeline(
       undefined,
       stageMetadata,
     );
+    trace?.endStage("malformed-prose-repair", state.articleDoc, traceCtx!, true, false);
   }
 
   // Editorial polish: improves coherence, flow and natural language without
@@ -1504,6 +1747,9 @@ export async function runPostAssemblyPipeline(
   };
   if (isEditorialPolishEnabled()) {
     const inputFingerprint = fp(state.blog);
+    const trace = state.debugTrace;
+    const traceCtx = trace ? traceContextFor(state) : undefined;
+    trace?.beginStage("editorial-polish", JSON.stringify(preEditorialDoc), traceCtx!);
     const editorCtx = { chatWithRetry: deps.chatWithRetry };
     const research = editorialResearch;
     // Dedicated source-list blocks remain application-owned. Evidence-bearing
@@ -2057,6 +2303,7 @@ export async function runPostAssemblyPipeline(
         targetedRepairsPersisted,
       },
     );
+    trace?.endStage("editorial-polish", state.articleDoc, traceCtx!, accepted, !accepted);
   }
 
   // The editor is never allowed to change ownership. This is a confirmation
@@ -2088,6 +2335,7 @@ export async function runPostAssemblyPipeline(
   // editorial content is settled, so anchors cannot make a bad factual
   // sentence undeletable earlier in the pipeline.
   state = runTrackedHtmlStage(state, "language-switcher", () => {
+    const snap = snapshotState(state);
     const slugs = pairedSlugs(state.slug || "blog-post");
     const switcherHtml = renderLanguageSwitcher({
       currentLanguage: "en",
@@ -2101,50 +2349,77 @@ export async function runPostAssemblyPipeline(
       fingerprint: fingerprintHtml(switcherHtml),
     };
     syncBlogFromDocument(state);
+    // Stage-aware integrity contract: the switcher stage owns the switcher
+    // field; everything else must be untouched.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["cta-switcher-schema", "protected-content"]),
+      "language-switcher",
+    );
     return state.blog;
   });
 
   state = await runInternalLinks(state, deps);
 
-  state = runTrackedHtmlStage(state, "external-links", (html) => {
-    const researchItems = deps.context?.research || [];
-    const eligible = researchItems.filter(
-      (item: { url?: string }) => typeof item?.url === "string" && isEligibleExternalSourceUrl(item.url),
-    );
-    const rejected = researchItems.length - eligible.length;
-    console.log(
-      `[external-links:candidates] researchSources=${researchItems.length}` +
-      ` eligible=${eligible.length} rejected=${rejected}`,
-    );
-    if (eligible.length === 0) {
-      const message = researchItems.length === 0
-        ? "no research sources available — 0 external links injected"
-        : "no eligible external sources (all B2I-owned or invalid URLs) — 0 external links injected";
-      console.log(`[external-links] WARNING: ${message}`);
-      state.warnings.push(`External links: ${message}`);
-      return html;
-    }
-    const requested = Math.min(6, eligible.length);
-    const before = countEditorialExternalLinks(html);
-    const result = insertExternalResearchLinks(html, eligible, 6);
-    const after = countEditorialExternalLinks(result.html);
-    console.log(
-      `[external-links:inject] requested=${requested} inserted=${result.linksInserted}` +
-      ` skipped=${Math.max(0, requested - result.linksInserted)}` +
-      ` externalBefore=${before} externalAfter=${after}`,
-    );
-    return result.html;
-  });
+  {
+    const snap = snapshotState(state);
+    state = runTrackedHtmlStage(state, "external-links", () => {
+      const researchItems = deps.context?.research || [];
+      const eligible = researchItems.filter(
+        (item: { url?: string }) => typeof item?.url === "string" && isEligibleExternalSourceUrl(item.url),
+      );
+      const rejected = researchItems.length - eligible.length;
+      console.log(
+        `[external-links:candidates] researchSources=${researchItems.length}` +
+        ` eligible=${eligible.length} rejected=${rejected}`,
+      );
+      if (eligible.length === 0) {
+        const message = researchItems.length === 0
+          ? "no research sources available — 0 external links injected"
+          : "no eligible external sources (all B2I-owned or invalid URLs) — 0 external links injected";
+        console.log(`[external-links] WARNING: ${message}`);
+        state.warnings.push(`External links: ${message}`);
+        return state.blog;
+      }
+      const requested = Math.min(6, eligible.length);
+      const before = countEditorialExternalLinks(state.blog);
+      // Canonical model-based insertion: each citation is added as a NEW
+      // paragraph block, so existing editorial text, punctuation, inline
+      // nodes, sentence boundaries and block order are never altered.
+      const result = insertExternalResearchLinksIntoDocument(state.articleDoc, eligible, 6);
+      syncBlogFromDocument(state);
+      const after = countEditorialExternalLinks(state.blog);
+      console.log(
+        `[external-links:inject] requested=${requested} inserted=${result.insertedLinks}` +
+        ` skipped=${Math.max(0, requested - result.insertedLinks)}` +
+        ` externalBefore=${before} externalAfter=${after}`,
+      );
+      return state.blog;
+    });
+    // Stage-aware integrity contract: link injection owns link changes only;
+    // every other invariant (FAQ parity, protected content, facts) must hold.
+    enforceIntegrityContract(state, deps, snap, new Set<ContractCategory>(["links", "word-count"]), "external-links");
+  }
 
-  state = runTrackedHtmlStage(state, "external-dedup", (html) =>
-    deduplicateEditorialExternalLinks(html).html,
-  );
+  {
+    const snap = snapshotState(state);
+    state = runTrackedHtmlStage(state, "external-dedup", (html) =>
+      deduplicateEditorialExternalLinks(html).html,
+    );
+    enforceIntegrityContract(state, deps, snap, new Set<ContractCategory>(["links", "word-count"]), "external-dedup");
+  }
 
-  state = runTrackedHtmlStage(state, "link-enforce", (html) => {
-    const result = enforceInternalLinkLimit(html, 4);
-    console.log(`[link-enforce] retained=${result.retained.length} removed=${result.removed.length}`);
-    return result.html;
-  });
+  {
+    const snap = snapshotState(state);
+    state = runTrackedHtmlStage(state, "link-enforce", (html) => {
+      const result = enforceInternalLinkLimit(html, 4);
+      console.log(`[link-enforce] retained=${result.retained.length} removed=${result.removed.length}`);
+      return result.html;
+    });
+    enforceIntegrityContract(state, deps, snap, new Set<ContractCategory>(["links", "word-count"]), "link-enforce");
+  }
 
   state = runTrackedHtmlStage(state, "factual-final", (html) => {
     const research = deps.context?.research || [];
@@ -2192,7 +2467,9 @@ export async function runPostAssemblyPipeline(
   // introducing unsupported claims, ownership violations, repetition or
   // protected-content changes.
   state = runTrackedHtmlStage(state, "post-ownership-seo-reconcile", (html) => {
+    const snap = snapshotState(state);
     const research = deps.context?.research || [];
+    traceKeyphraseDensity("factual-ownership-cleanup", state);
     const result = reconcilePostOwnershipKeyphrase(
       state.articleDoc,
       state.keyphrase,
@@ -2206,10 +2483,22 @@ export async function runPostAssemblyPipeline(
     console.log(
       `[post-ownership-seo-reconcile] h2=${result.h2KeyphraseRestored}` +
       ` first100=${result.first100KeyphraseRestored}` +
+      ` occ=${result.keyphraseCountBefore} → ${result.keyphraseCountAfter}` +
       ` density=${result.densityBefore.toFixed(2)}% → ${result.densityAfter.toFixed(2)}%` +
       (result.h2KeyphraseRestored || result.first100KeyphraseRestored
         ? ""
         : " (no change committed)"),
+    );
+    traceKeyphraseDensity("post-ownership-seo-reconcile", state);
+    // Stage-aware integrity contract: the reconciliation owns SEO/keyphrase
+    // and word-count changes only; links, facts, FAQ parity and protected
+    // content must be untouched or the exact snapshot is restored.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["seo", "word-count"]),
+      "post-ownership-seo-reconcile",
     );
     return state.blog;
   });
@@ -2221,11 +2510,21 @@ export async function runPostAssemblyPipeline(
   // If the CTA is missing or damaged, sets it on the canonical ArticleDocument
   // and re-renders — avoiding fragile HTML string surgery that can break WP blocks.
   state = runTrackedHtmlStage(state, "cta-preserve", (html) => {
+    const snap = snapshotState(state);
     const cta = analyzeCanonicalEnglishCta(html);
     const canonicalDocCta = state.articleDoc.cta?.html.replace(/\s+/g, " ").trim()
       === CANONICAL_ENGLISH_CTA_HTML.replace(/\s+/g, " ").trim()
       && state.articleDoc.cta?.fingerprint === CANONICAL_ENGLISH_CTA_FINGERPRINT;
-    if (cta.valid && canonicalDocCta) return html;
+    if (cta.valid && canonicalDocCta) {
+      enforceIntegrityContract(
+        state,
+        deps,
+        snap,
+        new Set<ContractCategory>(["cta-switcher-schema", "protected-content"]),
+        "cta-preserve",
+      );
+      return html;
+    }
 
     console.log(`[cta-preserve] canonical CTA check failed: ${cta.issues.join("; ")} — re-injecting`);
 
@@ -2239,6 +2538,13 @@ export async function runPostAssemblyPipeline(
       fingerprint: CANONICAL_ENGLISH_CTA_FINGERPRINT,
     };
     syncBlogFromDocument(state);
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["cta-switcher-schema", "protected-content"]),
+      "cta-preserve",
+    );
     return state.blog;
   });
 
@@ -2246,15 +2552,70 @@ export async function runPostAssemblyPipeline(
   // call when needed, then a coherence gate. Trimming is structure-aware:
   // repetition and low-value detail are removed first, complete arguments,
   // examples, transitions, evidence and heading relationships are preserved,
-  // and unresolved coherence damage blocks saving.
+  // and unresolved coherence damage blocks saving. The trim is density-aware:
+  // it must not accept a trimmed candidate that crosses the hard keyphrase
+  // stuffing limit without resolving it deterministically right here.
   state = await runFinalTrimStage(state, deps);
+
+  // Deterministic post-final-trim SEO reconciliation. Final trim removes
+  // non-keyphrase words, which can raise keyphrase density above the hard 3%
+  // limit without any occurrence being added. This stage reuses the protected
+  // keyphrase-removal logic and re-validates every hard gate on the canonical
+  // ArticleDocument before committing; when no safe correction exists it
+  // restores the exact pre-stage snapshot and fails closed (blocks saving).
+  state = runTrackedHtmlStage(state, "final-seo-reconcile", (html) => {
+    const snap = snapshotState(state);
+    const research = deps.context?.research || [];
+    traceKeyphraseDensity("final-seo-reconcile:before", state);
+    const result = reconcileFinalKeyphraseDensity(
+      state.articleDoc,
+      state.keyphrase,
+      research,
+      deps.context?.claimOwnership,
+      state.wordMin,
+      state.wordMax,
+    );
+    if (!result.accepted) {
+      restoreSnapshot(state, snap);
+      syncBlogFromDocument(state);
+      console.error(
+        `[final-seo-reconcile] rollback=success reason=${result.rejectionReasons.join("; ")}` +
+        ` inputFp=${fp(html)} restoredFp=${fp(state.blog)}`,
+      );
+      throw new Error(
+        `Final keyphrase density reconciliation failed: ` +
+        `${result.rejectionReasons.join("; ")}`,
+      );
+    }
+    syncBlogFromDocument(state);
+    traceKeyphraseDensity("final-seo-reconcile:after", state);
+    // Stage-aware integrity contract: the reconciliation owns SEO density,
+    // word count and the sentence-quality/malformed effects of its removals;
+    // links, facts, FAQ parity and protected content must be untouched.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["seo", "word-count", "malformed", "sentence-quality"]),
+      "final-seo-reconcile",
+    );
+    return state.blog;
+  });
 
   // FAQ schema is application-owned. Always regenerate it from canonical,
   // protected visible FAQ entries after every content-changing stage.
   state = runTrackedHtmlStage(state, "faq-recovery", () => {
+    const snap = snapshotState(state);
     if (state.articleDoc.visibleFaq.length === 0) {
       state.articleDoc.faqSchema = null;
       syncBlogFromDocument(state);
+      enforceIntegrityContract(
+        state,
+        deps,
+        snap,
+        new Set<ContractCategory>(["cta-switcher-schema"]),
+        "faq-recovery",
+      );
       return state.blog;
     }
     const schemaHtml = renderFaqSchema(state.articleDoc.visibleFaq);
@@ -2267,6 +2628,15 @@ export async function runPostAssemblyPipeline(
     syncBlogFromDocument(state);
     console.log(
       `[faq-recovery] regenerated schema from ${state.articleDoc.visibleFaq.length} protected FAQ entries`,
+    );
+    // Stage-aware integrity contract: schema regeneration owns the schema
+    // field; canonical/rendered/schema semantic parity must hold.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>(["cta-switcher-schema"]),
+      "faq-recovery",
     );
     return state.blog;
   });
@@ -2320,6 +2690,51 @@ export async function runPostAssemblyPipeline(
           .join("; "),
       );
     }
+    // The deterministic malformed repair above can remove non-keyphrase words,
+    // raising keyphrase density past the hard 3% limit. This repair boundary
+    // owns that: the same deterministic reconcile runs here and fails closed
+    // (restoring the exact pre-preflight snapshot) when it cannot be resolved.
+    const densityReconcile = reconcileFinalKeyphraseDensity(
+      state.articleDoc,
+      state.keyphrase,
+      deps.context?.research || [],
+      deps.context?.claimOwnership,
+      state.wordMin,
+      state.wordMax,
+    );
+    if (!densityReconcile.accepted) {
+      restoreSnapshot(state, snap);
+      console.error(
+        `[final-preflight] density resolution failed — rollback=success` +
+        ` reason=${densityReconcile.rejectionReasons.join("; ")}`,
+      );
+      throw new Error(
+        `Final preflight could not keep keyphrase density inside the hard limit: ` +
+        `${densityReconcile.rejectionReasons.join("; ")}`,
+      );
+    }
+    if (densityReconcile.applied) {
+      console.log(
+        `[final-preflight] density reconcile removed=${densityReconcile.removedSentences} sentence(s)` +
+        ` density=${densityReconcile.densityBefore.toFixed(2)}% → ${densityReconcile.densityAfter.toFixed(2)}%`,
+      );
+    }
+    // Stage-aware integrity contract at the last repair boundary: the repair
+    // owns malformed/sentence quality, word count, SEO density and coherence;
+    // FAQ parity, links, facts, ownership and protected content must hold.
+    enforceIntegrityContract(
+      state,
+      deps,
+      snap,
+      new Set<ContractCategory>([
+        "malformed",
+        "sentence-quality",
+        "word-count",
+        "seo",
+        "coherence",
+      ]),
+      "final-preflight",
+    );
     if (state.articleDoc.visibleFaq.length > 0) {
       const schemaHtml = renderFaqSchema(state.articleDoc.visibleFaq);
       state.articleDoc.faqSchema = {
@@ -2376,13 +2791,20 @@ export async function runPostAssemblyPipeline(
   // and the final SEO audit deducts points. Naturalness/structural corruption
   // is still a genuine hard gate below.
   state = runTrackedHtmlStage(state, "editorial-h2-enforce", () => {
-    const result = enforceEditorialH2Keyphrase(state.articleDoc, state.keyphrase);
+    const result = applyEditorialH2WithDensityGuard(state.articleDoc, state.keyphrase);
     syncBlogFromDocument(state);
-    if (result.satisfied) {
+    if (result.rolledBack) {
+      // The H2 keyphrase placement is a soft signal; stuffing is a hard gate.
+      // The heading change was rolled back so a later stage can never
+      // reintroduce density above the hard limit.
+      console.log(
+        `[editorial-h2-enforce] satisfied=true but density=${result.densityAfter.toFixed(2)}% > 3%` +
+        ` — heading change rolled back (soft skip)`,
+      );
+    } else if (result.satisfied) {
       console.log(
         `[editorial-h2-enforce] satisfied=true` +
-        ` changedSection=${result.changedSectionId ?? "none"}` +
-        ` headingAfter="${result.headingAfter ?? "-"}"`,
+        ` density=${result.densityAfter.toFixed(2)}%`,
       );
     } else {
       // Missing exact-focus-keyphrase in an editorial H2 is soft. Never force
@@ -2471,6 +2893,9 @@ export async function runPostAssemblyPipeline(
   // following stage is the canonical validation-only gate.
   if (isFullDocumentEditorialEnabled()) {
     const inputFingerprint = fp(state.blog);
+    const trace = state.debugTrace;
+    const traceCtx = trace ? traceContextFor(state) : undefined;
+    trace?.beginStage("final-document-editorial", JSON.stringify(state.articleDoc), traceCtx!);
     // Boundary precondition: only structurally valid canonical HTML may reach the
     // final-document diagnosis. Do not send invalid HTML to the model.
     assertFinalEditorialBoundary(state);
@@ -2522,6 +2947,7 @@ export async function runPostAssemblyPipeline(
         diagnostics: outcome.diagnostics,
       },
     );
+    trace?.endStage("final-document-editorial", state.articleDoc, traceCtx!, outcome.accepted, !outcome.accepted);
     console.log(
       `[final-document-editorial] run=${outcome.runId} mode=${outcome.mode}` +
       ` findings=${outcome.findings.length} selected=${outcome.selectedUnitIds.length}` +
@@ -2678,12 +3104,16 @@ async function runClaimCheck(state: PipelineState, deps: PipelineDependencies): 
 
 function runConclusionDiscipline(state: PipelineState): PipelineState {
   const inputFingerprint = fp(state.blog);
+  const trace = state.debugTrace;
+  const traceCtx = trace ? traceContextFor(state) : undefined;
+  trace?.beginStage("conclusion-discipline", JSON.stringify(state.articleDoc), traceCtx!);
   const maxConclusionWords = Math.min(
     300,
     Math.max(80, Math.round(state.requestedWordCount * 0.12)),
   );
   const result = trimConclusionToBudget(state.articleDoc, maxConclusionWords);
   if (result.removedBlocks > 0) syncBlogFromDocument(state);
+  trace?.endStage("conclusion-discipline", state.articleDoc, traceCtx!, true, false);
   recordStage(
     state,
     "conclusion-discipline",
@@ -3023,6 +3453,7 @@ export type CompactionRejectionReason =
   | "unsupported-claim"
   | "quote-integrity"
   | "malformed-prose"
+  | "section-grounding"
   | `coherence:${CoherenceViolation["type"]}`
   | "source-relevance"
   | "wordpress-integrity"
@@ -3069,8 +3500,10 @@ function supportedClaimSentences(
  *  sentence-completeness validator so trim/compaction validation can never
  *  disagree with AI acceptance, malformed-prose scanning or the final QC and
  *  pre-save gates. */
-function isCorruptBlockText(text: string): boolean {
-  if (!isSentenceComplete(text, "paragraph")) return true;
+function isCorruptBlockText(text: string, hasStructuredContinuation = false): boolean {
+  if (!isSentenceComplete(text, "paragraph", {
+    allowColonBeforeStructuredContinuation: hasStructuredContinuation,
+  })) return true;
   if (
     /^\s*(?:instead|however|therefore|meanwhile|moreover|furthermore|nevertheless|nonetheless|consequently|additionally|likewise|similarly|hence|thus|yet|so|but|and)\s*[,:]|^\s*(?:as a result|on the other hand|that said|in addition|for example|for instance)\s*[,:]/i.test(text)
   ) {
@@ -3098,7 +3531,9 @@ function supportedClaimsInCoherentBlocks(
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (isCorruptBlockText(text)) continue;
+    const remainder = html.slice(blockRe.lastIndex).trimStart();
+    const hasStructuredContinuation = /^<!--\s*wp:(?:list|table)\b/i.test(remainder);
+    if (isCorruptBlockText(text, hasStructuredContinuation)) continue;
     for (const claim of scanFactualRisks(blockHtml, keyphrase, research).claims) {
       if (claim.supported && claim.sentenceText) {
         claims.push(claim.sentenceText.replace(/\s+/g, " ").trim().toLowerCase());
@@ -3293,6 +3728,11 @@ async function runBoundedSectionCompaction(
     : [];
   const relevanceViolations = assessSourceSectionRelevance(candidate, research)
     .filter((violation) => violation.sectionId === target.id);
+  // Section topic grounding is a hard invariant: the compacted section body
+  // must still share a content word with its own H2, or final QC fails. The
+  // AI rewrite is rejected and the snapshot preserved when grounding is lost.
+  const sectionGroundingCarriers = countSectionGroundingCarriers(candidate.sections[targetIndex]);
+  const grounded = sectionGroundingCarriers > 0;
   const canonicalCount = countCanonicalVisibleWords(candidate);
   const withinWordRange = canonicalCount >= state.wordMin && canonicalCount <= state.wordMax;
   const wpStructureValid = validateWordpressBlockPairs(renderArticleDocument(candidate)).valid;
@@ -3314,6 +3754,7 @@ async function runBoundedSectionCompaction(
     && candidateUnsupported.length === 0
     && sectionCoherence.length === 0
     && relevanceViolations.length === 0
+    && grounded
     && withinWordRange
     && wpStructureValid
     && structurallyValid
@@ -3332,6 +3773,7 @@ async function runBoundedSectionCompaction(
     if (candidateMalformed.length > 0 && !unmatchedQuotes) reasons.push("malformed-prose");
     for (const violation of sectionCoherence) reasons.push(`coherence:${violation.type}`);
     if (relevanceViolations.length > 0) reasons.push("source-relevance");
+    if (!grounded) reasons.push("section-grounding");
     if (!wpStructureValid || !structurallyValid) reasons.push("wordpress-integrity");
     if (!protectedContent) reasons.push("protected-content");
     return rejectCompaction(
@@ -3394,18 +3836,23 @@ function logTrimCoherenceDiagnostics(
  *    with zero database writes. Coherence failures are never converted into
  *    warnings.
  */
-async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
+export async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencies): Promise<PipelineState> {
   const snap = snapshotState(state);
   const preHtml = state.blog;
   const inputFp = fp(preHtml);
   const stageBaseline = createArticleIntegrityBaseline(preHtml);
   const initialWordCount = countCanonicalVisibleWords(state.articleDoc);
   const preTrimCoherence = validateCoherence(state.articleDoc);
+  const trace = state.debugTrace;
+  const traceCtx = trace ? traceContextFor(state) : undefined;
+  trace?.beginStage("final-trim", snap.articleDoc, traceCtx!);
+  traceKeyphraseDensity("final-trim:before", state);
   logTrimCoherenceDiagnostics("preTrimCoherenceViolations", preTrimCoherence);
   if (initialWordCount <= state.wordMax) {
     console.log(`[final-trim] skipped (wc=${initialWordCount} <= ${state.wordMax})`);
     logTrimCoherenceDiagnostics("postTrimCoherenceViolations", preTrimCoherence);
     logTrimCoherenceDiagnostics("newTrimIntroducedViolations", []);
+    trace?.endStage("final-trim", state.articleDoc, traceCtx!, true, false);
     recordStage(state, "final-trim", inputFp, inputFp, true, undefined, {
       skipped: true,
       reason: "within-max",
@@ -3489,6 +3936,7 @@ async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencie
       `[final-trim] ${coherence.length} coherence violation(s) after trimming and bounded compaction:\n` +
       coherenceViolationSummary(coherence).join("\n"),
     );
+    trace?.endStage("final-trim", state.articleDoc, traceCtx!, false, true);
     throw new Error(
       `Coherence violations after final trim: ${coherence.length}` +
       ` (first=${coherence[0].type} in ${coherence[0].componentId})`,
@@ -3498,10 +3946,69 @@ async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencie
     console.error(
       `[final-trim] word count ${finalWordCount} outside ${state.wordMin}-${state.wordMax} after trimming and bounded compaction`,
     );
+    trace?.endStage("final-trim", state.articleDoc, traceCtx!, false, true);
     throw new Error(
       `Final trim could not reach the word-count range: ${finalWordCount} (target ${state.wordMin}-${state.wordMax})`,
     );
   }
+
+  // 4. Density-aware acceptance: trimming removes non-keyphrase words, which
+  //    raises keyphrase density. A trim candidate that crosses the hard 3%
+  //    stuffing limit must be resolved deterministically right here, before
+  //    the trimmed output is accepted — never handed downstream unresolved.
+  //    When no safe correction exists the complete pre-trim snapshot is
+  //    restored and the trim fails closed (blocks saving).
+  const densityReconcile = reconcileFinalKeyphraseDensity(
+    state.articleDoc,
+    state.keyphrase,
+    research,
+    deps.context?.claimOwnership,
+    state.wordMin,
+    state.wordMax,
+  );
+  if (!densityReconcile.accepted) {
+    trace?.endStage("final-trim", state.articleDoc, traceCtx!, false, true);
+    restoreSnapshot(state, snap);
+    syncBlogFromDocument(state);
+    console.error(
+      `[final-trim] density resolution failed — rollback=success` +
+      ` reason=${densityReconcile.rejectionReasons.join("; ")}` +
+      ` restoredFp=${fp(state.blog)}`,
+    );
+    throw new Error(
+      `Final trim created unresolvable keyphrase density: ` +
+      `${densityReconcile.rejectionReasons.join("; ")}`,
+    );
+  }
+  if (densityReconcile.applied) {
+    syncBlogFromDocument(state);
+    totalRemoved += densityReconcile.removedWords;
+    finalWordCount = countCanonicalVisibleWords(state.articleDoc);
+    console.log(
+      `[final-trim] density reconcile removed=${densityReconcile.removedSentences} sentence(s)` +
+      ` (${densityReconcile.removedWords} words) ` +
+      `density=${densityReconcile.densityBefore.toFixed(2)}% → ${densityReconcile.densityAfter.toFixed(2)}%`,
+    );
+  }
+  // Stage-aware integrity contract: final trim legitimately owns word count,
+  // malformed/sentence quality (pass-0 residue purge), SEO density and
+  // coherence; it must never damage FAQ parity, links, facts, ownership,
+  // protected content or WordPress structure — otherwise the exact pre-trim
+  // snapshot is restored and the pipeline fails closed.
+  enforceIntegrityContract(
+    state,
+    deps,
+    snap,
+    new Set<ContractCategory>([
+      "malformed",
+      "sentence-quality",
+      "word-count",
+      "seo",
+      "coherence",
+    ]),
+    "final-trim",
+  );
+  traceKeyphraseDensity("final-trim:after", state);
 
   if (totalRemoved > 0) {
     console.log(
@@ -3520,6 +4027,7 @@ async function runFinalTrimStage(state: PipelineState, deps: PipelineDependencie
   }
   assertRenderedCacheMatchesDocument(state);
   const outputFp = fp(state.blog);
+  trace?.endStage("final-trim", state.articleDoc, traceCtx!, guard.accepted, !guard.accepted);
   recordStage(
     state,
     "final-trim",
@@ -3547,7 +4055,11 @@ async function runInternalLinks(state: PipelineState, deps: PipelineDependencies
     await seedDefaultLinks(state.userId);
     const result = await injectLinks(state.blog, state.userId);
     if (result.linksInjected > 0) {
-      return runTrackedHtmlStage(state, "internal-links", (html) => result.modifiedContent, snap);
+      state = runTrackedHtmlStage(state, "internal-links", (html) => result.modifiedContent, snap);
+      // Stage-aware integrity contract: link injection owns link changes only;
+      // every other invariant must hold or the exact snapshot is restored.
+      enforceIntegrityContract(state, deps, snap, new Set<ContractCategory>(["links", "word-count"]), "internal-links");
+      return state;
     }
   } catch (err) {
     skipReason = "link-injection-failed";
@@ -3594,9 +4106,23 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
     state.normalizationResult = result;
     state.normalizationAccepted = accepted;
 
+    const candidateAfter = result.after;
+    const candidateDensity = typeof candidateAfter?.keyphraseDensity === "number"
+      ? candidateAfter.keyphraseDensity.toFixed(2)
+      : "?";
+    console.log(
+      `[kp-density] seo-normalization:candidate wc=${candidateAfter?.readableWordCount ?? "?"}` +
+      ` occ=${candidateAfter?.exactKeyphraseCount ?? "?"}` +
+      ` density=${candidateDensity}%` +
+      ` accepted=${accepted} reasons=${result.passed ? "none" : "see [SEO-NORMALIZER] log"}`,
+    );
+
     if (accepted) {
-      return runTrackedHtmlStage(state, "seo-normalization", (html) => result.html, snap);
+      const committed = runTrackedHtmlStage(state, "seo-normalization", (html) => result.html, snap);
+      traceKeyphraseDensity("seo-normalization:accepted", state);
+      return committed;
     }
+    traceKeyphraseDensity("seo-normalization:rejected(restored)", state);
   } catch (error) {
     state.normalizationResult = null;
     state.normalizationAccepted = false;
@@ -3638,6 +4164,15 @@ export function runFinalValidation(state: PipelineState): { passed: boolean; rea
   );
   const policy = buildPolicy(state.requestedWordCount, state.wordMin, state.wordMax, state.keyphrase);
   const result = evaluatePolicy(metrics, policy);
+  if (state.articleDoc) {
+    const density = canonicalKeyphraseMetrics(state.articleDoc, state.keyphrase);
+    console.log(
+      `[kp-density] final-validation wc=${density.wordCount} occ=${density.occurrences}` +
+      ` density=${density.density.toFixed(2)}%` +
+      ` gateDensity=${metrics.keyphraseDensity.toFixed(2)}%` +
+      ` passed=${result.passed} fp=${fp(state.blog)}`,
+    );
+  }
   if (!result.passed && state.articleDoc) {
     const languageViolations = scanEnglishLanguageConsistency(state.articleDoc);
     if (languageViolations.length > 0) {

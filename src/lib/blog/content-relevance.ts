@@ -3,8 +3,9 @@
 // H2 topic, and that editorial H2 headings are natural (never a duplicated
 // concatenation of the keyphrase onto an already-equivalent heading).
 
-import type { ArticleDocument } from "@/lib/blog/article-document";
+import type { ArticleDocument, ArticleSection } from "@/lib/blog/article-document";
 import { renderComponentHtml } from "@/lib/blog/article-document";
+import { normalizedSentenceTextsOfSectionHtml } from "@/lib/blog/factual-risk-scanner";
 
 const TOPIC_STOP_WORDS = new Set([
   "the", "a", "an", "and", "or", "but", "for", "of", "on", "in", "to", "with",
@@ -161,24 +162,122 @@ export function assessSourceSectionRelevance(
  * heading. A fully off-topic section cannot satisfy its H2.
  */
 export function assessSectionTopicGrounding(doc: ArticleDocument): string[] {
-  const ungrounded: string[] = [];
-  for (const section of doc.sections) {
-    if (section.sectionType !== "main") continue;
-    const headingWords = topicWords(section.heading);
-    if (headingWords.length === 0) continue;
-    const sectionHtml = renderComponentHtml(section);
-    const paragraphs = [...sectionHtml.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)]
-      .map((m) => m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim())
-      .filter((text) => text.length > 0 && !/^\s*sources?:/i.test(text));
-    const grounded = paragraphs.some((text) => {
-      const words = topicWords(text);
-      return words.some((word) => headingWords.includes(word));
+  return findUngroundedSectionIds(doc).map((sectionId) => {
+    const section = doc.sections.find((item) => item.id === sectionId);
+    return `${section?.heading ?? sectionId} (${sectionId})`;
+  });
+}
+
+/** Content words of a main section's heading (stop words and location/year
+ *  tokens excluded), used for topic-grounding comparisons. */
+function sectionHeadingContentWords(section: ArticleSection): string[] {
+  return topicWords(section.heading);
+}
+
+/**
+ * True when the section's body contains at least one non-source paragraph
+ * sharing a content word with its heading. This is the single topic-grounding
+ * rule shared by the section-relevance scanner, the stage-aware integrity
+ * contract and the final QC gate, so a producer can never disagree with the
+ * gate about whether a section is grounded.
+ */
+export function isSectionTopicGrounded(section: ArticleSection): boolean {
+  if (section.sectionType !== "main") return true;
+  const headingWords = sectionHeadingContentWords(section);
+  if (headingWords.length === 0) return true;
+  const sectionHtml = renderComponentHtml(section);
+  const paragraphs = [...sectionHtml.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)]
+    .map((m) => m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim())
+    .filter((text) => text.length > 0 && !/^\s*sources?:/i.test(text));
+  return paragraphs.some((text) => {
+    const words = topicWords(text);
+    return words.some((word) => headingWords.includes(word));
+  });
+}
+
+/**
+ * Number of distinct non-source body paragraphs that carry at least one
+ * heading content word. Used by removal producers (final trim, factual scan)
+ * to refuse a candidate that would leave the section with zero grounding.
+ * `excludeBlockIndex` simulates removing one block so a producer can verify
+ * that an alternative grounding paragraph survives.
+ */
+export function countSectionGroundingCarriers(
+  section: ArticleSection,
+  excludeBlockIndex?: number,
+): number {
+  if (section.sectionType !== "main") return Number.POSITIVE_INFINITY;
+  const headingWords = sectionHeadingContentWords(section);
+  if (headingWords.length === 0) return Number.POSITIVE_INFINITY;
+  let carriers = 0;
+  for (let blockIndex = 0; blockIndex < section.blocks.length; blockIndex++) {
+    if (excludeBlockIndex !== undefined && blockIndex === excludeBlockIndex) continue;
+    const block = section.blocks[blockIndex];
+    if (block.type !== "paragraph" && block.type !== "list") continue;
+    const html = renderComponentHtml({
+      id: section.id,
+      blocks: [block],
+      status: section.status,
     });
-    if (!grounded) {
-      ungrounded.push(`${section.heading} (${section.id})`);
-    }
+    const text = html
+      .replace(/<[^>]+>/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text || /^\s*sources?:/i.test(text)) continue;
+    if (topicWords(text).some((word) => headingWords.includes(word))) carriers++;
   }
-  return ungrounded;
+  return carriers;
+}
+
+/** True when a candidate body text still carries at least one content word of
+ *  the section heading. Used by final-trim sentence shortening to refuse a
+ *  shortened remainder that would unground the section. */
+export function textCarriesHeadingContentWord(section: ArticleSection, text: string): boolean {
+  if (section.sectionType !== "main") return true;
+  const headingWords = sectionHeadingContentWords(section);
+  if (headingWords.length === 0) return true;
+  return topicWords(text).some((word) => headingWords.includes(word));
+}
+
+/** Stable section IDs whose body lost all topic grounding. Used by the
+ *  stage-aware integrity contract so a mutating stage can never turn a
+ *  previously grounded section into an ungrounded one silently. */
+export function findUngroundedSectionIds(doc: ArticleDocument): string[] {
+  return doc.sections
+    .filter((section) => section.sectionType === "main" && !isSectionTopicGrounded(section))
+    .map((section) => section.id);
+}
+
+/**
+ * Complete normalized sentence texts of the section's non-source body
+ * paragraphs that carry at least one heading content word. The normalized
+ * texts are computed with the EXACT sentence splitting the removal producer
+ * uses when matching preserved sentences, so a preserved carrier always
+ * matches and survives.
+ */
+export function groundingCarrierSentenceTexts(section: ArticleSection): string[] {
+  if (section.sectionType !== "main") return [];
+  const headingWords = sectionHeadingContentWords(section);
+  if (headingWords.length === 0) return [];
+  const sectionHtml = renderComponentHtml(section);
+  return normalizedSentenceTextsOfSectionHtml(sectionHtml).filter((sentence) =>
+    topicWords(sentence).some((word) => headingWords.includes(word)),
+  );
+}
+
+/**
+ * Essential grounding carriers: the section's minimum grounded substance.
+ * When several paragraphs share a heading word, removing a claim sentence
+ * from one of them cannot unground the section, so no preservation is needed
+ * and every unsupported claim is still removed. When a single paragraph is
+ * the section's only grounding carrier, its carrier sentences must survive
+ * removal. Removal producers pass the returned texts through
+ * `preserveSentenceTexts`.
+ */
+export function essentialGroundingCarrierSentenceTexts(section: ArticleSection): string[] {
+  if (section.sectionType !== "main") return [];
+  if (countSectionGroundingCarriers(section) !== 1) return [];
+  return groundingCarrierSentenceTexts(section);
 }
 
 const KEYPHRASE_FUNCTION_WORDS = new Set([

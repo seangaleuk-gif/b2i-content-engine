@@ -64,6 +64,15 @@ export interface SentenceCompletenessAnalysis {
   trailingFragment: TrailingFragment | null;
 }
 
+export interface SentenceCompletenessOptions {
+  /**
+   * A paragraph ending in a colon is complete when the next canonical block
+   * is the non-empty list/table it introduces. Callers must derive this from
+   * the surrounding block sequence; it is never enabled for isolated prose.
+   */
+  allowColonBeforeStructuredContinuation?: boolean;
+}
+
 const PROSE_KINDS = new Set<SentenceCompletenessKind>([
   "paragraph",
   "quote",
@@ -148,6 +157,7 @@ export function hasUnmistakableFragmentEnding(text: string): boolean {
 export function analyzeSentenceCompleteness(
   text: string,
   kind: SentenceCompletenessKind,
+  options?: SentenceCompletenessOptions,
 ): SentenceCompletenessAnalysis {
   const normalized = normalizeText(text);
   if (!normalized) return { complete: true, issues: [], trailingFragment: null };
@@ -173,6 +183,9 @@ export function analyzeSentenceCompleteness(
 
   // Prose kinds: complete sentences with terminal punctuation are required.
   const tail = normalized.replace(CLOSING_DELIM_RE, "");
+  if (options?.allowColonBeforeStructuredContinuation && /:$/.test(tail)) {
+    return { complete: true, issues: [], trailingFragment: null };
+  }
   if (TERMINAL_MARK_RE.test(tail) && !SETUP_ENDING_RE.test(tail)) {
     return { complete: true, issues: [], trailingFragment: null };
   }
@@ -215,6 +228,10 @@ export function analyzeSentenceCompleteness(
 }
 
 /** Convenience: complete only when the text is valid prose for the kind. */
-export function isSentenceComplete(text: string, kind: SentenceCompletenessKind): boolean {
-  return analyzeSentenceCompleteness(text, kind).complete;
+export function isSentenceComplete(
+  text: string,
+  kind: SentenceCompletenessKind,
+  options?: SentenceCompletenessOptions,
+): boolean {
+  return analyzeSentenceCompleteness(text, kind, options).complete;
 }

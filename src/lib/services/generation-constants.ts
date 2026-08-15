@@ -7,7 +7,7 @@ export const SEO_TITLE_MIN = 50;
  * Bump this on every change to the generation/pipeline code shipped to
  * production.
  */
-export const GENERATION_BUILD_ID = "b2i-english-2026-08-20-1";
+export const GENERATION_BUILD_ID = "b2i-english-2026-08-20-2";
 
 import { AppError } from "./errors";
 export const SEO_TITLE_MAX = 70;

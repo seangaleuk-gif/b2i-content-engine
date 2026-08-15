@@ -4978,6 +4978,7 @@ describe("pipeline stage order and fallback", () => {
       { stage: "post-ownership-seo-reconcile", inputFingerprint: "b7", outputFingerprint: "b7", accepted: true },
       { stage: "cta-preserve", inputFingerprint: "b7", outputFingerprint: "b8", accepted: true },
       { stage: "final-trim", inputFingerprint: "b8", outputFingerprint: "b9", accepted: true },
+      { stage: "final-seo-reconcile", inputFingerprint: "b9", outputFingerprint: "b9", accepted: true },
       { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
       { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
       { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },
@@ -5050,7 +5051,7 @@ describe("pipeline stage 2 integration", () => {
       "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
       "language-switcher", "internal-links", "external-links", "external-dedup",
       "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve", "final-trim",
-      "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
+      "final-seo-reconcile", "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce", "final-qc-scan",
       "editorial-h2-save-assert", "final-validation",
     ];
     // All required stages present
@@ -5393,6 +5394,7 @@ describe("pipeline stage skip recording and rollback", () => {
       { stage: "post-ownership-seo-reconcile", inputFingerprint: "b7", outputFingerprint: "b7", accepted: true },
       { stage: "cta-preserve", inputFingerprint: "b7", outputFingerprint: "b8", accepted: true },
       { stage: "final-trim", inputFingerprint: "b8", outputFingerprint: "b9", accepted: true },
+      { stage: "final-seo-reconcile", inputFingerprint: "b9", outputFingerprint: "b9", accepted: true },
       { stage: "faq-recovery", inputFingerprint: "b9", outputFingerprint: "c0", accepted: true },
       { stage: "wc-check", inputFingerprint: "c0", outputFingerprint: "c1", accepted: true },
       { stage: "final-preflight", inputFingerprint: "c1", outputFingerprint: "c1", accepted: true },

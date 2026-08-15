@@ -27,7 +27,9 @@ import {
   parseArticleDocumentFromHtml,
   parseWordPressEditorialBlocks,
   parseCompleteEditorialRegion,
+  decodeHtmlEntities,
 } from "@/lib/blog/article-document";
+import { essentialGroundingCarrierSentenceTexts } from "@/lib/blog/content-relevance";
 
 export interface ClaimOwnershipEntry extends EvidenceLedgerEntry {
   ownerSectionId: string;
@@ -350,11 +352,13 @@ export function cleanFaqOwnershipViolations(
 
     const cleanup = removeUnsupportedSentences(paragraphHtml, claims);
     totalRemoved += cleanup.sentencesRemoved;
-    const cleanedText = cleanup.html
-      .replace(/<!--\s*wp:paragraph\s*-->[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>[\s\S]*?<!--\s*\/wp:paragraph\s*-->/i, "$1")
-      .replace(/<[^>]+>/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
+    const cleanedText = decodeHtmlEntities(
+      cleanup.html
+        .replace(/<!--\s*wp:paragraph\s*-->[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>[\s\S]*?<!--\s*\/wp:paragraph\s*-->/i, "$1")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
 
     for (const claim of claims) {
       if (cleanup.sentencesRemoved === 0) {
@@ -460,8 +464,20 @@ export function enforceClaimOwnership(
       const originalBlock = component.blocks[blockIndex];
       if (!originalBlock) continue;
       const blockHtml = renderComponentHtml({ id: `${componentId}-repair`, blocks: [originalBlock], status: component.status });
+      // Section topic grounding is a hard invariant: an ownership removal must
+      // never delete the section's LAST sentence carrying a heading content
+      // word. When a single paragraph is the section's only grounding carrier,
+      // its sentences are preserved (in addition to the canonical owned
+      // occurrence), so the producer removes the out-of-owner claim and keeps
+      // the section grounded.
+      const groundingCarriers = essentialGroundingCarrierSentenceTexts(
+        component as unknown as ArticleSection,
+      );
       const repaired = removeUnsupportedSentences(blockHtml, claims, {
-        preserveSentenceTexts: preserveByKey.get(`${componentId}:${blockIndex}`) ?? [],
+        preserveSentenceTexts: [
+          ...(preserveByKey.get(`${componentId}:${blockIndex}`) ?? []),
+          ...groundingCarriers,
+        ],
       });
       const parsed = repaired.html.trim()
         ? parseCompleteEditorialRegion(repaired.html, `${componentId}-claim-ownership-repair`)

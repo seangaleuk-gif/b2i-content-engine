@@ -1,5 +1,10 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
-import { buildSystemPrompt, STAGE_SYSTEM_PROMPTS, type BlogContext } from "@/lib/services/prompt-builder";
+import {
+  buildSystemPrompt,
+  STAGE_SYSTEM_PROMPTS,
+  type BlogContext,
+} from "@/lib/services/prompt-builder";
+import { EDITORIAL_BLOCK_JSON_CONTRACT } from "@/lib/blog/editorial-block-contract";
 import {
   cleanBodyText,
   countWords,
@@ -231,6 +236,9 @@ export function validateComponents(
 function parseStructuredEditorialResponse(content: string, componentId: string): string {
   const payload = robustJsonParse(content, componentId);
   const normalized = normalizeAiEditorialPayload(payload, componentId);
+  if (normalized.recoveries.length > 0) {
+    console.warn(`[editorial-payload-normalization] component=${componentId} recoveries=${JSON.stringify(normalized.recoveries)}`);
+  }
   if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
     throw new Error(`${componentId} returned invalid structured blocks: ${normalized.errors.join("; ") || "empty block list"}`);
   }
@@ -327,7 +335,7 @@ export async function regenerateSection(
   const sectionResearchPrompt = sectionId && ctx.promptContext.claimOwnership
     ? `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${formatOwnedEvidencePacket(ctx.promptContext.claimOwnership, sectionId)}\nUse only assigned evidence. Preserve its complete meaning and natural named attribution. Never print evidence IDs. Do not move or repeat another section's evidence.`
     : `\n\nNo precise evidence packet is assigned to this regeneration. Do not introduce statistics, dates, currencies, quotations, performance benchmarks, survey findings, posting frequencies or platform-availability claims.`;
-  const userMsg = `Return section BODY content only. Do NOT return the H2 heading. Start directly with a paragraph or list. The application will insert the heading.\n\nSection heading for context only (do NOT repeat):\n"${heading}"\n\nRewrite the body content for this section. Target exactly ${wordTarget} words. Include the keyphrase "${keyphrase}" naturally (target ${keyphraseTarget} across full article). Return structured editorial blocks; the application renders WordPress HTML.\n\nArticle title: ${title}\nPrevious heading: ${prevHeading}\nNext heading: ${nextHeading}\n\nGUIDANCE:\n- Do NOT repeat statistics, examples, or explanations from other sections.\n- Focus exclusively on the content for THIS heading.${sectionResearchPrompt}\n\nReturn as JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}`;
+  const userMsg = `Return section BODY content only. Do NOT return the H2 heading. Start directly with a paragraph or list. The application will insert the heading.\n\nSection heading for context only (do NOT repeat):\n"${heading}"\n\nRewrite the body content for this section. Target exactly ${wordTarget} words. Include the keyphrase "${keyphrase}" naturally (target ${keyphraseTarget} across full article). Return structured editorial blocks; the application renders WordPress HTML.\n\nArticle title: ${title}\nPrevious heading: ${prevHeading}\nNext heading: ${nextHeading}\n\nGUIDANCE:\n- Do NOT repeat statistics, examples, or explanations from other sections.\n- Focus exclusively on the content for THIS heading.${sectionResearchPrompt}\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],

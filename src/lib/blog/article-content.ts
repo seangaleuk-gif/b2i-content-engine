@@ -7,6 +7,7 @@
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 import {
   analyzeSentenceCompleteness,
+  type SentenceCompletenessOptions,
   type SentenceCompletenessKind,
 } from "@/lib/blog/sentence-completeness";
 
@@ -52,6 +53,16 @@ export type EditorialBlock =
       headers: InlineContent[][];
       rows: InlineContent[][][];
     };
+
+/** True only for a canonical, non-empty list/table that can complete a
+ * preceding colon-led setup paragraph. */
+export function isNonEmptyStructuredContinuation(
+  block: EditorialBlock | undefined,
+): boolean {
+  if (block?.type === "list") return block.items.length > 0;
+  if (block?.type === "table") return block.headers.length > 0 && block.rows.length > 0;
+  return false;
+}
 
 // ── AI-facing simple payload model ──
 
@@ -123,6 +134,7 @@ function checkForDisallowedContent(
   context: string,
   opts?: NormalizationOptions,
   kind: SentenceCompletenessKind = "paragraph",
+  completenessOptions?: SentenceCompletenessOptions,
 ): void {
   if (WP_COMMENT_RE.test(text)) {
     errors.push(`${context}: contains WordPress block comment syntax`);
@@ -141,10 +153,66 @@ function checkForDisallowedContent(
   // final QC/pre-save gates. Incomplete model prose is rejected HERE at the
   // producer boundary so the owning producer's bounded correction retry runs
   // before any deterministic stage can carry the fragment downstream.
-  const completeness = analyzeSentenceCompleteness(text, kind);
+  const completeness = analyzeSentenceCompleteness(text, kind, completenessOptions);
   if (!completeness.complete) {
     errors.push(`${context}: ${completeness.issues[0]?.message ?? "incomplete prose"}`);
   }
+}
+
+type RecoveredListItems = {
+  items: unknown[];
+  recovery: string | null;
+  conflict: string | null;
+};
+
+/**
+ * AI providers may emit a singleton list item in `text`, `item`, or a
+ * string-valued `items` field. Those shapes are unambiguous, so normalize
+ * them at the producer boundary instead of spending another model call. Any
+ * conflicting aliases remain a hard schema error; object-valued/nested items
+ * are never guessed at.
+ */
+function recoverListItems(rb: Record<string, unknown>): RecoveredListItems {
+  if (Array.isArray(rb.items) && rb.items.length > 0) {
+    const aliasValues = [rb.text, rb.item]
+      .filter((value): value is string => typeof value === "string" && normalizeWhitespace(value).length > 0);
+    if (aliasValues.length > 0) {
+      return { items: [], recovery: null, conflict: "list contains both 'items' and singleton text/item content" };
+    }
+    return { items: rb.items, recovery: null, conflict: null };
+  }
+
+  const singletonCandidates = [
+    typeof rb.items === "string" ? normalizeWhitespace(rb.items) : "",
+    typeof rb.text === "string" ? normalizeWhitespace(rb.text) : "",
+    typeof rb.item === "string" ? normalizeWhitespace(rb.item) : "",
+  ].filter(Boolean);
+  const unique = [...new Set(singletonCandidates)];
+  if (unique.length > 1) {
+    return { items: [], recovery: null, conflict: "list has conflicting singleton item fields" };
+  }
+  if (unique.length === 1) {
+    return { items: [unique[0]], recovery: "normalized singleton list item to canonical items array", conflict: null };
+  }
+  return { items: [], recovery: null, conflict: null };
+}
+
+function rawBlockProvidesStructuredContinuation(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const rb = raw as Record<string, unknown>;
+  if (rb.type === "list") {
+    const recovered = recoverListItems(rb);
+    return !recovered.conflict && recovered.items.some(
+      (item) => typeof item === "string" && normalizeWhitespace(item).length > 0,
+    );
+  }
+  if (rb.type === "table") {
+    return Array.isArray(rb.headers)
+      && rb.headers.length > 0
+      && Array.isArray(rb.rows)
+      && rb.rows.length > 0;
+  }
+  return false;
 }
 
 // ── Normalizer ──
@@ -156,8 +224,10 @@ export function normalizeAiEditorialPayload(
 ): {
   blocks: EditorialBlock[];
   errors: string[];
+  recoveries: string[];
 } {
   const errors: string[] = [];
+  const recoveries: string[] = [];
   let rawBlocks: unknown[];
 
   if (input && typeof input === "object" && !Array.isArray(input)) {
@@ -166,13 +236,13 @@ export function normalizeAiEditorialPayload(
       rawBlocks = obj.blocks;
     } else {
       errors.push("AI payload must contain a 'blocks' array");
-      return { blocks: [], errors };
+      return { blocks: [], errors, recoveries };
     }
   } else if (Array.isArray(input)) {
     rawBlocks = input;
   } else {
     errors.push("AI payload must be an object with 'blocks' or a direct array");
-    return { blocks: [], errors };
+    return { blocks: [], errors, recoveries };
   }
 
   const blocks: EditorialBlock[] = [];
@@ -199,7 +269,14 @@ export function normalizeAiEditorialPayload(
           errors.push(`Block ${i}: paragraph has empty text`);
           continue;
         }
-        checkForDisallowedContent(text, errors, `Block ${i} paragraph`, opts, "paragraph");
+        checkForDisallowedContent(
+          text,
+          errors,
+          `Block ${i} paragraph`,
+          opts,
+          "paragraph",
+          { allowColonBeforeStructuredContinuation: rawBlockProvidesStructuredContinuation(rawBlocks[i + 1]) },
+        );
         blocks.push({ id, type: "paragraph", content: textToInlineContent(text) });
         break;
       }
@@ -242,14 +319,20 @@ export function normalizeAiEditorialPayload(
       }
       case "list": {
         const ordered = rb.ordered === true;
-        const itemsRaw = Array.isArray(rb.items) ? rb.items : [];
+        const recovered = recoverListItems(rb);
+        if (recovered.conflict) {
+          errors.push(`Block ${i}: ${recovered.conflict}`);
+          continue;
+        }
+        const itemsRaw = recovered.items;
         if (itemsRaw.length === 0) {
           errors.push(`Block ${i}: list has no items`);
           continue;
         }
         const items: InlineContent[][] = [];
         for (let j = 0; j < itemsRaw.length; j++) {
-          const itemText = typeof itemsRaw[j] === "string" ? normalizeWhitespace(itemsRaw[j]) : "";
+          const rawItem = itemsRaw[j];
+          const itemText = typeof rawItem === "string" ? normalizeWhitespace(rawItem) : "";
           if (!itemText) {
             errors.push(`Block ${i}: list item ${j} is empty`);
             continue;
@@ -261,7 +344,14 @@ export function normalizeAiEditorialPayload(
           errors.push(`Block ${i}: list has no valid items after filtering`);
           continue;
         }
-        blocks.push({ id, type: "list", ordered, items });
+        if (recovered.recovery) recoveries.push(`Block ${i}: ${recovered.recovery}`);
+        const previous = blocks[blocks.length - 1];
+        if (previous?.type === "list" && previous.ordered === ordered) {
+          previous.items.push(...items);
+          recoveries.push(`Block ${i}: merged adjacent ${ordered ? "ordered" : "unordered"} list block`);
+        } else {
+          blocks.push({ id, type: "list", ordered, items });
+        }
         break;
       }
       case "quote": {
@@ -336,7 +426,7 @@ export function normalizeAiEditorialPayload(
     }
   }
 
-  return { blocks, errors };
+  return { blocks, errors, recoveries };
 }
 
 // ── Canonical renderer ──
