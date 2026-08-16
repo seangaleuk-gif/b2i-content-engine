@@ -165,3 +165,111 @@ describe("temporal freshness gate", () => {
     expect(analyzeQuotationIntegrity(retainedText).balanced).toBe(true);
   });
 });
+
+function multiComponentDoc(
+  introText: string,
+  sectionText: string,
+  conclusionText: string,
+  faqAnswer: string,
+): ArticleDocument {
+  return {
+    metadata: {
+      title: "Threads Marketing Hong Kong Guide",
+      slug: "threads-marketing-hong-kong",
+      metaDescription: "A practical guide.",
+      excerpt: "A practical guide.",
+      targetWordCount: 1000,
+      focusKeyphrase: "threads marketing hong kong",
+    },
+    languageSwitcher: null,
+    introduction: { id: "intro", status: "generated", blocks: [paragraph("intro-1", introText)] },
+    sections: [{
+      id: "section-0",
+      heading: "Section",
+      headingLevel: 2,
+      sectionType: "main",
+      status: "generated",
+      blocks: [paragraph("s0-1", sectionText)],
+    }],
+    visibleFaq: [{ question: "When?", answerHtml: `<p>${faqAnswer}</p>`, answerText: faqAnswer }],
+    conclusion: { id: "conclusion", status: "generated", blocks: [paragraph("concl-1", conclusionText)] },
+    cta: null,
+    faqSchema: null,
+    insertedLinks: [],
+  };
+}
+
+function blockText(block: EditorialBlock): string {
+  return block.type === "paragraph" || block.type === "subheading" || block.type === "quote"
+    ? block.content.map((node) => node.text).join("")
+    : "";
+}
+
+describe("temporal freshness repair covers all components", () => {
+  it("repairs stale relative wording in the introduction (exact production sentence)", () => {
+    const doc = multiComponentDoc(
+      "Either way, they will influence how you plan your content, your campaigns, and your customer relationships in the coming months.",
+      "A normal section paragraph without temporal wording.",
+      "A durable conclusion.",
+      "A durable answer.",
+    );
+    const result = repairTemporalFreshnessDocument(doc, REFERENCE_DATE);
+    expect(result.unresolved).toHaveLength(0);
+    expect(result.rewrittenSentences + result.removedSentences).toBeGreaterThan(0);
+    const text = blockText(doc.introduction.blocks[0]);
+    expect(text).not.toContain("in the coming months");
+    expect(scanTemporalFreshness(text, REFERENCE_DATE)).toHaveLength(0);
+  });
+
+  it("repairs stale relative wording in a normal section", () => {
+    const doc = multiComponentDoc(
+      "A durable intro.",
+      "In the coming months, teams will adopt the new workflow.",
+      "A durable conclusion.",
+      "A durable answer.",
+    );
+    const result = repairTemporalFreshnessDocument(doc, REFERENCE_DATE);
+    expect(result.unresolved).toHaveLength(0);
+    const text = blockText(doc.sections[0].blocks[0]);
+    expect(text).not.toContain("in the coming months");
+    expect(scanTemporalFreshness(text, REFERENCE_DATE)).toHaveLength(0);
+  });
+
+  it("repairs stale relative wording in the conclusion", () => {
+    const doc = multiComponentDoc(
+      "A durable intro.",
+      "A normal section paragraph.",
+      "The platform will keep evolving in the coming months.",
+      "A durable answer.",
+    );
+    const result = repairTemporalFreshnessDocument(doc, REFERENCE_DATE);
+    expect(result.unresolved).toHaveLength(0);
+    const text = blockText(doc.conclusion.blocks[0]);
+    expect(text).not.toContain("in the coming months");
+    expect(scanTemporalFreshness(text, REFERENCE_DATE)).toHaveLength(0);
+  });
+
+  it("repairs stale relative wording in an FAQ answer", () => {
+    const doc = multiComponentDoc(
+      "A durable intro.",
+      "A normal section paragraph.",
+      "A durable conclusion.",
+      "Expect more features in the coming months.",
+    );
+    const result = repairTemporalFreshnessDocument(doc, REFERENCE_DATE);
+    expect(result.unresolved).toHaveLength(0);
+    expect(doc.visibleFaq[0].answerText).not.toContain("in the coming months");
+    expect(scanTemporalFreshness(doc.visibleFaq[0].answerText, REFERENCE_DATE)).toHaveLength(0);
+  });
+
+  it("leaves durable, non-temporal wording unchanged in every component", () => {
+    const durable = "This guide explains how to plan content, run campaigns, and build customer relationships.";
+    const doc = multiComponentDoc(durable, durable, durable, durable);
+    const before = JSON.stringify(doc);
+    const result = repairTemporalFreshnessDocument(doc, REFERENCE_DATE);
+    expect(result.removedSentences).toBe(0);
+    expect(result.rewrittenSentences).toBe(0);
+    expect(result.unresolved).toHaveLength(0);
+    expect(JSON.stringify(doc)).toBe(before);
+  });
+});

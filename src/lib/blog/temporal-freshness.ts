@@ -170,6 +170,20 @@ export function rewriteStaleTemporalSentence(
   const prefix = original.match(new RegExp(String.raw`^[^,，]{0,220}?${clause}\s*[,，]\s*(.+)$`, "iu"));
   if (prefix?.[1]) candidates.push(capitalizeSentence(prefix[1].trim()));
 
+  // A standalone relative-future adverbial that is not structurally required
+  // can be dropped so the sentence becomes durable/evergreen ("...customer
+  // relationships in the coming months." → "...customer relationships.").
+  // This is a GENERAL repair for any RELATIVE_FUTURE_RE phrase, never a
+  // detector whitelist: the original still scans as stale, and the candidate
+  // is accepted only if the remainder is non-empty, grammatical and no longer
+  // scans as a temporal issue.
+  if (issue.type === "ambiguous_relative_future") {
+    const dropped = original.replace(RELATIVE_FUTURE_RE, "");
+    if (dropped.trim()) {
+      candidates.push(capitalizeSentence(normalizeSentence(dropped)));
+    }
+  }
+
   for (const rawCandidate of candidates) {
     let candidate = normalizeSentence(rawCandidate);
     if (!candidate || candidate === normalizeSentence(original)) continue;
