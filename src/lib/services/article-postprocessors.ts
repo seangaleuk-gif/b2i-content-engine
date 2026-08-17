@@ -178,7 +178,7 @@ export function insertExternalResearchLinks(
     // boundary in the current result, so a citation can never split a block.
     const tail = result.slice(position).replace(/^\s+/, "");
     if (!isVerifiedBlockBoundary(tail)) continue;
-    const citation = `<!-- wp:paragraph --><p>Source: <a href="${escapeHtmlAttribute(assignment.source.url)}" target="_blank" rel="noopener noreferrer">${escapeHtmlText(assignment.source.title)}</a>.</p><!-- /wp:paragraph -->`;
+    const citation = `<!-- wp:paragraph --><p>Source: <a href="${escapeHtmlAttribute(assignment.source.url)}" target="_blank" rel="noopener noreferrer">${escapeHtmlText(assignment.source.title)}</a>${citationTerminalPunctuation(assignment.source.title)}</p><!-- /wp:paragraph -->`;
     result = result.slice(0, position) + `\n\n${citation}` + result.slice(position);
     linksInserted++;
   }
@@ -278,6 +278,28 @@ function tokenSet(text: string): Set<string> {
   );
 }
 
+/** Terminal punctuation for an external-source citation paragraph.
+ *
+ *  The anchor text is the source title, which may already carry its own
+ *  terminal punctuation (e.g. "How is AR changing digital marketing in Hong
+ *  Kong?"). Appending an unconditional period produces the invalid `? .`
+ *  double-punctuation that the sentence-quality/fragment gates reject. This
+ *  helper returns EXACTLY ONE terminal mark for the `Source: <title>` sentence:
+ *   - "" when the title already ends in `.`, `?` or `!` (looking past any
+ *     trailing quotes, parentheses or brackets so `"Why?"`, `(Yes!)`, `Title.`
+ *     and `Really?` are all recognised);
+ *   - "." otherwise.
+ *
+ *  The mark is placed OUTSIDE the anchor (the anchor holds only the title), so
+ *  the citation reads "Source: Title." / "Source: Title?" without ever
+ *  producing `? .`, `! .` or `. .`. */
+export function citationTerminalPunctuation(title: string): string {
+  const content = String(title ?? "").trimEnd();
+  const withoutClosers = content.replace(/["'“”‘’)\]}>]+$/, "");
+  if (/[.!?]$/.test(withoutClosers.trimEnd())) return "";
+  return ".";
+}
+
 /** Canonical editorial blocks eligible as citation anchors (same set the
  *  html-level producer scans: paragraph, list, quote, table; headings and
  *  protected html excluded). */
@@ -352,14 +374,16 @@ export function insertExternalResearchLinksIntoDocument(
     let shift = 0;
     for (const { assignment, order } of entries.sort((left, right) => right.order - left.order)) {
       const targetIndex = order + 1 + shift;
+      const terminal = citationTerminalPunctuation(assignment.source.title);
+      const citationContent: Extract<EditorialBlock, { type: "paragraph" }>["content"] = [
+        { type: "text", text: "Source: " },
+        { type: "link", text: assignment.source.title, href: assignment.source.url },
+      ];
+      if (terminal) citationContent.push({ type: "text", text: terminal });
       const citationBlock: Extract<EditorialBlock, { type: "paragraph" }> = {
         id: `${key}-external-citation-${citations.length}`,
         type: "paragraph",
-        content: [
-          { type: "text", text: "Source: " },
-          { type: "link", text: assignment.source.title, href: assignment.source.url },
-          { type: "text", text: "." },
-        ],
+        content: citationContent,
       };
       component.blocks.splice(targetIndex, 0, citationBlock);
       citations.push({ url: assignment.source.url, title: assignment.source.title });

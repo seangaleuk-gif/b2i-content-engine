@@ -192,3 +192,75 @@ describe("shadow editorial mode stays diagnosis-only in the pipeline", () => {
     expect(validation.passed, validation.reasons.join("; ")).toBe(true);
   });
 });
+
+describe("final-document editorial enforce mode fails closed on coherence-damaging patches", () => {
+  it("a patch that introduces a deletion-created discourse opening is rejected before commit", async () => {
+    process.env.ENABLE_FULL_DOCUMENT_EDITORIAL = "true";
+    process.env.FULL_DOCUMENT_EDITORIAL_MODE = "enforce";
+    const keyphrase = "threads marketing hong kong";
+    const doc = buildDeterministic2500WordDocument();
+    const range = englishWordTolerance(2500);
+    const state = createPipelineState({
+      userId: "test-user",
+      projectId: "fde-enforce-coherence",
+      keyphrase,
+      requestedWordCount: 2500,
+      articleDoc: doc,
+      h2Headings: doc.sections.map((s) => s.heading),
+      intro: "",
+      conclusion: "",
+      wordsPerSection: 350,
+      exactKeyphraseTarget: 9,
+      policy: buildPolicy(2500, range.min, range.max, keyphrase),
+      ctx: { research: [] },
+      wordMin: range.min,
+      wordMax: range.max,
+      systemPrompt: "test",
+      userMessage: "test",
+    });
+
+    let thrown: Error | undefined;
+    try {
+      await runPostAssemblyPipeline(state, {
+        chatWithRetry: async (_messages: unknown, _options: unknown, label?: string) => {
+          if (label === "final-document-diagnosis") {
+            return {
+              content: JSON.stringify({ findings: [{
+                findingId: "f-aw", category: "awkward-english", severity: "medium",
+                blockIds: ["section:section-0:section-0-block-0"],
+                message: "Awkward phrasing in this opening paragraph.",
+                evidenceIds: [], brandRuleIds: [], confidence: 0.8,
+              }] }),
+              finishReason: "stop", attemptsUsed: 0,
+            };
+          }
+          if (label === "final-document-patch") {
+            // The patch replaces the section's opening paragraph with a
+            // deletion-created discourse opening ("That's why ..."), which is a
+            // hard validateCoherence violation. The committed-candidate gate
+            // must reject it before commit.
+            return {
+              content: JSON.stringify({ edits: [{
+                blockId: "section:section-0:section-0-block-0",
+                replacementHtml: "<!-- wp:paragraph --><p>That's why customer community marketing has become such a powerful way for brands to grow.</p><!-- /wp:paragraph -->",
+                reason: "rewrite opening",
+              }] }),
+              finishReason: "stop", attemptsUsed: 0,
+            };
+          }
+          throw new Error(`Unexpected AI call in enforce test: ${label ?? "unknown"}`);
+        },
+        makeTrackedChatForStage: () => async () => {
+          throw new Error("Unexpected tracked AI call in enforce test");
+        },
+        telemetry: {},
+        context: { research: [] },
+      });
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    expect(thrown).toBeTruthy();
+    expect(thrown!.message).toContain("Final-document editorial acceptance failed");
+  });
+});

@@ -117,14 +117,14 @@ function makeArticleDoc(overrides?: Partial<ArticleDocument>): ArticleDocument {
     sectionFromHtml(
       "section-0",
       "First Main Heading",
-      `<!-- wp:paragraph --><p>First section content with several sentences. This covers the first main topic in detail. It has enough content to be useful for readers.</p><!-- /wp:paragraph -->
+      `<!-- wp:paragraph --><p>This first section provides useful content. This covers the first main topic in detail. It has enough content to be useful for readers.</p><!-- /wp:paragraph -->
 
-<!-- wp:paragraph --><p>Additional paragraph in the first section. This provides more depth on the first topic. Readers will find this informative and well-structured.</p><!-- /wp:paragraph -->`,
+<!-- wp:paragraph --><p>An extra paragraph adds useful detail. This provides more depth on the first topic. Readers will find this informative and well-structured.</p><!-- /wp:paragraph -->`,
     ),
     sectionFromHtml(
       "section-1",
       "Second Topic Explored",
-      `<!-- wp:paragraph --><p>Second section body text with quality content. This section explores a different angle of the main topic. Readers benefit from the varied perspective provided here.</p><!-- /wp:paragraph -->`,
+      `<!-- wp:paragraph --><p>The second section body provides quality content. This section explores a different angle of the main topic. Readers benefit from the varied perspective provided here.</p><!-- /wp:paragraph -->`,
     ),
     sectionFromHtml(
       "section-2",

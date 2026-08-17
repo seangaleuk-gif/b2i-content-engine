@@ -25,6 +25,15 @@ export const FULL_DOCUMENT_EDITORIAL_FLAG = "ENABLE_FULL_DOCUMENT_EDITORIAL";
 export const FULL_DOCUMENT_EDITORIAL_MODE = "FULL_DOCUMENT_EDITORIAL_MODE";
 export const FULL_DOCUMENT_EDITORIAL_FINDING_CAP = 60;
 export const FULL_DOCUMENT_EDITORIAL_EDIT_CAP = 25;
+// Compact-response bounds for the final-document diagnosis. The diagnosis must
+// return bounded structured findings only — it never needs to reproduce article
+// content — so every field is capped and the total response size is bounded far
+// below the observed runaway responses (>113,000 chars / ~30,000 tokens).
+export const FULL_DOCUMENT_EDITORIAL_RESPONSE_CHAR_CAP = 48_000;
+export const FULL_DOCUMENT_EDITORIAL_MESSAGE_CHAR_CAP = 240;
+export const FULL_DOCUMENT_EDITORIAL_MAX_BLOCK_IDS = 8;
+export const FULL_DOCUMENT_EDITORIAL_MAX_EVIDENCE_IDS = 20;
+export const FULL_DOCUMENT_EDITORIAL_MAX_BRAND_RULE_IDS = 10;
 
 export type EditorialFindingCategory =
   | "cross-section-repetition"
@@ -185,8 +194,20 @@ function normalizeFinding(raw: Record<string, unknown>, index: number): FullDocu
   if (!Array.isArray(raw.blockIds) || raw.blockIds.some((id) => typeof id !== "string")) {
     throw new Error(`finding ${index} has invalid blockIds`);
   }
+  if (raw.blockIds.length > FULL_DOCUMENT_EDITORIAL_MAX_BLOCK_IDS) {
+    throw new Error(`finding ${index} references too many blockIds (${raw.blockIds.length})`);
+  }
   if (typeof raw.message !== "string" || !raw.message.trim()) {
     throw new Error(`finding ${index} has no message`);
+  }
+  if (raw.message.trim().length > FULL_DOCUMENT_EDITORIAL_MESSAGE_CHAR_CAP) {
+    throw new Error(`finding ${index} message exceeds ${FULL_DOCUMENT_EDITORIAL_MESSAGE_CHAR_CAP} characters`);
+  }
+  if (Array.isArray(raw.evidenceIds) && raw.evidenceIds.length > FULL_DOCUMENT_EDITORIAL_MAX_EVIDENCE_IDS) {
+    throw new Error(`finding ${index} has too many evidenceIds (${raw.evidenceIds.length})`);
+  }
+  if (Array.isArray(raw.brandRuleIds) && raw.brandRuleIds.length > FULL_DOCUMENT_EDITORIAL_MAX_BRAND_RULE_IDS) {
+    throw new Error(`finding ${index} has too many brandRuleIds (${raw.brandRuleIds.length})`);
   }
   const confidence = Number(raw.confidence);
   if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
@@ -208,6 +229,14 @@ function normalizeFinding(raw: Record<string, unknown>, index: number): FullDocu
 }
 
 export function parseFullDocumentDiagnosis(content: string): DiagnosisEnvelope {
+  // Total response bound: the diagnosis must be a compact JSON findings list.
+  // A response this large cannot be legitimate findings (the observed runaway
+  // response was ~113,351 chars / ~30,019 tokens for an empty findings array).
+  if (content.length > FULL_DOCUMENT_EDITORIAL_RESPONSE_CHAR_CAP) {
+    throw new Error(
+      `diagnosis response too large (${content.length} chars > ${FULL_DOCUMENT_EDITORIAL_RESPONSE_CHAR_CAP})`,
+    );
+  }
   const parsed = JSON.parse(stripJsonFence(content)) as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("diagnosis must be a JSON object");
@@ -256,11 +285,19 @@ function diagnosisMessages(context: ReturnType<typeof documentContext>): ChatMes
       role: "system",
       content: `You are the final senior editor for a professional B2B article. Inspect the COMPLETE supplied article, including every section and protected field. Diagnose only; do not rewrite anything.
 
-Return only {"findings":[...]} where each finding has exactly: findingId, category, severity, blockIds, message, evidenceIds, brandRuleIds, confidence.
+Return ONLY a compact {"findings":[...]} JSON object where each finding has exactly: findingId, category, severity, blockIds, message, evidenceIds, brandRuleIds, confidence.
 Allowed categories: cross-section-repetition, section-overlap, contradiction, unsupported-claim, exaggerated-claim, awkward-english, mechanical-english, brand-positioning.
 Allowed severities: critical, high, medium, low. Confidence is 0..1.
 Use the exact stable block IDs supplied in editableBlocks. A finding may reference two or more block IDs. If an issue is confined to protected content and has no editable block ID, use an empty blockIds array and identify the protected field in the message.
-Treat unsupported factual assertions, contradictory recommendations, guarantees and brand-positioning conflicts as high or critical. Do not flag a claim as supported unless the supplied research actually supports it. Detect semantic repetition and overlapping section purposes, not merely identical wording.`,
+Treat unsupported factual assertions, contradictory recommendations, guarantees and brand-positioning conflicts as high or critical. Do not flag a claim as supported unless the supplied research actually supports it. Detect semantic repetition and overlapping section purposes, not merely identical wording.
+
+STRICT OUTPUT BOUNDS — the response must be small:
+- Do NOT reproduce, echo, paraphrase, summarise or quote the article, any block, paragraph, sentence, heading or protected field anywhere in the response. Never embed unchanged article content.
+- Reference blocks only by their stable block IDs; never include block HTML.
+- At most 30 findings, usually far fewer.
+- message must be a concise reason of at most 240 characters.
+- blockIds: at most 8 entries. evidenceIds: at most 20 entries. brandRuleIds: at most 10 entries.
+Return only genuine findings. Do not manufacture findings to reach the maximum count. Order findings by severity and editorial impact.`,
     },
     { role: "user", content: JSON.stringify(context) },
   ];

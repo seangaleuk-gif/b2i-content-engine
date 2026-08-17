@@ -132,12 +132,20 @@ describe("normalizeAiEditorialPayload", () => {
     expect(result.errors.join(" ")).toContain("unfinished setup");
   });
 
-  it("normalizes quote block", () => {
-    const input = { blocks: [{ type: "quote", text: "A wise statement." }] };
+  it("normalizes an attributable quote block", () => {
+    const input = { blocks: [{ type: "quote", text: '"A wise statement," said the analyst.' }] };
     const result = normalizeAiEditorialPayload(input, "sec-4");
     expect(result.errors.length).toBe(0);
     expect(result.blocks.length).toBe(1);
     expect(result.blocks[0]).toMatchObject({ id: "sec-4-quote-0", type: "quote" });
+  });
+
+  it("demotes an unattributed quote to a paragraph (quote provenance contract)", () => {
+    const input = { blocks: [{ type: "quote", text: "Brands that prove their worth will win over their audiences." }] };
+    const result = normalizeAiEditorialPayload(input, "sec-4");
+    expect(result.errors.length).toBe(0);
+    expect(result.blocks[0]).toMatchObject({ id: "sec-4-quote-0", type: "paragraph" });
+    expect(result.recoveries.join(" ")).toContain("demoted unattributed quote");
   });
 
   it("rejects an AI block with an unmatched quotation before rendering", () => {

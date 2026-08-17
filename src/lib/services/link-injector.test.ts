@@ -68,3 +68,47 @@ describe("injectLinks visible-text boundaries", () => {
     expect(validateWordpressBlockPairs(result.modifiedContent).valid).toBe(true);
   });
 });
+
+describe("injectLinks semantic anchor quality", () => {
+  it("skips a link when only a bare geographic anchor exists in the body", async () => {
+    db.order.mockResolvedValue({
+      data: [{
+        display_text: "Where to Find Paid Brand Deals in Hong Kong",
+        url_slug: "/blog/where-hong-kong-micro-influencers-find-paid-brand-deals-platforms-outreach",
+        keywords: ["hong kong", "paid deals"],
+        max_per_article: 1,
+      }],
+    });
+    // The body only ever mentions the bare geographic term — no specific phrase.
+    const html = "<p>Hong Kong brands are evaluating their influencer strategy this year.</p>";
+
+    const result = await injectLinks(html, "user-1");
+
+    // No semantically suitable anchor → the link is skipped, not weakened to
+    // a bare geographic anchor.
+    expect(result.linksInjected).toBe(0);
+    expect(result.modifiedContent).toBe(html);
+  });
+
+  it("prefers a specific semantic anchor over a geographic one when both exist", async () => {
+    db.order.mockResolvedValue({
+      data: [{
+        display_text: "Where to Find Paid Brand Deals in Hong Kong",
+        url_slug: "/blog/where-hong-kong-micro-influencers-find-paid-brand-deals-platforms-outreach",
+        keywords: ["paid deals", "hong kong"],
+        max_per_article: 1,
+      }],
+    });
+    const html = "<p>Hong Kong brands that run paid deals with creators see stronger results.</p>";
+
+    const result = await injectLinks(html, "user-1");
+
+    expect(result.linksInjected).toBe(1);
+    // The specific anchor wins; the bare geographic term stays a plain word.
+    expect(result.modifiedContent).toContain(
+      '<a href="/blog/where-hong-kong-micro-influencers-find-paid-brand-deals-platforms-outreach">paid deals</a>',
+    );
+    expect(result.modifiedContent).toContain("Hong Kong brands");
+    expect(validateWordpressBlockPairs(result.modifiedContent).valid).toBe(true);
+  });
+});

@@ -52,6 +52,8 @@ export interface ClaimOwnershipRepairResult {
   unresolved: Array<{ componentId: string; evidenceId: string; sentenceText: string }>;
 }
 
+import { normalizeTopicToken } from "@/lib/blog/topic-token-normalizer";
+
 const TOKEN_STOP_WORDS = new Set([
   "about", "after", "and", "are", "avoid", "best", "build", "building", "for", "from",
   "guide", "how", "hong", "into", "kong", "marketing", "more", "need", "practical", "strategy",
@@ -64,7 +66,8 @@ function tokens(text: string): string[] {
       .toLowerCase()
       .replace(/[^\p{L}\p{N}\s]/gu, " ")
       .split(/\s+/)
-      .filter((token) => token.length >= 3 && !TOKEN_STOP_WORDS.has(token)),
+      .filter((token) => token.length >= 3 && !TOKEN_STOP_WORDS.has(token))
+      .map(normalizeTopicToken),
   )];
 }
 
@@ -139,7 +142,8 @@ export function formatOwnedEvidencePacket(
   ledger: ClaimOwnershipLedger,
   sectionId: string,
 ): string {
-  const entries = evidenceForSection(ledger, sectionId);
+  const entries = evidenceForSection(ledger, sectionId)
+    .filter((entry) => !isIncidentalEvidenceForSection(entry));
   if (entries.length === 0) {
     return "No precise research claim is assigned to this section. Do not use statistics, dates, currencies, quotations, performance benchmarks, posting frequencies or platform-availability claims.";
   }
@@ -149,6 +153,51 @@ export function formatOwnedEvidencePacket(
     entry.url ? `Source URL: ${entry.url}` : "Source URL: unavailable",
   ].join("\n")).join("\n\n");
 }
+
+/** Concepts that keep a non-overlapping evidence sentence usable even when it
+ *  shares no topic word with the owner heading: quantified/platform/metric
+ *  evidence is exactly what a section prompt needs and must never be dropped. */
+const EVIDENCE_KEEP_CONCEPT_RE =
+  /\b(?:engagement|engagements|metric|metrics|benchmark|benchmarks|performance|roi|retention|adoption|usage|user|users|audience|audiences|cpm|reach|impressions?|conversion|conversions|click-through|revenue|growth|awareness|demographic|platform|app|feature|features|launch|launched|available|pricing|cost|spend)\b/i;
+
+/**
+ * True when an owned evidence sentence is an incidental source-page detail that
+ * does not support the owning section's intent (for example an event-logistics
+ * note such as "There's no strict dress code..."). Incidental details must not
+ * become editorial prose, so they are withheld from the section prompt.
+ *
+ * A sentence is withheld only when it is clearly off-topic: it shares no
+ * specific topic word with the owner heading, carries no quantity/statistic and
+ * carries no platform/metric concept. Useful event/industry evidence and every
+ * quantified claim are preserved, so factual grounding is never reduced.
+ */
+function isIncidentalEvidenceForSection(entry: ClaimOwnershipEntry): boolean {
+  const heading = entry.ownerHeading;
+  const evidence = entry.approvedText;
+  if (!heading || !evidence) return false;
+  const headingWords = new Set(
+    heading.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((word) => word.length > 2).map(normalizeTopicToken),
+  );
+  const evidenceWords = new Set(
+    evidence.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((word) => word.length > 2).map(normalizeTopicToken),
+  );
+  const shared = [...headingWords].filter((word) => evidenceWords.has(word));
+  // A specific shared topic word (non-generic) keeps the sentence relevant.
+  if (shared.some((word) => !SHARED_TOPIC_STOP_WORDS.has(word))) return false;
+  // Quantities and platform/metric concepts are always kept.
+  if ((entry.quantities ?? []).length > 0) return false;
+  if (EVIDENCE_KEEP_CONCEPT_RE.test(evidence)) return false;
+  return true;
+}
+
+/** Words so generic that sharing one with the heading proves nothing about the
+ *  sentence's relevance to the section intent. */
+const SHARED_TOPIC_STOP_WORDS = new Set([
+  "marketing", "digital", "hong", "kong", "hk", "brand", "brands", "business",
+  "businesses", "guide", "trends", "trend", "market", "markets", "local",
+  "content", "strategy", "strategies", "2026", "2025", "year", "new", "top",
+  "best", "tips", "campaign", "campaigns", "media", "social",
+]);
 
 function componentSequence(doc: ArticleDocument): Array<{ componentId: string; component: ArticleComponent | ArticleSection }> {
   return [

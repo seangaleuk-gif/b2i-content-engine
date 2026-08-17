@@ -34,11 +34,20 @@ const BOILERPLATE_PATTERNS: RegExp[] = [
   /\bproperty of their respective (?:owners|holders|companies)\b/i,
   /\bowned by their respective owners\b/i,
   /\bfor personal use only\b/i,
-  // Privacy / cookies / terms
-  /\bprivacy (?:policy|notice|statement)\b/i,
-  /\bcookie (?:policy|notice|preferences|consent)\b/i,
-  /\bterms of (?:service|use)\b/i,
-  /\bthis (?:site|website|page) (?:uses|stores|sets) cookies?\b/i,
+  // Privacy / cookies / terms — publisher SELF-REFERENTIAL boilerplate only.
+  // The publisher's own declaration about ITS policy or site ("our privacy
+  // policy", "this site's cookie preferences", "we use cookies", "terms of
+  // service of this site") is boilerplate and must never be copied into
+  // generated content. Editorial ADVICE about privacy ("offer a cookie consent
+  // option", "link to a privacy policy", "show a short privacy notice") is
+  // legitimate content for a privacy-focused article and is NOT boilerplate,
+  // so a bare vocabulary match is never sufficient — a first-person or
+  // site-self-referential frame is required.
+  /\b(?:our|this (?:site|website|page|app)\s*['’]s?)\s+privacy\s+(?:policy|notice|statement)\b/i,
+  /\bwe\s+(?:use|store|set|place|collect)\s+cookies?\b/i,
+  /\b(?:our|this (?:site|website|page|app)\s*['’]s?)\s+cookie\s+(?:policy|notice|preferences|consent)\b/i,
+  /\bterms\s+of\s+(?:service|use)\b\s+(?:for|of)\s+this\s+(?:site|website|page|app)\b/i,
+  /\bthis (?:site|website|page|app) (?:uses|stores|sets) cookies?\b/i,
   // Navigation / newsletter / sharing prompts
   /\bsubscribe to (?:our )?(?:newsletter|mailing list)\b/i,
   /\bfollow us on\b/i,
@@ -46,7 +55,11 @@ const BOILERPLATE_PATTERNS: RegExp[] = [
   /\b(?:skip to content|main menu|site map|search this site)\b/i,
   // Unrelated publisher announcements / promotional boilerplate
   /\b(?:event|conference|webinar|workshop) (?:registration|tickets?|sponsors?)\b/i,
-  /\ball (?:sessions?|events?) are (?:curated|subject to change)\b/i,
+  // Event-promotional copy about the source's OWN sessions/events ("all/every/
+  // each session(s)/event(s) are/is curated/designed/crafted/subject to
+  // change"). Genuine event/industry EVIDENCE (attendance statistics, survey
+  // findings) does not match this promotional frame.
+  /\b(?:all|every|each)\s+(?:sessions?|events?)\s+(?:are|is)\s+(?:curated|designed|crafted|subject to change)\b/i,
 ];
 
 /** True when the text is source/publisher boilerplate that must not be used

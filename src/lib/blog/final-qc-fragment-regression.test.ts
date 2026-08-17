@@ -230,7 +230,7 @@ describe("final-QC transaction recompute and snapshot", () => {
 
 describe("final-QC deterministic repair integration", () => {
   it("repairDeterministicMalformedProse repairs a trailing incomplete-sentence block deterministically", () => {
-    const doc = makeDoc([paragraph("p0", "A complete sentence here. Another complete sentence to.")]);
+    const doc = makeDoc([paragraph("p0", "Local teams share useful lessons here. Another complete sentence to.")]);
     const result = repairDeterministicMalformedProse(doc, 1);
     const findings = scanAll(doc);
     // The trailing '...to.' is an incomplete sentence ending; deterministic
@@ -242,7 +242,7 @@ describe("final-QC deterministic repair integration", () => {
   it("unresolved malformed prose still blocks with zero writes (gate remains hard)", () => {
     // A fragment that cannot be repaired deterministically must remain a hard
     // finding for the final scanner; it is never converted to a warning.
-    const doc = makeDoc([paragraph("p0", "Complete sentence one. Complete sentence two.")]);
+    const doc = makeDoc([paragraph("p0", "Local teams share useful lessons. Owners note common questions.")]);
     expect(scanAll(doc).malformed).toEqual([]);
     expect(scanAll(doc).sentenceQuality).toEqual([]);
   });

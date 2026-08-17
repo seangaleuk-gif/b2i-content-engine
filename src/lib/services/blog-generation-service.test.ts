@@ -119,7 +119,7 @@ function buildRequestMock(overrides: StageResponse[]) {
     if (q && q.length > 0) return Promise.resolve({ content: q.shift()! });
     if (stage === "outline") return Promise.resolve({ content: outlineValid().content });
     if (stage === "faq") return Promise.resolve({ content: JSON.stringify({ heading: "Frequently Asked Questions", entries: [{ question: "What is this?", answer: "This is the first FAQ entry." }, { question: "How does it work?", answer: "It works through a simple process." }, { question: "Who should use this?", answer: "Anyone can use this effectively." }, { question: "When should I start?", answer: "Starting now is recommended for best results." }] }) });
-    if (stage.startsWith("section_")) return Promise.resolve({ content: para("Valid section content.") });
+    if (stage.startsWith("section_")) return Promise.resolve({ content: para("Teams review the latest trends and build a clear plan for the year ahead.") });
     if (stage === "intro" || stage === "intro_retry" || stage === "intro_repair") return Promise.resolve({ content: para("Default intro.") });
     if (stage === "conclusion" || stage === "conclusion_retry" || stage === "conclusion_repair") return Promise.resolve({ content: para("Default conclusion.") });
     return Promise.resolve({ content: JSON.stringify({}) });
@@ -264,7 +264,7 @@ describe("runBlogGeneration — introduction successful retry", () => {
   it("invalid first then valid retry succeeds", async () => {
     const mock = buildRequestMock([
       { stage: "intro", content: "INVALID JSON" },
-      { stage: "intro_retry", content: para("Valid intro after retry.") },
+      { stage: "intro_retry", content: para("This valid intro reads clearly after the retry.") },
     ]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
   });
@@ -272,7 +272,7 @@ describe("runBlogGeneration — introduction successful retry", () => {
   it("WP comment first then clean retry succeeds", async () => {
     const mock = buildRequestMock([
       { stage: "intro", content: para("<!-- wp:paragraph -->bad") },
-      { stage: "intro_repair", content: para("Clean intro after repair.") },
+      { stage: "intro_repair", content: para("This clean intro reads clearly after the repair.") },
     ]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
   });
@@ -315,7 +315,7 @@ describe("runBlogGeneration — section successful retry", () => {
   it("invalid first then valid retry succeeds", async () => {
     const mock = buildRequestMock([
       { stage: "section_0", content: para("<!-- wp:paragraph -->bad") },
-      { stage: "section_0_repair", content: para("Valid section after repair.") },
+      { stage: "section_0_repair", content: para("This valid section reads clearly after the repair.") },
     ]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
   });
@@ -326,7 +326,7 @@ describe("runBlogGeneration — section successful retry", () => {
       { stage: "section_0", content: para("<!-- wp:paragraph -->bad") },
       { stage: "section_0_repair", content: blocksResponse([
         { type: "heading", text: "Key Benefits" },
-        { type: "paragraph", text: "Valid section body after repair." },
+        { type: "paragraph", text: "This valid section body reads clearly after the repair." },
       ]) },
     ]);
     const result = await runBlogGeneration("u", 1, { requestDeepSeek: mock });
@@ -378,7 +378,7 @@ describe("runBlogGeneration — conclusion successful retry", () => {
   it("invalid first then valid retry succeeds", async () => {
     const mock = buildRequestMock([
       { stage: "conclusion", content: "NOT JSON" },
-      { stage: "conclusion_retry", content: para("Valid conclusion after retry.") },
+      { stage: "conclusion_retry", content: para("This valid conclusion reads clearly after the retry.") },
     ]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
   });
@@ -386,7 +386,7 @@ describe("runBlogGeneration — conclusion successful retry", () => {
   it("CTA content first then clean retry succeeds", async () => {
     const mock = buildRequestMock([
       { stage: "conclusion", content: para("Create your free profile today!") },
-      { stage: "conclusion_repair", content: para("Clean conclusion after retry.") },
+      { stage: "conclusion_repair", content: para("This clean conclusion reads clearly after the retry.") },
     ]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
   });
@@ -601,6 +601,24 @@ describe("runBlogGeneration — successful flow", () => {
           "Measurement Strategy", "Practical Next Steps", "Frequently Asked Questions",
         ],
       }),
+    }, {
+      stage: "section_0",
+      content: para("The latest trends shape how Hong Kong marketing works for every team."),
+    }, {
+      stage: "section_1",
+      content: para("Audience behaviour changes how every team plans its outreach."),
+    }, {
+      stage: "section_2",
+      content: para("Channel planning keeps the whole plan on track."),
+    }, {
+      stage: "section_3",
+      content: para("Creative execution drives the campaign forward."),
+    }, {
+      stage: "section_4",
+      content: para("Measurement strategy shows what actually works."),
+    }, {
+      stage: "section_5",
+      content: para("Practical next steps follow the plan."),
     }]);
     const calls: Array<{ stage: string; user: string }> = [];
     const request = async (stage: string, messages: Array<{ role: string; content: string }>) => {
@@ -811,5 +829,180 @@ describe("runBlogGeneration — automatic research dispatch", () => {
     const mock = buildRequestMock([]);
     const result = await runBlogGeneration("u", 1, { requestDeepSeek: mock });
     expect(result.generated.externalLinks).toEqual(["https://example.com/report"]);
+  });
+});
+
+describe("section producer topic-grounding gate", () => {
+  const groundedOutline = JSON.stringify({
+    title: "Test", slug: "test", metaDescription: "Meta desc with enough chars for validation testing purposes.",
+    h2Headings: ["Budgeting for 2026: Where to Invest", "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions About Test"],
+    excerpt: "Excerpt.",
+  });
+  const UNGROUNDED = "The 2026 outlook shapes what teams do next.";
+  const GROUNDED = "Smart budgets keep the plan focused on what matters most this year.";
+
+  it("an ungrounded section body triggers exactly one bounded grounding regeneration and the repaired candidate is accepted", async () => {
+    const stages: string[] = [];
+    const base = buildRequestMock([
+      { stage: "outline", content: groundedOutline },
+      { stage: "section_0", content: para(UNGROUNDED) },
+      { stage: "section_0_grounding", content: para(GROUNDED) },
+    ]);
+    const request = async (stage: string) => {
+      stages.push(stage);
+      return base(stage);
+    };
+    await expect(runBlogGeneration("u", 1, { requestDeepSeek: request })).resolves.toBeDefined();
+    expect(stages.filter((stage) => stage === "section_0_grounding")).toHaveLength(1);
+  });
+
+  it("a second ungrounded candidate fails safely at the producer (never assembled)", async () => {
+    const base = buildRequestMock([
+      { stage: "outline", content: groundedOutline },
+      { stage: "section_0", content: para(UNGROUNDED) },
+      { stage: "section_0_grounding", content: para("The 2026 outlook shapes what teams do next.") },
+    ]);
+    let err: unknown = null;
+    try { await runBlogGeneration("u", 1, { requestDeepSeek: base }); } catch (error) { err = error; }
+    expect(err).not.toBeNull();
+    const msg = err instanceof Error && "cause" in err && err.cause instanceof Error
+      ? (err.cause as Error).message
+      : err instanceof Error ? err.message : String(err);
+    expect(msg).toContain("still does not address its topic");
+  });
+
+  it("an already-grounded section body does not trigger the grounding regeneration", async () => {
+    const stages: string[] = [];
+    const base = buildRequestMock([
+      { stage: "outline", content: groundedOutline },
+      { stage: "section_0", content: para(GROUNDED) },
+    ]);
+    const request = async (stage: string) => {
+      stages.push(stage);
+      return base(stage);
+    };
+    await expect(runBlogGeneration("u", 1, { requestDeepSeek: request })).resolves.toBeDefined();
+    expect(stages.some((stage) => stage.includes("grounding"))).toBe(false);
+  });
+});
+
+// ── Producer-content-contract shadow integration (Stage 3B) ──
+// The shared contract observes pre-assembly candidates WITHOUT authority:
+// existing validation still decides accept/reject/repair; disagreements are
+// recorded as debug events under ENABLE_PIPELINE_DEBUG_TRACE.
+
+describe("producer contract shadow integration", () => {
+  function shadowEvents(warnSpy: ReturnType<typeof vi.spyOn>): string[] {
+    return (warnSpy.mock.calls as Array<Array<unknown>>)
+      .map((args: unknown[]) => args.map(String).join(" "))
+      .filter((line: string) => line.includes("[producer-contract-shadow]"));
+  }
+
+  it("D: the intro repair candidate is shadow-evaluated and production authority is unchanged", async () => {
+    process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(createPipelineState).mockClear();
+      const mock = buildRequestMock([
+        // Generation fails EXISTING validation (fragment) → repair runs.
+        { stage: "intro", content: para("Free delivery for members.") },
+        // Repair passes existing validation (accepted) but the shared contract
+        // rejects the duplicated determiner → disagreement recorded.
+        { stage: "intro_repair", content: para("The a menu changes daily.") },
+      ]);
+      await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+      // Production unchanged: the repair candidate is accepted as today.
+      const doc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+      const introBlock = doc.introduction.blocks[0];
+      if (introBlock.type !== "paragraph") throw new Error("expected paragraph block");
+      expect(introBlock.content[0].text).toBe("The a menu changes daily.");
+
+      // Shadow: the REPAIRED candidate was evaluated and the disagreement logged.
+      const events = shadowEvents(warnSpy);
+      expect(events.some((line) =>
+        line.includes("label=intro repair")
+        && line.includes("existing=pass contract=fail")
+        && line.includes("duplicated-determiner"),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      delete process.env.ENABLE_PIPELINE_DEBUG_TRACE;
+    }
+  });
+
+  it("E: FAQ existing validation remains authoritative while the FAQ repair candidate is shadow-evaluated", async () => {
+    process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(createPipelineState).mockClear();
+      const validEntries = [
+        { question: "What is this?", answer: "This is a practical planning approach." },
+        { question: "How does it work?", answer: "It follows a clear process." },
+        { question: "Who is it for?", answer: "It is for professional teams." },
+        { question: "When should I begin?", answer: "Begin when the plan is ready." },
+      ];
+      const mock = buildRequestMock([
+        // Generation fails existing validation (fragment answer + count) → repair.
+        { stage: "faq", content: JSON.stringify({ entries: [{ question: "Only one?", answer: "Free delivery for members." }] }) },
+        // Repair passes validateFaqPayload (authoritative) but the shared
+        // contract rejects the duplicated determiner → disagreement recorded.
+        { stage: "faq_repair", content: JSON.stringify({ entries: [{ question: "What is this?", answer: "The a menu changes daily." }, ...validEntries.slice(1)] }) },
+      ]);
+      await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+      // Production authoritative: the repaired answer enters canonical visibleFaq.
+      const doc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+      expect(doc.visibleFaq[0].answerText).toBe("The a menu changes daily.");
+      expect(doc.visibleFaq).toHaveLength(4);
+
+      // Shadow: disagreement recorded for the FAQ repair candidate.
+      const events = shadowEvents(warnSpy);
+      expect(events.some((line) =>
+        line.includes("label=faq repair")
+        && line.includes("existing=pass contract=fail")
+        && line.includes("duplicated-determiner"),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      delete process.env.ENABLE_PIPELINE_DEBUG_TRACE;
+    }
+  });
+
+  it("shadow-evaluates the section grounding regeneration candidate", async () => {
+    process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(createPipelineState).mockClear();
+      const groundedOutline = JSON.stringify({
+        title: "Test", slug: "test", metaDescription: "Meta desc with enough chars for validation testing purposes.",
+        h2Headings: ["Budgeting for 2026: Where to Invest", "S2", "S3", "S4", "S5", "S6", "Frequently Asked Questions About Test"],
+        excerpt: "Excerpt.",
+      });
+      const mock = buildRequestMock([
+        { stage: "outline", content: groundedOutline },
+        { stage: "section_0", content: para("The 2026 outlook shapes what teams do next.") },
+        // Grounded (shares "budget" token) and accepted by existing validation,
+        // but the shared contract rejects the duplicated determiner.
+        { stage: "section_0_grounding", content: para("Smart budgets keep the plan focused on the a menu changes daily.") },
+      ]);
+      await runBlogGeneration("u", 1, { requestDeepSeek: mock });
+
+      // Production unchanged: the grounding candidate is accepted.
+      const doc = vi.mocked(createPipelineState).mock.calls[0][0].articleDoc;
+      const sectionBlock = doc.sections[0].blocks[0];
+      if (sectionBlock.type !== "paragraph") throw new Error("expected paragraph block");
+      expect(sectionBlock.content[0].text).toContain("the a menu changes daily");
+
+      const events = shadowEvents(warnSpy);
+      expect(events.some((line) =>
+        line.includes("label=section-0 grounding")
+        && line.includes("existing=pass contract=fail")
+        && line.includes("duplicated-determiner"),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      delete process.env.ENABLE_PIPELINE_DEBUG_TRACE;
+    }
   });
 });

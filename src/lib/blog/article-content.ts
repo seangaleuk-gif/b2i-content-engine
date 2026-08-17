@@ -126,6 +126,20 @@ function idFor(componentId: string, blockIndex: number, blockType: string): stri
   return `${componentId}-${blockType}-${blockIndex}`;
 }
 
+/** Attribution signals that make a quotation real: a named speaker/source or
+ *  an explicit attribution construction. Generated editorial prose that lacks
+ *  any of these is NOT a quotation and must never be serialized as `wp:quote`. */
+const QUOTE_ATTRIBUTION_RE =
+  /\b(?:said|says|told|explained|noted|wrote|argued|stated|claimed|recalled|reported|observed|added|concluded|asked|replied|responded|quoted)\b|\baccording to\b|\bin an interview\b|\b(?:research|report|study|survey|analyst|executive|founder|spokesperson|expert|advisor|creator)\s+(?:from|by|at|said|says|told|wrote|explained|noted|argued|concluded)\b|\breports?\s+(?:that|say)\b/i;
+
+/** True when the supplied text carries explicit quotation provenance. A quote
+ *  block without attribution is generated editorial prose and is demoted to a
+ *  normal paragraph at the canonical producing boundary — attribution is never
+ *  invented, and unattributed prose is never presented as a quotation. */
+export function quoteHasAttribution(text: string): boolean {
+  return QUOTE_ATTRIBUTION_RE.test(String(text ?? ""));
+}
+
 export const CTA_CONTENT_RE = /create your free profile|ready to grow your brand|app\.b2ihub\.com\/signup/i;
 
 function checkForDisallowedContent(
@@ -361,7 +375,17 @@ export function normalizeAiEditorialPayload(
           continue;
         }
         checkForDisallowedContent(text, errors, `Block ${i} quote`, opts, "quote");
-        blocks.push({ id, type: "quote", content: textToInlineContent(text) });
+        // Quote provenance contract: only attributable quotations may be
+        // serialized as wp:quote. Unattributed generated prose is demoted to a
+        // normal paragraph at this canonical producing boundary, so editorial
+        // prose can never masquerade as a quotation and attribution is never
+        // invented.
+        if (quoteHasAttribution(text)) {
+          blocks.push({ id, type: "quote", content: textToInlineContent(text) });
+        } else {
+          recoveries.push(`Block ${i}: demoted unattributed quote to paragraph`);
+          blocks.push({ id, type: "paragraph", content: textToInlineContent(text) });
+        }
         break;
       }
       case "table": {

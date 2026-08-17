@@ -43,7 +43,7 @@ import {
   type EditorialPolishMode,
 } from "@/lib/pipeline/editorial-polish";
 import { runComponentRegeneration, regenerateConclusion, regenerateSection } from "@/lib/services/component-regenerator";
-import { scanFactualRisks, removeUnsupportedSentences, formatClaimLog } from "@/lib/blog/factual-risk-scanner";
+import { scanFactualRisks, removeUnsupportedSentences, formatClaimLog, scanUnsupportedClaimsInDocument } from "@/lib/blog/factual-risk-scanner";
 import { enforceInternalLinkLimit } from "@/lib/blog/final-article-policy";
 import { trimConclusionToBudget, extractRoboticPhraseMatches } from "@/lib/blog/publication-quality";
 import { isEligibleExternalSourceUrl } from "@/lib/services/article-postprocessors";
@@ -67,10 +67,13 @@ import { scanEnglishLanguageConsistency, formatLanguageConsistencyViolations } f
 import {
   compressDocumentStructureAware,
   validateCoherence,
+  coherenceViolationIdentity,
   coherenceViolationSummary,
+  isLastSubstantiveBodyOfSubsection,
   MIN_SECTION_WORDS,
   type CoherenceViolation,
 } from "@/lib/blog/coherence";
+import { opensWithDiscourseDependency, opensWithOrphanTransition } from "@/lib/blog/transition-rules";
 import { isSentenceComplete } from "@/lib/blog/sentence-completeness";
 import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
 import {
@@ -91,6 +94,7 @@ import {
   countSectionGroundingCarriers,
 } from "@/lib/blog/content-relevance";
 import { repairTemporalFreshnessDocument, findTemporalFreshnessIssues } from "@/lib/blog/temporal-freshness";
+import { repairFaqKeyphraseNaturalness } from "@/lib/blog/faq-keyphrase-naturalness";
 import {
   runFullDocumentEditorial,
   isFullDocumentEditorialEnabled,
@@ -288,6 +292,11 @@ function enforceIntegrityContract(
   } else {
     trace?.recordContract(label, true, [], []);
   }
+}
+
+/** Normalize a claim's text for removed-vs-skipped comparison. */
+function normalizeClaimText(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 /** THE ONLY place state.blog is assigned. No other code may assign state.blog directly. */
@@ -703,6 +712,24 @@ export function trimResidualSafeProseToMaximum(
         const safe = safeTrimParagraph(section.blocks[blockIndex], keyphrase, research);
         if (!safe || sectionWords - safe.wordCount < 50) continue;
         if (countCanonicalVisibleWords(doc) - safe.wordCount < wordMin) continue;
+        // Shared mutation-contract rules, identical to the structure-aware trim
+        // producer: never remove the LAST substantive body block of an H3
+        // subsection (that would orphan the H3 into an empty subsection), and
+        // never remove a paragraph whose following paragraph opens with a
+        // discourse connector, orphan transition or dangling pronoun that
+        // depends on this paragraph's content.
+        if (isLastSubstantiveBodyOfSubsection(section.blocks, blockIndex)) continue;
+        const nextBlock = section.blocks[blockIndex + 1];
+        if (nextBlock && nextBlock.type === "paragraph") {
+          const nextText = paragraphPlainText(nextBlock) ?? "";
+          if (
+            opensWithDiscourseDependency(nextText)
+            || opensWithOrphanTransition(nextText)
+            || /^this\b|^that\b|^these\b|^those\b|^it\b|^they\b/i.test(nextText)
+          ) {
+            continue;
+          }
+        }
         candidates.push({ section, blockIndex, wordCount: safe.wordCount, distanceFromEnd: section.blocks.length - 1 - blockIndex });
       }
     }
@@ -1030,8 +1057,41 @@ export function runTrackedHtmlStage(state: PipelineState, stageName: string, fn:
   return state;
 }
 
-// ── Pipeline state factory ──
+/**
+ * Paragraph-normalization stage with a coherence safety assertion. The
+ * producer never splits before a sentence that opens with an orphan transition
+ * (shared rule in transition-rules.ts), so normalization cannot create an
+ * orphan-transition chunk. As a deterministic backstop, coherence is validated
+ * with the authoritative scanner before and after the stage using STABLE
+ * violation identities: if the mutation would introduce a coherence violation,
+ * the whole stage mutation is restored (the offending split is not committed).
+ * A relocated pre-existing violation (reindexed by a split) is recognised as
+ * the same violation and never blocks the stage.
+ */
+function runParagraphNormalizationStage(
+  state: PipelineState,
+  label: string,
+): PipelineState {
+  const snap = snapshotState(state);
+  const preKeys = new Set(
+    validateCoherence(state.articleDoc).map((v) => coherenceViolationIdentity(v)),
+  );
+  state = runTrackedHtmlStage(state, label, (html) =>
+    normalizeParagraphs(html, MAX_SENTENCES_PER_PARAGRAPH).html,
+  );
+  const introduced = validateCoherence(state.articleDoc)
+    .map((v) => coherenceViolationIdentity(v))
+    .filter((key) => !preKeys.has(key));
+  if (introduced.length > 0) {
+    console.warn(
+      `[${label}] coherence guard: paragraph normalization would introduce ${introduced.length} coherence violation(s) — restoring pre-stage state`,
+    );
+    restoreSnapshot(state, snap);
+  }
+  return state;
+}
 
+// ── Pipeline state factory ──
 export function createPipelineState(params: {
   userId: string; projectId: string; keyphrase: string; requestedWordCount: number;
   articleDoc: ArticleDocument; h2Headings: string[];
@@ -1279,6 +1339,27 @@ export function runSourceRelevanceRepairStage(
   const stageBaseline = createArticleIntegrityBaseline(preRemovalHtml);
   const initial = assessSourceSectionRelevance(state.articleDoc, research);
 
+  // Absolute topic-grounding safety assertion at the earliest post-assembly
+  // boundary. A main section whose body shares no heading topic token is a
+  // hard failure HERE — it is never exempted because it already existed in the
+  // stage snapshot, and it must never travel to final QC. The producer gate
+  // should prevent this from occurring; this gate is the deterministic
+  // backstop that fails closed with section diagnostics.
+  const ungroundedSections = assessSectionTopicGrounding(state.articleDoc);
+  if (ungroundedSections.length > 0) {
+    trace?.endStage("source-relevance-repair", state.articleDoc, traceCtx!, false, true);
+    recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, false, "ungrounded-section", {
+      detected: 0,
+      removedBlockIds: [],
+      removedUrls: [],
+      unresolved: 0,
+      ungrounded: ungroundedSections,
+    });
+    throw new Error(
+      `Section topic grounding: ${ungroundedSections.length} ungrounded main section(s): ${ungroundedSections.join("; ")}`,
+    );
+  }
+
   if (initial.length === 0) {
     trace?.endStage("source-relevance-repair", state.articleDoc, traceCtx!, true, false);
     recordStage(state, "source-relevance-repair", inputFingerprint, inputFingerprint, true, undefined, {
@@ -1368,9 +1449,7 @@ export async function runPostAssemblyPipeline(
   state = await runTrim(state, deps);
 
   // Paragraph normalization: HTML-returning, must parse back
-  state = runTrackedHtmlStage(state, "paragraphs", (html) => {
-    return normalizeParagraphs(html, MAX_SENTENCES_PER_PARAGRAPH).html;
-  });
+  state = runParagraphNormalizationStage(state, "paragraphs");
 
   state = await runRegeneration(state, deps);
 
@@ -1441,6 +1520,18 @@ export async function runPostAssemblyPipeline(
     let repaired = false;
     for (const { label, component } of editableComponents) {
       const componentHtmlBefore = componentHtml(component);
+      // Structural pre-flight: a factual mutation must only ever run on a
+      // balanced component. If the component is already invalid (e.g. an
+      // orphan "<!-- /wp:paragraph -->" produced by an earlier stage), fail
+      // HERE with a precise diagnostic so the producing stage is identified —
+      // never silently pass malformed HTML into the removal path.
+      const preflightStructure = validateWordpressBlockPairs(componentHtmlBefore);
+      if (!preflightStructure.valid) {
+        throw new Error(
+          `Component ${component.id} has invalid WordPress structure before factual removal: ` +
+          `${preflightStructure.issues.join("; ")}`,
+        );
+      }
       const risk = scanFactualRisks(componentHtmlBefore, state.keyphrase, research);
       console.log(`[factual-scan:${label}] ${formatClaimLog(risk.claims)}`);
       if (!risk.hasHighRisk) continue;
@@ -1473,22 +1564,35 @@ export async function runPostAssemblyPipeline(
         replaceComponentHtml(component, cleanup.html, "normalized");
         weakenedComponentIds.add(component.id);
         repaired = true;
+      }
+      // Claim-specific removal report: distinguish claims successfully removed
+      // from claims the producer skipped (link/grounding/dependent protection).
+      // A skipped claim is a hard failure at this boundary, never a success.
+      const afterHtml = cleanupWouldEmpty ? componentHtmlBefore : cleanup.html;
+      const afterClaims = scanFactualRisks(afterHtml, state.keyphrase, research).claims
+        .filter((claim) => !claim.supported);
+      const removedClaims = unsupported.filter(
+        (before) => !afterClaims.some((after) => normalizeClaimText(after.text) === normalizeClaimText(before.text)),
+      );
+      const skippedClaims = afterClaims;
+      for (const claim of removedClaims) {
+        console.log(
+          `[factual-scan:${label}] REMOVED unsupported [${claim.category}] text="${claim.text.slice(0, 120)}"`,
+        );
+      }
+      for (const claim of skippedClaims) {
+        console.error(
+          `[factual-scan:${label}] SKIPPED unsupported [${claim.category}]` +
+          ` reason="${claim.supportReason ?? "safe-removal-protection"}"` +
+          ` text="${claim.text.slice(0, 120)}"`,
+        );
+      }
+      if (cleanup.sentencesRemoved > 0) {
         console.log(
           `[factual-scan:${label}] removed ${cleanup.sentencesRemoved} complete unsupported sentence/list item/row(s)` +
           (cleanup.orphanedTransitionsRemoved > 0
             ? ` and ${cleanup.orphanedTransitionsRemoved} orphaned transition(s)`
             : ""),
-        );
-      }
-      const factualCandidateHtml = cleanupWouldEmpty ? componentHtmlBefore : cleanup.html;
-      const remaining = scanFactualRisks(
-        factualCandidateHtml,
-        state.keyphrase,
-        research,
-      ).claims.filter((claim) => !claim.supported);
-      if (remaining.length > 0) {
-        state.warnings.push(
-          `Unresolved factual claim in ${label}: ${remaining[0].text}`,
         );
       }
     }
@@ -1507,7 +1611,22 @@ export async function runPostAssemblyPipeline(
     if (faqCleanup.unsupportedSentencesRemoved > 0 || faqCleanup.citationsAdded > 0) {
       repaired = true;
       if (state.articleDoc.visibleFaq.length > 0) {
-        const schemaHtml = renderFaqSchema(state.articleDoc.visibleFaq);
+    // FAQ keyphrase naturalness reconcile: the exact keyphrase must appear in
+    // FAQ copy only where it reads naturally, never mechanically repeated in
+    // every question and answer. This canonical reconcile layer repairs
+    // redundant occurrences deterministically; meaning, parity and protected
+    // markup are preserved by the repair contract.
+    const faqNaturalness = repairFaqKeyphraseNaturalness(
+      state.articleDoc.visibleFaq,
+      state.keyphrase,
+    );
+    if (faqNaturalness.changedIndexes.length > 0) {
+      state.articleDoc.visibleFaq = faqNaturalness.repaired;
+      console.log(
+        `[faq-recovery] repaired FAQ keyphrase naturalness in items ${faqNaturalness.changedIndexes.join(", ")}`,
+      );
+    }
+    const schemaHtml = renderFaqSchema(state.articleDoc.visibleFaq);
         state.articleDoc.faqSchema = {
           id: "faq-schema",
           type: "faq-schema",
@@ -1520,6 +1639,43 @@ export async function runPostAssemblyPipeline(
       );
     }
     if (repaired) syncBlogFromDocument(state);
+    // ── Absolute unsupported-claim boundary verification ──
+    // The removal producer deliberately skips claims whose sentence carries a
+    // protected link, a grounding carrier or a dependent reference. Those
+    // skips are REAL failures, not successes: final-QC treats every unsupported
+    // claim as a hard failure. Verify the CANONICAL ArticleDocument (never a
+    // stale rendered cache) with the same authoritative scanner final-QC uses,
+    // and fail closed HERE with component/block/claim detail so an unsupported
+    // claim can never ride silently to final-QC.
+    const unresolvedClaims = scanUnsupportedClaimsInDocument(
+      state.articleDoc,
+      state.keyphrase,
+      research,
+    );
+    if (unresolvedClaims.length > 0) {
+      const trace = state.debugTrace;
+      const traceCtx = trace ? traceContextFor(state) : undefined;
+      trace?.endStage("factual-scan", state.articleDoc, traceCtx!, false, true);
+      restoreSnapshot(state, snap);
+      syncBlogFromDocument(state);
+      console.error(
+        `[factual-scan] ${unresolvedClaims.length} unsupported claim(s) remain after factual cleanup — rollback=success` +
+        ` claims=${JSON.stringify(unresolvedClaims.map((claim) => ({
+          component: claim.componentId,
+          block: claim.blockId,
+          category: claim.category,
+          text: claim.text,
+        })))}`,
+      );
+      throw new Error(
+        `Unresolved unsupported claims after factual cleanup (${unresolvedClaims.length}): ` +
+        unresolvedClaims
+          .map((claim) =>
+            `${claim.componentId}/${claim.blockId}[${claim.category}] "${claim.text.slice(0, 120)}"`,
+          )
+          .join("; "),
+      );
+    }
     // Stage-aware integrity contract: factual removal owns the factual claims
     // it removes, the word count and the FAQ entries it corrects; everything
     // else — malformed prose, sentence quality, links, WordPress structure,
@@ -1625,10 +1781,7 @@ export async function runPostAssemblyPipeline(
 
   // Paragraph normalization immediately precedes editorial polish so the AI
   // receives the final paragraph boundaries it is allowed to edit.
-  state = runTrackedHtmlStage(state, "paragraphs-final", (html) => {
-    const result = normalizeParagraphs(html, MAX_SENTENCES_PER_PARAGRAPH);
-    return result.html;
-  });
+  state = runParagraphNormalizationStage(state, "paragraphs-final");
 
   const editorialResearch = deps.context?.research || [];
   const protectedSentencesByBlockId = Object.fromEntries(
@@ -1700,6 +1853,28 @@ export async function runPostAssemblyPipeline(
       // Rejected repair restores the exact pre-stage canonical snapshot, then
       // the pipeline fails closed (zero writes) at this repair boundary.
       trace?.endStage("malformed-prose-repair", state.articleDoc, traceCtx!, false, true);
+      // Quarantine the rejected candidate BEFORE restore. This boundary throws
+      // a plain Error (it does not go through enforceIntegrityContract), so it
+      // would otherwise be invisible to the debug/pipeline-failures snapshot
+      // system and the offending text (e.g. a fragment FAQ answer) would be
+      // lost. Diagnostic-only: never persisted to blog_versions/project content.
+      captureIntegrityRejection({
+        projectId: state.projectId,
+        stage: "malformed-prose-repair",
+        previous: JSON.parse(snap.articleDoc) as ArticleDocument,
+        rejected: state.articleDoc,
+        violations: [
+          ...hardUnresolved.map((finding) =>
+            `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] ${finding.issues.map((issue) => issue.message).join("; ")}`,
+          ),
+          ...remainingSentenceQuality.map((finding) =>
+            `${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}] ${finding.issues.map((issue) => issue.message).join("; ")}`,
+          ),
+        ],
+        ownedViolations: [],
+        keyphrase: state.keyphrase,
+        trace,
+      });
       restoreSnapshot(state, snap);
       recordStage(
         state,
@@ -1893,6 +2068,17 @@ export async function runPostAssemblyPipeline(
           && candidateRepeats >= baselineRepeats
         ) {
           comparativeReasons.push(`repetition did not improve: ${baselineRepeats} → ${candidateRepeats}`);
+        }
+        // Shared mutation contract: a candidate that INTRODUCES a coherence
+        // violation (empty H3 subsection, deletion-created discourse opening,
+        // orphan transition, dangling reference) is rejected at this boundary —
+        // the editor must never commit damage it introduced and leave final QC
+        // to discover it later. Pre-existing violations are comparative-neutral:
+        // candidates must not make them worse.
+        const baselineCoherence = baselineMetrics.coherenceViolationCount ?? 0;
+        const candidateCoherence = metrics.coherenceViolationCount ?? 0;
+        if (candidateCoherence > baselineCoherence) {
+          comparativeReasons.push(`coherence regressed: ${baselineCoherence} → ${candidateCoherence}`);
         }
         const baselineScore = baselineMetrics.editorialScore ?? 100;
         const candidateScore = metrics.editorialScore ?? 100;
@@ -2472,25 +2658,27 @@ export async function runPostAssemblyPipeline(
 
   state = runTrackedHtmlStage(state, "factual-final", (html) => {
     const research = deps.context?.research || [];
-    const factualComponents = [
-      { label: "introduction", html: componentHtml(state.articleDoc.introduction) },
-      ...state.articleDoc.sections
-        .filter((section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading")
-        .map((section) => ({ label: section.id, html: componentHtml(section) })),
-      { label: "conclusion", html: componentHtml(state.articleDoc.conclusion) },
-      ...state.articleDoc.visibleFaq.map((entry, index) => ({
-        label: `faq-${index + 1}`,
-        html: `${entry.question} ${entry.answerHtml || entry.answerText}`,
-      })),
-    ];
-    for (const component of factualComponents) {
-      const unsupported = scanFactualRisks(component.html, state.keyphrase, research).claims
-        .filter((claim) => !claim.supported);
-      if (unsupported.length > 0) {
-        state.warnings.push(
-          `Final factual confirmation found ${unsupported.length} unsupported claim(s) in ${component.label}`,
-        );
-      }
+    // Absolute unsupported-claim verification over the CANONICAL document
+    // (never a stale `blog` cache), using the same authoritative scanner as
+    // final-QC. Unsupported claims at this gate are hard failures.
+    const unsupportedClaims = scanUnsupportedClaimsInDocument(
+      state.articleDoc,
+      state.keyphrase,
+      research,
+    );
+    if (unsupportedClaims.length > 0) {
+      console.error(
+        `[factual-final] ${unsupportedClaims.length} unsupported claim(s) at the final factual gate:\n` +
+        unsupportedClaims
+          .map((claim) =>
+            `  ${claim.componentId}/${claim.blockId}[${claim.category}] "${claim.text.slice(0, 120)}"`,
+          )
+          .join("\n"),
+      );
+      throw new Error(
+        `Final unsupported claims: ${unsupportedClaims.length}` +
+        ` (first=${unsupportedClaims[0].componentId}/${unsupportedClaims[0].blockId} text="${unsupportedClaims[0].text.slice(0, 120)}")`,
+      );
     }
     const ledger = deps.context?.claimOwnership;
     const ownershipViolations = ledger
@@ -2708,6 +2896,7 @@ export async function runPostAssemblyPipeline(
   // than the routine first point where already-known defects abort generation.
   state = runTrackedHtmlStage(state, "final-preflight", () => {
     const snap = snapshotState(state);
+    const research = deps.context?.research || [];
     const repair = repairDeterministicMalformedProse(
       state.articleDoc,
       state.wordMin,
@@ -2782,6 +2971,38 @@ export async function runPostAssemblyPipeline(
       console.log(
         `[final-preflight] density reconcile removed=${densityReconcile.removedSentences} sentence(s)` +
         ` density=${densityReconcile.densityBefore.toFixed(2)}% → ${densityReconcile.densityAfter.toFixed(2)}%`,
+      );
+    }
+    // Absolute unsupported-claim boundary verification at the LAST repair
+    // boundary. The same authoritative canonical scanner final-QC uses must
+    // find zero unsupported claims here, so final-QC can never uniquely
+    // discover an already-existing unsupported claim. If one exists (a prior
+    // stage skipped it behind a safe-removal protection), fail closed HERE
+    // with component/block/claim detail instead of riding to final-QC.
+    const preflightUnsupportedClaims = scanUnsupportedClaimsInDocument(
+      state.articleDoc,
+      state.keyphrase,
+      research,
+    );
+    if (preflightUnsupportedClaims.length > 0) {
+      restoreSnapshot(state, snap);
+      syncBlogFromDocument(state);
+      console.error(
+        `[final-preflight] ${preflightUnsupportedClaims.length} unsupported claim(s) at the final repair boundary — rollback=success` +
+        ` claims=${JSON.stringify(preflightUnsupportedClaims.map((claim) => ({
+          component: claim.componentId,
+          block: claim.blockId,
+          category: claim.category,
+          text: claim.text,
+        })))}`,
+      );
+      throw new Error(
+        `Unresolved unsupported claims at final repair boundary (${preflightUnsupportedClaims.length}): ` +
+        preflightUnsupportedClaims
+          .map((claim) =>
+            `${claim.componentId}/${claim.blockId}[${claim.category}] "${claim.text.slice(0, 120)}"`,
+          )
+          .join("; "),
       );
     }
     // Stage-aware integrity contract at the last repair boundary: the repair
@@ -2900,11 +3121,15 @@ export async function runPostAssemblyPipeline(
     const boilerplate = countBoilerplateInDocument(state.articleDoc);
     const ungrounded = assessSectionTopicGrounding(state.articleDoc);
     const headings = assessHeadingNaturalness(state.articleDoc, state.keyphrase);
-    const unsupportedClaims = scanFactualRisks(
-      state.blog,
+    // Same authoritative canonical unsupported-claim scanner as the factual
+    // boundaries: final-QC and every earlier gate agree on the SAME canonical
+    // document, so a claim can never be missed by preflight and discovered
+    // only here (stale-render divergence is impossible by construction).
+    const unsupportedClaims = scanUnsupportedClaimsInDocument(
+      state.articleDoc,
       state.keyphrase,
       research,
-    ).claims.filter((claim) => !claim.supported);
+    );
     const unresolved = coherence.length
       + malformed.length
       + sentenceQuality.length
@@ -2971,12 +3196,22 @@ export async function runPostAssemblyPipeline(
       protectedSentencesByBlockId,
       validateProductionCandidate: (candidate) => {
         const wordCount = countCanonicalVisibleWords(candidate);
-        return {
-          passed: wordCount >= state.wordMin && wordCount <= state.wordMax,
-          reasons: wordCount >= state.wordMin && wordCount <= state.wordMax
-            ? []
-            : [`canonical word count ${wordCount} outside ${state.wordMin}-${state.wordMax}`],
-        };
+        const reasons: string[] = [];
+        if (wordCount < state.wordMin || wordCount > state.wordMax) {
+          reasons.push(`canonical word count ${wordCount} outside ${state.wordMin}-${state.wordMax}`);
+        }
+        // The final-document editor is the last content-changing owner. Its
+        // committed candidate must satisfy the SAME shared coherence contract as
+        // every earlier mutating stage (empty H3 subsection, deletion-created
+        // discourse opening, orphan transition, unfinished example, ...). The
+        // baseline is coherence-clean here (final-qc-scan ran immediately before
+        // this stage), so any validateCoherence violation in the candidate is
+        // introduced by the patch and must fail closed at THIS boundary — never
+        // ride silently to the later final validation gate.
+        for (const violation of validateCoherence(candidate)) {
+          reasons.push(`coherence ${violation.type} in ${violation.componentId}`);
+        }
+        return { passed: reasons.length === 0, reasons };
       },
       aiCall: async (messages, options, label) =>
         deps.chatWithRetry(messages, options, label || "final-document-editorial"),
@@ -4183,7 +4418,35 @@ async function runSeoNormalization(state: PipelineState, deps: PipelineDependenc
     );
 
     if (accepted) {
+      // SEO normalization may split long paragraphs. Splitting can turn a
+      // single multi-sentence example paragraph into a fragment that opens with
+      // an example marker and now reads as an unfinished example. Apply the SAME
+      // semantic safety principle as the paragraph-normalization stage: snapshot
+      // coherence (stable identities) before committing, then scan the candidate
+      // with the authoritative validateCoherence. A split that INTRODUCES a
+      // genuine new coherence violation is rejected/rolled back; a merely
+      // relocated/pre-existing violation (reindexed by a split) is recognised as
+      // the same violation and does not block the commit.
+      const preSeoCoherence = new Set(
+        validateCoherence(state.articleDoc).map((v) => coherenceViolationIdentity(v)),
+      );
       const committed = runTrackedHtmlStage(state, "seo-normalization", (html) => result.html, snap);
+      const introduced = validateCoherence(committed.articleDoc)
+        .map((v) => coherenceViolationIdentity(v))
+        .filter((key) => !preSeoCoherence.has(key));
+      if (introduced.length > 0) {
+        console.warn(
+          `[seo-normalization] coherence guard: candidate would introduce ${introduced.length} coherence violation(s) — rolling back`,
+        );
+        restoreSnapshot(state, snap);
+        state.normalizationAccepted = false;
+        recordStage(state, "seo-normalization", fp(state.blog), fp(state.blog), true, undefined, {
+          skipped: true,
+          reason: "coherence-guard",
+          diagnostic: `introduced ${introduced.join("; ")}`,
+        });
+        return state;
+      }
       traceKeyphraseDensity("seo-normalization:accepted", state);
       return committed;
     }

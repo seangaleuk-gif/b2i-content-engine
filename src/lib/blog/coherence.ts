@@ -34,6 +34,12 @@ import {
   isSentenceComplete,
   type SentenceCompletenessKind,
 } from "@/lib/blog/sentence-completeness";
+import {
+  ORPHAN_TRANSITION_RE,
+  ORPHAN_TRANSITION_PHRASES,
+  opensWithDiscourseDependency,
+  opensWithStrictDiscourseDependency,
+} from "@/lib/blog/transition-rules";
 
 export type CoherenceViolationType =
   | "unfinished-example"
@@ -41,13 +47,27 @@ export type CoherenceViolationType =
   | "dangling-reference"
   | "incomplete-sentence"
   | "thin-section"
-  | "empty-section";
+  | "empty-section"
+  | "empty-subsection"
+  | "misplaced-forward-reference";
 
 export interface CoherenceViolation {
   componentId: string;
   blockId: string | null;
   type: CoherenceViolationType;
   snippet: string;
+}
+
+/** Stable semantic identity of a coherence violation for delta comparison.
+ *  Based on violation type + component identity + normalized offending content
+ *  — never the positional block id — so a block inserted BEFORE an existing
+ *  violation (which reindexes the block id) is not reclassified as "resolved +
+ *  newly introduced". Two violations with the same type and content in the
+ *  same component are the same semantic violation; a genuinely different
+ *  offending text produces a different identity and is still detected as new. */
+export function coherenceViolationIdentity(violation: CoherenceViolation): string {
+  const content = (violation.snippet ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  return `${violation.type}|${violation.componentId}|${content}`;
 }
 
 /** A section must keep at least this many words to remain a coherent unit
@@ -60,11 +80,18 @@ const EXAMPLE_MARKERS =
 const PENDING_EXAMPLE_PATTERN =
   /\b(?:wants?|plans?|hopes?|aims?|intends?|is (?:thinking|considering|planning|looking)|decides?|needs?|tries?|would like|will try|expects?)\s+to\b/i;
 
-const ORPHAN_TRANSITION_RE =
-  /^\s*(?:instead|however|therefore|meanwhile|moreover|furthermore|nevertheless|nonetheless|consequently|additionally|likewise|similarly|hence|thus|yet|so|but|and)\s*[,:]/i;
+/** A pending-action verb ("want to", "plans to", "hopes to") inside an "if"
+ *  conditional clause is part of a COMPLETE conditional example ("For example,
+ *  if you want to have deeper conversations, a private group might work
+ *  better"), not a dangling setup — the pending action is a condition, and the
+ *  main clause supplies the example's outcome. Only a pending action in a
+ *  NON-conditional frame marks an unfinished example lead-in. */
+const CONDITIONAL_PENDING_RE =
+  /\bif\s+[^.!?]{1,60}?\b(?:want|wants|plan|plans|hope|hopes|need|needs|try|tries)\s+to\b/i;
 
-const ORPHAN_TRANSITION_PHRASES =
-  /^\s*(?:as a result|on the other hand|that said|in addition|at the same time|for this reason|for that reason|in other words)\s*[,:]/i;
+function isConditionalPending(text: string): boolean {
+  return CONDITIONAL_PENDING_RE.test(String(text ?? ""));
+}
 
 const INSTEAD_TRANSITION_RE = /^\s*instead\s*[,:]/i;
 
@@ -82,6 +109,66 @@ const DANGLING_REFERENCE_RE =
   /^\s*(?:this|that|these|those|it|they|its|their|them)\s+(?:is|are|was|were|means|mean|shows?|show|suggests?|suggest|makes?|make|reflects?|reflect|represents?|represent)\b/i;
 
 const SETUP_ENDING_RE = /[:—-]$/;
+
+// ── Component-aware forward-reference transitions ──
+// A forward reference ("In the next section, we'll answer some common
+// questions...") must point at the component that ACTUALLY follows the current
+// one in canonical document order (intro → main sections → conclusion → FAQ).
+// A reference to FAQ questions issued from the final main section (where the
+// conclusion comes next) is structurally wrong and is flagged here.
+
+const FORWARD_REFERENCE_RE =
+  /\b(?:in the next (?:section|part)|the next (?:section|part)|the following (?:section|part)|in the (?:section|part) below|in the (?:sections|parts) below|coming up (?:next|below)|in the next few (?:sections|parts|steps))\b|\bwe(?:['’]ll| will) (?:answer|cover|explore|look at|discuss|examine|address|dive into|see|turn to|introduce)\b/i;
+
+/** The component type a forward reference promises. "main" covers references
+ *  to a generic next topic; "faq"/"conclusion" are determinate references. */
+function forwardReferenceTargetType(sentence: string): "faq" | "conclusion" | "main" | null {
+  const lower = sentence.toLowerCase();
+  if (/\b(?:common )?questions?\b|\bfaq\b|\bfrequently asked\b/.test(lower)) return "faq";
+  if (/\b(?:conclusion|wrap[- ]?up|summary|final thoughts?|recap)\b/.test(lower)) return "conclusion";
+  if (FORWARD_REFERENCE_RE.test(lower)) return "main";
+  return null;
+}
+
+/** The component type that actually follows `componentId` in canonical order.
+ *  After the conclusion, the visible FAQ is the final component. */
+function actualNextComponentType(
+  doc: ArticleDocument,
+  componentId: string,
+): "faq" | "conclusion" | "main" | null {
+  const order: Array<{ id: string; type: "main" | "conclusion" }> = [
+    ...doc.sections
+      .filter(
+        (section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading",
+      )
+      .map((section) => ({ id: section.id, type: "main" as const })),
+    { id: doc.conclusion.id, type: "conclusion" as const },
+  ];
+  const index = order.findIndex((entry) => entry.id === componentId);
+  if (index < 0) return null;
+  const next = order[index + 1];
+  if (next) return next.type;
+  return doc.visibleFaq.length > 0 ? "faq" : null;
+}
+
+/** True when a forward reference in `sentence` promises a target that does not
+ *  match the actual next component in canonical document order. */
+function hasMisplacedForwardReference(
+  sentence: string,
+  doc: ArticleDocument,
+  componentId: string,
+): boolean {
+  if (!FORWARD_REFERENCE_RE.test(sentence)) return false;
+  const promised = forwardReferenceTargetType(sentence);
+  if (!promised) return false;
+  const actual = actualNextComponentType(doc, componentId);
+  if (!actual) return false;
+  // A reference to the FAQ/conclusion must name the component that actually
+  // follows. A generic "main" reference is wrong only when the actual next
+  // component is NOT a main section.
+  if (promised === "faq" || promised === "conclusion") return promised !== actual;
+  return actual !== "main";
+}
 
 function plainBlockText(block: EditorialBlock): string {
   if (block.type === "list") return block.items.flat().map((node) => node.text).join(" ");
@@ -129,7 +216,6 @@ function previousSubstantiveParagraph(
  */
 export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
   const violations: CoherenceViolation[] = [];
-
   const checkComponent = (componentId: string, blocks: EditorialBlock[]) => {
     const paragraphs = blocks
       .map((block) => ({ block, text: plainBlockText(block).replace(/\s+/g, " ").trim() }))
@@ -176,15 +262,21 @@ export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
         continue;
       }
 
-      // 2. Unfinished example: an example marker paragraph is dangling when it
-      //    has a single sentence that introduces a pending action without a
-      //    resolution, or when nothing follows it in the section. A following
-      //    paragraph that refers back to the example ("It could...", "The
-      //    brand then...") counts as the resolution.
+      // 2. Unfinished example: an example marker paragraph is dangling only when
+      //    it is a genuine pending setup — a NON-conditional pending-action
+      //    verb ("Consider a boutique that plans to test...") or an incomplete
+      //    fragment — OR when an incomplete example is the section's last block.
+      //    A COMPLETE example sentence is valid regardless of a "want to"/"plan
+      //    to" construction inside it: "For example, if you want X, a group
+      //    might work better", "For example, a local bakery might share...",
+      //    "For example, you can..." all present a substantive completed
+      //    example. A following paragraph that refers back to the example ("It
+      //    could...", "The brand then...") also counts as the resolution.
       if (EXAMPLE_MARKERS.test(text)) {
+        const exampleComplete = isSentenceComplete(text, "paragraph");
         const singleSentence = (text.match(/[^.!?]+(?:[.!?]+["”’)]*|$)/g) ?? []).length <= 1;
-        const pending = PENDING_EXAMPLE_PATTERN.test(text);
-        const nothingFollows = !next;
+        const pending = PENDING_EXAMPLE_PATTERN.test(text) && !isConditionalPending(text);
+        const nothingFollows = !next && !exampleComplete;
         const nextRefersBack = Boolean(
           next
           && /^\s*(?:it|they|this|that|these|those|the (?:brand|business|shop|company|store|startup|team|boutique))\b/i.test(next.text),
@@ -219,16 +311,55 @@ export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
         }
       }
 
-      // 4. Dangling reference: a demonstrative pronoun opening the component
-      //    (first paragraph) cannot refer back to anything.
-      if (i === 0 && DANGLING_REFERENCE_RE.test(text)) {
-        violations.push({
-          componentId,
-          blockId: block.id,
-          type: "dangling-reference",
-          snippet: text.slice(0, 160),
-        });
+      // 4. Dangling reference / deletion-created discourse opening: a component
+      //    opening that refers back to prior content cannot be valid — no
+      //    antecedent exists by construction. This catches deletion producers
+      //    that remove an opening claim and leave "That's why...", "This
+      //    means...", "Given this..." as the new first paragraph. The STRICT
+      //    shared rule in transition-rules.ts covers only openers that are
+      //    dependent in every context (a section legitimately opening with
+      //    "This approach..." is not blocked), and the existing demonstrative-
+      //    pronoun rule keeps its historical scope.
+      if (i === 0) {
+        if (opensWithStrictDiscourseDependency(text) || DANGLING_REFERENCE_RE.test(text)) {
+          violations.push({
+            componentId,
+            blockId: block.id,
+            type: "dangling-reference",
+            snippet: text.slice(0, 160),
+          });
+        }
+      } else if (opensWithDiscourseDependency(text)) {
+        // Deeper in a component the FULL dependency vocabulary still requires a
+        // complete substantive antecedent. A missing antecedent (only source
+        // citations remain, or every earlier paragraph was deleted) means the
+        // dependency dangles — the same signal the orphan-transition rule uses.
+        const antecedent = previousSubstantiveParagraph(paragraphs, i);
+        if (!antecedent) {
+          violations.push({
+            componentId,
+            blockId: block.id,
+            type: "dangling-reference",
+            snippet: text.slice(0, 160),
+          });
+        }
       }
+    }
+
+    // 5. Empty H3 subsection: an H3 must own at least one substantive body
+    //    block before the next H2/H3 or the component end. A Source-attribution
+    //    paragraph alone does not count. Consecutive H3 headings with no body
+    //    are orphaned headings and a hard structural violation (survives final
+    //    trim and is also caught absolutely by final QC).
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i].type !== "subheading") continue;
+      if (h3HasSubstantiveBody(blocks, i)) continue;
+      violations.push({
+        componentId,
+        blockId: blocks[i].id,
+        type: "empty-subsection",
+        snippet: plainBlockText(blocks[i]).replace(/\s+/g, " ").trim().slice(0, 160),
+      });
     }
   };
 
@@ -237,6 +368,29 @@ export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
     checkComponent(section.id, section.blocks);
   }
   checkComponent(doc.conclusion.id, doc.conclusion.blocks);
+
+  // 6. Component-aware forward references. The final paragraph of a component
+  //    is the transition point: a forward reference there must match the
+  //    component that ACTUALLY follows in canonical document order.
+  const transitionComponents: Array<{ componentId: string; blocks: EditorialBlock[] }> = [
+    { componentId: doc.introduction.id, blocks: doc.introduction.blocks },
+    ...editorialSections(doc).map((section) => ({ componentId: section.id, blocks: section.blocks })),
+    { componentId: doc.conclusion.id, blocks: doc.conclusion.blocks },
+  ];
+  for (const { componentId, blocks } of transitionComponents) {
+    const paragraphs = blocks
+      .map((block) => ({ block, text: plainBlockText(block).replace(/\s+/g, " ").trim() }))
+      .filter((entry) => entry.text.length > 0 && entry.block.type !== "subheading");
+    const lastParagraph = paragraphs[paragraphs.length - 1];
+    if (lastParagraph && hasMisplacedForwardReference(lastParagraph.text, doc, componentId)) {
+      violations.push({
+        componentId,
+        blockId: lastParagraph.block.id,
+        type: "misplaced-forward-reference",
+        snippet: lastParagraph.text.slice(0, 160),
+      });
+    }
+  }
 
   // 5. Sections too thin to support their heading (or empty).
   for (const section of editorialSections(doc)) {
@@ -263,6 +417,60 @@ export function validateCoherence(doc: ArticleDocument): CoherenceViolation[] {
 }
 
 /** The paragraph must be safe to remove as a whole block. */
+
+/** A block counts as substantive subsection body when it carries real content:
+ *  a paragraph that is NOT a Source-attribution-only line, or a non-empty
+ *  list/table/quote. Source attribution alone never makes an H3 valid. */
+function isSubstantiveBodyBlock(block: EditorialBlock): boolean {
+  if (block.type === "list" || block.type === "table" || block.type === "quote") {
+    return plainBlockText(block).replace(/\s+/g, " ").trim().length > 0;
+  }
+  if (block.type !== "paragraph") return false;
+  const text = plainBlockText(block).replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  if (isSourceCitation(text)) return false;
+  return true;
+}
+
+/** The nearest preceding H3 (subheading) block index, or -1 if `blockIndex`
+ *  is not inside any H3 subsection. */
+function owningH3Index(blocks: EditorialBlock[], blockIndex: number): number {
+  for (let index = blockIndex - 1; index >= 0; index--) {
+    if (blocks[index].type === "subheading") return index;
+  }
+  return -1;
+}
+
+/** True when block `blockIndex` is the ONLY substantive body block of its H3
+ *  subsection (the blocks strictly after the owning H3, up to the next
+ *  subheading or the section end). Removing it would orphan the H3. Shared by
+ *  every block-removal producer (structure-aware trim, residual safe trim) so
+ *  no producer can disagree about what counts as subsection body. */
+export function isLastSubstantiveBodyOfSubsection(blocks: EditorialBlock[], blockIndex: number): boolean {
+  const h3 = owningH3Index(blocks, blockIndex);
+  if (h3 < 0) return false;
+  let substantiveCount = 0;
+  let thisIsSubstantive = false;
+  for (let index = h3 + 1; index < blocks.length; index++) {
+    if (blocks[index].type === "subheading") break;
+    if (isSubstantiveBodyBlock(blocks[index])) {
+      substantiveCount++;
+      if (index === blockIndex) thisIsSubstantive = true;
+    }
+  }
+  return thisIsSubstantive && substantiveCount === 1;
+}
+
+/** True when the H3 at `h3BlockIndex` owns at least one substantive body block
+ *  before the next subheading or the component end. */
+function h3HasSubstantiveBody(blocks: EditorialBlock[], h3BlockIndex: number): boolean {
+  for (let index = h3BlockIndex + 1; index < blocks.length; index++) {
+    if (blocks[index].type === "subheading") break;
+    if (isSubstantiveBodyBlock(blocks[index])) return true;
+  }
+  return false;
+}
+
 function isRemovableParagraph(
   doc: ArticleDocument,
   section: ArticleSection,
@@ -304,13 +512,20 @@ function isRemovableParagraph(
   if (nextBlock) {
     const nextText = plainBlockText(nextBlock).replace(/\s+/g, " ").trim();
     if (ORPHAN_TRANSITION_RE.test(nextText) || ORPHAN_TRANSITION_PHRASES.test(nextText)) return false;
-    if (DANGLING_REFERENCE_RE.test(nextText)) return false;
+    if (DANGLING_REFERENCE_RE.test(nextText) || opensWithDiscourseDependency(nextText)) return false;
     if (EXAMPLE_MARKERS.test(text) === false && /^this\b|^that\b|^these\b|^those\b|^it\b|^they\b/i.test(nextText)) return false;
   }
   // The previous paragraph must not be an example marker that this paragraph
   // completes.
   const prevBlock = section.blocks[blockIndex - 1];
   if (prevBlock && EXAMPLE_MARKERS.test(plainBlockText(prevBlock))) return false;
+
+  // Subsection integrity: never remove the LAST substantive body block of an
+  // H3 subsection — doing so would orphan the H3 (an empty subsection).
+  // Source-attribution-only paragraphs are not substantive body, so a
+  // subsection that would be left with only a Source citation is still
+  // orphaned and the removal is rejected.
+  if (isLastSubstantiveBodyOfSubsection(section.blocks, blockIndex)) return false;
 
   return true;
 }

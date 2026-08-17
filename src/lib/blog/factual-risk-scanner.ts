@@ -9,11 +9,14 @@
 import {
   parseWordPressEditorialBlocks,
   renderEditorialBlocksToWordPress,
+  renderArticleDocument,
   type EditorialBlock,
 } from "@/lib/blog/article-document";
 import { isSourceBoilerplate, stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 import { hasDanglingSentenceEnding } from "@/lib/blog/publication-quality";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
+import { opensWithDiscourseDependency } from "@/lib/blog/transition-rules";
 
 // ── Types ──
 
@@ -647,7 +650,8 @@ function isOrphanTransitionOpener(sentence: string): boolean {
 
 function isDependentReference(sentence: string): boolean {
   const normalized = sentence.replace(/^\s*["\u201C'\u2018(]+\s*/, "");
-  return DEPENDENT_REFERENCE_PATTERNS.some((pattern) => pattern.test(normalized));
+  return DEPENDENT_REFERENCE_PATTERNS.some((pattern) => pattern.test(normalized))
+    || opensWithDiscourseDependency(normalized);
 }
 
 function isSourceCitationParagraph(text: string): boolean {
@@ -951,8 +955,23 @@ export function removeUnsupportedSentences(
   removed += nonParagraphCleanup.removed;
 
   const continuity = repairOrphanedTransitions(modified);
+  const finalHtml = continuity.html;
+
+  // Structural fail-closed guard: a factual mutation must NEVER emit unbalanced
+  // WordPress markup (e.g. an orphan "<!-- /wp:paragraph -->" from a sentence
+  // splice that straddled a block boundary). If the removal produced invalid
+  // structure, it fails HERE with a precise diagnostic rather than allowing
+  // malformed HTML downstream to the strict re-parse boundary. The section's
+  // claims are then left in place (fail-closed) — never silently weakened.
+  const structure = validateWordpressBlockPairs(finalHtml);
+  if (!structure.valid) {
+    throw new Error(
+      `factual removal produced invalid WordPress structure: ${structure.issues.join("; ")}`,
+    );
+  }
+
   return {
-    html: continuity.html,
+    html: finalHtml,
     sentencesRemoved: removed,
     orphanedTransitionsRemoved: continuity.removed,
   };
@@ -1364,4 +1383,73 @@ export function formatClaimLog(claims: ScannedClaim[]): string {
     );
   }
   return lines.join("\n");
+}
+
+// ── Canonical-document unsupported-claim scanner ──
+
+export interface LocatedUnsupportedClaim extends ScannedClaim {
+  componentId: string;
+  blockId: string;
+}
+
+function plainBlockTextForLocation(block: EditorialBlock): string {
+  if (block.type === "list") return block.items.flat().map((node) => node.text).join(" ");
+  if (block.type === "table") {
+    return [...block.headers, ...block.rows.flat()].flat().map((node) => node.text).join(" ");
+  }
+  return block.content.map((node) => node.text).join(" ");
+}
+
+/**
+ * THE authoritative absolute unsupported-claim verification over the canonical
+ * ArticleDocument. This is the ONLY scanner the factual boundaries (factual-scan,
+ * factual-final, final-preflight) and the final-QC gate use for unsupported
+ * claims, so they can never disagree about which claim is unsupported and where
+ * it lives. It renders the canonical document (never a stale `blog` cache),
+ * scans with the same `scanFactualRisks` the removal producer uses, and locates
+ * each unsupported claim's component/block id from the canonical blocks.
+ */
+export function scanUnsupportedClaimsInDocument(
+  doc: import("@/lib/blog/article-document").ArticleDocument,
+  keyphrase: string,
+  research?: Array<{ title?: string; snippet?: string; url?: string }>,
+): LocatedUnsupportedClaim[] {
+  const html = renderArticleDocument(doc);
+
+  const unsupported = scanFactualRisks(html, keyphrase, research).claims
+    .filter((claim) => !claim.supported);
+
+  const components: Array<{ id: string; blocks: EditorialBlock[] }> = [
+    { id: doc.introduction.id, blocks: doc.introduction.blocks },
+    ...doc.sections
+      .filter((section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading")
+      .map((section) => ({ id: section.id, blocks: section.blocks })),
+    { id: doc.conclusion.id, blocks: doc.conclusion.blocks },
+  ];
+
+  const located: LocatedUnsupportedClaim[] = [];
+  for (const claim of unsupported) {
+    const needle = normalizeForMatch(claim.text);
+    let componentId = "-";
+    let blockId = "-";
+    outer: for (const component of components) {
+      const componentText = normalizeForMatch(
+        component.blocks.map((block) => plainBlockTextForLocation(block)).join(" "),
+      );
+      if (!componentText.includes(needle)) continue;
+      componentId = component.id;
+      for (const block of component.blocks) {
+        if (normalizeForMatch(plainBlockTextForLocation(block)).includes(needle)) {
+          blockId = block.id;
+          break outer;
+        }
+      }
+      // The claim is present in the component but not wholly inside one block's
+      // plain text (e.g. it spans inline markup); keep the component-level
+      // attribution and stop searching.
+      break;
+    }
+    located.push({ ...claim, componentId, blockId });
+  }
+  return located;
 }

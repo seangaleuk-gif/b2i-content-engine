@@ -24,6 +24,8 @@ import { computeKeyphraseDensity, englishKeyphraseDensity } from "@/lib/content-
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import { titleCaseKeyphrase } from "@/lib/services/text-utils";
+import { scanSentenceQualityText, lowercaseStartValidTokensFromKeyphrase } from "@/lib/blog/sentence-quality";
+import { findMalformedProseTextIssues } from "@/lib/blog/publication-quality";
 import {
   assessHeadingNaturalness,
   assessHeadingTextNaturalness,
@@ -175,12 +177,72 @@ function headingAlreadyCoversTopic(heading: string, keyphrase: string): boolean 
   return contentWords.filter((word) => lower.includes(word)).length >= Math.max(2, contentWords.length - 1);
 }
 
-/** Insert the exact keyphrase naturally at the start of the introduction's
- *  first paragraph so it appears inside the first 100 readable words. Inline
- *  content (links, emphasis, strong) is preserved node-for-node: only a
- *  leading text node is prepended and the first alpha of the first sentence is
- *  lowercased in place, so an injected internal link in the opening paragraph
- *  can never be lost by the reconciliation. */
+/** Keyphrase content words that form a phrase: "hong kong", "marketing
+ *  trends", "trends 2026". If the paragraph ALREADY contains such an adjacent
+ *  pair outside the inserted exact-keyphrase occurrence, inserting the full
+ *  keyphrase would read as duplication ("...hong kong marketing trends 2026,
+ *  Hong Kong marketing is changing fast."). */
+const KEYPHRASE_PAIR_STOP_WORDS = new Set([
+  "the", "a", "an", "for", "of", "in", "on", "at", "to", "with", "and", "or",
+  "that", "this", "these", "those", "how", "what", "when", "why", "where",
+  "is", "are", "will", "be", "it", "its", "you", "your",
+]);
+
+function keyphraseContentWords(keyphrase: string): string[] {
+  return (keyphrase.toLowerCase().match(/[a-z0-9]+/gi) ?? [])
+    .filter((word) => word.length > 2);
+}
+
+function escapeRegexLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** True when the text carries a keyphrase-word phrase (an adjacent pair of
+ *  keyphrase content words) OUTSIDE the exact keyphrase occurrence itself.
+ *  Rejects repairs that would duplicate the keyphrase's own phrasing. */
+function hasDuplicatedKeyphrasePhrasing(text: string, keyphrase: string): boolean {
+  const lower = text.toLowerCase();
+  const kpLower = keyphrase.toLowerCase();
+  if (!lower.includes(kpLower)) return false;
+  const remainder = lower.replace(new RegExp(escapeRegexLiteral(kpLower), "g"), " ");
+  const words = keyphraseContentWords(keyphrase);
+  for (let index = 0; index < words.length - 1; index++) {
+    const pair = `${words[index]} ${words[index + 1]}`;
+    if (pair.split(/\s+/).every((word) => KEYPHRASE_PAIR_STOP_WORDS.has(word))) continue;
+    if (remainder.includes(pair)) return true;
+  }
+  return false;
+}
+
+/** Lowercasing the paragraph's first word after prepending the lead must never
+ *  break a proper-noun phrase ("Hong Kong" → "hong Kong"). A capitalized
+ *  first word followed by another capitalized word, or a first word that keeps
+ *  an interior capital (brand casing), means the repair cannot read naturally. */
+function lowercaseWouldBreakProperNoun(firstSentence: string): boolean {
+  const words = firstSentence.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return false;
+  const first = words[0];
+  if (!/^[A-Z]/.test(first)) return false;
+  if (/[A-Z]/.test(first.slice(1))) return true;
+  if (words[1] && /^[A-Z]/.test(words[1])) return true;
+  return false;
+}
+
+/**
+ * Insert the exact keyphrase naturally at the start of the introduction's
+ * first paragraph so it appears inside the first 100 readable words. Inline
+ * content (links, emphasis, strong) is preserved node-for-node: only a leading
+ * text node is prepended and the first alpha of the first sentence is
+ * lowercased in place, so an injected internal link in the opening paragraph
+ * can never be lost by the reconciliation.
+ *
+ * The candidate is committed ONLY when it passes the same sentence-quality,
+ * malformed-prose, duplication and capitalization gates used by every other
+ * deterministic repair. A repair that would create keyword-shaped prose,
+ * duplicated keyphrase phrasing, a broken proper-noun casing or malformed
+ * grammar is NOT committed — the soft first-100 signal stays unsatisfied
+ * rather than corrupting the introduction.
+ */
 function insertKeyphraseInIntroduction(
   doc: ArticleDocument,
   keyphrase: string,
@@ -199,7 +261,27 @@ function insertKeyphraseInIntroduction(
   }
   const firstSentence = fullText.match(/^[^.!?]+[.!?]+/)?.[0];
   if (!firstSentence) return { changed: false };
+
+  // Naturalness gates. The lead must not duplicate keyphrase phrasing already
+  // present in the paragraph, and lowercasing the opening must not break a
+  // proper-noun phrase such as "Hong Kong".
   const lead = `When it comes to ${keyphrase}, `;
+  const candidateText = `${lead}${fullText}`;
+  const validTokens = lowercaseStartValidTokensFromKeyphrase(keyphrase);
+  if (hasDuplicatedKeyphrasePhrasing(candidateText, keyphrase)) return { changed: false };
+  if (lowercaseWouldBreakProperNoun(firstSentence)) return { changed: false };
+  if (scanSentenceQualityText(candidateText, { validLowercaseTokens: validTokens }).length > 0) {
+    return { changed: false };
+  }
+  if (findMalformedProseTextIssues([candidateText], ["paragraph"]).length > 0) {
+    return { changed: false };
+  }
+  // The repaired first 100 readable words must actually contain the keyphrase.
+  const first100 = getFirstNReadableWords(renderArticleDocument(doc), 100).toLowerCase();
+  const kpLower = keyphrase.toLowerCase();
+  if (!first100.includes(kpLower) && !candidateText.toLowerCase().includes(kpLower)) {
+    return { changed: false };
+  }
 
   let newContent = [...block.content];
   // Lowercase the first alpha of the first sentence in place (node-aware), so

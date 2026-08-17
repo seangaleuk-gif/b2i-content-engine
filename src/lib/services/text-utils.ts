@@ -2,6 +2,7 @@ import { AppError } from "./errors";
 import { findSentenceBoundaryOffsets, splitSentences } from "@/lib/seo/seo-text-utils";
 import { parseWordpressBlockStructure, type WordpressBlockRange } from "@/lib/blog/wordpress-block-structure";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
+import { opensWithOrphanTransition } from "@/lib/blog/transition-rules";
 
 export function countReadableWords(html: string): number {
   // Strip non-readable content first
@@ -180,9 +181,9 @@ function extractMalformedJsonStringProperty(raw: string, allowedProps: string[])
     const marker = `"${prop}"`;
     const startIdx = raw.indexOf(marker);
     if (startIdx < 0) continue;
-    let colonIdx = raw.indexOf(":", startIdx + marker.length);
+    const colonIdx = raw.indexOf(":", startIdx + marker.length);
     if (colonIdx < 0) continue;
-    let openQuote = raw.indexOf('"', colonIdx + 1);
+    const openQuote = raw.indexOf('"', colonIdx + 1);
     if (openQuote < 0) continue;
 
     // Forward scan, tag-aware. Only stop at `}` (single-property object boundary).
@@ -493,7 +494,16 @@ function splitParagraphBlock(
 
     let selectedIndex = -1;
     let selectedVisibleBoundary: number | null = null;
+    const sentences = splitSentences(scan.visibleText);
     for (const index of searchOrder) {
+      // Coherence guard: never split immediately before a sentence that opens
+      // with an orphan transition ("So, ", "Instead, ", "However, "). The next
+      // chunk would START with that transition and the authoritative coherence
+      // scanner would flag it as orphaned with no antecedent. Folding the
+      // transition sentence into the current chunk keeps it mid-paragraph,
+      // where it reads naturally.
+      const nextSentence = sentences[index + 1];
+      if (nextSentence && opensWithOrphanTransition(nextSentence)) continue;
       const visibleBoundary = visibleBoundaryForSentence(index);
       if (visibleBoundary === null) continue;
       selectedIndex = index;

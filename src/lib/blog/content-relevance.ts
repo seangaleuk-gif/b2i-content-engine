@@ -6,6 +6,7 @@
 import type { ArticleDocument, ArticleSection } from "@/lib/blog/article-document";
 import { renderComponentHtml } from "@/lib/blog/article-document";
 import { normalizedSentenceTextsOfSectionHtml } from "@/lib/blog/factual-risk-scanner";
+import { normalizeTopicToken } from "@/lib/blog/topic-token-normalizer";
 
 const TOPIC_STOP_WORDS = new Set([
   "the", "a", "an", "and", "or", "but", "for", "of", "on", "in", "to", "with",
@@ -51,7 +52,8 @@ export interface HeadingNaturalnessRepair {
 
 function topicWords(text: string): string[] {
   return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
-    .filter((word) => word.length > 2 && !TOPIC_STOP_WORDS.has(word));
+    .filter((word) => word.length > 2 && !TOPIC_STOP_WORDS.has(word))
+    .map(normalizeTopicToken);
 }
 
 function linkHrefs(html: string): string[] {

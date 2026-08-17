@@ -187,4 +187,25 @@ describe("external-link producer never corrupts blocks", () => {
       expect(scanSentenceQualityInDocument(parsed.doc)).toEqual([]);
     }
   });
+
+  it("html producer does not double-punctuate a source title that already ends in '?' (the production shape)", () => {
+    const doc = buildDoc([
+      { id: "s0-0", type: "paragraph", content: [{ type: "text", text: "Local teams can share useful lessons from daily work with clear and honest words." }] },
+      { id: "s0-1", type: "paragraph", content: [{ type: "text", text: "Owners can note common questions and turn those questions into helpful future posts before planning the next routine." }] },
+    ]);
+    const blog = renderArticleDocument(doc);
+    const result = insertExternalResearchLinks(blog, [
+      { url: "https://example.com/ar", title: "What are common questions for local teams?", snippet: "Owners can note common questions and turn those questions into helpful future posts." },
+    ], 6);
+    expect(result.linksInserted).toBeGreaterThan(0);
+    // The rendered citation must never contain the invalid `? .` sequence.
+    expect(result.html).not.toMatch(/\? \./);
+    // The anchor carries the full title (ending in '?') with no extra period.
+    expect(result.html).toContain(">What are common questions for local teams?</a>");
+    const parsed = parseArticleDocumentFromHtml(result.html, doc);
+    if (parsed.doc) {
+      expect(scanMalformedProseInDocument(parsed.doc)).toEqual([]);
+      expect(scanSentenceQualityInDocument(parsed.doc)).toEqual([]);
+    }
+  });
 });

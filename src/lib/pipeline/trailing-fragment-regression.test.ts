@@ -317,6 +317,7 @@ describe("block-type-aware completeness: no false positives on structural surfac
         { id: "s0-1", type: "list", ordered: false, items: [[{ type: "text", text: "Posting without a plan" }], [{ type: "text", text: "Ignoring comments" }]] },
         { id: "s0-2", type: "table", headers: [[{ type: "text", text: "Channel" }], [{ type: "text", text: "Best use" }]], rows: [[[{ type: "text", text: "Threads" }], [{ type: "text", text: "Conversations" }]]] },
         { id: "s0-3", type: "subheading", level: 3, content: [{ type: "text", text: "Start Small" }] },
+        { id: "s0-4", type: "paragraph", content: [{ type: "text", text: "A small weekly routine is easier to maintain than a big one." }] },
       ],
       status: "generated",
     }];
@@ -458,17 +459,23 @@ describe("a link-losing compaction is still rejected and rolled back", () => {
     ];
     const sections = headings.map((heading, index) => {
       const body = makeParagraphs(index, 10);
+      // Grounded fixture: the earliest post-assembly boundary fails closed on
+      // ungrounded sections. The grounding paragraph is appended (year-stripped
+      // so it introduces no date claim) to keep the targeted paragraphs' stable
+      // block indices intact.
+      const topicPhrase = heading.replace(/\b20\d{2}\b/g, "").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+      const grounding = paragraphHtml(`${topicPhrase} shapes how the team plans the work covered below.`);
       if (index === 3) {
-        return section(`section-${index}`, heading, `${paragraphHtml(unfinishedExample)}\n\n${body}`);
+        return section(`section-${index}`, heading, `${paragraphHtml(unfinishedExample)}\n\n${body}\n\n${grounding}`);
       }
       if (index === 5) {
         return section(
           `section-${index}`,
           heading,
-          `${body}\n\n${paragraphHtml(`Source: <a href="https://example.com/strategy-2026" target="_blank" rel="noopener noreferrer">Marketing Teams and Budgeting for Hong Kong</a>.`)}\n\n${paragraphHtml(orphan)}`,
+          `${body}\n\n${paragraphHtml(`Source: <a href="https://example.com/strategy-2026" target="_blank" rel="noopener noreferrer">Marketing Teams and Budgeting for Hong Kong</a>.`)}\n\n${paragraphHtml(orphan)}\n\n${grounding}`,
         );
       }
-      return section(`section-${index}`, heading, body);
+      return section(`section-${index}`, heading, `${body}\n\n${grounding}`);
     });
     sections.push(section("faq-section", "Frequently Asked Questions About Threads Marketing", "", "faq-heading"));
     const doc: ArticleDocument = {

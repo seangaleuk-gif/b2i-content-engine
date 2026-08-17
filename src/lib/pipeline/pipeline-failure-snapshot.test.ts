@@ -11,12 +11,16 @@ import {
   captureIntegrityRejection,
   updateIntegrityRejectionRollback,
   retainNewestFailureSnapshots,
+  captureProducerComponentFailure,
+  parseProducerBlockViolations,
   MAX_RETAINED_FAILURE_SNAPSHOTS,
   PIPELINE_BUILD_IDENTIFIER,
   type IntegrityRejectionSnapshotArtifact,
+  type ProducerComponentFailureArtifact,
 } from "@/lib/pipeline/pipeline-failure-snapshot";
 import { GENERATION_BUILD_ID } from "@/lib/services/generation-constants";
 import { validateArticleIntegrityContract } from "@/lib/blog/article-integrity-contract";
+import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
 
 const KEYPHRASE = "threads marketing hong kong";
 
@@ -437,5 +441,235 @@ describe("quarantined pipeline-failure snapshots for integrity rejections", () =
     // Pre/post documents are identical on a successful stage (no capture ran).
     expect(JSON.stringify(same)).toBe(JSON.stringify(pre));
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a malformed-prose repair-boundary rejection captures the offending FAQ text in the rejected candidate", () => {
+    process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    const dir = tempDir("fs-faq");
+    const pre = makeDoc(
+      [paragraph("Owners can note common questions and turn those questions into helpful future posts.")].join("\n\n"),
+    );
+    const rejected = makeDoc(
+      [paragraph("Owners can note common questions and turn those questions into helpful future posts.")].join("\n\n"),
+    );
+    // The rejected candidate carries a fragment FAQ answer — the exact shape a
+    // malformed-prose-repair boundary rejection would quarantine. The scanner
+    // flags it as component=faq-0 / blockId=faq-0-answer.
+    rejected.visibleFaq = [{ question: "How does the loyalty programme work?", answerHtml: "", answerText: "Free delivery for members." }];
+    expect(
+      scanMalformedProseInDocument(rejected).some((f) =>
+        f.componentId === "faq-0" && f.issues.some((issue) => issue.code === "fragment"),
+      ),
+    ).toBe(true);
+
+    const filePath = captureIntegrityRejection({
+      projectId: "faq-project",
+      stage: "malformed-prose-repair",
+      previous: pre,
+      rejected,
+      violations: ["faq-0-answer[fragment] Free delivery for members."],
+      ownedViolations: [],
+      keyphrase: KEYPHRASE,
+      dir,
+    })!;
+    expect(filePath).not.toBeNull();
+    const artifact = JSON.parse(fs.readFileSync(filePath, "utf8")) as IntegrityRejectionSnapshotArtifact;
+    // The rejected candidate retains the exact offending FAQ answer; the
+    // pre-stage snapshot has no FAQ content.
+    expect(artifact.documents.rejectedCandidate.visibleFaq[0]?.answerText).toBe("Free delivery for members.");
+    expect(artifact.documents.preStage.visibleFaq).toEqual([]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ── Producer-level component failure quarantine ──
+// Generation-stage failures (a failed generated/repaired editorial component)
+// happen before any full ArticleDocument is assembled. captureProducerComponentFailure
+// preserves the failing candidate in debug mode so the offending block text is
+// never lost — the exact defect that hid block 6 / block 9 in production.
+
+describe("quarantined producer component failures preserve the rejected candidate", () => {
+  const SECTION_ERRORS = [
+    "Block 6 paragraph: sentence-like unit has no finite predicate (fragment)",
+    "Block 9 paragraph: sentence-like unit has no finite predicate (fragment)",
+  ];
+  const RAW_BLOCKS = Array.from({ length: 10 }, (_, index) => ({
+    type: "paragraph",
+    text: index === 6 || index === 9
+      ? `Restaurant teams that reply to every review promptly. ${index}`
+      : `Local teams share useful lessons from daily work with clear and honest words. ${index}`,
+  }));
+
+  function normalizedBlocks(): ArticleDocument["sections"][number]["blocks"] {
+    return RAW_BLOCKS.map((block, index) => ({
+      id: `section-2-paragraph-${index}`,
+      type: "paragraph" as const,
+      content: [{ type: "text" as const, text: block.text }],
+    }));
+  }
+
+  it("captures project/build, component, attempt, exact blocks, violations, fingerprint and pre-repair text", () => {
+    process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    const dir = tempDir("fs-producer");
+    const filePath = captureProducerComponentFailure({
+      projectId: "test-project",
+      stage: "section_2_repair",
+      componentId: "section-2",
+      heading: "Building a Digital Presence to Keep Customers Coming Back",
+      attempt: "repair",
+      rawCandidate: { blocks: RAW_BLOCKS },
+      blocks: normalizedBlocks(),
+      errors: SECTION_ERRORS,
+      recoveries: [],
+      preRepair: { blocks: normalizedBlocks().slice(0, 8) },
+      dir,
+    })!;
+    expect(filePath).not.toBeNull();
+    expect(path.basename(filePath)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_producer-section_2_repair_project-test-project\.json$/);
+    expect(fs.readdirSync(dir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+
+    const artifact = JSON.parse(fs.readFileSync(filePath, "utf8")) as ProducerComponentFailureArtifact;
+    expect(artifact.schema).toBe("producer-component-failure/v1");
+    expect(artifact.build).toBe(PIPELINE_BUILD_IDENTIFIER);
+    expect(artifact.projectId).toBe("test-project");
+    expect(artifact.stage).toBe("section_2_repair");
+    expect(artifact.componentId).toBe("section-2");
+    expect(artifact.heading).toBe("Building a Digital Presence to Keep Customers Coming Back");
+    expect(artifact.attempt).toBe("repair");
+    expect(artifact.candidateFingerprint).toBeTruthy();
+    expect(artifact.errors).toEqual(SECTION_ERRORS);
+
+    // Exactly the two failing blocks, with index, type, message and text.
+    expect(artifact.violations).toHaveLength(2);
+    expect(artifact.violations[0]).toEqual({
+      blockIndex: 6,
+      blockType: "paragraph",
+      message: "sentence-like unit has no finite predicate (fragment)",
+      text: "Restaurant teams that reply to every review promptly. 6",
+    });
+    expect(artifact.violations[1]).toEqual({
+      blockIndex: 9,
+      blockType: "paragraph",
+      message: "sentence-like unit has no finite predicate (fragment)",
+      text: "Restaurant teams that reply to every review promptly. 9",
+    });
+
+    // The exact normalized candidate blocks are preserved.
+    expect(artifact.blocks).toHaveLength(10);
+    expect(
+      artifact.blocks.some((b) =>
+        b.type === "paragraph" && b.content.some((n) => n.text.includes("Restaurant teams that reply to every review promptly.")),
+      ),
+    ).toBe(true);
+
+    // Relevant pre-repair text is preserved.
+    expect(artifact.preRepair).toBeTruthy();
+    expect(artifact.preRepair!.blocks).toHaveLength(8);
+    expect(artifact.preRepair!.fingerprint).toBeTruthy();
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("capture is diagnostic-only: writes under debug/ and never touches repositories or blog_versions", () => {
+    process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    const dir = tempDir("fs-producer-no-persistence");
+    const filePath = captureProducerComponentFailure({
+      projectId: "test-project",
+      stage: "section_2_repair",
+      componentId: "section-2",
+      attempt: "repair",
+      rawCandidate: { blocks: RAW_BLOCKS },
+      blocks: normalizedBlocks(),
+      errors: SECTION_ERRORS,
+      dir,
+    })!;
+    expect(filePath).not.toBeNull();
+    expect(path.dirname(filePath)).toBe(dir);
+    expect(fs.readdirSync(dir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    // No database/repository surface: the producer capture module writes plain
+    // diagnostic JSON only, exactly like the integrity-rejection capture.
+    const source = fs.readFileSync("src/lib/pipeline/pipeline-failure-snapshot.ts", "utf8");
+    expect(source).not.toMatch(/repositories|blog-version|supabase|blogVersionRepository|projectRepository/i);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns null and never writes when the debug flag is disabled", () => {
+    delete process.env.ENABLE_PIPELINE_DEBUG_TRACE;
+    const dir = tempDir("fs-producer-disabled");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = captureProducerComponentFailure({
+      projectId: "disabled-project",
+      stage: "section_2_repair",
+      componentId: "section-2",
+      attempt: "repair",
+      rawCandidate: { blocks: RAW_BLOCKS },
+      blocks: normalizedBlocks(),
+      errors: SECTION_ERRORS,
+      dir,
+    });
+    expect(result).toBeNull();
+    expect(fs.existsSync(dir) ? fs.readdirSync(dir) : []).toEqual([]);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a write failure logs a warning and returns null without throwing", () => {
+    process.env.ENABLE_PIPELINE_DEBUG_TRACE = "true";
+    const parent = tempDir("fs-producer-write-fail");
+    const fileAsDir = path.join(parent, "pipeline-failures");
+    fs.writeFileSync(fileAsDir, "i am a file, not a directory");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let result: string | null = "sentinel";
+    expect(() => {
+      result = captureProducerComponentFailure({
+        projectId: "write-fail",
+        stage: "section_2_repair",
+        componentId: "section-2",
+        attempt: "repair",
+        rawCandidate: { blocks: RAW_BLOCKS },
+        blocks: normalizedBlocks(),
+        errors: SECTION_ERRORS,
+        dir: fileAsDir,
+      });
+    }).not.toThrow();
+    expect(result).toBeNull();
+    expect(warnSpy.mock.calls.some((args) => args.map(String).join(" ").includes("pipeline-failure-snapshot"))).toBe(true);
+
+    warnSpy.mockRestore();
+    fs.rmSync(parent, { recursive: true, force: true });
+  });
+
+  it("parseProducerBlockViolations extracts index, type, message and offending text; non-block errors map to -1", () => {
+    const violations = parseProducerBlockViolations(
+      [
+        "Block 6 paragraph: sentence-like unit has no finite predicate (fragment)",
+        "Block 2 list item 1: sentence-like unit has no finite predicate (fragment)",
+        "AI payload must contain a 'blocks' array",
+      ],
+      {
+        blocks: [
+          { type: "paragraph", text: "Local teams share useful lessons from daily work." },
+          { type: "paragraph", text: "A second ordinary paragraph." },
+          { type: "list", items: ["WhatsApp", "Fragmented noun phrase without any finite verb."] },
+        ],
+      },
+    );
+    expect(violations).toEqual([
+      {
+        blockIndex: 6,
+        blockType: "paragraph",
+        message: "sentence-like unit has no finite predicate (fragment)",
+        text: undefined,
+      },
+      {
+        blockIndex: 2,
+        blockType: "list item 1",
+        message: "sentence-like unit has no finite predicate (fragment)",
+        text: "WhatsApp | Fragmented noun phrase without any finite verb.",
+      },
+      { blockIndex: -1, blockType: "", message: "AI payload must contain a 'blocks' array", text: undefined },
+    ]);
   });
 });

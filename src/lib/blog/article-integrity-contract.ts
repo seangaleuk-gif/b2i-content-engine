@@ -28,7 +28,7 @@ import {
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
 import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
 import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
-import { validateCoherence } from "@/lib/blog/coherence";
+import { validateCoherence, coherenceViolationIdentity } from "@/lib/blog/coherence";
 import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
 import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import { findUngroundedSectionIds } from "@/lib/blog/content-relevance";
@@ -55,6 +55,12 @@ export type ContractCategory =
 export interface IntegrityContractViolation {
   category: ContractCategory;
   message: string;
+  /** Stable semantic identity for delta comparison. Survives block reindexing
+   *  (a structural insertion before an existing violation must not reclassify
+   *  it as newly introduced) while still distinguishing a genuinely different
+   *  violation (different offending content/signature). Defaults to the
+   *  message for categories whose messages already use stable ids. */
+  identity?: string;
 }
 
 export interface IntegrityContractOptions {
@@ -245,21 +251,37 @@ function collectViolations(
   options: IntegrityContractOptions,
 ): IntegrityContractViolation[] {
   const violations: IntegrityContractViolation[] = [];
-  const push = (category: ContractCategory, message: string) => {
-    violations.push({ category, message });
+  const push = (category: ContractCategory, message: string, identity?: string) => {
+    violations.push({ category, message, ...(identity ? { identity } : {}) });
   };
 
   const research = options.research ?? [];
   const render = renderArticleDocument(doc);
 
+  // Normalized offending-content signature for stable delta identity.
+  const normalizeContent = (text: string): string =>
+    text.toLowerCase().replace(/\s+/g, " ").trim();
+
   // Malformed prose (includes lowercase starts and punctuation-only residue).
   for (const finding of scanMalformedProseInDocument(doc)) {
-    push("malformed", `${finding.componentId}/${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}]`);
+    const codes = [...new Set(finding.issues.map((issue) => issue.code))].sort().join(",");
+    const signature = normalizeContent(finding.issues.map((issue) => issue.message).join(" "));
+    push(
+      "malformed",
+      `${finding.componentId}/${finding.blockId}[${codes}]`,
+      `malformed|${finding.componentId}|${codes}|${signature}`,
+    );
   }
 
   // Sentence quality (duplicated determiners, fragments, lowercase starts).
   for (const finding of scanSentenceQualityInDocument(doc)) {
-    push("sentence-quality", `${finding.componentId}/${finding.blockId}[${finding.issues.map((issue) => issue.code).join(",")}]`);
+    const codes = [...new Set(finding.issues.map((issue) => issue.code))].sort().join(",");
+    const signature = normalizeContent(finding.issues.map((issue) => issue.message).join(" "));
+    push(
+      "sentence-quality",
+      `${finding.componentId}/${finding.blockId}[${codes}]`,
+      `sentence-quality|${finding.componentId}|${codes}|${signature}`,
+    );
   }
 
   // WordPress block structure.
@@ -309,14 +331,18 @@ function collectViolations(
     push("cta-switcher-schema", "FAQ schema present with zero canonical entries");
   }
 
-  // Coherence. The message carries the block id so the delta filter can
-  // distinguish a NEWLY introduced violation in one block from a pre-existing
-  // violation of the same type in a DIFFERENT block of the same component —
-  // otherwise a stage could add an orphan-transition or dangling reference to
-  // a component that already had one and the delta would silently mask it.
+  // Coherence. The message carries the current block id for diagnostics; the
+  // stable identity is type + component + normalized offending content, so a
+  // structural insertion that reindexes an unchanged violation never looks
+  // like a newly introduced one, while a genuinely new/different violation
+  // still fails closed.
   for (const violation of validateCoherence(doc)) {
     const blockRef = violation.blockId ? `/${violation.blockId}` : "";
-    push("coherence", `${violation.type} in ${violation.componentId}${blockRef}`);
+    push(
+      "coherence",
+      `${violation.type} in ${violation.componentId}${blockRef}`,
+      `coherence|${coherenceViolationIdentity(violation)}`,
+    );
   }
 
   // Section topic grounding: a section whose body no longer shares any
@@ -388,7 +414,10 @@ function collectViolations(
  * mutating stage: when a pre-mutation snapshot is supplied, only violations
  * the candidate INTRODUCED (absent from the snapshot) count; pre-existing
  * damage belongs to earlier owners and the final gates. Violations outside the
- * stage's declared ownership must fail closed.
+ * stage's declared ownership must fail closed. The contract runs the same
+ * authoritative sentence-quality scanner as final QC and the repair
+ * boundaries, so every stage that introduces a sentence-quality violation is
+ * rejected at its own boundary.
  */
 export function validateArticleIntegrityContract(
   doc: ArticleDocument,
@@ -397,10 +426,17 @@ export function validateArticleIntegrityContract(
   const candidate = collectViolations(doc, options);
   let relevant = candidate;
   if (options.previous) {
+    // Delta comparison uses the STABLE semantic identity (category + identity)
+    // so a violation relocated by a structural block insertion/reindex is
+    // recognised as the same pre-existing violation, while a genuinely new or
+    // modified violation still fails closed. The diagnostic message (with the
+    // current block id) is preserved for reporting.
+    const violationKey = (v: IntegrityContractViolation): string =>
+      `${v.category}:${v.identity ?? v.message}`;
     const beforeKeys = new Set(
-      collectViolations(options.previous, options).map((v) => `${v.category}:${v.message}`),
+      collectViolations(options.previous, options).map(violationKey),
     );
-    relevant = candidate.filter((v) => !beforeKeys.has(`${v.category}:${v.message}`));
+    relevant = candidate.filter((v) => !beforeKeys.has(violationKey(v)));
   }
   const violations: IntegrityContractViolation[] = [];
   const ownedViolations: IntegrityContractViolation[] = [];

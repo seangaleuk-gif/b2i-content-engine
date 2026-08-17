@@ -366,17 +366,31 @@ export async function chatWithRetry(
 ): Promise<ChatResult> {
   const requestId = nextRequestId();
   let lastError: DeepSeekError | null = null;
+  // Budget actually used by the last attempt. Escalation stays base-relative
+  // (retry 1 = base × 1.5, retry 2 = base × 2) but a retry is never issued
+  // when its escalated budget equals a budget already used: after saturating
+  // the provider maximum (default 32,768), an identical-budget retry cannot
+  // succeed and only wastes a full token allowance.
+  const baseBudget = options.maxTokens ?? DEFAULT_MAX_TOKENS;
+  let lastBudgetUsed = baseBudget;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // Escalate the budget on reasoning-token exhaustion OR truncation:
     // first retry ×1.5, second retry ×2, capped at the provider maximum.
     let attemptOptions = options;
     if (attempt > 0 && (lastError?.type === "token_exhaustion" || lastError?.type === "truncated")) {
-      const originalBudget = options.maxTokens ?? DEFAULT_MAX_TOKENS;
       const multiplier = TOKEN_EXHAUSTION_MULTIPLIERS[attempt - 1] ?? TOKEN_EXHAUSTION_MULTIPLIERS[TOKEN_EXHAUSTION_MULTIPLIERS.length - 1];
-      const escalated = Math.min(MAX_TOKENS_LIMIT, Math.floor(originalBudget * multiplier));
+      const escalated = Math.min(MAX_TOKENS_LIMIT, Math.floor(baseBudget * multiplier));
+      if (escalated <= lastBudgetUsed) {
+        // The escalated budget would be identical to (or below) the budget the
+        // last attempt already saturated. Escalating is impossible, so an
+        // identical-budget retry would repeat the same failure — fail safely.
+        console.log(`[deepseek:${stage}:${requestId}] ${lastError.type} — max_tokens already ${lastBudgetUsed}; skipping identical-budget retry`);
+        break;
+      }
+      lastBudgetUsed = escalated;
       attemptOptions = { ...options, maxTokens: escalated };
-      console.log(`[deepseek:${stage}:${requestId}] ${lastError.type} — retrying with max_tokens ${originalBudget} → ${escalated}`);
+      console.log(`[deepseek:${stage}:${requestId}] ${lastError.type} — retrying with max_tokens ${lastBudgetUsed}`);
     }
 
     try {

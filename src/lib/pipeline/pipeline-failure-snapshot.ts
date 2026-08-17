@@ -22,6 +22,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { renderArticleDocument, fingerprintHtml, countCanonicalVisibleWords } from "@/lib/blog/article-document";
 import type { ArticleDocument } from "@/lib/blog/article-document";
+import { renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
+import type { EditorialBlock } from "@/lib/blog/article-document";
 import { canonicalKeyphraseMetrics } from "@/lib/blog/final-seo-reconcile";
 import { GENERATION_BUILD_ID } from "@/lib/services/generation-constants";
 import {
@@ -256,5 +258,177 @@ export function updateIntegrityRejectionRollback(
       ` — ${error instanceof Error ? error.message : String(error)}`,
     );
     return false;
+  }
+}
+
+// ── Producer-level component failure quarantine ──
+//
+// The integrity-rejection snapshots above capture failures of the post-assembly
+// pipeline, where a full canonical ArticleDocument already exists. Generation-
+// stage producer failures (a generated/repaired editorial component that fails
+// deterministic acceptance, e.g. section_2_repair throwing
+// "Block 6 paragraph: sentence-like unit has no finite predicate") happen
+// BEFORE any full document is assembled, so they were previously invisible to
+// this system and the failing candidate's text was lost.
+//
+// When ENABLE_PIPELINE_DEBUG_TRACE=true, captureProducerComponentFailure writes
+// the SAME quarantine format into the SAME debug/pipeline-failures/ directory,
+// preserving (debug mode only): project/build, component id + heading,
+// generation-vs-repair attempt, the exact normalized candidate blocks, the
+// exact failing block indexes + offending text + violation type/message, a
+// candidate fingerprint, and the relevant pre-repair text when available. It is
+// purely diagnostic — never written to blog_versions/project content — and a
+// write failure only logs a warning. Retention reuses the same cap.
+
+export interface ProducerBlockViolation {
+  /** Raw block index from the error label ("Block 6 ..." → 6). -1 when the
+   *  error is not a per-block label. */
+  blockIndex: number;
+  /** Block type from the label ("paragraph", "list item 3", ...). */
+  blockType: string;
+  /** The full deterministic acceptance message after the label. */
+  message: string;
+  /** Best-effort offending text extracted from the raw candidate payload. */
+  text?: string;
+}
+
+export interface ProducerComponentFailureInput {
+  projectId: string;
+  /** Debug stage label, e.g. "section_2_repair", "intro_repair". */
+  stage: string;
+  /** Canonical component id, e.g. "section-2", "intro", "conclusion". */
+  componentId: string;
+  /** H2 heading for a section; omitted for components with no heading. */
+  heading?: string;
+  attempt: "generation" | "repair";
+  /** The raw JSON payload of the failing candidate (repaired attempt). */
+  rawCandidate?: unknown;
+  /** The exact normalized candidate blocks produced by normalizeAiEditorialPayload. */
+  blocks: EditorialBlock[];
+  errors: string[];
+  recoveries?: string[];
+  /** The prior generation attempt (the "pre-repair text") when available. */
+  preRepair?: { rawCandidate?: unknown; blocks: EditorialBlock[] };
+  /** Override for the output directory (tests use a temp dir). */
+  dir?: string;
+}
+
+export interface ProducerComponentFailureArtifact {
+  schema: "producer-component-failure/v1";
+  timestamp: string;
+  build: string;
+  projectId: string;
+  stage: string;
+  componentId: string;
+  heading?: string;
+  attempt: "generation" | "repair";
+  candidateFingerprint: string;
+  violations: ProducerBlockViolation[];
+  errors: string[];
+  recoveries: string[];
+  blocks: EditorialBlock[];
+  preRepair?: { fingerprint: string; blocks: EditorialBlock[] };
+  rawCandidate?: unknown;
+}
+
+const BLOCK_ERROR_LABEL_RE = /^Block (\d+)\s+([^:]+):\s*([\s\S]*)$/;
+
+/** Best-effort text of a raw editorial block by the index used in error labels. */
+function blockTextFromRaw(rawCandidate: unknown, blockIndex: number): string | undefined {
+  let block: unknown;
+  if (rawCandidate && typeof rawCandidate === "object" && !Array.isArray(rawCandidate)) {
+    const obj = rawCandidate as Record<string, unknown>;
+    if (!Array.isArray(obj.blocks)) return undefined;
+    block = obj.blocks[blockIndex];
+  } else if (Array.isArray(rawCandidate)) {
+    block = rawCandidate[blockIndex];
+  } else {
+    return undefined;
+  }
+  if (!block || typeof block !== "object" || Array.isArray(block)) return undefined;
+  const rb = block as Record<string, unknown>;
+  if (typeof rb.text === "string") return rb.text;
+  if (typeof rb.item === "string") return rb.item;
+  if (Array.isArray(rb.items)) {
+    const joined = rb.items
+      .map((item) => (typeof item === "string" ? item : ""))
+      .filter(Boolean)
+      .join(" | ");
+    return joined || undefined;
+  }
+  return undefined;
+}
+
+/** Parse the "Block 6 paragraph: <message>" acceptance labels into structured
+ *  per-block diagnostics, attaching the offending text from the raw payload. */
+export function parseProducerBlockViolations(
+  errors: string[],
+  rawCandidate?: unknown,
+): ProducerBlockViolation[] {
+  return (errors ?? []).map((error) => {
+    const match = error.match(BLOCK_ERROR_LABEL_RE);
+    if (!match) {
+      return { blockIndex: -1, blockType: "", message: error, text: blockTextFromRaw(rawCandidate, -1) };
+    }
+    const blockIndex = Number(match[1]);
+    const blockType = match[2].trim();
+    const message = match[3].trim();
+    return { blockIndex, blockType, message, text: blockTextFromRaw(rawCandidate, blockIndex) };
+  });
+}
+
+function componentFingerprint(blocks: EditorialBlock[], rawCandidate?: unknown): string {
+  if (blocks.length > 0) return fingerprintHtml(renderEditorialBlocksToWordPress(blocks));
+  return fingerprintHtml(JSON.stringify(rawCandidate ?? ""));
+}
+
+/** Persist a producer-level component failure artifact to debug/pipeline-failures/
+ *  when the debug trace flag is enabled. Returns the written path or null (a
+ *  write failure only logs a warning — it never masks the original producer
+ *  error or changes generation behaviour). */
+export function captureProducerComponentFailure(input: ProducerComponentFailureInput): string | null {
+  if (!isPipelineDebugTraceEnabled()) return null;
+  const dir = input.dir ?? DEFAULT_FAILURE_DIR;
+  try {
+    const blocks = input.blocks ?? [];
+    const artifact: ProducerComponentFailureArtifact = {
+      schema: "producer-component-failure/v1",
+      timestamp: new Date().toISOString(),
+      build: PIPELINE_BUILD_IDENTIFIER,
+      projectId: input.projectId,
+      stage: input.stage,
+      componentId: input.componentId,
+      heading: input.heading,
+      attempt: input.attempt,
+      candidateFingerprint: componentFingerprint(blocks, input.rawCandidate),
+      violations: parseProducerBlockViolations(input.errors, input.rawCandidate),
+      errors: [...(input.errors ?? [])],
+      recoveries: [...(input.recoveries ?? [])],
+      blocks,
+      preRepair: input.preRepair
+        ? {
+            fingerprint: componentFingerprint(input.preRepair.blocks, input.preRepair.rawCandidate),
+            blocks: input.preRepair.blocks ?? [],
+          }
+        : undefined,
+      rawCandidate: input.rawCandidate !== undefined
+        ? JSON.parse(JSON.stringify(input.rawCandidate))
+        : undefined,
+    };
+    const filename =
+      `${timestampForFilename(new Date())}_producer-${sanitizeFilenamePart(input.stage)}` +
+      `_project-${sanitizeFilenamePart(input.projectId)}.json`;
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, filename);
+    fs.writeFileSync(filePath, JSON.stringify(artifact, null, 2), "utf8");
+    retainNewestFailureSnapshots(dir, MAX_RETAINED_FAILURE_SNAPSHOTS);
+    console.warn(`[pipeline-failure-snapshot] producer component failure quarantined: ${filePath}`);
+    return filePath;
+  } catch (error) {
+    console.warn(
+      `[pipeline-failure-snapshot] failed to persist producer component failure for stage=${input.stage}` +
+      ` project=${input.projectId} — ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
   }
 }

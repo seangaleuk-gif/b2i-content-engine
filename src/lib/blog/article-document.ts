@@ -465,6 +465,46 @@ export function validateFaqParity(
  * - Question and answer in same or separate paragraph blocks
  * - Inline <strong> emphasis inside answers (not treated as questions)
  */
+// ── Structural FAQ heading locator (Stage 3J) ──
+// The rendered FAQ section is anchored by the explicit renderer marker
+// (<!-- b2i-faq-heading -->) emitted by renderArticleDocument immediately
+// before the FAQ H2. For legacy HTML without the marker, the fallback matches
+// actual H2 heading TEXT inside structural wp:heading blocks that starts with
+// a supported FAQ label. Neither path scans arbitrary HTML substrings for
+// "faq", so URLs, hrefs, attributes, source labels or ordinary paragraph text
+// containing "faq" cannot spoof the FAQ section, and a match can never span
+// across H2s.
+
+const FAQ_HEADING_TEXT_RE = /^(?:frequently asked questions|faqs?|常見問題)/i;
+
+const STRUCTURAL_H2_BLOCK_RE = /<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*\n?<h2\b[^>]*>([\s\S]*?)<\/h2>/gi;
+
+/** Offset just after the FAQ heading's closing </h2>, or -1 when absent. */
+function findFaqHeadingEnd(html: string): number {
+  // 1. Primary: the explicit renderer marker emitted right before the FAQ H2.
+  const markerIdx = html.indexOf(FAQ_HEADING_MARKER);
+  if (markerIdx >= 0) {
+    const afterMarker = html.slice(markerIdx + FAQ_HEADING_MARKER.length);
+    const block = afterMarker.match(STRUCTURAL_H2_BLOCK_RE)?.[0];
+    if (block) {
+      const close = block.lastIndexOf("</h2>");
+      if (close >= 0) return markerIdx + FAQ_HEADING_MARKER.length + close + "</h2>".length;
+    }
+  }
+  // 2. Legacy fallback: structural H2 blocks whose heading TEXT is a FAQ
+  //    heading (prefix-anchored label match on real heading text only).
+  STRUCTURAL_H2_BLOCK_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = STRUCTURAL_H2_BLOCK_RE.exec(html)) !== null) {
+    const headingText = decodeHtmlEntities(match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+    if (FAQ_HEADING_TEXT_RE.test(headingText)) {
+      const close = match[0].lastIndexOf("</h2>");
+      if (close >= 0) return match.index + close + "</h2>".length;
+    }
+  }
+  return -1;
+}
+
 export function extractVisibleFaqFromArticle(
   html: string,
   doc?: ArticleDocument,
@@ -481,12 +521,12 @@ export function extractVisibleFaqFromArticle(
     }));
   }
 
-  // Find the FAQ section: look for H2 heading that reads "FAQ" / "Frequently Asked Questions"
-  const faqH2Re = /<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->\s*\n?<h2\b[^>]*>[\s\S]*?(Frequently Asked Questions|FAQ|FAQs|常見問題)[\s\S]*?<\/h2>/i;
-  const faqMatch = html.match(faqH2Re);
-  if (!faqMatch) return result;
-
-  const faqStart = faqMatch.index! + faqMatch[0].length;
+  // Locate the FAQ heading structurally (Stage 3J): the explicit renderer
+  // marker first, then a structural H2 heading-text fallback. "faq" inside
+  // URLs, hrefs, attributes, source labels, or ordinary paragraph text can
+  // never anchor the FAQ section, and the locator can never span across H2s.
+  const faqStart = findFaqHeadingEnd(html);
+  if (faqStart < 0) return result;
 
   // FAQ section ends at the next H2 heading or at the conclusion
   const nextH2Re = /<!--\s*wp:heading\s+\{[^}]*"level"\s*:\s*2[^}]*\}\s*-->/g;

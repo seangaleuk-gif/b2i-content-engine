@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
 import { renderArticleDocument, parseArticleDocumentFromHtml } from "@/lib/blog/article-document";
 import { insertExternalResearchLinksIntoDocument } from "@/lib/services/article-postprocessors";
@@ -227,5 +229,87 @@ describe("canonical external-link producer: text-preserving by invariant", () =>
     expect(scanSentenceQualityInDocument(parsed.doc!)).toEqual([]);
     const citations = parsed.doc!.sections.flatMap((s) => s.blocks).filter((b) => editorialText(b).startsWith("Source: "));
     expect(citations.length).toBe(2);
+  });
+});
+
+describe("external-link citation terminal punctuation (production `? .` root cause)", () => {
+  const titleVariants: Array<{ title: string; expected: string }> = [
+    // The exact production failure: a title already ending in '?'.
+    { title: "How is AR changing digital marketing in Hong Kong?", expected: "Source: How is AR changing digital marketing in Hong Kong?" },
+    { title: "What changed for local marketers?", expected: "Source: What changed for local marketers?" },
+    { title: "Wow, what a result!", expected: "Source: Wow, what a result!" },
+    { title: "The definitive guide.", expected: "Source: The definitive guide." },
+    { title: "A title with no terminal punctuation", expected: "Source: A title with no terminal punctuation." },
+    // Quotes/parentheses wrapping terminal punctuation must not double-punctuate.
+    { title: "\"Why is this?\"", expected: "Source: \"Why is this?\"" },
+    { title: "Top tips (2026 guide)", expected: "Source: Top tips (2026 guide)." },
+    { title: "(Yes!)", expected: "Source: (Yes!)" },
+    { title: "\"Read the full report.\"", expected: "Source: \"Read the full report.\"" },
+  ];
+
+  function runForTitle(title: string): { block: Extract<EditorialBlock, { type: "paragraph" }>; html: string } {
+    const doc = buildDoc();
+    const result = insertExternalResearchLinksIntoDocument(doc, [
+      { url: "https://example.com/t", title, snippet: "Owners can note common questions and turn those questions into helpful future posts." },
+    ], 6);
+    expect(result.insertedLinks).toBe(1);
+    const citation = collectBlocks(doc).find(({ block }) => String(block.id).includes("external-citation"))!.block as Extract<EditorialBlock, { type: "paragraph" }>;
+    return { block: citation, html: renderArticleDocument(doc) };
+  }
+
+  it.each(titleVariants)("title '$title' produces '$expected' with no doubled terminal punctuation", ({ title, expected }) => {
+    const { block, html } = runForTitle(title);
+    // The paragraph's plain text is exactly "Source: <title>" plus (when
+    // needed) a single period — never "? .", "! ." or ". .".
+    expect(editorialText(block)).toBe(expected);
+    // Never double-punctuate anywhere in the rendered block.
+    expect(html).not.toMatch(/\? \.|! \.|\. \.|\.\)\.|\?\)\s*\./);
+    // The anchor holds the exact title and the source URL is preserved.
+    const link = block.content.find((node) => node.type === "link")!;
+    expect(link.text).toBe(title);
+    expect(link.href).toBe("https://example.com/t");
+  });
+
+  it("produces no punctuation-only fragment or malformed prose for any title variant", () => {
+    for (const { title } of titleVariants) {
+      const doc = buildDoc();
+      const result = insertExternalResearchLinksIntoDocument(doc, [
+        { url: "https://example.com/t", title, snippet: "Owners can note common questions and turn those questions into helpful future posts." },
+      ], 6);
+      expect(result.insertedLinks, title).toBe(1);
+      expect(scanMalformedProseInDocument(doc), title).toEqual([]);
+      expect(scanSentenceQualityInDocument(doc), title).toEqual([]);
+      // Round-trip: parse-back keeps valid WordPress structure and no fragment.
+      const parsed = parseArticleDocumentFromHtml(renderArticleDocument(doc), doc);
+      expect(parsed.doc, title).not.toBeNull();
+      expect(scanMalformedProseInDocument(parsed.doc!), title).toEqual([]);
+      expect(scanSentenceQualityInDocument(parsed.doc!), title).toEqual([]);
+    }
+  });
+
+  it("the quarantined production fixture (AR ?-title source) inserts a valid Source sentence with no fragment", () => {
+    // Derived from the quarantined 2026-08-15 project-13 failure: the pre-stage
+    // AR section (section-4) with the production source whose title ends in '?'.
+    const fixturePath = path.resolve(__dirname, "../../../fixtures/external-links-ar-question.json");
+    expect(fs.existsSync(fixturePath), `missing fixture ${fixturePath}`).toBe(true);
+    const doc = JSON.parse(fs.readFileSync(fixturePath, "utf8")) as ArticleDocument;
+    const beforeIds = doc.sections[0].blocks.map((b) => b.id);
+    const result = insertExternalResearchLinksIntoDocument(doc, [
+      { url: "https://stateglobe.com/blog/top-10-digital-marketing-trends-in-hong-kong", title: "How is AR changing digital marketing in Hong Kong?", snippet: "Augmented reality is no longer a gimmick reserved for big brands with deep pockets. For Hong Kong businesses, it’s becoming a practical way to help customers picture your product in their own world before they buy." },
+    ], 6);
+    expect(result.insertedLinks).toBe(1);
+    const citation = doc.sections[0].blocks.find((b) => String(b.id).includes("external-citation")) as Extract<EditorialBlock, { type: "paragraph" }>;
+    expect(editorialText(citation)).toBe("Source: How is AR changing digital marketing in Hong Kong?");
+    expect(editorialText(citation)).not.toMatch(/\? \.$/);
+    // Existing AR blocks keep their exact order and ids.
+    const afterIds = doc.sections[0].blocks.map((b) => b.id).filter((id) => !String(id).includes("external-citation"));
+    expect(afterIds).toEqual(beforeIds);
+    // No fragment findings; round-trip is clean.
+    expect(scanMalformedProseInDocument(doc)).toEqual([]);
+    expect(scanSentenceQualityInDocument(doc)).toEqual([]);
+    const parsed = parseArticleDocumentFromHtml(renderArticleDocument(doc), doc);
+    expect(parsed.doc).not.toBeNull();
+    expect(scanMalformedProseInDocument(parsed.doc!)).toEqual([]);
+    expect(scanSentenceQualityInDocument(parsed.doc!)).toEqual([]);
   });
 });

@@ -1,7 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chat, chatWithRetry, DeepSeekError, type ChatOptions } from "./deepseek";
-
-const API_URL = "https://api.deepseek.com/v1/chat/completions";
+import { chat, chatWithRetry, DeepSeekError } from "./deepseek";
 
 function mockFetchResponse(body: unknown, status = 200): void {
   const payload = JSON.stringify(body);
@@ -162,28 +160,24 @@ describe("chatWithRetry reasoning-token exhaustion", () => {
     expect(retryBody.max_tokens).toBe(10000);
   });
 
-  it("retry budgets respect the configured maximum (32768)", async () => {
+  it("retry budgets respect the configured maximum (32768) and stop escalating at the cap", async () => {
     let calls = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(async () => {
         calls++;
-        if (calls <= 2) {
-          return new Response(JSON.stringify(exhaustionBody("thinking", 25000)), { status: 200 });
-        }
-        return new Response(JSON.stringify(successBody("ok")), { status: 200 });
+        return new Response(JSON.stringify(exhaustionBody("thinking", 25000)), { status: 200 });
       }),
     );
 
-    const result = await chatWithRetry(
-      [{ role: "user", content: "test" }],
-      { maxTokens: 25000 },
-      "test-stage",
-      2,
-    );
-    expect(result.content).toBe("ok");
-
-    // 25000 × 1.5 = 37500 → capped at 32768
+    // 25000 → 32768 (capped ×1.5); once the cap is reached the next retry would
+    // be identical, so the retry loop must fail safely instead of repeating the
+    // saturated budget.
+    await expect(
+      chatWithRetry([{ role: "user", content: "test" }], { maxTokens: 25000 }, "test-stage", 2),
+    ).rejects.toBeInstanceOf(DeepSeekError);
+    expect(calls).toBe(2);
+    // The only escalated retry used the capped 32768 budget.
     const retryBody = lastFetchBody();
     expect(retryBody.max_tokens).toBe(32768);
   });
@@ -377,38 +371,63 @@ describe("truncated partial-content handling", () => {
     ).rejects.toMatchObject({ type: "truncated" });
   });
 
-  it("truncated retries respect the 32,768 cap", async () => {
+  it("truncated retries respect the 32,768 cap and stop once it is reached", async () => {
     let calls = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(async () => {
         calls++;
-        if (calls <= 2) {
-          return new Response(JSON.stringify({
-            id: "x",
-            object: "chat.completion",
-            created: 1,
-            model: "deepseek-v4-flash",
-            choices: [{
-              index: 0,
-              message: { role: "assistant", content: "partial", reasoning_content: "" },
-              finish_reason: "length",
-            }],
-            usage: { prompt_tokens: 10, completion_tokens: 30000, total_tokens: 30010 },
-          }), { status: 200 });
-        }
-        return new Response(JSON.stringify(successBody("ok")), { status: 200 });
+        return new Response(JSON.stringify({
+          id: "x",
+          object: "chat.completion",
+          created: 1,
+          model: "deepseek-v4-flash",
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: "partial", reasoning_content: "" },
+            finish_reason: "length",
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 30000, total_tokens: 30010 },
+        }), { status: 200 });
       }),
     );
 
-    const result = await chatWithRetry(
-      [{ role: "user", content: "test" }],
-      { maxTokens: 30000 },
-      "section_0",
-      2,
-    );
-    expect(result.content).toBe("ok");
+    // 30000 → 32768 (capped ×1.5); the second retry would be an identical 32768
+    // budget, so it must not be issued — fail safely.
+    await expect(
+      chatWithRetry([{ role: "user", content: "test" }], { maxTokens: 30000 }, "section_0", 2),
+    ).rejects.toMatchObject({ type: "truncated" });
+    expect(calls).toBe(2);
     expect(lastFetchBody().max_tokens).toBe(32768);
+  });
+
+  it("truncation with the default 32,768 budget never issues an identical-budget retry", async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async () => {
+        calls++;
+        return new Response(JSON.stringify({
+          id: "x",
+          object: "chat.completion",
+          created: 1,
+          model: "deepseek-v4-flash",
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: "partial runaway content", reasoning_content: "" },
+            finish_reason: "length",
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 32768, total_tokens: 32778 },
+        }), { status: 200 });
+      }),
+    );
+
+    // The diagnosis stage uses the 32768 default. After saturating it once, a
+    // retry at the identical budget cannot help and must be skipped.
+    await expect(
+      chatWithRetry([{ role: "user", content: "test" }], {}, "final-document-diagnosis", 2),
+    ).rejects.toMatchObject({ type: "truncated" });
+    expect(calls).toBe(1);
   });
 
   it("emits reasoning_effort only when thinking is enabled", async () => {

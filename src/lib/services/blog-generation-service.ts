@@ -30,14 +30,17 @@ import { runComponentRegeneration, regenerateIntroduction, regenerateSection, re
 import { buildGenerationReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry } from "@/lib/services/generation-telemetry";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
-import { type ArticleDocument, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords, parseCompleteEditorialRegion } from "@/lib/blog/article-document";
+import { type ArticleDocument, type ArticleSection, type EditorialBlock, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords, parseCompleteEditorialRegion } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
 import { pairedSlugs, sanitizeSectionUrls, isEligibleExternalSourceUrl, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
 import { CTA_CONTENT_RE, normalizeAiEditorialPayload, renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
+import { captureProducerComponentFailure } from "@/lib/pipeline/pipeline-failure-snapshot";
+import { shadowValidateProducerCandidate } from "@/lib/blog/producer-content-contract";
+import { analyzeSentenceCompleteness } from "@/lib/blog/sentence-completeness";
 import { buildClaimOwnershipLedger, formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
 import { stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
-import { repairHeadingNaturalness } from "@/lib/blog/content-relevance";
+import { repairHeadingNaturalness, isSectionTopicGrounded } from "@/lib/blog/content-relevance";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 export class OutlineHeadingValidationError extends Error {
@@ -168,12 +171,83 @@ function logEditorialRecoveries(componentId: string, recoveries: string[]): void
   console.warn(`[editorial-payload-normalization] component=${componentId} recoveries=${JSON.stringify(recoveries)}`);
 }
 
+/**
+ * Producer topic-grounding gate. A generated main section must pass the SAME
+ * authoritative `isSectionTopicGrounded` scanner the final gate uses: its body
+ * must substantively share the heading's topic tokens (morphologically
+ * normalized). When the produced body does not, EXACTLY ONE bounded targeted
+ * regeneration runs using the actual section heading, section intent and owned
+ * evidence — the model is never told to insert a literal detector token. A
+ * candidate that remains ungrounded fails safely at the producer and is never
+ * assembled into the ArticleDocument.
+ */
+async function ensureSectionTopicGrounded(params: {
+  trackedChat: (stage: string, messages: ChatMessage[], options?: ChatOptions) => Promise<{ content: string }>;
+  sectionSystem: string;
+  index: number;
+  heading: string;
+  ownedEvidence: string;
+  originalRequest: string;
+  blocks: EditorialBlock[];
+  keyphrase?: string;
+}): Promise<EditorialBlock[]> {
+  const asSection = (blocks: EditorialBlock[]): ArticleSection => ({
+    id: `section-${params.index}`,
+    heading: params.heading,
+    headingLevel: 2,
+    sectionType: "main",
+    status: "generated",
+    blocks,
+  });
+
+  if (isSectionTopicGrounded(asSection(params.blocks))) return params.blocks;
+
+  console.log(
+    `[grounding-producer] section ${params.index} ("${params.heading}") body does not substantively address its assigned topic — one bounded regeneration`,
+  );
+  const groundingMsg =
+    `Your previous body for section "${params.heading}" does not substantively address its assigned topic.\n\n`
+    + `Rewrite the section body so it genuinely explains and expands this topic: ${params.heading}.\n\n`
+    + `Use the approved evidence below for this section:\n${params.ownedEvidence}\n\n`
+    + `Make the section's content clearly about its heading. Do not change the topic, do not invent attribution, `
+    + `and do not repeat content from other sections.\n\nOriginal request and evidence:\n${params.originalRequest}`;
+  const res = await params.trackedChat(`section_${params.index}_grounding`, [
+    { role: "system", content: params.sectionSystem },
+    { role: "user", content: groundingMsg },
+  ], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
+  const raw = robustJsonParse(res.content, `section-${params.index}-grounding`);
+  const reNorm = normalizeAiEditorialPayload(raw, `section-${params.index}`);
+  logEditorialRecoveries(`section-${params.index}-grounding`, reNorm.recoveries);
+  shadowValidateProducerCandidate({
+    label: `section-${params.index} grounding`,
+    candidate: { blocks: reNorm.blocks },
+    context: {
+      componentId: `section-${params.index}`,
+      componentType: "section",
+      scope: "complete-component",
+      keyphrase: params.keyphrase,
+    },
+    existingPassed: reNorm.errors.length === 0 && reNorm.blocks.length > 0,
+  });
+  if (reNorm.errors.length > 0 || reNorm.blocks.length === 0) {
+    throw AppError.internal(
+      new Error(`Section ${params.index} ("${params.heading}"): grounding regeneration produced invalid blocks — ${reNorm.errors.join("; ") || "empty blocks"}`),
+    );
+  }
+  if (!isSectionTopicGrounded(asSection(reNorm.blocks))) {
+    throw AppError.internal(
+      new Error(`Section ${params.index} ("${params.heading}"): body still does not address its topic after one targeted regeneration`),
+    );
+  }
+  return reNorm.blocks;
+}
+
 interface AcceptedFaqPayload {
   entries: Array<{ question: string; answer: string }>;
   errors: string[];
 }
 
-function validateFaqPayload(raw: unknown, min: number, max: number): AcceptedFaqPayload {
+export function validateFaqPayload(raw: unknown, min: number, max: number): AcceptedFaqPayload {
   if (!raw || typeof raw !== "object" || !Array.isArray((raw as Record<string, unknown>).entries)) {
     return { entries: [], errors: ["entries must be an array"] };
   }
@@ -211,6 +285,16 @@ function validateFaqPayload(raw: unknown, min: number, max: number): AcceptedFaq
     }
     if (!analyzeQuotationIntegrity(answer).balanced) {
       errors.push(`entry ${index + 1} answer contains an unmatched quotation mark`);
+    }
+    // FAQ answers are prose requiring complete sentences — the SAME shared
+    // sentence-completeness contract the post-assembly scanner (kind
+    // "faq-answer") and keyphrase-naturalness audit enforce. A noun-phrase or
+    // verbless fragment answer would otherwise survive generation and only fail
+    // later at the malformed-prose-repair boundary; reject/repair it HERE so the
+    // FAQ producer never carries a fragment into the assembled pipeline.
+    const completeness = analyzeSentenceCompleteness(answer, "faq-answer");
+    if (!completeness.complete) {
+      errors.push(`entry ${index + 1} answer is not a complete sentence: ${completeness.issues[0]?.message ?? "incomplete"}`);
     }
     entries.push({ question, answer });
   }
@@ -306,6 +390,23 @@ function requireCompleteGeneratedBlocks(html: string, componentId: string) {
     ));
   }
   return parsed.blocks;
+}
+
+/**
+ * Strict WordPress structural assertion at the section PRODUCER boundary. A
+ * generated section body must be balanced (every opener has a matching closer)
+ * before it can enter the ArticleDocument. If the rendered canonical blocks or
+ * the URL sanitizer ever emit an orphaned/extra WordPress comment, the section
+ * is REJECTED here with a precise diagnostic — malformed structure must never
+ * travel downstream to be re-exposed by a later strict re-parse.
+ */
+function assertSectionWordpressStructure(html: string, sectionIndex: number, heading: string): void {
+  const structure = validateWordpressBlockPairs(html);
+  if (!structure.valid) {
+    throw AppError.internal(new Error(
+      `Section ${sectionIndex} ("${heading}"): generated body has invalid WordPress structure — ${structure.issues.join("; ")}`,
+    ));
+  }
 }
 
 /**
@@ -635,13 +736,37 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     }
     const normalized = normalizeAiEditorialPayload(parsed, "intro");
     logEditorialRecoveries("intro", normalized.recoveries);
+    shadowValidateProducerCandidate({
+      label: "intro generation",
+      candidate: { blocks: normalized.blocks },
+      context: { componentId: "intro", componentType: "introduction", scope: "complete-component", keyphrase },
+      existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0,
+    });
     if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
       const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments or Markdown fences.\n\nOriginal request and approved evidence:\n${introUserMsg}`;
       const repairRes = await trackedChat("intro_repair", [{ role: "system", content: bundle.introSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "intro-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "intro");
       logEditorialRecoveries("intro-repair", repairedNorm.recoveries);
+      shadowValidateProducerCandidate({
+        label: "intro repair",
+        candidate: { blocks: repairedNorm.blocks },
+        context: { componentId: "intro", componentType: "introduction", scope: "complete-component", keyphrase },
+        existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0,
+      });
       if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+        captureProducerComponentFailure({
+          projectId: String(projectId),
+          stage: "intro_repair",
+          componentId: "intro",
+          heading: outline.title,
+          attempt: "repair",
+          rawCandidate: repaired,
+          blocks: repairedNorm.blocks,
+          errors: repairedNorm.errors,
+          recoveries: repairedNorm.recoveries,
+          preRepair: { rawCandidate: parsed, blocks: normalized.blocks },
+        });
         throw AppError.internal(new Error(`Introduction generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
       }
       return { type: "intro", content: renderEditorialBlocksToWordPress(repairedNorm.blocks) };
@@ -671,13 +796,50 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
           raw = {};
         }
         if (parsed.errors.length > 0) {
+          shadowValidateProducerCandidate({
+            label: "faq generation",
+            candidate: { faqEntries: parsed.entries },
+            context: {
+              componentId: "faq",
+              componentType: "faq",
+              scope: "complete-component",
+              keyphrase,
+              faqRange: { min: faqRange.min, max: faqRange.max },
+            },
+            existingPassed: false,
+          });
           const repairMsg = `${faqMsg}\n\nYour previous FAQ failed deterministic acceptance: ${parsed.errors.join("; ")}. Return ONLY corrected JSON with ${faqRange.min}-${faqRange.max} complete entries. Do not return HTML, WordPress comments, Markdown, CTA/signup copy or Chinese text.`;
           const repairRes = await trackedChat("faq_repair", [{ role: "system", content: bundle.faqSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 60_000 });
           raw = robustJsonParse(repairRes.content, "faq-repair");
           parsed = validateFaqPayload(raw, faqRange.min, faqRange.max);
+          shadowValidateProducerCandidate({
+            label: "faq repair",
+            candidate: { faqEntries: parsed.entries },
+            context: {
+              componentId: "faq",
+              componentType: "faq",
+              scope: "complete-component",
+              keyphrase,
+              faqRange: { min: faqRange.min, max: faqRange.max },
+            },
+            existingPassed: parsed.errors.length === 0,
+          });
           if (parsed.errors.length > 0) {
             throw AppError.internal(new Error(`FAQ generation failed deterministic acceptance after one targeted retry: ${parsed.errors.join("; ")}`));
           }
+        } else {
+          shadowValidateProducerCandidate({
+            label: "faq generation",
+            candidate: { faqEntries: parsed.entries },
+            context: {
+              componentId: "faq",
+              componentType: "faq",
+              scope: "complete-component",
+              keyphrase,
+              faqRange: { min: faqRange.min, max: faqRange.max },
+            },
+            existingPassed: true,
+          });
         }
         // The accepted outline owns the FAQ H2. The FAQ model owns only the
         // Q&A entries and may not replace an already validated heading with
@@ -703,21 +865,73 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
         const raw = robustJsonParse(res.content, `section_${i}`);
         const normalized = normalizeAiEditorialPayload(raw, `section-${i}`);
         logEditorialRecoveries(`section-${i}`, normalized.recoveries);
+        shadowValidateProducerCandidate({
+          label: `section-${i} generation`,
+          candidate: { blocks: normalized.blocks },
+          context: { componentId: `section-${i}`, componentType: "section", scope: "complete-component", keyphrase },
+          existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0,
+        });
         if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
           const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments, Markdown fences or H2 headings.\n\nOriginal request and approved evidence:\n${msg}`;
           const repairRes = await trackedChat(`section_${i}_repair`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
           const repaired = robustJsonParse(repairRes.content, `section-${i}-repair`);
           const repairedNorm = normalizeAiEditorialPayload(repaired, `section-${i}`);
           logEditorialRecoveries(`section-${i}-repair`, repairedNorm.recoveries);
+          shadowValidateProducerCandidate({
+            label: `section-${i} repair`,
+            candidate: { blocks: repairedNorm.blocks },
+            context: { componentId: `section-${i}`, componentType: "section", scope: "complete-component", keyphrase },
+            existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0,
+          });
           if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+            // Quarantine the failed repaired component BEFORE the throw. This is
+            // a producer-level failure — it occurs before any full ArticleDocument
+            // is assembled, so it is outside the post-assembly integrity-rejection
+            // snapshot path. In debug mode only, preserve the exact candidate so
+            // the offending block text is never lost. Never persists to
+            // blog_versions/project content and never exposes to normal output.
+            captureProducerComponentFailure({
+              projectId: String(projectId),
+              stage: `section_${i}_repair`,
+              componentId: `section-${i}`,
+              heading: h2Text,
+              attempt: "repair",
+              rawCandidate: repaired,
+              blocks: repairedNorm.blocks,
+              errors: repairedNorm.errors,
+              recoveries: repairedNorm.recoveries,
+              preRepair: { rawCandidate: raw, blocks: normalized.blocks },
+            });
             throw AppError.internal(new Error(`Section ${i} ("${h2Text}"): generation failed after retry — ${repairedNorm.errors.join("; ") || "empty blocks"}`));
           }
-          let html = renderEditorialBlocksToWordPress(repairedNorm.blocks);
+          const groundedBlocks = await ensureSectionTopicGrounded({
+            trackedChat,
+            sectionSystem: bundle.sectionSystem,
+            index: i,
+            heading: h2Text,
+            ownedEvidence,
+            originalRequest: msg,
+            blocks: repairedNorm.blocks,
+            keyphrase,
+          });
+          let html = renderEditorialBlocksToWordPress(groundedBlocks);
           if (researchUrls.length > 0) html = sanitizeSectionUrls(html, researchUrls);
+          assertSectionWordpressStructure(html, i, h2Text);
           return { type: "section", index: i, heading: h2Text, content: html };
         }
-        let html = renderEditorialBlocksToWordPress(normalized.blocks);
+        const groundedBlocks = await ensureSectionTopicGrounded({
+          trackedChat,
+          sectionSystem: bundle.sectionSystem,
+          index: i,
+          heading: h2Text,
+          ownedEvidence,
+          originalRequest: msg,
+          blocks: normalized.blocks,
+          keyphrase,
+        });
+        let html = renderEditorialBlocksToWordPress(groundedBlocks);
         if (researchUrls.length > 0) html = sanitizeSectionUrls(html, researchUrls);
+        assertSectionWordpressStructure(html, i, h2Text);
         return { type: "section", index: i, heading: h2Text, content: html };
       }));
     }
@@ -733,13 +947,36 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     }
     const normalized = normalizeAiEditorialPayload(parsed, "conclusion", { disallowCtaContent: true });
     logEditorialRecoveries("conclusion", normalized.recoveries);
+    shadowValidateProducerCandidate({
+      label: "conclusion generation",
+      candidate: { blocks: normalized.blocks },
+      context: { componentId: "conclusion", componentType: "conclusion", scope: "complete-component", keyphrase },
+      existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0,
+    });
     if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
       const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ") || "empty blocks"}. Return ONLY valid conclusion JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA content. No signup buttons. No HTML.\n\nOriginal request and approved evidence:\n${concUserMsg}`;
       const repairRes = await trackedChat("conclusion_repair", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "conclusion-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "conclusion", { disallowCtaContent: true });
       logEditorialRecoveries("conclusion-repair", repairedNorm.recoveries);
+      shadowValidateProducerCandidate({
+        label: "conclusion repair",
+        candidate: { blocks: repairedNorm.blocks },
+        context: { componentId: "conclusion", componentType: "conclusion", scope: "complete-component", keyphrase },
+        existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0,
+      });
       if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+        captureProducerComponentFailure({
+          projectId: String(projectId),
+          stage: "conclusion_repair",
+          componentId: "conclusion",
+          attempt: "repair",
+          rawCandidate: repaired,
+          blocks: repairedNorm.blocks,
+          errors: repairedNorm.errors,
+          recoveries: repairedNorm.recoveries,
+          preRepair: { rawCandidate: parsed, blocks: normalized.blocks },
+        });
         throw AppError.internal(new Error(`Conclusion generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
       }
       return { type: "conclusion", content: renderEditorialBlocksToWordPress(repairedNorm.blocks) };

@@ -78,7 +78,9 @@ export type MalformedProseIssueCode =
   | "instruction-placeholder"
   | "replacement-character"
   | "punctuation-fragment"
-  | "lowercase-sentence-start";
+  | "lowercase-sentence-start"
+  | "fragment"
+  | "missing-aux-inversion";
 
 export interface MalformedProseTextIssue {
   textIndex: number;
@@ -319,6 +321,10 @@ export function findMalformedProseTextIssues(
         addIssue(index, "missing-terminal-punctuation", issue.message, trimmed);
       } else if (issue.code === "trailing-fragment") {
         addIssue(index, "trailing-fragment", issue.message, trimmed);
+      } else if (issue.code === "no-finite-predicate") {
+        addIssue(index, "fragment", issue.message, trimmed);
+      } else if (issue.code === "missing-aux-inversion") {
+        addIssue(index, "missing-aux-inversion", issue.message, trimmed);
       }
     }
     for (const pattern of CORRUPT_TEXT_PATTERNS) {
@@ -352,6 +358,8 @@ const HARD_MALFORMED_CODES: ReadonlySet<MalformedProseIssueCode> = new Set([
   "incomplete-sentence-ending",
   "missing-terminal-punctuation",
   "trailing-fragment",
+  "fragment",
+  "missing-aux-inversion",
   "unmatched-parentheses",
   "unmatched-quotation",
   "broken-quoted-fragment",

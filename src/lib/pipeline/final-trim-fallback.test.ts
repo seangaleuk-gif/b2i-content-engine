@@ -130,11 +130,19 @@ function buildOverTargetDocument(): ArticleDocument {
   ];
   const sections = headings.map((heading, index) => {
     const body = makeParagraphs(index, 10);
+    // Each main section must be topic-grounded (the earliest post-assembly
+    // boundary now fails closed on ungrounded sections). The grounding
+    // paragraph is APPENDED so the targeted paragraphs keep their original
+    // stable block indices and the pre-existing coherence findings remain
+    // attributable to the same block ids across stage snapshots. Years are
+    // stripped so the grounding paragraph introduces no date claim.
+    const topicPhrase = heading.replace(/\b20\d{2}\b/g, "").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+    const grounding = paragraphHtml(`${topicPhrase} shapes how the team plans the work covered below.`);
     if (index === 3) {
       // Affected section 1: latent incomplete-sentence quotation paragraph plus
       // a complete wp:quote block. The paragraph survives the deterministic
       // trim (it contains the topic year and would be flagged by the gate).
-      return section(`section-${index}`, heading, `${paragraphHtml(INCOMPLETE_QUOTE_PARAGRAPH)}\n\n${quoteHtml(QUOTE_TEXT)}\n\n${body}`);
+      return section(`section-${index}`, heading, `${paragraphHtml(INCOMPLETE_QUOTE_PARAGRAPH)}\n\n${quoteHtml(QUOTE_TEXT)}\n\n${body}\n\n${grounding}`);
     }
     if (index === 5) {
       // Affected section 2: a Source: citation directly followed by an
@@ -142,10 +150,10 @@ function buildOverTargetDocument(): ArticleDocument {
       return section(
         `section-${index}`,
         heading,
-        `${body}\n\n${paragraphHtml(`Source: <a href="${RESEARCH[0].url}" target="_blank" rel="noopener noreferrer">${RESEARCH[0].title}</a>.`)}\n\n${paragraphHtml(ORPHAN_PARAGRAPH)}`,
+        `${body}\n\n${paragraphHtml(`Source: <a href="${RESEARCH[0].url}" target="_blank" rel="noopener noreferrer">${RESEARCH[0].title}</a>.`)}\n\n${paragraphHtml(ORPHAN_PARAGRAPH)}\n\n${grounding}`,
       );
     }
-    return section(`section-${index}`, heading, body);
+    return section(`section-${index}`, heading, `${body}\n\n${grounding}`);
   });
   sections.push(section("faq-section", "Frequently Asked Questions About Threads Marketing", "", "faq-heading"));
   return {
