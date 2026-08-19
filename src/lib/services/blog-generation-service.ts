@@ -14,6 +14,7 @@ import {
 import { EDITORIAL_BLOCK_JSON_CONTRACT } from "@/lib/blog/editorial-block-contract";
 import { getCompiledBundle } from "@/lib/services/prompt-compiler";
 import { AiService, type ChatMessage, type ChatOptions } from "@/lib/services/deepseek";
+import { makeGeneralClaimDiscovery } from "@/lib/blog/general-claim-discovery";
 import { AppError } from "@/lib/services/errors";
 import {
   countReadableWords,
@@ -30,15 +31,15 @@ import { runComponentRegeneration, regenerateIntroduction, regenerateSection, re
 import { buildGenerationReport } from "@/lib/services/quality-scorer";
 import { GenerationTelemetry } from "@/lib/services/generation-telemetry";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
-import { type ArticleDocument, type ArticleSection, type EditorialBlock, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords, parseCompleteEditorialRegion } from "@/lib/blog/article-document";
+import { type ArticleDocument, type ArticleSection, type EditorialBlock, type SourceAttribution, renderArticleDocument, fingerprintHtml, renderFaqSchema, detectClaimConflicts, extractVisibleFaqFromArticle, extractFaqPairsFromSectionBody, renderComponentHtml, countComponentWords, countCanonicalVisibleWords, parseCompleteEditorialRegion } from "@/lib/blog/article-document";
 import { buildPolicy, analyzeFinalArticle, evaluatePolicy } from "@/lib/blog/final-article-policy";
 import { createPipelineState, runPostAssemblyPipeline, type PipelineState, type PipelineDependencies, validatePipelineOrder } from "@/lib/pipeline/blog-generation-pipeline";
 import { pairedSlugs, sanitizeSectionUrls, isEligibleExternalSourceUrl, renderLanguageSwitcher } from "@/lib/services/article-postprocessors";
 import { CTA_CONTENT_RE, normalizeAiEditorialPayload, renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
 import { captureProducerComponentFailure } from "@/lib/pipeline/pipeline-failure-snapshot";
-import { shadowValidateProducerCandidate } from "@/lib/blog/producer-content-contract";
+import { shadowValidateProducerCandidate, validateProducerSentenceAccounting } from "@/lib/blog/producer-content-contract";
 import { analyzeSentenceCompleteness } from "@/lib/blog/sentence-completeness";
-import { buildClaimOwnershipLedger, formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
+import { buildClaimOwnershipLedger, formatOwnedEvidencePacket, evidenceForSection } from "@/lib/blog/claim-ownership";
 import { stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 import { repairHeadingNaturalness, isSectionTopicGrounded } from "@/lib/blog/content-relevance";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
@@ -253,6 +254,15 @@ export function validateFaqPayload(raw: unknown, min: number, max: number): Acce
   }
   const rawEntries = (raw as { entries: unknown[] }).entries;
   const errors: string[] = [];
+  // FAQ is synthesis-only: source provenance is not permitted on FAQ output.
+  const rawAttributions = (raw as { sourceAttributions?: unknown }).sourceAttributions;
+  if (Array.isArray(rawAttributions) && rawAttributions.length > 0) {
+    errors.push("FAQ is synthesis-only — sourceAttributions must be []");
+  }
+  const rawFreeProse = (raw as { freeProseSentences?: unknown }).freeProseSentences;
+  if (Array.isArray(rawFreeProse) && rawFreeProse.length > 0) {
+    errors.push("FAQ is synthesis-only — freeProseSentences must be []");
+  }
   if (rawEntries.length < min || rawEntries.length > max) {
     errors.push(`entry count ${rawEntries.length}; expected ${min}-${max}`);
   }
@@ -487,6 +497,16 @@ export async function runBlogGeneration(
         overrides.requestDeepSeek!(stage, messages, options)
     : (stage: string) => ai.makeCallerForStage(stage);
 
+  // General verifiable-claim discovery is a SHADOW/DIAGNOSTIC layer only.
+  // B2I is source-first: ordinary editorial/guidance prose must never be
+  // deleted for lacking direct research entailment, so discovered claims can
+  // never be a hard mutation authority. Disabled by default (zero calls);
+  // FACTUAL_DISCOVERY_SHADOW=1 wires the seam so discovered claims are
+  // merged, entailed and logged — never deleted, never blocking publication.
+  const generalClaimDiscovery = process.env.FACTUAL_DISCOVERY_SHADOW === "1"
+    ? makeGeneralClaimDiscovery(pipelineChatWithRetry)
+    : undefined;
+
   const research = await researchRepository.findByProject(Number(projectId));
   const knowledge = await knowledgeRepository.findByUser(userId);
   await promptSectionRepository.seedDefaults(userId);
@@ -716,7 +736,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   const researchUrls = (context.research || []).map((r: any) => r.url || r.link || "").filter(Boolean);
 
   // Phase B: Parallel section generation
-  type TaskResult = { type: string; index?: number; heading?: string; content: string };
+  type TaskResult = { type: string; index?: number; heading?: string; content: string; attributions?: SourceAttribution[]; freeProseSentences?: string[] };
 
   // Log active request count for diagnostics
   let activeGenerationRequests = 0;
@@ -726,7 +746,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   // only `limit` HTTP requests are in flight simultaneously.
   const taskFactories: (() => Promise<TaskResult>)[] = [];
 
-  const introUserMsg = `Write the introduction (${introTarget} words). Write it in ENGLISH ONLY — do not use Chinese characters. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another supported type is clearly useful.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+      const introUserMsg = `Write the introduction (${introTarget} words). Write it in ENGLISH ONLY — do not use Chinese characters. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another supported type is clearly useful. This component is synthesis-only: return sourceAttributions: [] and freeProseSentences: [].\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
   taskFactories.push(() => trackedChat("intro", [{ role: "system", content: bundle.introSystem }, { role: "user", content: introUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
     let parsed: any;
     try { parsed = robustJsonParse(res.content, "intro"); } catch {
@@ -736,25 +756,36 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     }
     const normalized = normalizeAiEditorialPayload(parsed, "intro");
     logEditorialRecoveries("intro", normalized.recoveries);
+    const provenanceViolations = validateProducerSentenceAccounting(
+      { blocks: normalized.blocks, sentenceAccounting: normalized.sentenceAccounting },
+      { componentId: "intro", componentType: "introduction", scope: "complete-component", keyphrase, ownedEvidenceIds: new Set(), research: context.research, synthesisOnly: true },
+    );
     shadowValidateProducerCandidate({
       label: "intro generation",
       candidate: { blocks: normalized.blocks },
       context: { componentId: "intro", componentType: "introduction", scope: "complete-component", keyphrase },
-      existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0,
+      existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0 && provenanceViolations.length === 0,
     });
-    if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments or Markdown fences.\n\nOriginal request and approved evidence:\n${introUserMsg}`;
+    if (normalized.errors.length > 0 || normalized.blocks.length === 0 || provenanceViolations.length > 0) {
+      const provenanceNote = provenanceViolations.length > 0
+        ? `\nSource provenance violations (this component is synthesis-only — return sourceAttributions: []): ${provenanceViolations.map((v) => v.message).join("; ")}`
+        : "";
+      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ")}${provenanceNote}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments or Markdown fences.\n\nOriginal request and approved evidence:\n${introUserMsg}`;
       const repairRes = await trackedChat("intro_repair", [{ role: "system", content: bundle.introSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "intro-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "intro");
       logEditorialRecoveries("intro-repair", repairedNorm.recoveries);
+      const repairedProvenance = validateProducerSentenceAccounting(
+        { blocks: repairedNorm.blocks, sentenceAccounting: repairedNorm.sentenceAccounting },
+        { componentId: "intro", componentType: "introduction", scope: "complete-component", keyphrase, ownedEvidenceIds: new Set(), research: context.research, synthesisOnly: true },
+      );
       shadowValidateProducerCandidate({
         label: "intro repair",
         candidate: { blocks: repairedNorm.blocks },
         context: { componentId: "intro", componentType: "introduction", scope: "complete-component", keyphrase },
-        existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0,
+        existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0 && repairedProvenance.length === 0,
       });
-      if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+      if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0 || repairedProvenance.length > 0) {
         captureProducerComponentFailure({
           projectId: String(projectId),
           stage: "intro_repair",
@@ -767,7 +798,10 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
           recoveries: repairedNorm.recoveries,
           preRepair: { rawCandidate: parsed, blocks: normalized.blocks },
         });
-        throw AppError.internal(new Error(`Introduction generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
+        throw AppError.internal(new Error(`Introduction generation failed after retry: ${[
+          ...repairedNorm.errors,
+          ...repairedProvenance.map((v) => `${v.code}: ${v.message}`),
+        ].join("; ") || "empty blocks"}`));
       }
       return { type: "intro", content: renderEditorialBlocksToWordPress(repairedNorm.blocks) };
     }
@@ -784,7 +818,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
 
     if (isFaq) {
       // FAQ: structured output with heading + entries, not an editorial section
-      const faqMsg = `Return FAQ content as structured JSON. Use: {"heading": "...", "entries": [{"question": "...", "answer": "..."}]}. Generate ${faqTarget} words total across ${faqRange.min}-${faqRange.max} entries. Each answer must be 1-3 complete sentences. Write every question and answer in ENGLISH ONLY — do not use Chinese characters. Do not include HTML, WordPress comments, Markdown fences, signup URLs, CTA content, or precise statistics. Questions must be conceptual or practical rather than asking for a number already owned by a body section.\n\nHeading: "${h2Text}"\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+      const faqMsg = `Return FAQ content as structured JSON. Use: {"heading": "...", "entries": [{"question": "...", "answer": "..."}]}. Generate ${faqTarget} words total across ${faqRange.min}-${faqRange.max} entries. Each answer must be 1-3 complete sentences. Write every question and answer in ENGLISH ONLY — do not use Chinese characters. Do not include HTML, WordPress comments, Markdown fences, signup URLs, CTA content, or precise statistics. Questions must be conceptual or practical rather than asking for a number already owned by a body section. This component is synthesis-only: return no sourceAttributions and no freeProseSentences.\n\nHeading: "${h2Text}"\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
       taskFactories.push(() => trackedChat("faq", [{ role: "system", content: bundle.faqSystem }, { role: "user", content: faqMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
         let raw: unknown;
         let parsed: AcceptedFaqPayload;
@@ -859,31 +893,54 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     } else {
       // Editorial section: structured JSON blocks
       const ownedEvidence = formatOwnedEvidencePacket(claimOwnership, `section-${i}`);
-      const sectionResearchPrompt = `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${ownedEvidence}\n\nUse only assigned evidence. Preserve complete meaning and use natural named attribution. Never print SOURCE-N identifiers. Do not repeat precise evidence from earlier or later sections.`;
-      const msg = `Return section BODY as structured JSON blocks. Do NOT return H2 heading. Write the body in ENGLISH ONLY — do not use Chinese characters. Section heading: "${h2Text}". Target ${wordsPerSection} words. Previous heading: ${prev}. Next heading: ${next}. Title: ${outline.title}. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Use paragraph, subheading (H3 only), list, quote or table types as needed.${kpNote}${sectionResearchPrompt}`;
+      const ownedEvidenceIds = new Set(
+        evidenceForSection(claimOwnership, `section-${i}`).map((entry) => entry.evidenceId),
+      );
+      const provenanceContext = {
+        componentId: `section-${i}`,
+        componentType: "section" as const,
+        scope: "complete-component" as const,
+        keyphrase,
+        ownedEvidenceIds,
+        research: context.research,
+        synthesisOnly: false,
+      };
+      const sectionResearchPrompt = `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${ownedEvidence}\n\nUse only assigned evidence. Preserve complete meaning and use natural named attribution. Never print SOURCE-N identifiers. Do not repeat precise evidence from earlier or later sections.\nDo not introduce any concrete external-world fact — statistic, number, price, date, platform capability, company behaviour, payment or advertising mechanic, or market claim — that is not present in the approved claims above. Advice, guidance, opinion and hypothetical examples are allowed as free prose but must never assert external-world facts.\nAccount for EVERY sentence you write exactly once: source-backed factual sentences go in sourceAttributions with the owned evidence ID(s); advice, opinion, rhetorical and hypothetical sentences go in freeProseSentences (see the contract below).`;
+      const msg = `Return section BODY as structured JSON blocks. Do NOT return H2 heading. Write the body in ENGLISH ONLY — do not use Chinese characters. Section heading: "${h2Text}". Target ${wordsPerSection} words. Previous heading: ${prev}. Next heading: ${next}. Title: ${outline.title}. Return JSON: {"blocks": [{"type": "paragraph", "sentences": [{"text": "Complete sentence.", "kind": "free_prose"}]}]}. Every paragraph sentence and list item carries a kind (see the contract); use paragraph, subheading (H3 only), list, quote or table types as needed.${kpNote}${sectionResearchPrompt}`;
       taskFactories.push(() => trackedChat(`section_${i}`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: msg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 90_000 }).then(async (res: any) => {
         const raw = robustJsonParse(res.content, `section_${i}`);
-        const normalized = normalizeAiEditorialPayload(raw, `section-${i}`);
+        const normalized = normalizeAiEditorialPayload(raw, `section-${i}`, { requireSentenceKinds: true });
         logEditorialRecoveries(`section-${i}`, normalized.recoveries);
+        const provenanceViolations = validateProducerSentenceAccounting(
+          { blocks: normalized.blocks, sentenceAccounting: normalized.sentenceAccounting },
+          provenanceContext,
+        );
         shadowValidateProducerCandidate({
           label: `section-${i} generation`,
           candidate: { blocks: normalized.blocks },
           context: { componentId: `section-${i}`, componentType: "section", scope: "complete-component", keyphrase },
-          existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0,
+          existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0 && provenanceViolations.length === 0,
         });
-        if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-          const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments, Markdown fences or H2 headings.\n\nOriginal request and approved evidence:\n${msg}`;
+        if (normalized.errors.length > 0 || normalized.blocks.length === 0 || provenanceViolations.length > 0) {
+          const provenanceNote = provenanceViolations.length > 0
+            ? `\nSource provenance violations: ${provenanceViolations.map((v) => `${v.code}: ${v.message}`).join("; ")}`
+            : "";
+          const repairMsg = `Your previous response for the section "${h2Text}" had errors: ${normalized.errors.join("; ") || "no valid blocks"}${provenanceNote}.\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}\nReturn JSON only. No HTML, WordPress comments, Markdown fences or H2 headings.\n\nOriginal request and approved evidence:\n${msg}`;
           const repairRes = await trackedChat(`section_${i}_repair`, [{ role: "system", content: bundle.sectionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
           const repaired = robustJsonParse(repairRes.content, `section-${i}-repair`);
-          const repairedNorm = normalizeAiEditorialPayload(repaired, `section-${i}`);
+          const repairedNorm = normalizeAiEditorialPayload(repaired, `section-${i}`, { requireSentenceKinds: true });
           logEditorialRecoveries(`section-${i}-repair`, repairedNorm.recoveries);
+          const repairedProvenance = validateProducerSentenceAccounting(
+            { blocks: repairedNorm.blocks, sentenceAccounting: repairedNorm.sentenceAccounting },
+            provenanceContext,
+          );
           shadowValidateProducerCandidate({
             label: `section-${i} repair`,
             candidate: { blocks: repairedNorm.blocks },
             context: { componentId: `section-${i}`, componentType: "section", scope: "complete-component", keyphrase },
-            existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0,
+            existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0 && repairedProvenance.length === 0,
           });
-          if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+          if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0 || repairedProvenance.length > 0) {
             // Quarantine the failed repaired component BEFORE the throw. This is
             // a producer-level failure — it occurs before any full ArticleDocument
             // is assembled, so it is outside the post-assembly integrity-rejection
@@ -902,7 +959,11 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
               recoveries: repairedNorm.recoveries,
               preRepair: { rawCandidate: raw, blocks: normalized.blocks },
             });
-            throw AppError.internal(new Error(`Section ${i} ("${h2Text}"): generation failed after retry — ${repairedNorm.errors.join("; ") || "empty blocks"}`));
+            const repairedDiagnostics = [
+              ...repairedNorm.errors,
+              ...repairedProvenance.map((v) => `${v.code}: ${v.message}`),
+            ];
+            throw AppError.internal(new Error(`Section ${i} ("${h2Text}"): generation failed after retry — ${repairedDiagnostics.join("; ") || "empty blocks"}`));
           }
           const groundedBlocks = await ensureSectionTopicGrounded({
             trackedChat,
@@ -917,7 +978,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
           let html = renderEditorialBlocksToWordPress(groundedBlocks);
           if (researchUrls.length > 0) html = sanitizeSectionUrls(html, researchUrls);
           assertSectionWordpressStructure(html, i, h2Text);
-          return { type: "section", index: i, heading: h2Text, content: html };
+          return { type: "section", index: i, heading: h2Text, content: html, attributions: repairedNorm.sourceAttributions, freeProseSentences: repairedNorm.freeProseSentences };
         }
         const groundedBlocks = await ensureSectionTopicGrounded({
           trackedChat,
@@ -932,12 +993,12 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
         let html = renderEditorialBlocksToWordPress(groundedBlocks);
         if (researchUrls.length > 0) html = sanitizeSectionUrls(html, researchUrls);
         assertSectionWordpressStructure(html, i, h2Text);
-        return { type: "section", index: i, heading: h2Text, content: html };
+        return { type: "section", index: i, heading: h2Text, content: html, attributions: normalized.sourceAttributions, freeProseSentences: normalized.freeProseSentences };
       }));
     }
   }
 
-  const concUserMsg = `Write the conclusion (${conclusionTarget} words). Write it in ENGLISH ONLY — do not use Chinese characters. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another type is clearly useful. Do NOT include any CTA content, signup buttons, or CTA headings — the application handles the CTA separately. Summarize only ideas already established in the body and do not repeat any precise factual claim.\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
+      const concUserMsg = `Write the conclusion (${conclusionTarget} words). Write it in ENGLISH ONLY — do not use Chinese characters. Return JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. Only use "paragraph" type unless another type is clearly useful. Do NOT include any CTA content, signup buttons, or CTA headings — the application handles the CTA separately. Summarize only ideas already established in the body and do not repeat any precise factual claim. This conclusion is synthesis-only: return sourceAttributions: [] and freeProseSentences: [].\n\nTitle: ${outline.title}${kpNote}${synthesisOnlyPrompt}`;
   taskFactories.push(() => trackedChat("conclusion", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: concUserMsg }], { responseFormat: { type: "json_object" }, maxTokens: 6144, timeoutMs: 90_000 }).then(async (res: any) => {
     let parsed: any;
     try { parsed = robustJsonParse(res.content, "conclusion"); } catch {
@@ -947,25 +1008,36 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     }
     const normalized = normalizeAiEditorialPayload(parsed, "conclusion", { disallowCtaContent: true });
     logEditorialRecoveries("conclusion", normalized.recoveries);
+    const provenanceViolations = validateProducerSentenceAccounting(
+      { blocks: normalized.blocks, sentenceAccounting: normalized.sentenceAccounting },
+      { componentId: "conclusion", componentType: "conclusion", scope: "complete-component", keyphrase, ownedEvidenceIds: new Set(), research: context.research, synthesisOnly: true },
+    );
     shadowValidateProducerCandidate({
       label: "conclusion generation",
       candidate: { blocks: normalized.blocks },
       context: { componentId: "conclusion", componentType: "conclusion", scope: "complete-component", keyphrase },
-      existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0,
+      existingPassed: normalized.errors.length === 0 && normalized.blocks.length > 0 && provenanceViolations.length === 0,
     });
-    if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
-      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ") || "empty blocks"}. Return ONLY valid conclusion JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA content. No signup buttons. No HTML.\n\nOriginal request and approved evidence:\n${concUserMsg}`;
+    if (normalized.errors.length > 0 || normalized.blocks.length === 0 || provenanceViolations.length > 0) {
+      const provenanceNote = provenanceViolations.length > 0
+        ? `\nSource provenance violations (this component is synthesis-only — return sourceAttributions: []): ${provenanceViolations.map((v) => v.message).join("; ")}`
+        : "";
+      const repairMsg = `Your previous response had errors: ${normalized.errors.join("; ") || "empty blocks"}${provenanceNote}. Return ONLY valid conclusion JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}. No CTA content. No signup buttons. No HTML.\n\nOriginal request and approved evidence:\n${concUserMsg}`;
       const repairRes = await trackedChat("conclusion_repair", [{ role: "system", content: bundle.conclusionSystem }, { role: "user", content: repairMsg }], { responseFormat: { type: "json_object" }, maxTokens: 8192, timeoutMs: 60_000 });
       const repaired = robustJsonParse(repairRes.content, "conclusion-repair");
       const repairedNorm = normalizeAiEditorialPayload(repaired, "conclusion", { disallowCtaContent: true });
       logEditorialRecoveries("conclusion-repair", repairedNorm.recoveries);
+      const repairedProvenance = validateProducerSentenceAccounting(
+        { blocks: repairedNorm.blocks, sentenceAccounting: repairedNorm.sentenceAccounting },
+        { componentId: "conclusion", componentType: "conclusion", scope: "complete-component", keyphrase, ownedEvidenceIds: new Set(), research: context.research, synthesisOnly: true },
+      );
       shadowValidateProducerCandidate({
         label: "conclusion repair",
         candidate: { blocks: repairedNorm.blocks },
         context: { componentId: "conclusion", componentType: "conclusion", scope: "complete-component", keyphrase },
-        existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0,
+        existingPassed: repairedNorm.errors.length === 0 && repairedNorm.blocks.length > 0 && repairedProvenance.length === 0,
       });
-      if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0) {
+      if (repairedNorm.errors.length > 0 || repairedNorm.blocks.length === 0 || repairedProvenance.length > 0) {
         captureProducerComponentFailure({
           projectId: String(projectId),
           stage: "conclusion_repair",
@@ -977,7 +1049,10 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
           recoveries: repairedNorm.recoveries,
           preRepair: { rawCandidate: parsed, blocks: normalized.blocks },
         });
-        throw AppError.internal(new Error(`Conclusion generation failed after retry: ${repairedNorm.errors.join("; ") || "empty blocks"}`));
+        throw AppError.internal(new Error(`Conclusion generation failed after retry: ${[
+          ...repairedNorm.errors,
+          ...repairedProvenance.map((v) => `${v.code}: ${v.message}`),
+        ].join("; ") || "empty blocks"}`));
       }
       return { type: "conclusion", content: renderEditorialBlocksToWordPress(repairedNorm.blocks) };
     }
@@ -1035,6 +1110,11 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
   const slugs = pairedSlugs(outline.slug || "blog-post");
 
   // Build sections array excluding FAQ (rendered separately from visibleFaq)
+  const sectionResultById = new Map(
+    results
+      .filter((r): r is TaskResult => r.type === "section" && r.index !== undefined)
+      .map((r) => [`section-${r.index}`, r]),
+  );
   const docSections: ArticleDocument["sections"] = sectionBodies
     .filter((s) => s.index !== faqIndex)
     .map((s) => ({
@@ -1044,6 +1124,8 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
       sectionType: "main" as const,
       blocks: requireCompleteGeneratedBlocks(s.body, `section-${s.index}`),
       status: s.status as any,
+      sourceAttributions: sectionResultById.get(`section-${s.index}`)?.attributions,
+      freeProseSentences: sectionResultById.get(`section-${s.index}`)?.freeProseSentences,
     }));
   // Add the FAQ heading section (empty blocks, rendered from visibleFaq)
   if (faqHeadingText) {
@@ -1092,6 +1174,7 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     makeTrackedChatForStage,
     telemetry,
     context,
+    generalClaimDiscovery,
   } satisfies PipelineDependencies);
   if (researchWarnings.length > 0) {
     pipelineState.warnings.push(...researchWarnings);
@@ -1128,3 +1211,6 @@ Return ONLY an outline. Generate exactly ${editorialH2Min} editorial H2 section 
     systemPrompt, userMessage,
   };
 }
+
+
+

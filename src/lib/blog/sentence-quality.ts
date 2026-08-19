@@ -9,6 +9,8 @@
 import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
 import { extractPlainTextFromEditorialBlocks } from "@/lib/blog/article-document";
 import type { InlineContent } from "@/lib/blog/article-content";
+import { isDomainInternalDot } from "@/lib/seo/seo-text-utils";
+import { isPipelineDebugTraceEnabled } from "@/lib/pipeline/pipeline-debug-trace";
 
 export type SentenceQualityIssueCode =
   | "duplicated-determiner"
@@ -22,6 +24,15 @@ export interface SentenceQualityIssue {
   code: SentenceQualityIssueCode;
   sentence: string;
   message: string;
+}
+
+export interface SentenceQualityScanOptions {
+  validLowercaseTokens?: ReadonlySet<string>;
+  /** Case-insensitive proper-name spans (e.g. "DON DON DONKI") extracted from
+   *  supplied research/source evidence. An adjacent repeated token whose span
+   *  is an exact member of this set is a legitimate named entity, NOT prose
+   *  corruption, and is licensed (never reported as repeated-adjacent-word). */
+  licensedRepeatedWordSpans?: ReadonlySet<string>;
 }
 
 /** Determiner/demonstrative pairs that can never be adjacent ("the this",
@@ -39,9 +50,9 @@ const DUPLICATED_DETERMINER_RE =
 const DUPLICATED_THOSE_RE =
   /\bthose\s+(?:the|this|these|those|a|an)\b/i;
 
-/** Any adjacent repeated word ("these these", "the the", "and and"). */
+/** Any adjacent repeated word ("these these", "the the", "and and", "we we"). */
 const REPEATED_ADJACENT_WORD_RE =
-  /\b([a-z]{3,})\s+\1\b/i;
+  /\b([a-z]{2,})\s+\1\b/i;
 
 /** Adjective/adverb immediately before a determiner is an ungrammatical noun
  *  phrase ("broader these market changes picture", "the wider the gap").
@@ -172,6 +183,7 @@ export function sentenceTextRanges(text: string): SentenceTextRange[] {
     if (char === "." && /\d/.test(text[index - 1] ?? "") && /\d/.test(text[index + 1] ?? "")) continue;
     if (char === "." && ABBREVIATION_DOT_RE.test(text.slice(0, index + 1))) continue;
     if (char === "." && isInteriorAbbreviationDot(text, index)) continue;
+    if (char === "." && isDomainInternalDot(text, index)) continue;
     let end = index + 1;
     while (/[.!?]/.test(text[end] ?? "")) end++;
     while (/["”’)]/.test(text[end] ?? "")) end++;
@@ -255,13 +267,74 @@ function splitSentences(text: string): string[] {
   return sentenceTextRanges(text).map((range) => range.text);
 }
 
+// ── Entity-aware repeated-word licensing (single authority) ──
+// An adjacent repeated token is only prose corruption when it is NOT a
+// legitimate named-entity span. The detector stays primary: the finding is
+// suppressed ONLY when the exact repeated-token span (case-insensitive) is
+// proven to be a proper-name span in the supplied research/source evidence.
+
+/** Maximal runs of 2+ capitalized tokens in evidence text ("DON DON DONKI",
+ *  "BEE BEE Home"). Capitalization is only the extraction signal for candidate
+ *  spans; the span must ALSO contain an adjacent repeated token to be licensed,
+ *  and the article's own repeated span must match the evidence exactly. */
+const EVIDENCE_CAPITALIZED_RUN_RE =
+  /\b(?:[A-Z][A-Za-z0-9'&-]*\s+){1,}[A-Z][A-Za-z0-9'&-]*\b/g;
+
+/** Derive the licensed repeated-token proper-name spans from supplied evidence
+ *  (research/source titles and snippets). Only spans that themselves contain an
+ *  adjacent repeated token are eligible: this is the tight named-entity
+ *  contract, so ordinary Title-Case prose in research can never license a
+ *  genuine accidental duplicate in the article. */
+export function licensedRepeatedWordSpansFromEvidence(
+  evidence: Array<{ title?: string; snippet?: string; url?: string }> | string,
+): ReadonlySet<string> {
+  const text = typeof evidence === "string"
+    ? evidence
+    : evidence
+        .map((entry) => [entry.title ?? "", entry.snippet ?? ""].filter(Boolean).join(" "))
+        .filter(Boolean)
+        .join(" ");
+  const spans = new Set<string>();
+  for (const match of text.matchAll(EVIDENCE_CAPITALIZED_RUN_RE)) {
+    const span = match[0].replace(/\s+/g, " ").trim().toLowerCase();
+    const tokens = span.split(" ").filter(Boolean);
+    if (tokens.length < 2) continue;
+    if (!REPEATED_ADJACENT_WORD_RE.test(span)) continue;
+    spans.add(span);
+  }
+  return spans;
+}
+
+/** Whether an adjacent repeated-token occurrence in `sentence` sits inside a
+ *  span that is an exact member of the licensed evidence set. Tries a bounded
+ *  window around each adjacent identical pair so a 2-4 token entity licenses
+ *  whether it appears at the start, middle or end of the sentence. */
+function containsLicensedRepeatedWordSpan(
+  sentence: string,
+  licensed: ReadonlySet<string>,
+): boolean {
+  const words = sentence.split(/\s+/).map((word) =>
+    word.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, ""),
+  );
+  for (let i = 0; i + 1 < words.length; i++) {
+    if (words[i].toLowerCase() !== words[i + 1].toLowerCase()) continue;
+    for (let start = Math.max(0, i - 1); start <= i; start++) {
+      for (let end = i + 1; end < Math.min(words.length, i + 5); end++) {
+        const span = words.slice(start, end + 1).join(" ").toLowerCase();
+        if (licensed.has(span)) return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** Scan plain prose text (a paragraph) for sentence-quality violations. Uses
  *  the same authoritative lowercase-start and punctuation-only-residue rules
  *  as the malformed-prose scanner, so the final sentence-quality QC and the
  *  final-preflight repair boundary can never disagree on the same document. */
 export function scanSentenceQualityText(
   text: string,
-  options?: { validLowercaseTokens?: ReadonlySet<string> },
+  options?: SentenceQualityScanOptions,
 ): SentenceQualityIssue[] {
   const issues: SentenceQualityIssue[] = [];
   const seen = new Set<string>();
@@ -281,7 +354,16 @@ export function scanSentenceQualityText(
       add("duplicated-determiner", normalized, "duplicated determiner or demonstrative");
     }
     if (REPEATED_ADJACENT_WORD_RE.test(normalized)) {
-      add("repeated-adjacent-word", normalized, "repeated adjacent word");
+      const licensed = options?.licensedRepeatedWordSpans;
+      if (licensed && licensed.size > 0 && containsLicensedRepeatedWordSpan(normalized, licensed)) {
+        if (isPipelineDebugTraceEnabled()) {
+          console.log(
+            `[sentence-quality] repeated-word licensed reason=named-entity sentence="${normalized.slice(0, 120)}"`,
+          );
+        }
+      } else {
+        add("repeated-adjacent-word", normalized, "repeated adjacent word");
+      }
     }
     if (MALFORMED_NOUN_PHRASE_RE.test(normalized)) {
       add("malformed-noun-phrase", normalized, "adjective/adverb immediately before a determiner");
@@ -311,20 +393,24 @@ export function formatSentenceQualityIssues(issues: SentenceQualityIssue[]): str
  * block with issues is unresolved deterministic corruption and must be a hard
  * failure at the final gate and in the pre-save gate.
  */
-export function scanSentenceQualityInDocument(doc: ArticleDocument): Array<{
+export function scanSentenceQualityInDocument(
+  doc: ArticleDocument,
+  options?: SentenceQualityScanOptions,
+): Array<{
   componentId: string;
   blockId: string;
   issues: SentenceQualityIssue[];
 }> {
   const findings: Array<{ componentId: string; blockId: string; issues: SentenceQualityIssue[] }> = [];
-  const options = {
+  const merged: SentenceQualityScanOptions = {
     validLowercaseTokens: lowercaseStartValidTokensFromKeyphrase(doc.metadata.focusKeyphrase),
+    ...(options ?? {}),
   };
   const checkComponent = (componentId: string, blocks: EditorialBlock[]) => {
     for (const block of blocks) {
       if (block.type === "subheading") continue;
       const text = extractPlainTextFromEditorialBlocks([block]);
-      const issues = scanSentenceQualityText(text, options);
+      const issues = scanSentenceQualityText(text, merged);
       if (issues.length > 0) {
         findings.push({ componentId, blockId: block.id, issues });
       }

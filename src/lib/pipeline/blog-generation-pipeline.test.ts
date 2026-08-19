@@ -818,6 +818,39 @@ describe("final-article validation order", () => {
     expect(issues.length).toBeGreaterThan(0);
     expect(issues.some((i) => i.code === "MISSING_STAGE")).toBe(true);
   });
+
+  it("final-document-editorial must run before final-qc-scan, which precedes validation-only gates", () => {
+    process.env.ENABLE_FULL_DOCUMENT_EDITORIAL = "true";
+    process.env.FULL_DOCUMENT_EDITORIAL_MODE = "enforce";
+    const ordered = [
+      "claim-check", "source-relevance-repair", "expansion", "trim", "paragraphs", "regeneration",
+      "seo-normalization", "title-repair", "factual-scan", "claim-ownership", "temporal-freshness",
+      "post-factual-keyphrase", "paragraphs-final", "malformed-prose-repair", "claim-ownership-final",
+      "language-switcher", "internal-links", "external-links", "external-dedup",
+      "link-enforce", "factual-final", "post-ownership-seo-reconcile", "cta-preserve", "final-trim",
+      "final-seo-reconcile", "faq-recovery", "wc-check", "final-preflight", "editorial-h2-enforce",
+      "final-document-editorial", "final-qc-scan", "editorial-h2-save-assert", "final-validation",
+    ];
+    const ok = validatePipelineOrder({
+      stageOutputs: ordered.map((stage, index) => ({ stage, inputFingerprint: `in${index}`, outputFingerprint: `out${index}`, accepted: true })),
+    } as any);
+    expect(ok).toEqual([]);
+
+    // Wrong order (QC before the editor) must be rejected.
+    const wrong = validatePipelineOrder({
+      stageOutputs: ordered.map((stage, index) => ({ stage: stage === "final-document-editorial" ? "final-qc-scan" : stage === "final-qc-scan" ? "final-document-editorial" : stage, inputFingerprint: `in${index}`, outputFingerprint: `out${index}`, accepted: true })),
+    } as any);
+    expect(wrong.some((issue) => issue.code === "STAGE_ORDER" && issue.message.includes("final-document-editorial must run before final-qc-scan"))).toBe(true);
+
+    // Every stage after final-qc-scan must be validation-only.
+    const validationOnly = new Set(["editorial-h2-save-assert", "final-validation"]);
+    const qcIndex = ordered.indexOf("final-qc-scan");
+    for (const stage of ordered.slice(qcIndex + 1)) {
+      expect(validationOnly.has(stage), `stage after QC must be validation-only: ${stage}`).toBe(true);
+    }
+    delete process.env.ENABLE_FULL_DOCUMENT_EDITORIAL;
+    delete process.env.FULL_DOCUMENT_EDITORIAL_MODE;
+  });
 });
 
 describe("pipeline error hardening", () => {

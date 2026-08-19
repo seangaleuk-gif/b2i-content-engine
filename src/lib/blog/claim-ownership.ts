@@ -11,6 +11,7 @@
 
 import {
   buildEvidenceLedger,
+  isTopicContextYearClaim,
   removeUnsupportedSentences,
   scanFactualRisks,
   type EvidenceLedgerEntry,
@@ -248,31 +249,9 @@ function occurrenceScore(occurrence: ClaimOccurrence): number {
 
 /**
  * A bare 4-digit year in a `date_claim` that is the article's own topic year
- * (present in the focus keyphrase, title or meta description) is topic
- * context, not a precise factual claim owned by a section. For a topic-year
- * article ("Hong Kong Marketing Trends 2026") the year legitimately appears in
- * every section and in synthesis-only FAQ questions; treating it as an
- * ownership-tracked claim would strip the year from non-owner sections and
- * block the article on FAQ questions that merely name the topic.
+ * is topic context, not a precise factual claim owned by a section. Shared
+ * implementation lives in factual-risk-scanner.ts (isTopicContextYearClaim).
  */
-export function isTopicContextYearClaim(
-  claim: ScannedClaim,
-  topicContext: { keyphrase: string; title?: string; metaDescription?: string; headings?: string[] },
-): boolean {
-  if (claim.category !== "date_claim") return false;
-  const year = claim.text.trim();
-  if (!/^(?:19|20)\d{2}$/.test(year)) return false;
-  const haystack = [
-    topicContext.keyphrase,
-    topicContext.title ?? "",
-    topicContext.metaDescription ?? "",
-    ...(topicContext.headings ?? []),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  return haystack.includes(year.toLowerCase());
-}
 
 /**
  * THE single authoritative ownership scanner. It scans the introduction, every

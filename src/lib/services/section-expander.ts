@@ -1,6 +1,8 @@
 import type { ChatMessage, ChatOptions, ChatResult } from "@/lib/services/deepseek";
 import { countReadableWords, robustJsonParse, splitLongParagraphs } from "@/lib/services/text-utils";
 import { validateWordpressBlockPairs } from "@/lib/blog/article-integrity";
+import { validateProducerSentenceAccounting } from "@/lib/blog/producer-content-contract";
+import type { SourceAttribution } from "@/lib/blog/article-document";
 import {
   extractPlainTextFromEditorialBlocks,
   parseWordPressEditorialBlocks,
@@ -25,6 +27,12 @@ export interface ExpandableSection {
   body: string;
   /** Approved evidence owned by this section; no other evidence is permitted. */
   evidencePrompt?: string;
+  /** SOURCE-X-CLAIM-Y IDs owned by this section (for provenance validation). */
+  ownedEvidenceIds?: ReadonlySet<string>;
+  /** Internal-only source provenance accepted for this section (output). */
+  attributions?: SourceAttribution[];
+  /** Internal-only free-prose accounting accepted for this section (output). */
+  freeProseSentences?: string[];
 }
 
 interface ExpansionResult {
@@ -33,6 +41,10 @@ interface ExpansionResult {
   afterSection: number;
   sectionIndex: number;
   reason?: string;
+  /** Internal-only source provenance declared by the expansion response. */
+  attributions?: SourceAttribution[];
+  /** Internal-only free-prose accounting declared by the expansion response. */
+  freeProseSentences?: string[];
 }
 
 function validateEditorialFragment(html: string): { valid: boolean; reason?: string } {
@@ -140,8 +152,8 @@ export async function expandToMinimum(
     console.log(`[section-expander:EXPAND] section=${target.origIndex} currentSectionWords=${target.wc} originalSectionTarget=${allocatedPerSection} articleShortfall=${articleShortfall} requestedAddition=${requestedAddition} isMissing=${isMissing}`);
 
     const evidenceBoundary = target.evidencePrompt?.trim()
-      ? `\n\nCLAIM OWNERSHIP BOUNDARY:\n${target.evidencePrompt}\nUse only this assigned evidence. Do not introduce or repeat any other precise statistic, date, currency, quotation, benchmark, posting frequency, survey result or platform-availability claim.`
-      : `\n\nCLAIM OWNERSHIP BOUNDARY:\nNo precise evidence is assigned. Do not introduce statistics, dates, currencies, quotations, benchmarks, posting frequencies, survey results or platform-availability claims.`;
+      ? `\n\nCLAIM OWNERSHIP BOUNDARY:\n${target.evidencePrompt}\nUse only this assigned evidence. Do not introduce or repeat any other precise statistic, date, currency, quotation, benchmark, posting frequency, survey result or platform-availability claim.\nDeclare source provenance for every source-backed factual sentence via "sourceAttributions": [{"sentence":"<exact sentence as written>","evidenceIds":["SOURCE-1-CLAIM-2"]}] using ONLY the evidence IDs above.`
+      : `\n\nCLAIM OWNERSHIP BOUNDARY:\nNo precise evidence is assigned. Do not introduce statistics, dates, currencies, quotations, benchmarks, posting frequencies, survey results or platform-availability claims. Return sourceAttributions: [].`;
     const expandPrompt = isMissing
       ? `Generate the full section body. Target approximately ${allocatedPerSection} words. WordPress block format. Return as JSON: {"body": "..."}\n\nSection heading: "${target.heading}"${evidenceBoundary}`
       : `Return ONLY additional WordPress paragraph, list, quote, or table blocks.\n\nDo NOT rewrite the existing section.\nDo NOT repeat the heading.\nDo NOT output an H2.\nDo NOT output the complete section.\nDo NOT repeat a precise claim already present in the existing section. Prefer non-statistical practical guidance, examples and transitions.\n\nWrite approximately ${requestedAddition} additional readable words that continue naturally from the existing section.\n\nSection heading for context (do NOT repeat): "${target.heading}"\n\nExisting section body:\n${target.body.substring(target.body.length - 900)}${evidenceBoundary}\n\nReturn as JSON: {"body": "additional blocks only"}`;
@@ -152,7 +164,30 @@ export async function expandToMinimum(
         { responseFormat: { type: "json_object" }, maxTokens: 8192 }
       );
 
-      const aiBody = (robustJsonParse(res.content) as Record<string, string>).body || "";
+      const aiPayload = robustJsonParse(res.content) as Record<string, unknown>;
+      const aiBody = typeof aiPayload.body === "string" ? aiPayload.body : "";
+      const rawAttributions = aiPayload.sourceAttributions;
+      const attributions: SourceAttribution[] | undefined = Array.isArray(rawAttributions)
+        && rawAttributions.length > 0
+        ? rawAttributions
+            .filter((entry): entry is SourceAttribution =>
+              typeof entry === "object"
+              && entry !== null
+              && typeof (entry as SourceAttribution).sentence === "string"
+              && Array.isArray((entry as SourceAttribution).evidenceIds)
+              && (entry as SourceAttribution).evidenceIds.every((id) => typeof id === "string"))
+            .map((entry) => ({
+              sentence: (entry as SourceAttribution).sentence.trim(),
+              evidenceIds: (entry as SourceAttribution).evidenceIds.filter((id) => typeof id === "string"),
+            }))
+            .filter((entry) => entry.sentence.length > 0 && entry.evidenceIds.length > 0)
+        : undefined;
+      const rawFreeProse = aiPayload.freeProseSentences;
+      const freeProseSentences: string[] | undefined = Array.isArray(rawFreeProse)
+        && rawFreeProse.length > 0
+        ? rawFreeProse.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+            .map((entry) => entry.trim())
+        : undefined;
 
       const beforeWC = countReadableWords(target.body);
       const additionWC = countReadableWords(aiBody);
@@ -184,6 +219,43 @@ export async function expandToMinimum(
         continue;
       }
 
+      // Source-first provenance: the response must account for EVERY new
+      // sentence exactly once (source_fact via sourceAttributions or
+      // free_prose via freeProseSentences) with owned evidence only and
+      // declared-only fidelity. Violations reject the expansion (the existing
+      // bounded retry keeps the section unchanged).
+      if (attributions?.length || freeProseSentences?.length) {
+        const parsedBlocks = parseWordPressEditorialBlocks(aiBody, `section-${target.origIndex}-expansion`);
+        const violations = validateProducerSentenceAccounting(
+          {
+            blocks: parsedBlocks.blocks,
+            sourceAttributions: attributions,
+            freeProseSentences,
+          },
+          {
+            componentId: target.id ?? `section-${target.origIndex}`,
+            componentType: "section",
+            scope: "additive-fragment",
+            keyphrase: undefined,
+            ownedEvidenceIds: target.ownedEvidenceIds ?? new Set(),
+            research: undefined,
+            synthesisOnly: false,
+          },
+        );
+        if (violations.length > 0) {
+          results.push({
+            accepted: false,
+            beforeSection: beforeWC,
+            afterSection: additionWC,
+            sectionIndex: target.origIndex,
+            reason: `expansion-source-provenance:${violations.map((v) => v.code).join(",")}`,
+          });
+          console.log(`[section-expander:REJECT] section=${target.origIndex} reason=expansion-source-provenance`);
+          expansions++;
+          continue;
+        }
+      }
+
       let mergedBody: string;
       let afterWC: number;
 
@@ -203,8 +275,8 @@ export async function expandToMinimum(
           expansions++;
           continue;
         }
-        workingSections[target.origIndex] = { ...workingSections[target.origIndex], body: mergedBody };
-        results.push({ accepted: true, beforeSection: beforeWC, afterSection: afterWC, sectionIndex: target.origIndex });
+        workingSections[target.origIndex] = { ...workingSections[target.origIndex], body: mergedBody, attributions, freeProseSentences };
+        results.push({ accepted: true, beforeSection: beforeWC, afterSection: afterWC, sectionIndex: target.origIndex, attributions, freeProseSentences });
         console.log(`[section-expander:EXPAND] section=${target.origIndex} beforeSection=${beforeWC} addition=${additionWC} afterSection=${afterWC} accepted=true`);
       } else {
         const newBodyOnly = isMissing ? afterWC : additionWC;
@@ -296,3 +368,4 @@ export async function trimToMaximum(
 export function normalizeParagraphs(html: string, maxSentences: number = paragraphSentenceLimit()): { html: string; splitCount: number } {
   return splitLongParagraphs(html, maxSentences);
 }
+

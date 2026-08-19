@@ -25,6 +25,7 @@ import type { ArticleDocument } from "@/lib/blog/article-document";
 import { renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
 import type { EditorialBlock } from "@/lib/blog/article-document";
 import { canonicalKeyphraseMetrics } from "@/lib/blog/final-seo-reconcile";
+import { analyzeFinalArticle } from "@/lib/blog/final-article-policy";
 import { GENERATION_BUILD_ID } from "@/lib/services/generation-constants";
 import {
   PipelineDebugTrace,
@@ -32,6 +33,12 @@ import {
   type TraceViolationKey,
   type TraceBlockChange,
 } from "@/lib/pipeline/pipeline-debug-trace";
+import {
+  measureParagraphLengthDiagnostics,
+  paragraphLengthStageTrace,
+  type LongParagraphDiagnostic,
+  type ParagraphLengthStageRecord,
+} from "@/lib/pipeline/paragraph-length-trace";
 
 /** Build identifier embedded in every artifact — the SAME production English
  *  pipeline build id referenced by the generation/pipeline logs. Reused from
@@ -428,6 +435,122 @@ export function captureProducerComponentFailure(input: ProducerComponentFailureI
     console.warn(
       `[pipeline-failure-snapshot] failed to persist producer component failure for stage=${input.stage}` +
       ` project=${input.projectId} — ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+}
+
+// ── Final-validation failure snapshot (Stage 3L) ──
+// When final validation fails for ANY reason and ENABLE_PIPELINE_DEBUG_TRACE is
+// set, the failing document is persisted BEFORE the generation aborts so the
+// violating paragraph and its first introducing stage are identifiable. Uses
+// the SAME bounded debug snapshot directory and retention policy as the
+// integrity-rejection artifacts. Purely diagnostic: a failed snapshot write
+// only logs a warning and can never change generation behavior.
+
+export interface FinalValidationFailureInput {
+  projectId: string;
+  articleDoc: ArticleDocument;
+  html: string;
+  reasons: string[];
+  keyphrase: string;
+  title?: string;
+  metaDescription?: string;
+  requestedWordCount?: number;
+  dir?: string;
+}
+
+export interface FinalValidationFailureArtifact {
+  schema: "final-validation-failure/v1";
+  timestamp: string;
+  build: string;
+  projectId: string;
+  stage: "final-validation";
+  fingerprints: { document: string; html: string };
+  wordCount: number;
+  metrics: {
+    readableWordCount: number;
+    h2Count: number;
+    faqEntryCount: number;
+    exactKeyphraseCount: number;
+    keyphraseDensity: number;
+    longParagraphCount: number;
+  };
+  reasons: string[];
+  longParagraphs: LongParagraphDiagnostic[];
+  paragraphLengthTrace: ParagraphLengthStageRecord[];
+  documents: { articleDoc: ArticleDocument; blog: string };
+}
+
+export function buildFinalValidationFailureSnapshot(
+  input: FinalValidationFailureInput,
+): FinalValidationFailureArtifact {
+  const metrics = analyzeFinalArticle(
+    input.html,
+    input.keyphrase,
+    input.title,
+    input.metaDescription,
+    input.requestedWordCount,
+    countCanonicalVisibleWords(input.articleDoc),
+  );
+  const paragraphs = measureParagraphLengthDiagnostics(
+    input.html,
+    input.articleDoc,
+    input.keyphrase,
+    input.title,
+    input.metaDescription,
+    input.requestedWordCount,
+  );
+  return {
+    schema: "final-validation-failure/v1",
+    timestamp: new Date().toISOString(),
+    build: PIPELINE_BUILD_IDENTIFIER,
+    projectId: input.projectId,
+    stage: "final-validation",
+    fingerprints: {
+      document: fingerprintHtml(input.html),
+      html: fingerprintHtml(input.html),
+    },
+    wordCount: countCanonicalVisibleWords(input.articleDoc),
+    metrics: {
+      readableWordCount: metrics.readableWordCount,
+      h2Count: metrics.h2Count,
+      faqEntryCount: metrics.faqEntryCount,
+      exactKeyphraseCount: metrics.exactKeyphraseCount,
+      keyphraseDensity: metrics.keyphraseDensity,
+      longParagraphCount: metrics.longParagraphCount,
+    },
+    reasons: [...input.reasons],
+    longParagraphs: paragraphs.paragraphs,
+    paragraphLengthTrace: paragraphLengthStageTrace(),
+    documents: {
+      articleDoc: JSON.parse(JSON.stringify(input.articleDoc)) as ArticleDocument,
+      blog: input.html,
+    },
+  };
+}
+
+/** Persist the final-validation failure snapshot when debug tracing is on.
+ *  Returns the artifact path, or null when disabled/failed. */
+export function captureFinalValidationFailure(
+  input: FinalValidationFailureInput,
+): string | null {
+  if (!isPipelineDebugTraceEnabled()) return null;
+  const dir = input.dir ?? DEFAULT_FAILURE_DIR;
+  try {
+    const artifact = buildFinalValidationFailureSnapshot(input);
+    const filename =
+      `${timestampForFilename(new Date())}_final-validation_project-${sanitizeFilenamePart(input.projectId)}.json`;
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, filename);
+    fs.writeFileSync(filePath, JSON.stringify(artifact, null, 2), "utf8");
+    retainNewestFailureSnapshots(dir, MAX_RETAINED_FAILURE_SNAPSHOTS);
+    console.warn(`[pipeline-failure-snapshot] final-validation failure quarantined: ${filePath}`);
+    return filePath;
+  } catch (error) {
+    console.warn(
+      `[pipeline-failure-snapshot] failed to persist final-validation failure for project=${input.projectId}` +
+      ` — ${error instanceof Error ? error.message : String(error)}`,
     );
     return null;
   }

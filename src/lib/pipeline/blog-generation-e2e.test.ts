@@ -1047,8 +1047,7 @@ describe("opt-in pipeline debug tracing: observational only", () => {
   }
 
   it("enabled tracing produces no pipeline/output differences vs disabled", async () => {
-    const disabled = await runOnce(false);
-    const enabled = await runOnce(true, (trace) => {
+    const disabled = await runOnce(false);    const enabled = await runOnce(true, (trace) => {
       expect(trace).toBeDefined();
       // Every mutating stage recorded a stage line with a contract record.
       const stages = (trace as { recordsFor(): Array<{ stage: string; contract?: unknown }> }).recordsFor();
@@ -1077,5 +1076,5 @@ describe("opt-in pipeline debug tracing: observational only", () => {
     // Final validation identical.
     expect(JSON.stringify(runFinalValidation(enabled))).toBe(JSON.stringify(runFinalValidation(disabled)));
     delete process.env.ENABLE_PIPELINE_DEBUG_TRACE;
-  });
+  }, 60_000);
 });

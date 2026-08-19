@@ -144,7 +144,7 @@ describe("Stage 3J: boundary safety", () => {
 });
 
 describe("Stage 3J: exact live /faq/ failure fixture", () => {
-  const SNAPSHOT = path.resolve("debug", "pipeline-failures", "2026-08-17T13-44-08-570Z_external-links_project-22.json");
+  const SNAPSHOT = path.resolve("src", "lib", "__live-fixtures__", "2026-08-17T13-44-08-570Z_external-links_project-22.json");
 
   it("the live rejected candidate now extracts 6 FAQ entries (canonical = 6, divs = 6)", () => {
     const snapshot = JSON.parse(fs.readFileSync(SNAPSHOT, "utf8")) as {
@@ -177,7 +177,7 @@ describe("Stage 3J: exact live /faq/ failure fixture", () => {
 });
 
 describe("Stage 3J: integrity contract stays fail-closed", () => {
-  const SNAPSHOT = path.resolve("debug", "pipeline-failures", "2026-08-17T13-44-08-570Z_external-links_project-22.json");
+  const SNAPSHOT = path.resolve("src", "lib", "__live-fixtures__", "2026-08-17T13-44-08-570Z_external-links_project-22.json");
 
   function docFromSnapshot(): Parameters<typeof renderArticleDocument>[0] {
     const snapshot = JSON.parse(fs.readFileSync(SNAPSHOT, "utf8")) as {

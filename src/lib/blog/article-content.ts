@@ -4,6 +4,7 @@
 // content inside sections: paragraphs, H3 subheadings, lists, quotes,
 // and tables.
 
+import type { SourceAttribution } from "@/lib/blog/article-document";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 import {
   analyzeSentenceCompleteness,
@@ -81,6 +82,20 @@ export interface AiEditorialPayload {
 export interface NormalizationOptions {
   /** When true, reject blocks containing CTA/registration content. Use only for conclusion generation. */
   disallowCtaContent?: boolean;
+  /** When true (factual-capable producers), paragraph/list prose must be
+   *  returned as STRUCTURAL sentence objects (each sentence carries its own
+   *  kind + optional evidenceIds) — legacy `text`-only blocks are rejected so
+   *  provenance can never be bypassed by omitting the sentence structure. */
+  requireSentenceKinds?: boolean;
+}
+
+/** Structurally-coupled per-sentence provenance extracted from a producer
+ *  response: the sentence text appears exactly once, carrying its own kind.
+ *  `source_fact` requires owned evidence IDs; `free_prose` never has them. */
+export interface SentenceAccountingEntry {
+  sentence: string;
+  kind: "source_fact" | "free_prose";
+  evidenceIds: string[];
 }
 
 // ── Helpers ──
@@ -216,8 +231,17 @@ function rawBlockProvidesStructuredContinuation(raw: unknown): boolean {
   const rb = raw as Record<string, unknown>;
   if (rb.type === "list") {
     const recovered = recoverListItems(rb);
-    return !recovered.conflict && recovered.items.some(
-      (item) => typeof item === "string" && normalizeWhitespace(item).length > 0,
+    const items = recovered.conflict ? [] : recovered.items;
+    if (items.some((item) => typeof item === "string" && normalizeWhitespace(item).length > 0)) {
+      return true;
+    }
+    // Structural list items (sentence objects with kind) also continue a
+    // colon-led paragraph.
+    return Array.isArray(rb.items) && rb.items.some((item) =>
+      typeof item === "object"
+      && item !== null
+      && typeof (item as Record<string, unknown>).text === "string"
+      && normalizeWhitespace((item as Record<string, unknown>).text as string).length > 0,
     );
   }
   if (rb.type === "table") {
@@ -237,6 +261,9 @@ export function normalizeAiEditorialPayload(
   opts?: NormalizationOptions,
 ): {
   blocks: EditorialBlock[];
+  sourceAttributions: SourceAttribution[];
+  freeProseSentences: string[];
+  sentenceAccounting: SentenceAccountingEntry[];
   errors: string[];
   recoveries: string[];
 } {
@@ -250,16 +277,25 @@ export function normalizeAiEditorialPayload(
       rawBlocks = obj.blocks;
     } else {
       errors.push("AI payload must contain a 'blocks' array");
-      return { blocks: [], errors, recoveries };
+      return { blocks: [], sourceAttributions: [], freeProseSentences: [], sentenceAccounting: [], errors, recoveries };
     }
   } else if (Array.isArray(input)) {
     rawBlocks = input;
   } else {
     errors.push("AI payload must be an object with 'blocks' or a direct array");
-    return { blocks: [], errors, recoveries };
+    return { blocks: [], sourceAttributions: [], freeProseSentences: [], sentenceAccounting: [], errors, recoveries };
+  }
+
+  // Schema hardening: an EMPTY blocks array (or a bare empty array) is an
+  // explicit schema violation — never a silent "empty blocks". Provenance
+  // metadata can never substitute for article blocks.
+  if (rawBlocks.length === 0) {
+    errors.push("AI payload contains an empty 'blocks' array — no article blocks were provided");
+    return { blocks: [], sourceAttributions: [], freeProseSentences: [], sentenceAccounting: [], errors, recoveries };
   }
 
   const blocks: EditorialBlock[] = [];
+  const sentenceAccounting: SentenceAccountingEntry[] = [];
 
   for (let i = 0; i < rawBlocks.length; i++) {
     const raw = rawBlocks[i];
@@ -278,9 +314,30 @@ export function normalizeAiEditorialPayload(
 
     switch (blockType) {
       case "paragraph": {
+        const structured = parseStructuredSentences(rb, `Block ${i} paragraph`, opts, errors);
+        if (structured) {
+          const text = structured.text;
+          checkForDisallowedContent(
+            text,
+            errors,
+            `Block ${i} paragraph`,
+            opts,
+            "paragraph",
+            { allowColonBeforeStructuredContinuation: rawBlockProvidesStructuredContinuation(rawBlocks[i + 1]) },
+          );
+          blocks.push({ id, type: "paragraph", content: textToInlineContent(text) });
+          sentenceAccounting.push(...structured.entries);
+          break;
+        }
         const text = typeof rb.text === "string" ? normalizeWhitespace(rb.text) : "";
         if (!text) {
           errors.push(`Block ${i}: paragraph has empty text`);
+          continue;
+        }
+        if (opts?.requireSentenceKinds) {
+          errors.push(
+            `Block ${i} paragraph: factual-capable producers must return structural sentences with kind ({"type":"paragraph","sentences":[{"text":"...","kind":"free_prose"}]})`,
+          );
           continue;
         }
         checkForDisallowedContent(
@@ -348,7 +405,28 @@ export function normalizeAiEditorialPayload(
           const rawItem = itemsRaw[j];
           const itemText = typeof rawItem === "string" ? normalizeWhitespace(rawItem) : "";
           if (!itemText) {
+            // Structural sentence object list item?
+            if (rawItem && typeof rawItem === "object") {
+              const sentenceText = typeof (rawItem as Record<string, unknown>).text === "string"
+                ? normalizeWhitespace((rawItem as Record<string, unknown>).text as string)
+                : "";
+              if (sentenceText) {
+                const entries: SentenceAccountingEntry[] = [];
+                const entry = validateSentenceObject(rawItem, `Block ${i} list item ${j}`, opts, errors, entries);
+                if (entry) {
+                  items.push(textToInlineContent(sentenceText));
+                  sentenceAccounting.push(entry);
+                }
+                continue;
+              }
+            }
             errors.push(`Block ${i}: list item ${j} is empty`);
+            continue;
+          }
+          if (opts?.requireSentenceKinds) {
+            errors.push(
+              `Block ${i} list item ${j}: factual-capable producers must return structural items with kind ({"type":"list","items":[{"text":"...","kind":"free_prose"}]})`,
+            );
             continue;
           }
           checkForDisallowedContent(itemText, errors, `Block ${i} list item ${j}`, opts, "list-item");
@@ -450,7 +528,101 @@ export function normalizeAiEditorialPayload(
     }
   }
 
-  return { blocks, errors, recoveries };
+  // Canonical provenance is DERIVED from the structurally-coupled sentence
+  // objects — the producer payload never duplicates prose. source_fact
+  // sentences become sourceAttributions; free_prose sentences become
+  // freeProseSentences (internal canonical state, never rendered to WP).
+  const sourceAttributions: SourceAttribution[] = sentenceAccounting
+    .filter((entry) => entry.kind === "source_fact")
+    .map((entry) => ({ sentence: entry.sentence, evidenceIds: [...entry.evidenceIds] }));
+  const freeProseSentences: string[] = sentenceAccounting
+    .filter((entry) => entry.kind === "free_prose")
+    .map((entry) => entry.sentence);
+
+  // Schema hardening: sentence accounting can never substitute for article
+  // blocks — an explicit violation when accounting exists without any block.
+  if (blocks.length === 0 && sentenceAccounting.length > 0) {
+    errors.push(
+      "sentence accounting cannot substitute for article blocks — at least one normalized block is required",
+    );
+  }
+
+  return { blocks, sourceAttributions, freeProseSentences, sentenceAccounting, errors, recoveries };
+}
+
+/** Validate ONE structurally-coupled sentence object from a producer payload
+ *  and push its accounting entry. Returns the entry or null on violation. */
+function validateSentenceObject(
+  raw: unknown,
+  label: string,
+  opts: NormalizationOptions | undefined,
+  errors: string[],
+  entries: SentenceAccountingEntry[],
+): SentenceAccountingEntry | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    errors.push(`${label}: sentence must be an object`);
+    return null;
+  }
+  const item = raw as Record<string, unknown>;
+  const text = typeof item.text === "string" ? normalizeWhitespace(item.text) : "";
+  if (!text) {
+    errors.push(`${label}: sentence has empty text`);
+    return null;
+  }
+  const kind = item.kind;
+  if (kind !== "free_prose" && kind !== "source_fact") {
+    errors.push(`${label}: sentence kind must be "free_prose" or "source_fact"`);
+    return null;
+  }
+  const evidenceIds = Array.isArray(item.evidenceIds) ? item.evidenceIds : [];
+  if (kind === "source_fact") {
+    const validIds = evidenceIds
+      .filter((id): id is string => typeof id === "string" && /^SOURCE-\d+-CLAIM-\d+$/.test(id));
+    if (validIds.length === 0) {
+      errors.push(`${label}: source_fact sentence requires owned SOURCE-N-CLAIM-M evidenceIds`);
+      return null;
+    }
+    entries.push({ sentence: text, kind: "source_fact", evidenceIds: validIds });
+    return { sentence: text, kind: "source_fact", evidenceIds: validIds };
+  }
+  if (evidenceIds.length > 0) {
+    errors.push(`${label}: free_prose sentence must not declare evidenceIds`);
+    return null;
+  }
+  entries.push({ sentence: text, kind: "free_prose", evidenceIds: [] });
+  return { sentence: text, kind: "free_prose", evidenceIds: [] };
+}
+
+/** Parse a paragraph block's structural `sentences` array. Returns the joined
+ *  text + accounting entries when at least one valid sentence exists; null
+ *  when the block is not structural (legacy `text` or absent). */
+function parseStructuredSentences(
+  rb: Record<string, unknown>,
+  label: string,
+  opts: NormalizationOptions | undefined,
+  errors: string[],
+): { text: string; entries: SentenceAccountingEntry[] } | null {
+  const rawSentences = rb.sentences;
+  if (!Array.isArray(rawSentences)) return null;
+  if (rawSentences.length === 0) {
+    errors.push(`${label}: sentences array must not be empty`);
+    return null;
+  }
+  const entries: SentenceAccountingEntry[] = [];
+  const texts: string[] = [];
+  for (let j = 0; j < rawSentences.length; j++) {
+    const entry = validateSentenceObject(rawSentences[j], `${label} sentence ${j}`, opts, errors, entries);
+    if (entry) texts.push(entry.sentence);
+  }
+  if (texts.length === 0) {
+    errors.push(`${label}: no valid structured sentences`);
+    return null;
+  }
+  return { text: texts.join(" "), entries };
+}
+
+function extractSourceAttributions(input: unknown, errors: string[]): SourceAttribution[] {
+  return [];
 }
 
 // ── Canonical renderer ──

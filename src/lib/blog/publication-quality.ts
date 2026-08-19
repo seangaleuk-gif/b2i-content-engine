@@ -203,6 +203,15 @@ export function countRepeatedIdeaPairs(texts: string[], excludeWords?: ReadonlyS
  * object, signalled by an interrogative/relative pronoun earlier in the
  * sentence or by a preceding infinitive ("to deal with."). Those are never
  * flagged, so valid prose cannot block publication.
+ *
+ * Valid intransitive verb-particle endings ("someone steps in.", "the team
+ * moves on.") are also legitimate: the terminal particle binds directly to an
+ * intransitive phrasal verb and needs no object. The particle must IMMEDIATELY
+ * follow a finite head verb from the closed intransitive-licensing set;
+ * copula/auxiliary heads ("The budget is for."), transitive-requiring heads
+ * ("The campaign depends on.", "Customers asked about.", "This package comes
+ * with.") and particles after an object ("We discussed the plan in.") remain
+ * dangling.
  */
 export function hasDanglingSentenceEnding(text: string): boolean {
   // Structural apostrophe normalization: the typographic apostrophe (U+2019)
@@ -211,7 +220,7 @@ export function hasDanglingSentenceEnding(text: string): boolean {
   // The opening single-quote mark (U+2018) is normalized the same way so a
   // sentence quoted with curly quotes still matches its straight-quote form.
   const normalized = text.replace(/[’‘]/g, "'");
-  if (!/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from)\s*[.!?]\s*$/i.test(normalized)) {
+  if (!/\b(?:a|an|the|to|for|with|and|or|but|because|of|in|on|at|from|about)\s*[.!?]\s*$/i.test(normalized)) {
     return false;
   }
   if (/\b(?:what|which|who|whom|whose|where|how|why|when)\b/i.test(normalized)) return false;
@@ -223,7 +232,7 @@ export function hasDanglingSentenceEnding(text: string): boolean {
   // cannot license a later dangling ending ("This is worth considering, but
   // the budget is for." is still dangling).
   if (
-    /\bworth\s+[a-z]+\w*ing\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(normalized)
+    /\bworth\s+[a-z]+\w*ing\s+(?:to|for|with|of|in|on|at|from|about)\s*[.!?]\s*$/i.test(normalized)
   ) {
     return false;
   }
@@ -233,12 +242,61 @@ export function hasDanglingSentenceEnding(text: string): boolean {
   // must IMMEDIATELY follow the verb: "Let's discuss the budget for." has the
   // dangling "for." after an intervening object, so it is still flagged.
   if (
-    /\blet(?:'s|\sus)\s+[a-z]+\s+(?:to|for|with|of|in|on|at|from)\s*[.!?]\s*$/i.test(normalized)
+    /\blet(?:'s|\sus)\s+[a-z]+\s+(?:to|for|with|of|in|on|at|from|about)\s*[.!?]\s*$/i.test(normalized)
   ) {
     return false;
   }
+  // Generic intransitive verb-particle ending: the terminal particle directly
+  // follows a finite head verb from the closed intransitive-licensing set
+  // ("someone steps in.", "members check in.", "the team moves on."). The head
+  // is morphologically normalized (steps→step, carried→carry, dropped→drop).
+  const particleEnd = normalized.match(
+    /\b([a-z]+)\s+(a|an|the|to|for|with|and|or|but|because|of|in|on|at|from|about)\s*[.!?]\s*$/i,
+  );
+  if (particleEnd) {
+    const head = normalizeVerbHead(particleEnd[1]);
+    const particle = particleEnd[2].toLowerCase();
+    if (INTRANSITIVE_PHRASAL_VERB_PARTICLES.has(`${head}|${particle}`)) return false;
+  }
   return true;
 }
+
+/** Morphological head normalization for the verb-particle rule: 3sg -s/-es/-ies,
+ *  -ed, -ing and doubled-consonant forms reduce to the base head
+ *  (steps→step, carries→carry, drops→drop, checked→check). The -es suffix is
+ *  stripped only when the base ends in a sibilant or -o (boxes→box, matches→
+ *  match, goes→go); "moves" is move+s, so it falls through to the -s rule. */
+function normalizeVerbHead(word: string): string {
+  let w = word.toLowerCase();
+  if (w.endsWith("ies")) w = w.slice(0, -3) + "y";
+  else if (w.endsWith("ing")) w = w.slice(0, -3);
+  else if (w.endsWith("ed")) w = w.slice(0, -2);
+  else if (w.endsWith("es")) {
+    const base = w.slice(0, -2);
+    if (/[oszx]$|[cs]h$/.test(base)) {
+      w = base; // boxes→box, matches→match, goes→go
+    } else {
+      w = w.slice(0, -1); // move+s → move (the -s rule)
+    }
+  } else if (w.endsWith("s") && !w.endsWith("ss")) {
+    w = w.slice(0, -1);
+  }
+  if (/([a-z])\1$/.test(w)) w = w.slice(0, -1);
+  return w;
+}
+
+/** Closed set of intransitive phrasal-verb heads (normalized base + particle)
+ *  that license a terminal particle without an object. Transitive counterparts
+ *  (depend on, ask about, come with, agree with, wait for, look at, care
+ *  about, invest in, plan for, ...) are intentionally absent and remain
+ *  dangling. */
+const INTRANSITIVE_PHRASAL_VERB_PARTICLES = new Set([
+  "step|in", "check|in", "join|in", "log|in", "sign|in", "settle|in",
+  "drop|in", "come|in", "dive|in", "fit|in", "tune|in", "stop|in",
+  "walk|in", "stay|in", "give|in", "get|in",
+  "move|on", "carry|on", "go|on", "hold|on", "hang|on", "drive|on",
+  "work|out", "follow|through",
+]);
 
 export function findMalformedProseTextIssues(
   texts: string[],

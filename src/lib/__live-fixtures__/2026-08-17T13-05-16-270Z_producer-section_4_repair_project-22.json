@@ -1,0 +1,205 @@
+{
+  "schema": "producer-component-failure/v1",
+  "timestamp": "2026-08-17T13:05:16.270Z",
+  "build": "b2i-english-2026-08-20-2",
+  "projectId": "22",
+  "stage": "section_4_repair",
+  "componentId": "section-4",
+  "heading": "Turning First-Time Diners Into Regulars",
+  "attempt": "repair",
+  "candidateFingerprint": "-412109676",
+  "violations": [],
+  "errors": [],
+  "recoveries": [],
+  "blocks": [
+    {
+      "id": "section-4-wp-0",
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "Instead, weave service skills into your weekly routine. A short daily drill keeps the team sharp on greetings, recommendations and follow-up."
+        }
+      ]
+    },
+    {
+      "id": "section-4-wp-1",
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "Staff who remember a diner's usual order turn a meal into a personal ritual. Loyalty grows quietly with every remembered detail."
+        }
+      ]
+    },
+    {
+      "id": "section-4-wp-2",
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "A welcome offer gives new diners a reason to return soon. Keep the offer simple and honour it without fuss."
+        }
+      ]
+    },
+    {
+      "id": "section-4-wp-3",
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "The SKIP model covers service, knowledge, incentives and personalisation. Each part of the model earns a little more trust on every visit."
+        }
+      ]
+    },
+    {
+      "id": "section-4-wp-4",
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "Diners trust consistency more than clever marketing tricks. A steady kitchen and a warm welcome carry the whole experience."
+        }
+      ]
+    },
+    {
+      "id": "section-4-wp-5",
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "A weekly special gives regulars something new to try. Staff can mention it naturally when they greet a familiar face."
+        }
+      ]
+    }
+  ],
+  "preRepair": {
+    "fingerprint": "-101462898",
+    "blocks": [
+      {
+        "id": "section-4-wp-0",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Repeat guests bring more than a single bill to the table. Their habits smooth out the quiet evenings that keep the kitchen busy."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-1",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Personal attention is the cheapest loyalty programme a restaurant can run. A name remembered at the door costs nothing and means everything."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-2",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "A host who greets regulars by name sets the tone for the whole evening. The rest of the team follows that example."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-3",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Small gestures, such as a favourite table or a familiar dessert, make diners feel at home. These details are easy to repeat once they become habits."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-4",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "The team's memory of what guests like is a quiet asset that compounds over time. Every remembered preference makes the next visit easier."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-5",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Start with honest feedback and act on what regulars tell you. A visible change proves that their words carry weight."
+          }
+        ]
+      }
+    ]
+  },
+  "rawCandidate": {
+    "blocks": [
+      {
+        "id": "section-4-wp-0",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Before a diner leaves, a simple thank-you message sets the stage for the next visit. Keep the note short and personal."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-1",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Follow up politely after a first visit, and keep the message brief. A single useful tip is worth more than a long reminder."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-2",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Rewards work best when they feel personal rather than generic. A choice of small rewards suits different tastes."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-3",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "A birthday greeting from the restaurant adds a human touch that members notice. It costs little and stays remembered."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-4",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "A regular who visits less often may simply need a gentle reminder. A warm invitation from a familiar voice usually works."
+          }
+        ]
+      },
+      {
+        "id": "section-4-wp-5",
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "Run a short loyalty programme that rewards the habits you want to see. Keep the rules clear and the reward prompt."
+          }
+        ]
+      }
+    ]
+  }
+}

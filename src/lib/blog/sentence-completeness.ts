@@ -24,6 +24,7 @@
 // without creating import cycles.
 
 import { findSentenceBoundaryOffsets, splitSentences } from "@/lib/seo/seo-text-utils";
+import { decodeHtmlEntities } from "@/lib/blog/article-document";
 import { runSentenceCompletenessShadow } from "@/lib/blog/sentence-completeness-shadow";
 import {
   decideHybridAuthority,
@@ -518,13 +519,21 @@ export function analyzeSentenceCompleteness(
   kind: SentenceCompletenessKind,
   options?: SentenceCompletenessOptions,
 ): SentenceCompletenessAnalysis {
-  const result = analyzeSentenceCompletenessDeterministic(text, kind, options);
+  // Shared-authority normalization: text derived from rendered HTML can carry
+  // entity-encoded punctuation ("isn&#39;t"). Decode ONCE at the entry so the
+  // deterministic core, the hybrid rescue and the observational shadow all
+  // judge the SAME decoded text that the canonical ArticleDocument path
+  // provides — the canonical doc scanner and the legacy rendered-HTML
+  // publication detector can never disagree about the same sentence. Decoding
+  // is a no-op for already-decoded canonical text.
+  const decoded = decodeHtmlEntities(text);
+  const result = analyzeSentenceCompletenessDeterministic(decoded, kind, options);
   if (isHybridSentenceCompletenessEnabled()) {
-    const { analysis, overrides } = decideHybridAuthority(text, kind, options, result);
+    const { analysis, overrides } = decideHybridAuthority(decoded, kind, options, result);
     runHybridOverrideDiagnostics(overrides);
     return analysis;
   }
-  runSentenceCompletenessShadow(text, kind, options);
+  runSentenceCompletenessShadow(decoded, kind, options);
   return result;
 }
 

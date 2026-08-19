@@ -9,8 +9,8 @@
 import {
   parseWordPressEditorialBlocks,
   renderEditorialBlocksToWordPress,
-  renderArticleDocument,
   type EditorialBlock,
+  type SourceAttribution,
 } from "@/lib/blog/article-document";
 import { isSourceBoilerplate, stripSourceBoilerplate } from "@/lib/blog/source-boilerplate";
 import { hasDanglingSentenceEnding } from "@/lib/blog/publication-quality";
@@ -36,6 +36,10 @@ export interface ScannedClaim {
   category: ClaimCategory;
   /** Whether this claim appears to be supported by research text */
   supported: boolean;
+  /** Semantic support verdict: "supported", "contradicted" or "insufficient".
+   *  A matching number/entity/keyword alone never yields "supported" — the
+   *  evidence must entail the claim's material parts. */
+  supportVerdict?: "supported" | "contradicted" | "insufficient";
   /** Complete sentence containing the detected fragment. */
   sentenceText?: string;
   /** Stable source identifier when the complete claim is supported. */
@@ -48,6 +52,85 @@ export interface ScannedClaim {
   supportReason?: string;
   /** Section index (which H2 section this appears in) */
   sectionIndex: number;
+  /** Source paragraph ordinal within the scanned HTML (general-discovered
+   *  claims only; pattern claims rely on the raw html position). */
+  blockId?: string;
+  /** Exact source span in the scanned visible text (general-discovered
+   *  claims only). */
+  sourceSpan?: { start: number; end: number };
+  /** Diagnostic-only marker: general-discovered claims are SHADOW findings.
+   *  They are reported (logs) but NEVER count toward hasHighRisk, never enter
+   *  the unsupported set, never drive removal and never gate publication.
+   *  The hard factual authority is source-derived: deterministic patterns +
+   *  provenance + entailment. */
+  shadow?: boolean;
+}
+
+// ── General verifiable-claim discovery ──
+// CLAIM_PATTERNS is a deterministic high-risk detector but must never define
+// the COMPLETE universe of factual claims: ordinary non-numeric assertions
+// (platform capabilities, payment mechanics, service availability, company
+// behaviour, rankings, event facts) carry no special keyword and would bypass
+// it. The factual authority therefore accepts ONE bounded structured
+// discovery result per scan invocation (supplied by the caller — the pipeline
+// builds it from a single model call; tests supply fixtures) and merges
+// verifiable discovered claims into the SAME entailment authority.
+
+export interface GeneralDiscoveredClaim {
+  /** Self-contained claim wording with all truth-conditional qualifiers. */
+  claim: string;
+}
+
+/** One sentence submitted to general discovery, with a stable deterministic
+ *  ID (`s<surface-sentence-index>`) that the response must echo exactly. */
+export interface GeneralDiscoveryRequestSentence {
+  sentenceId: string;
+  sentence: string;
+}
+
+/** One classified sentence in the structured discovery response. */
+export interface GeneralDiscoveryResponseSentence {
+  sentenceId: string;
+  verifiableClaims: string[];
+}
+
+export interface GeneralDiscoveryBatchRequest {
+  sentences: GeneralDiscoveryRequestSentence[];
+}
+
+export interface GeneralDiscoveryBatchResult {
+  sentences: GeneralDiscoveryResponseSentence[];
+}
+
+/** Per-scan-text discovery result: complete (claims may be empty — every
+ *  sentence was classified) or unavailable (coverage is unknown and the
+ *  factual authority must fail closed). */
+export type GeneralDiscoveryCoverageEntry =
+  | { status: "complete"; claims: GeneralDiscoveredClaim[] }
+  | { status: "unavailable"; reason: string };
+
+export type GeneralDiscoveredClaimsMap = Map<string, GeneralDiscoveryCoverageEntry>;
+
+/** Bounded structured discovery over ONE sentence batch. Must account for
+ *  every submitted sentence ID; throws on unverifiable batches. */
+export type GeneralClaimDiscovery = (
+  request: GeneralDiscoveryBatchRequest,
+) => Promise<GeneralDiscoveryBatchResult>;
+
+export interface FactualScanOptions {
+  /** Pre-warmed discovery coverage keyed by visible body text. When present,
+   *  the scanner merges complete results with pattern claims and throws the
+   *  distinct factual-coverage error for unavailable entries. */
+  generalDiscoveredClaims?: GeneralDiscoveredClaimsMap;
+  /** Explicit source→prose provenance for the scanned component: exact
+   *  sentences mapped to the SOURCE-X-CLAIM-Y IDs the producer was supplied.
+   *  Attributed sentences are validated against their DECLARED evidence only —
+   *  never reassigned heuristically from the whole ledger. */
+  declaredAttributions?: SourceAttribution[];
+  /** Free-prose accounting for the scanned component: sentences the producer
+   *  classified as advice/opinion/rhetoric/hypothetical. They are never fed
+   *  into general-claim discovery merging and never become factual claims. */
+  freeProseSentences?: string[];
 }
 
 export type ClaimCategory =
@@ -63,7 +146,9 @@ export type ClaimCategory =
   | "testimonial_quote"
   | "unattributed_source"
   | "business_result"
-  | "market_wide_claim";
+  | "market_wide_claim"
+  | "general_claim"
+  | "source_attributed";
 
 export interface EvidenceLedgerEntry {
   evidenceId: string;
@@ -99,8 +184,8 @@ const CLAIM_PATTERNS: Array<{
     regex: /\b\d{1,3}(?:\.\d+)?%[^.!?]{0,100}?(?:average|median)\s+engagement rate\b/gi,
   },
   // Numerical growth claims
-  { category: "numerical_growth", regex: /(?:increased|decreased|grew|fell|rose|dropped|doubled|tripled|jumped|surged)\s+(?:by|from|to)\s+\d+/gi },
-  { category: "numerical_growth", regex: /(?:jumped|surged|shot up|soared|plummeted|plunged)\s+(?:\d+)/gi },
+  { category: "numerical_growth", regex: /(?:increased|decreased|grew|fell|rose|dropped|doubled|tripled|jumped|surged)\s+(?:by|from|to)\s+\d+(?:,\d{3})*(?:\.\d+)?(?![\d.,])/gi },
+  { category: "numerical_growth", regex: /(?:jumped|surged|shot up|soared|plummeted|plunged)\s+\d+(?:,\d{3})*(?:\.\d+)?(?![\d.,])/gi },
   { category: "numerical_growth", regex: /\d+\s*(?:percent|per cent|times|x)\s+(?:increase|decrease|growth|drop|rise|fall|more)/gi },
   { category: "numerical_growth", regex: /\b\d+(?:\.\d+)?\s*x\s+(?:higher|lower|more|greater|better|faster)\b/gi },
   // Platform thresholds, recommended cadence and claimed peak-time windows
@@ -151,9 +236,25 @@ const CLAIM_PATTERNS: Array<{
     regex:
       /\b(?:engagement|reach|exposure|visibility)\b[^.!?]{0,40}\b(?:will|can)\s+(?:drop|rise|increase|decrease|grow)\b[^.!?]*/gi,
   },
+  // Comparative-quantity propositions ("worth more than a hundred one-time
+  // visitors", "more than a thousand followers") are factual claims: the
+  // evidence must assert the SAME comparison, not merely contain the number.
+  {
+    category: "comparative_performance",
+    regex:
+      /\b(?:more|less|better|worse|higher|lower|greater|worth\s+more|fewer|stronger|faster|cheaper|larger|bigger|smaller)\s+than\s+(?:a\s+)?(?:hundred|thousand|million|billion|hundreds|thousands|millions)\b[^.!?]*/gi,
+  },
+  // Superlative reputation propositions ("widely regarded as the best
+  // channel", "known as the leading retail channel") require evidence that
+  // asserts the same superlative strength.
+  {
+    category: "comparative_performance",
+    regex:
+      /\b(?:widely\s+)?(?:regarded|considered|seen|known)\s+as\s+the\s+(?:best|leading|top|most\s+\w+|number\s+one)\b[^.!?]*/gi,
+  },
   // Business results
   { category: "business_result", regex: /generated?\s+\d+\s*(?:percent|%|times|x|more)/gi },
-  { category: "business_result", regex: /(?:sales|revenue|traffic|leads|conversions?)\s+(?:rose|increased|grew|jumped|surged)\s+\d+/gi },
+  { category: "business_result", regex: /(?:sales|revenue|traffic|leads|conversions?)\s+(?:rose|increased|grew|jumped|surged)\s+\d+(?:,\d{3})*(?:\.\d+)?(?![\d.,])/gi },
   { category: "business_result", regex: /\d+\s*(?:percent|%)\s+(?:increase|decrease|growth|boost|rise|drop)\s+in\s+(?:sales|revenue|traffic|leads|conversions?|engagement|visits?)/gi },
   // Testimonials with quotation marks
   {
@@ -175,7 +276,7 @@ const CLAIM_PATTERNS: Array<{
   { category: "market_wide_claim", regex: /\bhit rock bottom\b[^.!?]*/gi },
   { category: "market_wide_claim", regex: /\beveryone (?:is|has|can|will|sees?|wants?|expects?)\b[^.!?]*/gi },
   { category: "market_wide_claim", regex: /\bbrands across (?:the )?(?:city|market|industry|region)\b[^.!?]*/gi },
-  { category: "market_wide_claim", regex: /\bthe most effective (?:way|strategy|approach|tool|method|channel|platform)\b[^.!?]*/gi },
+  { category: "market_wide_claim", regex: /\bthe (?:most effective|best|leading|top) (?:[a-z]+ ){0,3}(?:way|strategy|approach|tool|method|channel|platform)\b[^.!?]*/gi },
   { category: "market_wide_claim", regex: /\bno longer guarantees?\b[^.!?]*/gi },
   { category: "market_wide_claim", regex: /\b(?:nobody|no one) (?:can|will|ever|wants?|trusts?|clicks?)\b[^.!?]*/gi },
   { category: "market_wide_claim", regex: /\ball (?:businesses|brands|marketers|companies|teams)\b[^.!?]*/gi },
@@ -199,6 +300,138 @@ const CLAIM_PATTERNS: Array<{
   { category: "market_wide_claim", regex: /\b(?:consumers?|people|users?|audiences?|customers?)\b[^.!?]{0,60}\b(?:bombarded|flooded|inundated|overwhelmed)\b[^.!?]*/gi },
   { category: "market_wide_claim", regex: /\b(?:thousands?|hundreds?|millions?) of (?:messages|ads?|promotions?|notifications?)\b[^.!?]*/gi },
 ];
+
+// ── Claimhood: temporal scope vs genuine year assertions ──
+// A year/date token alone is never automatically an atomic factual claim.
+// "The Shape of the Market in 2026", "Our 2026 guide to Hong Kong retail
+// marketing" and "Hong Kong Marketing Trends 2026" name a topic, document or
+// edition — temporal context, not a proposition the text asserts. A year only
+// becomes a claim when the sentence is a finite clause and the year sits in a
+// temporal-adjunct position ("Hong Kong retail sales rose 6.5% in 2026") or
+// heads the clause as its subject ("2026 marks the launch of Threads ads").
+// This is a structural claimhood rule: no year, phrase or article is
+// whitelisted, and a genuine assertion involving a year is still checked.
+
+const TEMPORAL_PREPOSITIONS = new Set([
+  "in", "during", "by", "through", "until", "till", "since", "from",
+  "around", "about", "before", "after", "between", "throughout", "within",
+  "over", "on", "at", "for",
+]);
+
+const MONTH_NAMES = new Set([
+  "january", "february", "march", "april", "may", "june", "july",
+  "august", "september", "october", "november", "december",
+  "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct",
+  "nov", "dec",
+]);
+
+const YEAR_WINDOW_QUALIFIERS = new Set([
+  "early", "late", "mid", "mid-", "q1", "q2", "q3", "q4", "h1", "h2",
+  "first", "second", "third", "fourth", "calendar", "fiscal",
+]);
+
+const SENTENCE_OPENER_TOKENS = new Set([
+  "so", "and", "but", "yet", "however", "meanwhile", "still", "yes",
+  "indeed", "again", "now", "here", "then", "also", "or",
+]);
+
+const YEAR_CLAIM_WH_START_RE = /^(?:why|what|which|who|whom|whose|when|where|how)\b/i;
+
+// Imperative advice ("Plan ahead for 2026", "Expect more in 2026", "Start
+// with a clear strategy for 2026") is guidance, not an assertion. A verb
+// followed by "of/to/the/a/an" is not an imperative ("Start of 2026 saw…").
+const YEAR_CLAIM_IMPERATIVE_START_RE =
+  /^(?:expect|plan|prepare|get|start|begin|learn|discover|find|see|watch|read|use|try|adopt|embrace|focus|think|consider|look|build|create|make|put|ask|reach|target|aim|budget|save|invest|grow|improve|optimis\w*|optimiz\w*|test|measure|track|launch|post|share|engage|connect|follow|subscribe|join|register|book|apply|explore|check|compare|understand|remember|keep|stay|avoid|don['’]?t|let|imagine|picture|prep|gear|position|ready|set)\b\s+(?!of\b|to\b|the\b|a\b|an\b)/i;
+
+// Tensed predicates: the sentence must be a full clause, not a nominal
+// heading/topic label. Closed set in the same style as the scanner's other
+// verb lists (attribution verbs, dangling-verb particles).
+const FINITE_PREDICATE_RE =
+  /\b(?:is|are|was|were|am|'s|'re|'m|will|won['’]?t|would|shall|should|may|might|can|could|must|have|has|had|'ve|do|does|did|be|been|being)\b|\b(?:rose|fell|grew|grown|drop(?:ped|s)?|increase(?:d|s)?|decrease(?:d|s)?|surge(?:d|s)?|jump(?:ed|s)?|climb(?:ed|s)?|decline(?:d|s)?|slump(?:ed|s)?|plunge(?:d|s)?|plummet(?:ed|s)?|recover(?:ed|s)?|rebound(?:ed|s)?|stabilis(?:ed|es)?|stabiliz(?:ed|es)?|improve(?:d|s)?|weaken(?:ed|s)?|soften(?:ed|s)?|accelerate(?:d|s)?|decelerate(?:ed|s)?|shift(?:ed|s)?|change(?:d|s)?|transform(?:ed|s)?|evolve(?:d|s)?|emerge(?:d|s)?|expand(?:ed|s)?|contract(?:ed|s)?|shrank|shrunk|shrink(?:s)?|double(?:d|s)?|triple(?:d|s)?|halve(?:d|s)?|hit(?:s)?|reach(?:ed|es)?|top(?:ped|s)?|exceed(?:ed|s)?|cross(?:ed|es)?|pass(?:ed|es)?|broke|broken|break(?:s)?|beat(?:en|s)?|set(?:s)?|record(?:ed|s)?|post(?:ed|s)?|report(?:ed|s)?|deliver(?:ed|s)?|produce(?:d|s)?|generate(?:d|s)?|achieve(?:d|s)?|earn(?:ed|s)?|brought|bring(?:s)?|attract(?:ed|s)?|drew|drawn|draw(?:s)?|welcomed|welcome(?:s)?|saw|seen|see(?:s)?|mark(?:ed|s)?|feature(?:d|s)?|include(?:d|s)?|offer(?:ed|s)?|launch(?:ed|es)?|release(?:d|s)?|introduce(?:d|s)?|debut(?:ed|s)?|start(?:ed|s)?|began|begun|begin(?:s)?|end(?:ed|s)?|open(?:ed|s)?|close(?:d|s)?|announce(?:d|s)?|unveil(?:ed|s)?|happen(?:ed|s)?|occur(?:red|s)?|took\s+place|take(?:s)?\s+place|arrive(?:d|s)?|return(?:ed|s)?|survive(?:d|s)?|thrive(?:d|s)?|spent|spend(?:s|ing)?|pay(?:s)?|paid|buy(?:s)?|bought|sell(?:s)?|sold|invest(?:ed|s)?|cost(?:s)?|save(?:d|s)?|budget(?:ed|s)?|hire(?:d|s)?|employ(?:ed|s)?|shop(?:ped|s)?|visit(?:ed|s)?|attend(?:ed|s)?|book(?:ed|s)?|order(?:ed|s)?|purchase(?:d|s)?)\b|\b(?:aim(?:s)?|expect(?:s)?|project(?:s)?|forecast(?:s)?|anticipate(?:s)?|predict(?:s)?|plan(?:s)?|schedule(?:s)?|target(?:s)?|want(?:s)?|need(?:s)?|hope(?:s)?|intend(?:s)?|trend(?:s)?|point(?:s)?|lead(?:s)?|look(?:s)?|remain(?:s)?|stay(?:s)?|continue(?:s)?|become(?:s)?|represent(?:s)?|signal(?:s)?|usher(?:s)?|herald(?:s)?|kick(?:s)?|drive(?:s)?|fuel(?:s)?|push(?:es)?|boost(?:s)?|strengthen(?:s)?|reshape(?:s)?|pave(?:s)?|promise(?:s)?|show(?:s)?|reveal(?:s)?|suggest(?:s)?|indicate(?:s)?|find(?:s)?|confirm(?:s)?|prove(?:s)?|demonstrate(?:s)?|highlight(?:s)?|emphasiz(?:es|e(?:d)?)|emphasise(?:s|d)?|stress(?:es)?|warn(?:s)?|argue(?:s)?|note(?:s)?|say(?:s)?|state(?:s)?|claim(?:s)?|work(?:s)?|fail(?:s)?|succeed(?:s)?|matter(?:s)?|count(?:s)?|apply(?:ies|s)?|follow(?:s)?|prepare(?:s)?|gear(?:s)?|position(?:s)?|ready(?:ies|s)?|turn(?:s)?|move(?:s)?|head(?:s)?|go(?:es)?|come(?:s)?|get(?:s)?|make(?:s)?|take(?:s)?|give(?:s)?|keep(?:s)?|hold(?:s)?|put(?:s)?|build(?:s)?|create(?:s)?|adopt(?:s)?|embrace(?:s)?|use(?:s)?|rel(?:ies|y)?|depend(?:s)?|ride(?:s)?|coast(?:s)?|glide(?:s)?|slide(?:s)?|drift(?:s)?|waver(?:s)?|struggle(?:s)?|grapple(?:s)?|navigate(?:s)?|steer(?:s)?|lay(?:s)?)\b/i;
+
+// A year at clause head is a genuine assertion only when it is followed by a
+// predicate — when it directly modifies a document/topic noun ("2026 guide",
+// "2026 sales", "2026-2027 outlook", "2026: What to expect") it is scope.
+const YEAR_MODIFIER_AFTER_RE =
+  /^\s*(?:['’]s\b|[–—\-/]\s*\d|[.:,!?;]|(?:the\s+|our\s+|their\s+|this\s+|that\s+|a\s+)?(?:hong\s+kong\s+)?(?:guide|report|edition|forecast|outlook|trends?|landscape|market(?:s)?|marketing|retail|budget|roadmap|roundup|review|analysis|insights?|playbook|survey|study|summary|update|series|season|campaign|collection|lineup|directory|list|checklist|masterclass|webinar|event|conference|show|expo|forum|summit|sales|revenue|profits?|results?|figures?|earnings|performance|growth|numbers?|plans?|goals?|targets?|strategy|strategies|issues?|shopper(?:s)?|consumer(?:s)?|customer(?:s)?|audience(?:s)?|brand(?:s)?|business(?:es)?|industry|industries|scene|space|sector(?:s)?|edition|report))\b/i;
+
+/**
+ * Claimhood for `date_claim`: the year is an atomic factual claim ONLY inside
+ * a finite clause where it is a temporal adjunct or the clause subject.
+ * Nominal topic/document headings ("The Shape of the Market in 2026"),
+ * document-scope noun phrases ("Our 2026 guide to…"), questions and
+ * imperative advice are not propositions and never enter the verifier.
+ */
+function isYearAssertionClaim(sentenceText: string, yearOffset: number): boolean {
+  const sentence = (sentenceText ?? "").trim();
+  if (!sentence) return false;
+  // A question never asserts ("What does 2026 hold?", "Why 2026 matters.").
+  if (YEAR_CLAIM_WH_START_RE.test(sentence) || /\?\s*$/.test(sentence)) return false;
+  // Imperative advice is guidance, not an assertion.
+  if (YEAR_CLAIM_IMPERATIVE_START_RE.test(sentence)) return false;
+  // Nominal fragments have no finite predicate → topic/document scope.
+  if (!FINITE_PREDICATE_RE.test(sentence)) return false;
+
+  const before = sentence.slice(0, yearOffset);
+  const tokens = before.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const window = tokens.slice(-4);
+
+  // A year immediately followed by a colon is a topic label ("Hong Kong
+  // Retail in 2026: What to Expect", "2026: The Year of Retail") — framing,
+  // never an assertion about the year.
+  if (/[:：]/.test(sentence.slice(yearOffset + 4, yearOffset + 5))) return false;
+
+  // Temporal-adjunct position: a temporal preposition governs the year and
+  // the tokens between them are only month/quarter/qualifier words
+  // ("sales rose 6.5% in 2026", "launched in March 2026", "by early 2026").
+  // "in the 2026 report" is NOT adjunct — the article "the" shows the year
+  // modifies the noun, so it stays document scope.
+  for (let index = window.length - 1; index >= 0; index--) {
+    if (!TEMPORAL_PREPOSITIONS.has(window[index])) continue;
+    const between = window.slice(index + 1);
+    if (between.every((token) =>
+      MONTH_NAMES.has(token) || YEAR_WINDOW_QUALIFIERS.has(token),
+    )) {
+      return true;
+    }
+    break;
+  }
+
+  // Subject position: the year opens the clause (possibly after openers like
+  // "So" / "However," / "March"). It is a claim only when followed by a
+  // predicate; a following noun means it merely modifies that noun.
+  if (
+    tokens.length === 0
+    || tokens.every((token) => SENTENCE_OPENER_TOKENS.has(token) || MONTH_NAMES.has(token))
+  ) {
+    const after = sentence.slice(yearOffset + 4);
+    return !YEAR_MODIFIER_AFTER_RE.test(after);
+  }
+  return false;
+}
+
+// ── Claimhood: qualifier-governed fragments are not independent claims ──
+// Decomposition must never drop a truth-conditional qualifier and emit a
+// stronger claim than the text asserts: "widely seen as the best retail
+// channel" must not additionally produce "the best retail channel". When a
+// weakening qualifier (epistemic perception, modal, attribution, estimation)
+// directly governs an absolute market-wide fragment, the fragment is not an
+// independently asserted proposition — the qualified form is handled by its
+// own pattern ("widely regarded/seen/known as the best…").
+
+const MARKET_WIDE_GOVERNANCE_RE =
+  /(?:widely|often|generally|commonly|increasingly|traditionally|frequently|usually|typically|long|now|still|reportedly|allegedly|perhaps|possibly|probably|likely|arguably|seemingly|by many|in many circles|by some estimates?)?\s*(?:seen|regarded|considered|viewed|perceived|known|hailed|touted|described|named|rated|voted|called|believed|thought|positioned|branded|framed|painted|portrayed|depicted|characterised|characterized|recognised|recognized|acknowledged)\s+(?:as|to be)\s+$|\b(?:may|might|can|could|would|should|perhaps|possibly|probably|likely|arguably|reportedly|allegedly|seemingly|seems?|appears?|estimated|expected|believed|thought|said|claimed|considered|projected|forecast)\s+(?:well\s+|to\s+)?(?:be\s+)?(?:the\s+)?(?:most\s+)?$|\b(?:reportedly|allegedly|according to\b[^.!?]{0,60}|by some estimates\b[^.!?]{0,40}|by some measures\b[^.!?]{0,40}|some say\b[^.!?]{0,30}|experts? (?:say|describe)\b[^.!?]{0,30})\s*[,;:]?\s*$/i;
+
+/**
+ * Claimhood for `market_wide_claim`: an absolute fragment ("the best channel",
+ * "everyone", "no one can") whose strength token is directly governed by a
+ * weakening qualifier ("widely seen as the best", "may be the best",
+ * "according to experts, the best") is not an independent stronger claim.
+ */
+function isQualifierGovernedFragment(sentenceText: string, fragmentOffset: number): boolean {
+  const prefix = (sentenceText ?? "").slice(0, fragmentOffset);
+  return MARKET_WIDE_GOVERNANCE_RE.test(prefix);
+}
 
 // ── Research-source text extraction ──
 
@@ -244,21 +477,156 @@ export function buildEvidenceLedger(
 
 // ── Scanner ──
 
-export function scanFactualRisks(
-  html: string,
-  keyphrase: string,
-  research?: Array<{ title?: string; snippet?: string; url?: string }>,
-): FactualRisk {
+/** The exact visible text a scan operates on — shared by the scanner and the
+ *  discovery warmers so the cache key and the scan lookup always agree. */
+export function visibleBodyTextForFactualScan(html: string): string {
   const scanHtml = stripPipelineCitationParagraphs(html)
     // Protected HTML assets are validated separately. This also excludes the
     // canonical visible FAQ, which receives its own structured factual pass.
     .replace(/<!--\s*wp:html\s*-->[\s\S]*?<!--\s*\/wp:html\s*-->/gi, "");
-  const bodyText = decodeHtmlEntities(scanHtml
+  return decodeHtmlEntities(scanHtml
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim());
+}
+
+// ── General-claim discovery warming ──
+// The discovery model call is asynchronous, while every scan and every final
+// gate is synchronous. The pipeline therefore WARMS the cache (at most one
+// bounded batch call per unique sentence set) before each gate, and the sync
+// scans read the warmed result.
+//
+// Completeness contract: every sentence of the scanned text receives a stable
+// deterministic ID and is submitted inside a bounded batch; the discovery
+// function must account for every submitted ID (or throw). A batch that stays
+// unavailable — provider failure, invalid JSON, truncation, missing/unknown/
+// duplicate IDs — is recorded as UNAVAILABLE coverage for that text. The scan
+// then fails closed with the distinct factual-coverage diagnostic: coverage
+// is unknown, so the article is never saved on pattern-only fallback.
+// CLAIM_PATTERNS remain merged high-risk backstops for complete coverage.
+
+const GENERAL_DISCOVERY_MIN_WORDS = 8;
+const GENERAL_DISCOVERY_CACHE_CAP = 400;
+const GENERAL_DISCOVERY_BATCH_SENTENCES = 6;
+
+function discoveryWordCount(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * Warm discovery for one scan text: split into sentences, assign stable IDs
+ * (`s<surface-sentence-index>`), submit in bounded batches, and verify every
+ * batch accounts for every submitted sentence ID. Any batch that cannot be
+ * completed marks the WHOLE text unavailable — never a silent pattern-only
+ * fallback. Memoised per process so repeated scans of the same text never
+ * re-call the model.
+ */
+export async function warmGeneralClaimDiscovery(
+  html: string,
+  discovery: GeneralClaimDiscovery,
+  cache?: GeneralDiscoveredClaimsMap,
+): Promise<GeneralDiscoveredClaimsMap> {
+  const map = cache ?? new Map<string, GeneralDiscoveryCoverageEntry>();
+  const text = visibleBodyTextForFactualScan(html);
+  if (map.has(text) || discoveryWordCount(text) < GENERAL_DISCOVERY_MIN_WORDS) return map;
+  if (map.size >= GENERAL_DISCOVERY_CACHE_CAP) {
+    map.set(text, { status: "unavailable", reason: "discovery cache capacity reached" });
+    return map;
+  }
+
+  const sentenceRangesList = sentenceRanges(text);
+  const sentences: GeneralDiscoveryRequestSentence[] = sentenceRangesList.map((range, index) => ({
+    sentenceId: `s${index}`,
+    sentence: text.slice(range.start, range.end).replace(/\s+/g, " ").trim(),
+  }));
+  if (sentences.length === 0) {
+    map.set(text, { status: "complete", claims: [] });
+    return map;
+  }
+
+  const claims: GeneralDiscoveredClaim[] = [];
+  for (let start = 0; start < sentences.length; start += GENERAL_DISCOVERY_BATCH_SENTENCES) {
+    const batch = sentences.slice(start, start + GENERAL_DISCOVERY_BATCH_SENTENCES);
+    try {
+      const result = await discovery({ sentences: batch });
+      // Defense in depth: the discovery seam already verifies completeness,
+      // but a supplied discovery function must never bypass the contract.
+      const violations = verifySubmittedSentenceCompleteness(batch, result);
+      if (violations.length > 0) {
+        map.set(text, { status: "unavailable", reason: violations.join("; ") });
+        return map;
+      }
+      for (const entry of result.sentences) {
+        for (const claim of entry.verifiableClaims) {
+          claims.push({ claim: claim.trim() });
+        }
+      }
+    } catch (err) {
+      map.set(text, {
+        status: "unavailable",
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return map;
+    }
+  }
+  map.set(text, { status: "complete", claims });
+  return map;
+}
+
+/** Deterministic batch completeness check (shared with the discovery seam so
+ *  warm and seam can never disagree about what "complete" means). */
+export function verifySubmittedSentenceCompleteness(
+  submitted: GeneralDiscoveryRequestSentence[],
+  result: GeneralDiscoveryBatchResult | null,
+): string[] {
+  if (!result || !Array.isArray(result.sentences)) return ["response has no sentences array"];
+  const errors: string[] = [];
+  const submittedIds = submitted.map((s) => s.sentenceId);
+  const returnedIds = result.sentences.map((s) => s.sentenceId);
+  const returnedDuplicates = returnedIds.filter((id, index) => returnedIds.indexOf(id) !== index);
+  if (returnedDuplicates.length > 0) {
+    errors.push(`duplicate sentence ids in response: ${[...new Set(returnedDuplicates)].join(", ")}`);
+  }
+  const unknown = returnedIds.filter((id) => !submittedIds.includes(id));
+  if (unknown.length > 0) {
+    errors.push(`unknown sentence ids in response: ${[...new Set(unknown)].join(", ")}`);
+  }
+  const missing = submittedIds.filter((id) => !returnedIds.includes(id));
+  if (missing.length > 0) {
+    errors.push(`missing sentence ids in response: ${missing.join(", ")}`);
+  }
+  for (const entry of result.sentences) {
+    if (typeof entry?.sentenceId !== "string" || !Array.isArray(entry.verifiableClaims)) {
+      errors.push("response contains a malformed sentence entry");
+    }
+  }
+  return errors;
+}
+
+/** Warm every canonical structured surface of a document (same surface set
+ *  `scanUnsupportedClaimsInDocument` scans, so the final gates never discover
+ *  a claim the warming step did not see). */
+export async function warmGeneralClaimDiscoveryForDocument(
+  doc: import("@/lib/blog/article-document").ArticleDocument,
+  discovery: GeneralClaimDiscovery,
+  cache?: GeneralDiscoveredClaimsMap,
+): Promise<GeneralDiscoveredClaimsMap> {
+  const map = cache ?? new Map<string, GeneralDiscoveryCoverageEntry>();
+  for (const surface of collectStructuredFactualSurfaces(doc)) {
+    await warmGeneralClaimDiscovery(surface.html, discovery, map);
+  }
+  return map;
+}
+
+export function scanFactualRisks(
+  html: string,
+  keyphrase: string,
+  research?: Array<{ title?: string; snippet?: string; url?: string }>,
+  options?: FactualScanOptions,
+): FactualRisk {
+  const bodyText = visibleBodyTextForFactualScan(html);
 
   const evidenceLedger = buildEvidenceLedger(research);
 
@@ -302,6 +670,29 @@ export function scanFactualRisks(
       const claimText = decodeHtmlEntities(m[0]).toLowerCase();
       const sentenceText = containingSentence(bodyText, m.index);
 
+      // Claimhood: non-claims and meaning-altered decompositions must never
+      // enter the unsupported set. A bare year in topic/document scope is
+      // temporal metadata, not a proposition; an absolute fragment governed
+      // by a weakening qualifier ("widely seen as the best channel") never
+      // yields a stronger independent claim.
+      const matchIndex = m.index;
+      const claimSentenceRange = sentenceRanges(bodyText).find(
+        (range) => matchIndex >= range.start && matchIndex < range.end,
+      );
+      const rawSentence = claimSentenceRange
+        ? bodyText.slice(claimSentenceRange.start, claimSentenceRange.end)
+        : bodyText;
+      const claimOffsetInSentence = claimSentenceRange ? matchIndex - claimSentenceRange.start : 0;
+      if (category === "date_claim" && !isYearAssertionClaim(rawSentence, claimOffsetInSentence)) {
+        continue;
+      }
+      if (
+        category === "market_wide_claim"
+        && isQualifierGovernedFragment(rawSentence, claimOffsetInSentence)
+      ) {
+        continue;
+      }
+
       // Quotation marks alone do not turn illustrative copy into a factual
       // testimonial. Suggested post prompts, hypothetical dialogue and calls
       // to action are ordinary editorial examples unless the surrounding
@@ -327,6 +718,7 @@ export function scanFactualRisks(
         htmlPosition: safeHtmlPos,
         category,
         supported: Boolean(support.entry) && quotationHasNamedLink,
+        supportVerdict: support.entry ? support.verdict : "insufficient",
         sentenceText,
         evidenceId: support.entry?.evidenceId,
         evidenceText: support.entry?.approvedText,
@@ -339,8 +731,276 @@ export function scanFactualRisks(
     }
   }
 
-  const hasHighRisk = claims.some((c) => !c.supported);
+  // General verifiable-claim merge — SHADOW/DIAGNOSTIC ONLY. The deterministic
+  // patterns never define the complete universe of factual claims, so general
+  // discovery is preserved as an observational layer: discovered claims are
+  // merged, located, entailed and LOGGED, but they are never a mutation
+  // authority. Ordinary editorial/guidance prose must never be deleted merely
+  // because it lacks direct research entailment, and an unavailable or
+  // unverifiable discovery result must never block publication — B2I is
+  // source-first, not exhaustive post-hoc fact checking. Every merged general
+  // claim carries `shadow: true` and is excluded from hasHighRisk, the
+  // unsupported set, removal and every gate.
+  const coverageEntry = options?.generalDiscoveredClaims?.get(bodyText);
+  if (coverageEntry?.status === "unavailable") {
+    console.warn(
+      `[factual-general-claim-discovery:shadow] coverage unavailable for a factual surface — ` +
+      `diagnostic layer skipped (reason=${coverageEntry.reason})`,
+    );
+  }
+  const discoveredClaims = coverageEntry?.status === "complete" ? coverageEntry.claims : [];
+  if (discoveredClaims.length > 0) {
+    const sentenceRangeList = sentenceRanges(bodyText);
+    const paragraphBlocks = [...html.matchAll(
+      /<!--\s*wp:paragraph\s*-->([\s\S]*?)<!--\s*\/wp:paragraph\s*-->/gi,
+    )];
+    for (const item of discoveredClaims) {
+      const claimText = (item.claim ?? "").trim();
+      if (!claimText || claimText.length > 400) continue;
+
+      const located = locateDiscoveredClaimSentence(
+        claimText,
+        bodyText,
+        sentenceRangeList,
+      );
+      if (!located) {
+        console.warn(
+          `[factual-general-claim-discovery:shadow] discovered claim cannot be located in its source text — ` +
+          `skipped (diagnostic only; claim="${claimText.slice(0, 120)}")`,
+        );
+        continue;
+      }
+      const sentenceText = bodyText.slice(located.start, located.end).replace(/\s+/g, " ").trim();
+      // Free-prose accounting: sentences the producer classified as
+      // advice/opinion/hypothetical are never fed into discovery merging.
+      const freeProse = options?.freeProseSentences ?? [];
+      if (freeProse.some((sentence) =>
+        normalizeForMatch(sentenceText).includes(normalizeForMatch(sentence)),
+      )) {
+        continue;
+      }
+      if (normalizeForMatch(sentenceText).includes(normalizeForMatch(claimText)) === false
+        && tokenOverlapRatio(claimText, sentenceText) < 0.5) {
+        console.warn(
+          `[factual-general-claim-discovery:shadow] discovered claim does not match any classified sentence — ` +
+          `skipped (diagnostic only; claim="${claimText.slice(0, 120)}")`,
+        );
+        continue;
+      }
+      if (isDuplicateGeneralClaim(claimText, sentenceText, claims)) continue;
+
+      const block = locateParagraphBlock(claimText, sentenceText, paragraphBlocks);
+      const blockAnchorEnd = block ? block.anchorEnd : 0;
+      const beforeClaim = html.substring(0, blockAnchorEnd);
+      const lastOpenComment = beforeClaim.lastIndexOf("<!--");
+      const lastCloseComment = beforeClaim.lastIndexOf("-->");
+      if (lastOpenComment > lastCloseComment) continue; // protected block
+
+      const support = findSupportingEvidence(
+        sentenceText,
+        claimText,
+        "general_claim",
+        evidenceLedger,
+      );
+
+      claims.push({
+        text: claimText,
+        htmlPosition: blockAnchorEnd,
+        category: "general_claim",
+        supported: Boolean(support.entry),
+        supportVerdict: support.entry ? support.verdict : "insufficient",
+        sentenceText,
+        evidenceId: support.entry?.evidenceId,
+        evidenceText: support.entry?.approvedText,
+        evidenceUrl: support.entry?.url,
+        supportReason: support.reason,
+        sectionIndex: findSectionIndex(blockAnchorEnd),
+        blockId: block?.blockId,
+        sourceSpan: { start: located.start, end: located.end },
+        shadow: true,
+      });
+    }
+  }
+
+  // Explicit SOURCE→PROSE provenance: attributed sentences are validated
+  // against their DECLARED evidence only (never reassigned heuristically).
+  // A located attributed sentence whose declared evidence fails entailment is
+  // an unsupported hard claim — the existing cleanup removes it. A sentence
+  // that no longer exists in the text (edited/removed by a later stage) drops
+  // its attribution silently.
+  const declaredAttributions = options?.declaredAttributions ?? [];
+  if (declaredAttributions.length > 0) {
+    const sentenceRangeList = sentenceRanges(bodyText);
+    const paragraphBlocks = [...html.matchAll(
+      /<!--\s*wp:paragraph\s*-->([\s\S]*?)<!--\s*\/wp:paragraph\s*-->/gi,
+    )];
+    for (const attribution of declaredAttributions) {
+      const sentence = (attribution.sentence ?? "").trim();
+      if (!sentence) continue;
+      const located = locateDiscoveredClaimSentence(sentence, bodyText, sentenceRangeList);
+      if (!located) continue; // stale attribution — sentence is gone
+      const sentenceText = bodyText.slice(located.start, located.end).replace(/\s+/g, " ").trim();
+      if (normalizeForMatch(sentenceText).includes(normalizeForMatch(sentence)) === false
+        && tokenOverlapRatio(sentence, sentenceText) < 0.5) {
+        continue; // stale attribution — sentence was edited
+      }
+      if (claims.some((c) => normalizeForMatch(c.text) === normalizeForMatch(sentence))) {
+        continue; // identical proposition already claimed
+      }
+
+      const block = locateParagraphBlock(sentence, sentenceText, paragraphBlocks);
+      const blockAnchorEnd = block ? block.anchorEnd : 0;
+      const fidelity = validateAttributedSentenceFidelity(
+        sentence,
+        attribution.evidenceIds,
+        evidenceLedger,
+      );
+      claims.push({
+        text: sentence,
+        htmlPosition: blockAnchorEnd,
+        category: "source_attributed",
+        supported: fidelity.supported,
+        supportVerdict: fidelity.supported ? "supported" : "insufficient",
+        sentenceText,
+        evidenceId: fidelity.evidenceId,
+        supportReason: fidelity.reason,
+        sectionIndex: findSectionIndex(blockAnchorEnd),
+        blockId: block?.blockId,
+        sourceSpan: { start: located.start, end: located.end },
+      });
+    }
+  }
+
+  const hasHighRisk = claims.some((c) => !c.supported && !c.shadow);
   return { claims, hasHighRisk };
+}
+
+/** Absolute-superlative fragment detector for market-wide claims. */
+const MARKET_WIDE_SUPERLATIVE_FRAGMENT_RE =
+  /\bthe (?:most effective|best|leading|top) (?:[a-z]+ ){0,3}(?:way|strategy|approach|tool|method|channel|platform)\b/i;
+
+/**
+ * SOURCE → PROSE fidelity check for explicit provenance: the attributed
+ * sentence must be entailed by its DECLARED evidence (a sub-ledger built from
+ * the declared SOURCE-X-CLAIM-Y IDs) using the existing entailment authority.
+ * A declared market-wide/superlative sentence runs through the market-wide
+ * strength gate so a qualified source claim can never license a stronger
+ * unqualified sentence.
+ */
+export function validateAttributedSentenceFidelity(
+  sentence: string,
+  evidenceIds: string[],
+  ledger: EvidenceLedgerEntry[],
+): { supported: boolean; reason: string; evidenceId?: string } {
+  const byId = new Map(ledger.map((entry) => [entry.evidenceId, entry]));
+  const declared = evidenceIds
+    .map((id) => byId.get(id))
+    .filter((entry): entry is EvidenceLedgerEntry => Boolean(entry));
+  if (declared.length === 0) {
+    return {
+      supported: false,
+      reason: "declared evidence ids do not exist in the approved research ledger",
+    };
+  }
+  // An ABSOLUTE superlative fragment ("the best channel") runs through the
+  // market-wide strength gate; a qualifier-governed fragment ("widely seen as
+  // the best channel") uses the general comparison/superlative path — the same
+  // claimhood rule as pattern extraction, so a qualified source claim can
+  // never license a stronger unqualified sentence.
+  const fragmentIndex = sentence.search(MARKET_WIDE_SUPERLATIVE_FRAGMENT_RE);
+  const marketWide = fragmentIndex >= 0
+    && !isQualifierGovernedFragment(sentence, fragmentIndex);
+  const support = findSupportingEvidence(
+    sentence,
+    sentence,
+    marketWide ? "market_wide_claim" : "general_claim",
+    declared,
+  );
+  return {
+    supported: Boolean(support.entry),
+    reason: support.reason,
+    evidenceId: support.entry?.evidenceId,
+  };
+}
+
+/**
+ * A discovered claim is a duplicate when an existing claim already carries the
+ * same proposition: identical normalized wording, or — in the same sentence —
+ * an existing pattern fragment contained in the discovered text whose
+ * quantities fully cover the discovered claim's quantities ("6.5%" + "2026"
+ * cover "sales rose 6.5% in 2026", so the general claim collapses into the
+ * two deterministic claims instead of double-reporting the proposition).
+ */
+function isDuplicateGeneralClaim(
+  claimText: string,
+  sentenceText: string,
+  existing: ScannedClaim[],
+): boolean {
+  const normalized = normalizeForMatch(claimText);
+  if (existing.some((c) => normalizeForMatch(c.text) === normalized)) return true;
+  const sentenceClaims = existing.filter((c) =>
+    normalizeForMatch(c.sentenceText ?? "") === normalizeForMatch(sentenceText),
+  );
+  const quantities = extractQuantities(claimText);
+  const sentenceQuantities = sentenceClaims.flatMap((c) => extractQuantities(c.text));
+  return sentenceClaims.some((c) => normalized.includes(normalizeForMatch(c.text)))
+    && quantities.every((q) => sentenceQuantities.includes(q));
+}
+
+function tokenOverlapRatio(a: string, b: string): number {
+  const tokensA = contentTokens(a);
+  const tokensB = contentTokens(b);
+  if (tokensA.length === 0) return 0;
+  return tokensA.filter((token) => tokensB.includes(token)).length / tokensA.length;
+}
+
+/**
+ * Locate the discovered claim's sentence: exact containment first, then the
+ * sentence with the highest token overlap (≥ 0.5). Returns the exact span.
+ */
+function locateDiscoveredClaimSentence(
+  claimText: string,
+  bodyText: string,
+  ranges: TextRange[],
+): TextRange | null {
+  const normalized = normalizeForMatch(claimText);
+  for (const range of ranges) {
+    if (normalizeForMatch(bodyText.slice(range.start, range.end)).includes(normalized)) {
+      return range;
+    }
+  }
+  let best: TextRange | null = null;
+  let bestRatio = 0.5;
+  for (const range of ranges) {
+    const ratio = tokenOverlapRatio(claimText, bodyText.slice(range.start, range.end));
+    if (ratio > bestRatio) {
+      best = range;
+      bestRatio = ratio;
+    }
+  }
+  return best;
+}
+
+function locateParagraphBlock(
+  claimText: string,
+  sentenceText: string,
+  blocks: Array<RegExpExecArray>,
+): { blockId: string; anchorEnd: number } | null {
+  let best: { blockId: string; anchorEnd: number; ratio: number } | null = null;
+  for (let index = 0; index < blocks.length; index++) {
+    const match = blocks[index];
+    const commentEnd = match[0].indexOf("-->");
+    const anchorEnd = match.index + (commentEnd >= 0 ? commentEnd + 3 : match[0].length);
+    const visible = decodeHtmlEntities(match[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+    if (!visible) continue;
+    const ratio = normalizeForMatch(visible).includes(normalizeForMatch(sentenceText))
+      ? 1
+      : tokenOverlapRatio(sentenceText, visible);
+    if (!best || ratio > best.ratio) {
+      best = { blockId: `wp-paragraph-${index + 1}`, anchorEnd, ratio };
+    }
+  }
+  return best && best.ratio >= 0.5 ? best : null;
 }
 
 const DIRECT_ATTRIBUTION_RE = /\b(?:said|says|told(?:\s+us)?|shared|reported|noted|wrote|explained|added|recalled|commented|stated|claimed|observed)\b/i;
@@ -386,6 +1046,9 @@ function stripPipelineCitationParagraphs(html: string): string {
 interface EvidenceSupport {
   entry?: EvidenceLedgerEntry;
   reason: string;
+  /** Semantic verdict: a matching number/entity/keyword alone never yields
+   *  "supported" — the evidence must entail the claim's material parts. */
+  verdict: "supported" | "contradicted" | "insufficient";
 }
 
 const STOP_WORDS = new Set([
@@ -408,7 +1071,9 @@ function findSupportingEvidence(
   category: ClaimCategory,
   ledger: EvidenceLedgerEntry[],
 ): EvidenceSupport {
-  if (ledger.length === 0) return { reason: "no research evidence supplied" };
+  if (ledger.length === 0) {
+    return { reason: "no research evidence supplied", verdict: "insufficient" };
+  }
 
   const claimQuantity = extractFirstQuantity(claimFragment);
   const claimConcepts = extractClaimConcepts(sentenceText);
@@ -445,6 +1110,17 @@ function findSupportingEvidence(
       continue;
     }
 
+    // Temporal scope: when both the claim and the evidence carry an explicit
+    // year and they differ, the evidence does not entail the claim's temporal
+    // scope ("In 2025 new members received 50% off" is never supported by
+    // "In 2026 new members receive 50% off").
+    const claimYear = sentenceText.match(/\b(?:19|20)\d{2}\b/)?.[0];
+    const evidenceYear = entry.approvedText.match(/\b(?:19|20)\d{2}\b/)?.[0];
+    if (claimYear !== undefined && evidenceYear !== undefined && claimYear !== evidenceYear) {
+      closestReason = `evidence has a different temporal scope (${evidenceYear} vs claim ${claimYear})`;
+      continue;
+    }
+
     const conceptConflict = findConceptConflict(claimConcepts, entry.concepts);
     if (conceptConflict) {
       closestReason = conceptConflict;
@@ -457,6 +1133,21 @@ function findSupportingEvidence(
       && !claimConcepts.includes("survey-sample")
     ) {
       closestReason = "survey respondents were generalized to a broader population";
+      continue;
+    }
+
+    // Comparison/superlative entailment: a comparative or superlative claim
+    // ("worth more than a hundred", "widely regarded as the best channel")
+    // requires evidence asserting the SAME comparison strength. A matching
+    // number, entity or keyword alone never entails the comparison. Checked
+    // BEFORE the market-wide block so the reason names the comparison mismatch
+    // precisely when one exists.
+    const claimComparison = claimConcepts.includes("comparative-claim")
+      || claimConcepts.includes("superlative-claim");
+    const evidenceComparison = entry.concepts.includes("comparative-claim")
+      || entry.concepts.includes("superlative-claim");
+    if (claimComparison && !evidenceComparison) {
+      closestReason = "evidence does not entail the claim's comparison/superlative";
       continue;
     }
 
@@ -497,14 +1188,31 @@ function findSupportingEvidence(
       closestReason = "quantity matches but the subject or metric does not";
       continue;
     }
+    // Material-part entailment: when NO semantic concept links the claim and
+    // the evidence, a matching quantity/keyword/entity is not enough — the
+    // evidence must cover at least half of the claim's content tokens so the
+    // subject/relation/object proposition is genuinely entailed. Without this,
+    // "retailers reward staff with a 50% discount when they hit service
+    // targets" would be supported by evidence that merely says "new members
+    // receive a 50% discount". Date claims are exempt: the year IS their whole
+    // material proposition (temporal mismatch is handled by the year-scope
+    // check above), so topical sentence length must not drown them out.
+    if (!hasSemanticConcept && claimTokens.length >= 3 && category !== "date_claim") {
+      const coverage = overlap.length / claimTokens.length;
+      if (coverage < 0.5) {
+        closestReason = `evidence does not entail the claim's subject/relation/object (material coverage ${Math.round(coverage * 100)}%)`;
+        continue;
+      }
+    }
 
     return {
       entry,
       reason: `entailed by ${entry.evidenceId}`,
+      verdict: "supported",
     };
   }
 
-  return { reason: closestReason };
+  return { reason: closestReason, verdict: "insufficient" };
 }
 
 function findConceptConflict(claimConcepts: string[], evidenceConcepts: string[]): string | null {
@@ -569,6 +1277,22 @@ function extractClaimConcepts(text: string): string[] {
   if (/\btargeting\b|\bdemographics\b|\binterests\b|\bbehaviou?rs\b/.test(normalized)) concepts.add("ad-targeting");
   if (/\b(?:average|on average)\b/.test(normalized)) concepts.add("average");
   if (/\bmedian\b/.test(normalized)) concepts.add("median");
+  // Comparison/superlative strength signals: a comparative or superlative
+  // proposition ("worth more than a hundred", "widely regarded as the best")
+  // requires evidence that asserts the SAME comparison strength — a number or
+  // entity alone never entails the comparison.
+  if (
+    /\b(?:more|less|better|worse|higher|lower|greater|worth\s+more|fewer|stronger|faster|cheaper|larger|bigger|smaller)\s+than\b/.test(normalized)
+  ) {
+    concepts.add("comparative-claim");
+  }
+  if (
+    /\b(?:widely\s+)?(?:regarded|considered|seen|known)\s+as\s+the\s+(?:best|leading|top|most\s+\w+|number\s+one)\b/.test(normalized)
+    || /\bthe\s+(?:best|leading|top|highest|lowest|largest|biggest|strongest|fastest|cheapest|most\s+\w+)\s+(?!to\b|of\b)\w+\b/.test(normalized)
+    || /\b(?:unmatched|number\s+one)\b/.test(normalized)
+  ) {
+    concepts.add("superlative-claim");
+  }
   return [...concepts];
 }
 
@@ -1364,13 +2088,16 @@ function finalizeRemovedParagraph(
 // ── Format claims for logging ──
 
 export function formatClaimLog(claims: ScannedClaim[]): string {
-  const supported = claims.filter((c) => c.supported);
-  const unsupported = claims.filter((c) => !c.supported);
+  const hard = claims.filter((c) => !c.shadow);
+  const supported = hard.filter((c) => c.supported);
+  const unsupported = hard.filter((c) => !c.supported);
+  const shadow = claims.filter((c) => c.shadow);
   const lines: string[] = [];
-  lines.push(`Claims found: ${claims.length} (${unsupported.length} unsupported)`);
+  lines.push(`Claims found: ${hard.length} (${unsupported.length} unsupported)${shadow.length > 0 ? ` + ${shadow.length} shadow` : ""}`);
   for (const c of unsupported) {
     lines.push(
       `  [UNSUPPORTED] [${c.category}] section=${c.sectionIndex}` +
+      ` verdict=${c.supportVerdict ?? "insufficient"}` +
       ` reason="${c.supportReason ?? "no compatible evidence"}"` +
       ` text="${c.text.substring(0, 80)}"`,
     );
@@ -1378,7 +2105,16 @@ export function formatClaimLog(claims: ScannedClaim[]): string {
   for (const c of supported) {
     lines.push(
       `  [SUPPORTED]   [${c.category}] section=${c.sectionIndex}` +
+      ` verdict=${c.supportVerdict ?? "supported"}` +
       `${c.evidenceId ? ` evidence=${c.evidenceId}` : ""}` +
+      ` text="${c.text.substring(0, 80)}"`,
+    );
+  }
+  for (const c of shadow) {
+    lines.push(
+      `  [SHADOW]      [${c.category}] section=${c.sectionIndex}` +
+      ` verdict=${c.supportVerdict ?? "insufficient"}` +
+      ` reason="${c.supportReason ?? "no compatible evidence"}"` +
       ` text="${c.text.substring(0, 80)}"`,
     );
   }
@@ -1390,14 +2126,157 @@ export function formatClaimLog(claims: ScannedClaim[]): string {
 export interface LocatedUnsupportedClaim extends ScannedClaim {
   componentId: string;
   blockId: string;
+  /** Structured canonical surface owning the claim (Stage 3M/3N). */
+  surfaceType: "editorial-block" | "editorial-heading" | "faq-question" | "faq-answer";
+  /** Stable FAQ entry index for FAQ surfaces. */
+  faqIndex?: number;
 }
 
-function plainBlockTextForLocation(block: EditorialBlock): string {
-  if (block.type === "list") return block.items.flat().map((node) => node.text).join(" ");
-  if (block.type === "table") {
-    return [...block.headers, ...block.rows.flat()].flat().map((node) => node.text).join(" ");
+// ── Structured factual surfaces (Stage 3M/3N) ──
+// Every scanned factual claim must own an authoritative canonical surface:
+// an editorial block, an editorial H2 heading, or a FAQ question/answer entry.
+// The scanner never derives ownership by scanning one giant rendered blob and
+// guessing afterwards — it scans each canonical surface with the same
+// authoritative scanFactualRisks engine, so a legitimate visible claim can
+// never come back as component/block "-".
+
+interface StructuredFactualSurface {
+  surfaceType: "editorial-block" | "editorial-heading" | "faq-question" | "faq-answer";
+  componentId: string;
+  blockId: string;
+  html: string;
+  headingText?: string;
+  faqIndex?: number;
+}
+
+function escapeHeadingText(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function collectStructuredFactualSurfaces(
+  doc: import("@/lib/blog/article-document").ArticleDocument,
+): StructuredFactualSurface[] {
+  const surfaces: StructuredFactualSurface[] = [];
+  const pushBlocks = (componentId: string, blocks: EditorialBlock[]): void => {
+    for (const block of blocks) {
+      surfaces.push({
+        surfaceType: "editorial-block",
+        componentId,
+        blockId: block.id,
+        html: renderEditorialBlocksToWordPress([block]),
+      });
+    }
+  };
+  pushBlocks(doc.introduction.id, doc.introduction.blocks);
+  for (const section of doc.sections) {
+    pushBlocks(section.id, section.blocks);
+    if (section.heading && section.heading.trim()) {
+      surfaces.push({
+        surfaceType: "editorial-heading",
+        componentId: section.id,
+        blockId: `${section.id}-heading`,
+        html: `<!-- wp:heading {"level":2} -->\n<h2>${escapeHeadingText(section.heading)}</h2>\n<!-- /wp:heading -->`,
+        headingText: section.heading,
+      });
+    }
   }
-  return block.content.map((node) => node.text).join(" ");
+  pushBlocks(doc.conclusion.id, doc.conclusion.blocks);
+  doc.visibleFaq.forEach((entry, index) => {
+    if (entry.question && entry.question.trim()) {
+      surfaces.push({
+        surfaceType: "faq-question",
+        componentId: "faq",
+        blockId: `faq-${index}-question`,
+        html: `<p>${escapeHeadingText(entry.question)}</p>`,
+        faqIndex: index,
+      });
+    }
+    const answer = entry.answerHtml || (entry.answerText ? `<p>${escapeHeadingText(entry.answerText)}</p>` : "");
+    if (answer && answer.trim()) {
+      surfaces.push({
+        surfaceType: "faq-answer",
+        componentId: "faq",
+        blockId: `faq-${index}-answer`,
+        html: answer,
+        faqIndex: index,
+      });
+    }
+  });
+  return surfaces;
+}
+
+// ── FAQ factual semantics (Stage 3N) ──
+// FAQ questions and answers use the same factual semantics as the FAQ
+// sanitizer: an INTERROGATIVE sentence never asserts a fact (the sanitizer
+// never scans questions at all), and a bare topic-context year in an answer
+// (isTopicContextYearClaim) is not an unsupported assertion. Percentages,
+// currency, metrics, comparative/market-wide claims and factual date/result
+// assertions inside FAQ content remain strict.
+
+const INTERROGATIVE_START_RE = /^(?:what|which|who|whom|whose|when|where|why|how|is|are|was|were|do|does|did|can|could|will|would|should|may|might|shall|have|has|had)\b/i;
+
+function isInterrogativeSentence(sentence: string): boolean {
+  const trimmed = (sentence ?? "").trim();
+  if (!trimmed) return false;
+  if (/[?？]\s*$/.test(trimmed)) return true;
+  return INTERROGATIVE_START_RE.test(trimmed);
+}
+
+// ── Temporal heading framing (Stage 3M) ──
+// A standalone year used purely as non-assertive editorial/topic framing in a
+// heading ("Hong Kong Beauty Salon Marketing in 2026") is not an unsupported
+// factual assertion. The exemption is heading-only, applies ONLY to a bare
+// date_claim whose text is just the year, and never applies when the heading
+// carries quantitative/assertive factual signals (percentages, currency,
+// movement/result verbs, market-wide claims), which keep their normal rules.
+
+const YEAR_FRAMING_CLAIM_RE = /^(?:\s*(?:in|for|of|by|from|until|heading\s+into|as\s+we\s+approach)\s*)?(?:19|20)\d{2}$/i;
+
+const ASSERTIVE_HEADING_SIGNALS: RegExp[] = [
+  /\b\d+(?:\.\d+)?%/, // percentage
+  /\b(?:HK\$|US\$|[$£€¥])\s*\d[\d,]*(?:\.\d+)?/, // currency amount
+  // Assertive movement/result verbs — not framing nouns like "growth".
+  /\b(?:grew|rose|fell|increased|decreased|jumped|surged|dropped|climbed|declined|hit|reached|surpassed|exceeded|outpaced|doubled|tripled|halved|gained|lost|spent|saw|expect\w*|predict\w*|forecast\w*|estimat\w*|boosted|cut|reduced)\b/i,
+];
+
+function isTemporalHeadingFraming(headingText: string, claim: ScannedClaim): boolean {
+  if (claim.category !== "date_claim") return false;
+  if (!YEAR_FRAMING_CLAIM_RE.test(claim.text.trim())) return false;
+  const heading = headingText.replace(/\s+/g, " ").trim();
+  return !ASSERTIVE_HEADING_SIGNALS.some((signal) => signal.test(heading));
+}
+
+/**
+ * A bare 4-digit year in a `date_claim` that is the article's own topic year
+ * (present in the focus keyphrase, title, meta description or a heading) is
+ * topic context, not a precise factual assertion. For a topic-year article
+ * ("Hong Kong Marketing Trends 2026") the year legitimately appears in every
+ * section and in synthesis-only FAQ questions/answers; treating it as an
+ * unsupported claim would block the article on content that merely names the
+ * topic. Shared by the claim-ownership scanner and the structured FAQ
+ * surfaces, matching the FAQ sanitizer's semantics exactly.
+ */
+export function isTopicContextYearClaim(
+  claim: ScannedClaim,
+  topicContext: { keyphrase: string; title?: string; metaDescription?: string; headings?: string[] },
+): boolean {
+  if (claim.category !== "date_claim") return false;
+  const year = claim.text.trim();
+  if (!/^(?:19|20)\d{2}$/.test(year)) return false;
+  const haystack = [
+    topicContext.keyphrase,
+    topicContext.title ?? "",
+    topicContext.metaDescription ?? "",
+    ...(topicContext.headings ?? []),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(year.toLowerCase());
 }
 
 /**
@@ -1405,51 +2284,90 @@ function plainBlockTextForLocation(block: EditorialBlock): string {
  * ArticleDocument. This is the ONLY scanner the factual boundaries (factual-scan,
  * factual-final, final-preflight) and the final-QC gate use for unsupported
  * claims, so they can never disagree about which claim is unsupported and where
- * it lives. It renders the canonical document (never a stale `blog` cache),
- * scans with the same `scanFactualRisks` the removal producer uses, and locates
- * each unsupported claim's component/block id from the canonical blocks.
+ * it lives. It scans each canonical surface (editorial blocks + editorial H2
+ * headings) with the same `scanFactualRisks` the removal producer uses, and
+ * assigns the claim to the surface that owns it. A legitimate visible claim is
+ * never returned as component/block "-".
  */
 export function scanUnsupportedClaimsInDocument(
   doc: import("@/lib/blog/article-document").ArticleDocument,
   keyphrase: string,
   research?: Array<{ title?: string; snippet?: string; url?: string }>,
+  options?: FactualScanOptions,
 ): LocatedUnsupportedClaim[] {
-  const html = renderArticleDocument(doc);
-
-  const unsupported = scanFactualRisks(html, keyphrase, research).claims
-    .filter((claim) => !claim.supported);
-
-  const components: Array<{ id: string; blocks: EditorialBlock[] }> = [
-    { id: doc.introduction.id, blocks: doc.introduction.blocks },
-    ...doc.sections
-      .filter((section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading")
-      .map((section) => ({ id: section.id, blocks: section.blocks })),
-    { id: doc.conclusion.id, blocks: doc.conclusion.blocks },
-  ];
-
-  const located: LocatedUnsupportedClaim[] = [];
-  for (const claim of unsupported) {
-    const needle = normalizeForMatch(claim.text);
-    let componentId = "-";
-    let blockId = "-";
-    outer: for (const component of components) {
-      const componentText = normalizeForMatch(
-        component.blocks.map((block) => plainBlockTextForLocation(block)).join(" "),
-      );
-      if (!componentText.includes(needle)) continue;
-      componentId = component.id;
-      for (const block of component.blocks) {
-        if (normalizeForMatch(plainBlockTextForLocation(block)).includes(needle)) {
-          blockId = block.id;
-          break outer;
-        }
-      }
-      // The claim is present in the component but not wholly inside one block's
-      // plain text (e.g. it spans inline markup); keep the component-level
-      // attribution and stop searching.
-      break;
+  const topicContext = {
+    keyphrase,
+    title: doc.metadata.title,
+    metaDescription: doc.metadata.metaDescription,
+    headings: doc.sections.map((section) => section.heading),
+  };
+  // Explicit provenance is owned per component: intro/sections/conclusion
+  // carry their own attributions and free-prose accounting; FAQ is
+  // synthesis-only (none).
+  const attributionsByComponent = new Map<string, SourceAttribution[]>();
+  const freeProseByComponent = new Map<string, string[]>();
+  if (doc.introduction?.sourceAttributions?.length) {
+    attributionsByComponent.set(doc.introduction.id, doc.introduction.sourceAttributions);
+  }
+  if (doc.introduction?.freeProseSentences?.length) {
+    freeProseByComponent.set(doc.introduction.id, doc.introduction.freeProseSentences);
+  }
+  for (const section of doc.sections) {
+    if (section.sourceAttributions?.length) {
+      attributionsByComponent.set(section.id, section.sourceAttributions);
     }
-    located.push({ ...claim, componentId, blockId });
+    if (section.freeProseSentences?.length) {
+      freeProseByComponent.set(section.id, section.freeProseSentences);
+    }
+  }
+  if (doc.conclusion?.sourceAttributions?.length) {
+    attributionsByComponent.set(doc.conclusion.id, doc.conclusion.sourceAttributions);
+  }
+  if (doc.conclusion?.freeProseSentences?.length) {
+    freeProseByComponent.set(doc.conclusion.id, doc.conclusion.freeProseSentences);
+  }
+  const located: LocatedUnsupportedClaim[] = [];
+  for (const surface of collectStructuredFactualSurfaces(doc)) {
+    const surfaceOptions: FactualScanOptions = options
+      ? {
+          ...options,
+          declaredAttributions: attributionsByComponent.get(surface.componentId) ?? [],
+          freeProseSentences: freeProseByComponent.get(surface.componentId) ?? [],
+        }
+      : {
+          declaredAttributions: attributionsByComponent.get(surface.componentId) ?? [],
+          freeProseSentences: freeProseByComponent.get(surface.componentId) ?? [],
+        };
+    const unsupported = scanFactualRisks(surface.html, keyphrase, research, surfaceOptions).claims
+      .filter((claim) => !claim.supported && !claim.shadow);
+    for (const claim of unsupported) {
+      if (
+        surface.surfaceType === "editorial-heading"
+        && surface.headingText
+        && isTemporalHeadingFraming(surface.headingText, claim)
+      ) {
+        continue; // harmless temporal year framing in a heading
+      }
+      if (
+        surface.surfaceType === "faq-question"
+        && isInterrogativeSentence(claim.sentenceText ?? claim.text)
+      ) {
+        continue; // a question never asserts a fact (FAQ sanitizer semantics)
+      }
+      if (
+        surface.surfaceType === "faq-answer"
+        && isTopicContextYearClaim(claim, topicContext)
+      ) {
+        continue; // bare topic-context year in an FAQ answer (sanitizer semantics)
+      }
+      located.push({
+        ...claim,
+        componentId: surface.componentId,
+        blockId: surface.blockId,
+        surfaceType: surface.surfaceType,
+        ...(surface.faqIndex !== undefined ? { faqIndex: surface.faqIndex } : {}),
+      });
+    }
   }
   return located;
 }

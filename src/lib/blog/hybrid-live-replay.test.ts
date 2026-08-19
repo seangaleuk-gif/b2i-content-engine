@@ -15,8 +15,9 @@ import { decideSentenceCompletenessHybrid } from "@/lib/blog/hybrid-sentence-com
 import { splitSentences } from "@/lib/seo/seo-text-utils";
 
 const SNAPSHOT = path.resolve(
-  "debug",
-  "pipeline-failures",
+  "src",
+  "lib",
+  "__live-fixtures__",
   "2026-08-17T13-05-16-270Z_producer-section_4_repair_project-22.json",
 );
 

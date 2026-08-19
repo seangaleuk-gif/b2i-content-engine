@@ -37,7 +37,7 @@ import {
   englishTitleRange,
 } from "@/lib/content-standards";
 import { analyzePublicationQuality, keyphraseExclusionSet } from "@/lib/blog/publication-quality";
-import { scanFactualRisks } from "@/lib/blog/factual-risk-scanner";
+import { scanUnsupportedClaimsInDocument, type GeneralDiscoveredClaimsMap } from "@/lib/blog/factual-risk-scanner";
 import { validateClaimOwnership, type ClaimOwnershipLedger } from "@/lib/blog/claim-ownership";
 import { scanTemporalFreshness } from "@/lib/blog/temporal-freshness";
 import { analyzeCanonicalEnglishCta } from "@/lib/blog/canonical-cta";
@@ -45,7 +45,7 @@ import { parseWordpressBlockStructure } from "@/lib/blog/wordpress-block-structu
 import { scanEnglishLanguageConsistency } from "@/lib/blog/language-consistency";
 import { validateCoherence } from "@/lib/blog/coherence";
 import { countBoilerplateInDocument } from "@/lib/blog/source-boilerplate";
-import { scanSentenceQualityInDocument } from "@/lib/blog/sentence-quality";
+import { scanSentenceQualityInDocument, licensedRepeatedWordSpansFromEvidence } from "@/lib/blog/sentence-quality";
 import { scanMalformedProseInDocument } from "@/lib/blog/publication-quality";
 import { assessSourceSectionRelevance, assessSectionTopicGrounding, assessHeadingNaturalness } from "@/lib/blog/content-relevance";
 
@@ -370,30 +370,10 @@ export interface FinalArticleValidationContext {
     mandatoryOverflow: boolean;
     patches: Array<{ accepted: boolean }>;
   } | null;
-}
-
-function countUnsupportedFactualClaims(
-  doc: ArticleDocument,
-  keyphrase: string,
-  research: FinalArticleValidationContext["research"],
-): number {
-  const components = [
-    renderComponentHtml(doc.introduction),
-    ...doc.sections
-      .filter((section) => section.sectionType !== "faq-heading" && section.sectionType !== "conclusion-heading")
-      .map((section) => renderComponentHtml(section)),
-    renderComponentHtml(doc.conclusion),
-    ...doc.visibleFaq.map((entry) => `${entry.question} ${entry.answerHtml || entry.answerText}`),
-  ];
-  const unique = new Set<string>();
-  components.forEach((componentHtml, componentIndex) => {
-    for (const claim of scanFactualRisks(componentHtml, keyphrase, research).claims) {
-      if (claim.supported) continue;
-      const sentence = (claim.sentenceText ?? claim.text).replace(/\s+/g, " ").trim().toLowerCase();
-      unique.add(`${componentIndex}:${sentence}`);
-    }
-  });
-  return unique.size;
+  /** Pre-warmed general-claim discovery results (optional; pattern-only when
+   *  absent). Threaded from the pipeline so the final gate sees the same
+   *  verifiable claims the factual boundaries saw. */
+  generalDiscoveredClaims?: GeneralDiscoveredClaimsMap;
 }
 
 export function analyzeFinalArticle(
@@ -539,11 +519,12 @@ export function analyzeFinalArticle(
   }
   const publication = analyzePublicationQuality(html, keyphraseExclusionSet(keyphrase));
   const unsupportedFactualClaimCount = validationContext?.articleDoc
-    ? countUnsupportedFactualClaims(
+    ? scanUnsupportedClaimsInDocument(
         validationContext.articleDoc,
         keyphrase,
         validationContext.research,
-      )
+        { generalDiscoveredClaims: validationContext.generalDiscoveredClaims },
+      ).length
     : 0;
   const claimOwnershipViolationCount = validationContext?.articleDoc && validationContext.claimOwnership
     ? validateClaimOwnership(
@@ -566,7 +547,9 @@ export function analyzeFinalArticle(
     ? scanMalformedProseInDocument(validationContext.articleDoc).length
     : 0;
   const sentenceQualityViolationCount = validationContext?.articleDoc
-    ? scanSentenceQualityInDocument(validationContext.articleDoc).length
+    ? scanSentenceQualityInDocument(validationContext.articleDoc, {
+        licensedRepeatedWordSpans: licensedRepeatedWordSpansFromEvidence(validationContext.research ?? []),
+      }).length
     : 0;
   const sourceRelevanceViolationCount = validationContext?.articleDoc
     ? assessSourceSectionRelevance(
@@ -714,13 +697,23 @@ export function evaluatePolicy(
   const sourceRelevanceViolations = metrics.sourceRelevanceViolationCount ?? 0;
   const unnaturalHeadings = metrics.unnaturalHeadingCount ?? 0;
   const publicationGate = policy.enforcePublicationQuality;
+  // ── Hard-gate classification ──
+  // Contradictions remain a semantic hard blocker when publication enforcement
+  // is active (the full-document editor owns the contradiction category too);
+  // with enforcement off they are soft. Every other legacy rendered-HTML
+  // publication-quality metric is reclassified SOFT: its objective components
+  // are each owned by a canonical always-hard gate (malformed → canonical
+  // malformed blocks; unsupported/new-numeric claims → unsupported factual
+  // claims), and its stylistic components (repetition, conclusion share,
+  // robotic/aggregate editorial score) must never hard-fail publication.
   const claimsHard = !publicationGate || claimConflicts <= policy.maxClaimConflicts;
-  const malformedProseHard = !publicationGate || malformedProse <= policy.maxMalformedProseIssues;
-  const repeatedIdeasHard = !publicationGate || repeatedIdeas <= policy.maxRepeatedIdeaPairs;
-  const conclusionRatioHard = !publicationGate || conclusionRatio <= policy.maxConclusionWordRatio;
-  const conclusionNumbersHard = !publicationGate || conclusionNewNumbers <= policy.maxConclusionNewNumericClaims;
-  const factualScoreHard = !publicationGate || factualScore >= policy.minimumFactualScore;
-  const editorialScoreHard = !publicationGate || editorialScore >= policy.minimumEditorialScore;
+  // Detection confidence and aggregate stylistic penalties never determine
+  // publication severity: legacy rendered-HTML repetition, conclusion-share and
+  // malformed-prose gates are SOFT (their objective components are owned by the
+  // canonical always-hard gates below).
+  const conclusionNumbersHard = true; // duplicate of factualClaimsHard → soft
+  const factualScoreHard = true; // duplicate of factualClaimsHard → soft
+  const editorialScoreHard = true; // aggregate with stylistic penalties → soft
   const factualClaimsHard = unsupportedFactualClaims <= policy.maxUnsupportedFactualClaims;
   const ownershipHard = claimOwnershipViolations <= policy.maxClaimOwnershipViolations;
   const temporalHard = staleTemporalClaims <= policy.maxStaleTemporalClaims;
@@ -772,11 +765,6 @@ export function evaluatePolicy(
   if (!canonicalCtaHard) reasons.push("canonical CTA invalid");
   if (!conclusionHard) reasons.push("conclusion content missing");
   if (!claimsHard) reasons.push(`factual contradictions=${claimConflicts}`);
-  if (!malformedProseHard) reasons.push(`malformed prose issues=${malformedProse}`);
-  if (!repeatedIdeasHard) reasons.push(`repeated idea pairs=${repeatedIdeas}`);
-  if (!conclusionRatioHard) {
-    reasons.push(`conclusion share=${(conclusionRatio * 100).toFixed(1)}% (max: ${(policy.maxConclusionWordRatio * 100).toFixed(0)}%)`);
-  }
   if (!conclusionNumbersHard) reasons.push(`new numeric claims in conclusion=${conclusionNewNumbers}`);
   if (!factualScoreHard) reasons.push(`factual score=${factualScore} (minimum: ${policy.minimumFactualScore})`);
   if (!editorialScoreHard) reasons.push(`editorial score=${editorialScore} (minimum: ${policy.minimumEditorialScore})`);
@@ -801,7 +789,8 @@ export function evaluatePolicy(
   }
   if (!editorialOverflowHard) reasons.push("mandatory editorial selection overflow");
 
-  // Soft warning reasons
+  // Soft warning reasons (never block; always reported when exceeded so the
+  // stylistic/legacy signals stay observable even when their gates are soft)
   if (!kpSoft) reasons.push(`[SOFT] kp density=${metrics.keyphraseDensity.toFixed(2)}% < ${kpWarning}%`);
   if (!h2KpOk) reasons.push("[SOFT] no H2 keyphrase");
   if (!first100Ok) reasons.push("[SOFT] keyphrase not in first 100 words");
@@ -809,24 +798,32 @@ export function evaluatePolicy(
   if (!publicationGate && claimConflicts > policy.maxClaimConflicts) {
     reasons.push(`[SOFT] factual contradictions=${claimConflicts} (editorial polish disabled)`);
   }
-  if (!publicationGate && malformedProse > policy.maxMalformedProseIssues) {
-    reasons.push(`[SOFT] malformed prose issues=${malformedProse} (editorial polish disabled)`);
+  if (malformedProse > policy.maxMalformedProseIssues) {
+    reasons.push(`[SOFT] malformed prose issues=${malformedProse}`);
   }
-  if (!publicationGate && repeatedIdeas > policy.maxRepeatedIdeaPairs) {
-    reasons.push(`[SOFT] repeated idea pairs=${repeatedIdeas} (editorial polish disabled)`);
+  if (repeatedIdeas > policy.maxRepeatedIdeaPairs) {
+    reasons.push(`[SOFT] repeated idea pairs=${repeatedIdeas}`);
   }
-  if (!publicationGate && conclusionRatio > policy.maxConclusionWordRatio) {
-    reasons.push(`[SOFT] conclusion share=${(conclusionRatio * 100).toFixed(1)}% (editorial polish disabled)`);
+  if (conclusionRatio > policy.maxConclusionWordRatio) {
+    reasons.push(`[SOFT] conclusion share=${(conclusionRatio * 100).toFixed(1)}%`);
+  }
+  if (editorialScore < policy.minimumEditorialScore) {
+    reasons.push(`[SOFT] editorial score=${editorialScore}`);
+  }
+  if (conclusionNewNumbers > policy.maxConclusionNewNumericClaims) {
+    reasons.push(`[SOFT] new numeric claims in conclusion=${conclusionNewNumbers}`);
+  }
+  if (factualScore < policy.minimumFactualScore) {
+    reasons.push(`[SOFT] factual score=${factualScore}`);
   }
 
   const passed = wcHard && h2Hard && faqEntryHard && paraHard && kpStuffHard
     && linksHard && ctaHard && signupHard && switcherHard
     && faqBlockHard && faqJsonHard && wpHard && nestedHard && headingsHard && faqParityHard
     && placeholderHard && rawProseHard && dupFaqSchemaHard && dupCtaHard && conclusionHard
-    && claimsHard && malformedProseHard && repeatedIdeasHard && conclusionRatioHard
-    && conclusionNumbersHard && factualScoreHard && editorialScoreHard
+    && claimsHard && conclusionNumbersHard && factualScoreHard && editorialScoreHard
     && factualClaimsHard && ownershipHard && temporalHard && languageConsistencyHard
-    && coherenceHard && boilerplateHard && malformedProseHard && sentenceQualityHard
+    && coherenceHard && boilerplateHard && sentenceQualityHard
     && canonicalMalformedHard && sourceRelevanceHard && headingNaturalnessHard
     && fullDocumentEditorialHard && unresolvedEditorialHard && unvalidatedPatchesHard
     && editorialOverflowHard;

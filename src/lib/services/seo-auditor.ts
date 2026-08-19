@@ -146,6 +146,10 @@ export function runAudit(input: AuditInput): AuditResult {
         )
         .map((section) => section.heading)
     : h2Texts;
+  // Supply the reconstructed canonical ArticleDocument as the validation
+  // context so malformed-prose (and the other canonical block-level counts)
+  // come from the SAME canonical authority the final production policy
+  // enforces — never a second, independent hard interpretation.
   const m = analyzeFinalArticle(
     blog,
     keyword,
@@ -153,8 +157,10 @@ export function runAudit(input: AuditInput): AuditResult {
     metaDescription,
     targetWordCount,
     canonicalWordCount,
+    { articleDoc: parsed.doc ?? null, research: [] },
   );
   const policy = buildPolicy(targetWordCount, undefined, undefined, keyword);
+  const publicationGate = policy.enforcePublicationQuality;
 
   const { min: titleMin, max: titleMax } = englishTitleRange();
   const { min: metaMin, max: metaMax } = englishMetaRange();
@@ -407,22 +413,46 @@ export function runAudit(input: AuditInput): AuditResult {
   ));
 
   // ── Editorial quality (15%) ──
-  const malformedProse = m.malformedProseCount ?? 0;
+  // Canonical malformed prose (malformedProseBlockCount) is the SINGLE
+  // production authority: the final policy always hard-enforces it, independent
+  // of the publication-quality gate. The legacy rendered publication-quality
+  // count (malformedProseCount) is NOT authoritative and must not be presented
+  // as a hard failure.
+  const canonicalMalformed = m.malformedProseBlockCount ?? 0;
+  const legacyMalformed = m.malformedProseCount ?? 0;
   const repeatedIdeas = m.repeatedIdeaPairCount ?? 0;
   const conclusionRatio = m.conclusionWordRatio ?? 0;
   const editorialScore = m.editorialScore ?? 100;
+  const canonicalMalformedPass = canonicalMalformed <= policy.maxMalformedProseBlocks;
   checks.push(makeCheck(
     "malformed_prose",
     "Malformed or Corrupt Prose",
-    malformedProse === 0 ? 100 : 0,
-    malformedProse === 0 ? "pass" : "fail",
-    `${malformedProse} issue${malformedProse === 1 ? "" : "s"}`,
+    canonicalMalformedPass ? 100 : 0,
+    canonicalMalformedPass ? "pass" : "fail",
+    `${canonicalMalformed} issue${canonicalMalformed === 1 ? "" : "s"}`,
     "0 issues",
-    malformedProse === 0
-      ? "No broken fragments, corrupt tokens or unresolved placeholders were detected."
-      : "The article contains malformed or corrupt prose (hard failure).",
+    canonicalMalformedPass
+      ? legacyMalformed > 0 && !publicationGate
+        ? "No canonical malformed prose. A non-authoritative publication-quality prose diagnostic exists, but editorial polish is disabled, so it is not a production failure."
+        : "No broken fragments, corrupt tokens or unresolved placeholders were detected."
+      : "The article contains malformed or corrupt prose in an editable block (hard failure).",
     "Editorial Quality",
   ));
+  // Defensive non-authoritative diagnostic: a rendered-HTML publication-quality
+  // prose finding that the canonical scanner does not reproduce is soft only —
+  // never a hard failure — and only shown while editorial polish is disabled.
+  if (legacyMalformed > canonicalMalformed && !publicationGate) {
+    checks.push(makeCheck(
+      "publication_prose_diagnostic",
+      "Publication Prose Diagnostic",
+      90,
+      "warning",
+      `${legacyMalformed} rendered finding(s) not in canonical blocks`,
+      "No non-canonical findings",
+      "A rendered-HTML publication-quality prose finding is not reproduced by the canonical malformed scanner. Editorial polish is disabled, so this is a non-blocking diagnostic, not a production failure.",
+      "Editorial Quality",
+    ));
+  }
   checks.push(makeCheck(
     "repeated_ideas",
     "Repeated Ideas",
@@ -438,29 +468,35 @@ export function runAudit(input: AuditInput): AuditResult {
   checks.push(makeCheck(
     "conclusion_share",
     "Conclusion Length",
-    conclusionRatio <= 0.15 ? 100 : conclusionRatio <= 0.18 ? 70 : 0,
-    conclusionRatio <= 0.15 ? "pass" : conclusionRatio <= 0.18 ? "warning" : "fail",
+    conclusionRatio <= 0.15 ? 100 : conclusionRatio <= 0.18 ? 70 : publicationGate ? 0 : 60,
+    conclusionRatio <= 0.15 ? "pass" : conclusionRatio <= 0.18 ? "warning" : publicationGate ? "fail" : "warning",
     `${((m.conclusionWordRatio ?? 0) * 100).toFixed(1)}% of article`,
     "≤18% (preferred ≤15%)",
     conclusionRatio <= 0.18
       ? "The conclusion remains proportionate to the article."
-      : "The conclusion is over-expanded and functions like another article section (hard failure).",
+      : publicationGate
+        ? "The conclusion is over-expanded and functions like another article section (hard failure)."
+        : "The conclusion is over-expanded, but editorial polish is disabled, so this is a quality warning and not a production publication failure.",
     "Editorial Quality",
   ));
+  const editorialScorePass = editorialScore >= policy.minimumEditorialScore;
+  const editorialScoreStatus: AuditStatus = editorialScorePass
+    ? "pass"
+    : publicationGate
+      ? "fail"
+      : "warning";
   checks.push(makeCheck(
     "editorial_score",
     "Editorial Quality Score",
     editorialScore,
-    editorialScore >= 80
-      ? "pass"
-      : malformedProse > 0 || conclusionRatio > 0.18
-        ? "fail"
-        : "warning",
+    editorialScoreStatus,
     `${editorialScore}/100`,
-    "≥80/100",
-    editorialScore >= 80
+    `≥${policy.minimumEditorialScore}/100`,
+    editorialScorePass
       ? "Deterministic prose, repetition and conclusion checks passed."
-      : "The article does not meet the minimum editorial publication threshold.",
+      : publicationGate
+        ? "The article does not meet the minimum editorial publication threshold."
+        : `Editorial quality score ${editorialScore}/100 is below ${policy.minimumEditorialScore}, but editorial polish is disabled, so this is a quality warning and not a production publication failure.`,
     "Editorial Quality",
   ));
 

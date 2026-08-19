@@ -22,10 +22,29 @@ export {
 
 export type ComponentStatus = "generated" | "regenerated" | "expanded" | "normalized" | "trimmed" | "missing";
 
+/** Internal-only source provenance: an exact generated sentence mapped to the
+ *  approved research claim IDs it was derived from. NEVER rendered into
+ *  WordPress output — it exists only on the canonical ArticleDocument and is
+ *  carried through pipeline HTML round-trips by re-attachment. */
+export interface SourceAttribution {
+  /** Exact generated factual sentence (as produced by the model). */
+  sentence: string;
+  /** Approved research claim IDs (SOURCE-X-CLAIM-Y) supplied to the producer
+   *  that generated the sentence. */
+  evidenceIds: string[];
+}
+
 export interface ArticleComponent {
   id: string;
   blocks: EditorialBlock[];
   status: ComponentStatus;
+  /** Internal-only source→prose provenance (optional; absent for free prose). */
+  sourceAttributions?: SourceAttribution[];
+  /** Internal-only per-sentence accounting: every generated sentence is
+   *  either a sourceAttributions entry (source_fact) or listed here exactly
+   *  once (free_prose: advice/opinion/rhetoric/hypothetical only). Never
+   *  rendered into WordPress output. */
+  freeProseSentences?: string[];
 }
 
 export interface ArticleSection extends ArticleComponent {
@@ -1304,6 +1323,8 @@ export function parseArticleDocumentFromHtml(
     id: existingDoc.introduction?.id ?? "intro",
     blocks: introParse.blocks.length > 0 ? introParse.blocks : [],
     status: existingDoc.introduction?.status ?? "generated",
+    sourceAttributions: existingDoc.introduction?.sourceAttributions,
+    freeProseSentences: existingDoc.introduction?.freeProseSentences,
   };
 
   // Extract section bodies from between heading blocks. Each section stops at
@@ -1356,6 +1377,8 @@ export function parseArticleDocumentFromHtml(
       sectionType,
       blocks: sectionType === "faq-heading" ? [] : sectionParse.blocks,
       status: existing?.status ?? "generated",
+      sourceAttributions: existing?.sourceAttributions,
+      freeProseSentences: existing?.freeProseSentences,
     });
   }
 
@@ -1410,6 +1433,8 @@ export function parseArticleDocumentFromHtml(
       id: existingDoc.conclusion?.id ?? "conc",
       blocks: conclusionParse.blocks,
       status: existingDoc.conclusion?.status ?? "generated",
+      sourceAttributions: existingDoc.conclusion?.sourceAttributions,
+      freeProseSentences: existingDoc.conclusion?.freeProseSentences,
     },
     cta: cta ?? existingDoc.cta,
     faqSchema: faqSchema ?? existingDoc.faqSchema,

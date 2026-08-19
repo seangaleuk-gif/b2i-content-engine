@@ -103,6 +103,14 @@ function blocksResponse(blocks: unknown[]): string {
 function para(text: string): string {
   return blocksResponse([{ type: "paragraph", text }]);
 }
+/** Section-stage payload with STRUCTURAL sentence provenance: every
+ *  generated sentence carries its own kind (free_prose here). */
+function paraSection(text: string): string {
+  const sentences = text.match(/[^.!?]+[.!?]+/g)?.map((s) => s.trim()) ?? [text.trim()];
+  return JSON.stringify({
+    blocks: [{ type: "paragraph", sentences: sentences.map((s) => ({ text: s, kind: "free_prose" })) }],
+  });
+}
 
 /** Build a deterministic mock DeepSeek request function.
  *  Overrides: specific stage + content pairs that deviate from defaults.
@@ -119,7 +127,7 @@ function buildRequestMock(overrides: StageResponse[]) {
     if (q && q.length > 0) return Promise.resolve({ content: q.shift()! });
     if (stage === "outline") return Promise.resolve({ content: outlineValid().content });
     if (stage === "faq") return Promise.resolve({ content: JSON.stringify({ heading: "Frequently Asked Questions", entries: [{ question: "What is this?", answer: "This is the first FAQ entry." }, { question: "How does it work?", answer: "It works through a simple process." }, { question: "Who should use this?", answer: "Anyone can use this effectively." }, { question: "When should I start?", answer: "Starting now is recommended for best results." }] }) });
-    if (stage.startsWith("section_")) return Promise.resolve({ content: para("Teams review the latest trends and build a clear plan for the year ahead.") });
+    if (stage.startsWith("section_")) return Promise.resolve({ content: paraSection("Teams review the latest trends and build a clear plan for the year ahead.") });
     if (stage === "intro" || stage === "intro_retry" || stage === "intro_repair") return Promise.resolve({ content: para("Default intro.") });
     if (stage === "conclusion" || stage === "conclusion_retry" || stage === "conclusion_repair") return Promise.resolve({ content: para("Default conclusion.") });
     return Promise.resolve({ content: JSON.stringify({}) });
@@ -302,7 +310,7 @@ describe("runBlogGeneration — section successful retry", () => {
     const stages: string[] = [];
     const base = buildRequestMock([
       { stage: "section_0", content: para('The model emitted an unfinished "quotation.') },
-      { stage: "section_0_repair", content: para("The repaired section contains complete professional prose.") },
+      { stage: "section_0_repair", content: paraSection("The repaired section contains complete professional prose.") },
     ]);
     const request = async (stage: string) => {
       stages.push(stage);
@@ -315,7 +323,7 @@ describe("runBlogGeneration — section successful retry", () => {
   it("invalid first then valid retry succeeds", async () => {
     const mock = buildRequestMock([
       { stage: "section_0", content: para("<!-- wp:paragraph -->bad") },
-      { stage: "section_0_repair", content: para("This valid section reads clearly after the repair.") },
+      { stage: "section_0_repair", content: paraSection("This valid section reads clearly after the repair.") },
     ]);
     await expect(runBlogGeneration("u", 1, { requestDeepSeek: mock })).resolves.toBeDefined();
   });
@@ -324,10 +332,12 @@ describe("runBlogGeneration — section successful retry", () => {
     vi.mocked(createPipelineState).mockClear();
     const mock = buildRequestMock([
       { stage: "section_0", content: para("<!-- wp:paragraph -->bad") },
-      { stage: "section_0_repair", content: blocksResponse([
-        { type: "heading", text: "Key Benefits" },
-        { type: "paragraph", text: "This valid section body reads clearly after the repair." },
-      ]) },
+      { stage: "section_0_repair", content: JSON.stringify({
+        blocks: [
+          { type: "heading", text: "Key Benefits" },
+          { type: "paragraph", sentences: [{ text: "This valid section body reads clearly after the repair.", kind: "free_prose" }] },
+        ],
+      }) },
     ]);
     const result = await runBlogGeneration("u", 1, { requestDeepSeek: mock });
     expect(result).toBeDefined();
@@ -603,22 +613,22 @@ describe("runBlogGeneration — successful flow", () => {
       }),
     }, {
       stage: "section_0",
-      content: para("The latest trends shape how Hong Kong marketing works for every team."),
+      content: paraSection("The latest trends shape how Hong Kong marketing works for local teams."),
     }, {
       stage: "section_1",
-      content: para("Audience behaviour changes how every team plans its outreach."),
+      content: paraSection("Audience behaviour changes how local teams plan their outreach."),
     }, {
       stage: "section_2",
-      content: para("Channel planning keeps the whole plan on track."),
+      content: paraSection("Channel planning keeps the whole plan on track."),
     }, {
       stage: "section_3",
-      content: para("Creative execution drives the campaign forward."),
+      content: paraSection("Creative execution drives the campaign forward."),
     }, {
       stage: "section_4",
-      content: para("Measurement strategy shows what actually works."),
+      content: paraSection("Measurement strategy shows what actually works."),
     }, {
       stage: "section_5",
-      content: para("Practical next steps follow the plan."),
+      content: paraSection("Practical next steps follow the plan."),
     }]);
     const calls: Array<{ stage: string; user: string }> = [];
     const request = async (stage: string, messages: Array<{ role: string; content: string }>) => {
@@ -845,8 +855,8 @@ describe("section producer topic-grounding gate", () => {
     const stages: string[] = [];
     const base = buildRequestMock([
       { stage: "outline", content: groundedOutline },
-      { stage: "section_0", content: para(UNGROUNDED) },
-      { stage: "section_0_grounding", content: para(GROUNDED) },
+      { stage: "section_0", content: paraSection(UNGROUNDED) },
+      { stage: "section_0_grounding", content: paraSection(GROUNDED) },
     ]);
     const request = async (stage: string) => {
       stages.push(stage);
@@ -859,8 +869,8 @@ describe("section producer topic-grounding gate", () => {
   it("a second ungrounded candidate fails safely at the producer (never assembled)", async () => {
     const base = buildRequestMock([
       { stage: "outline", content: groundedOutline },
-      { stage: "section_0", content: para(UNGROUNDED) },
-      { stage: "section_0_grounding", content: para("The 2026 outlook shapes what teams do next.") },
+      { stage: "section_0", content: paraSection(UNGROUNDED) },
+      { stage: "section_0_grounding", content: paraSection("The 2026 outlook shapes what teams do next.") },
     ]);
     let err: unknown = null;
     try { await runBlogGeneration("u", 1, { requestDeepSeek: base }); } catch (error) { err = error; }
@@ -875,7 +885,7 @@ describe("section producer topic-grounding gate", () => {
     const stages: string[] = [];
     const base = buildRequestMock([
       { stage: "outline", content: groundedOutline },
-      { stage: "section_0", content: para(GROUNDED) },
+      { stage: "section_0", content: paraSection(GROUNDED) },
     ]);
     const request = async (stage: string) => {
       stages.push(stage);
@@ -981,10 +991,10 @@ describe("producer contract shadow integration", () => {
       });
       const mock = buildRequestMock([
         { stage: "outline", content: groundedOutline },
-        { stage: "section_0", content: para("The 2026 outlook shapes what teams do next.") },
+        { stage: "section_0", content: paraSection("The 2026 outlook shapes what teams do next.") },
         // Grounded (shares "budget" token) and accepted by existing validation,
         // but the shared contract rejects the duplicated determiner.
-        { stage: "section_0_grounding", content: para("Smart budgets keep the plan focused on the a menu changes daily.") },
+        { stage: "section_0_grounding", content: paraSection("Smart budgets keep the plan focused on the a menu changes daily.") },
       ]);
       await runBlogGeneration("u", 1, { requestDeepSeek: mock });
 
@@ -1006,3 +1016,8 @@ describe("producer contract shadow integration", () => {
     }
   });
 });
+
+
+
+
+

@@ -56,6 +56,11 @@ export interface TraceViolationKey {
   blockRef: string;
   /** Violation type/code, e.g. "orphan-transition". */
   type: string;
+  /** Stable semantic identity (Stage 3O): for malformed/sentence-quality
+   *  findings this is "code:normalized-text", so a finding that moves to a new
+   *  canonical block id during paragraph normalization is matched as
+   *  moved/preserved rather than resolved+introduced. */
+  signature?: string;
 }
 
 export interface TraceBlockChange {
@@ -87,6 +92,10 @@ export interface TraceStageRecord {
    *  observed so a violation final QC would reject is visible at the
    *  earliest applicable debug boundary, not silently carried. */
   present: TraceViolationKey[];
+  /** Semantic findings whose stable identity existed in the PRE-doc but at a
+   *  different canonical block id (block churn during normalization). They are
+   *  preserved — never recorded as resolved+introduced (Stage 3O). */
+  moved: TraceViolationKey[];
   firstIntroduced: TraceViolationKey[];
   changedBlocks: TraceBlockChange[];
   accepted: boolean;
@@ -148,18 +157,32 @@ function metricsFor(doc: ArticleDocument, keyphrase: string): TraceMetrics {
 
 function violationsFor(doc: ArticleDocument, ctx: TraceContext): TraceViolationKey[] {
   const keys: TraceViolationKey[] = [];
-  const push = (category: string, key: string, blockRef: string, type: string) => {
-    keys.push({ category, key, blockRef, type });
+  const push = (category: string, key: string, blockRef: string, type: string, signature?: string) => {
+    keys.push({ category, key, blockRef, type, ...(signature ? { signature } : {}) });
   };
 
   for (const finding of scanMalformedProseInDocument(doc)) {
     for (const issue of finding.issues) {
-      push("malformed", `${finding.componentId}/${finding.blockId}:${issue.code}`, `${finding.componentId}/${finding.blockId}`, issue.code);
+      const blockRef = `${finding.componentId}/${finding.blockId}`;
+      push(
+        "malformed",
+        `${blockRef}:${issue.code}`,
+        blockRef,
+        issue.code,
+        `${issue.code}:${normalizeText(issue.text).toLowerCase()}`,
+      );
     }
   }
   for (const finding of scanSentenceQualityInDocument(doc)) {
     for (const issue of finding.issues) {
-      push("sentence-quality", `${finding.componentId}/${finding.blockId}:${issue.code}`, `${finding.componentId}/${finding.blockId}`, issue.code);
+      const blockRef = `${finding.componentId}/${finding.blockId}`;
+      push(
+        "sentence-quality",
+        `${blockRef}:${issue.code}`,
+        blockRef,
+        issue.code,
+        `${issue.code}:${normalizeText(issue.sentence).toLowerCase()}`,
+      );
     }
   }
   for (const violation of validateCoherence(doc)) {
@@ -302,6 +325,34 @@ function keyOf(violation: TraceViolationKey): string {
   return `${violation.category}:${violation.key}`;
 }
 
+/** Semantic-violation identity used for cross-stage matching (Stage 3O): a
+ *  finding with a stable signature (malformed/sentence-quality text) matches
+ *  across structural block-ID churn, so an identical finding that moved to a
+ *  new block id during paragraph normalization is recorded as preserved, not
+ *  resolved+introduced. Findings without a signature match by their full key. */
+function violationIdentity(violation: TraceViolationKey): string {
+  return violation.signature
+    ? `${violation.category}:${violation.signature}`
+    : keyOf(violation);
+}
+
+/** Semantic findings present in both pre and post at DIFFERENT canonical block
+ *  ids (block churn during paragraph normalization): recorded as moved, never
+ *  resolved+introduced. */
+function computeMoved(record: TraceStageRecord): TraceViolationKey[] {
+  const preRefBySignature = new Map<string, string>();
+  for (const violation of record.preViolations) {
+    if (violation.signature) preRefBySignature.set(violationIdentity(violation), violation.blockRef);
+  }
+  const moved: TraceViolationKey[] = [];
+  for (const violation of record.postViolations) {
+    if (!violation.signature) continue;
+    const preRef = preRefBySignature.get(violationIdentity(violation));
+    if (preRef !== undefined && preRef !== violation.blockRef) moved.push(violation);
+  }
+  return sortKeys(moved);
+}
+
 /** Deterministic compact console emitter. Observational only. */
 function emit(line: string): void {
   console.log(`[debug-trace] ${line}`);
@@ -343,7 +394,7 @@ export class PipelineDebugTrace {
     // earliest applicable debug boundary even when no stage introduced it.
     const present: TraceViolationKey[] = [];
     for (const violation of preViolations) {
-      const key = keyOf(violation);
+      const key = violationIdentity(violation);
       if (!this.firstSeen.has(key)) {
         this.firstSeen.set(key, stage);
         present.push(violation);
@@ -360,6 +411,7 @@ export class PipelineDebugTrace {
         introduced: [],
         resolved: [],
         present,
+        moved: [],
         firstIntroduced: [],
         changedBlocks: [],
         accepted: true,
@@ -398,13 +450,14 @@ export class PipelineDebugTrace {
     record.accepted = false;
     record.rollback = true;
 
-    const preKeys = new Set(record.preViolations.map(keyOf));
-    const postKeys = new Set(record.postViolations.map(keyOf));
-    record.introduced = sortKeys(record.postViolations.filter((v) => !preKeys.has(keyOf(v))));
-    record.resolved = sortKeys(record.preViolations.filter((v) => !postKeys.has(keyOf(v))));
+    const preKeys = new Set(record.preViolations.map(violationIdentity));
+    const postKeys = new Set(record.postViolations.map(violationIdentity));
+    record.introduced = sortKeys(record.postViolations.filter((v) => !preKeys.has(violationIdentity(v))));
+    record.resolved = sortKeys(record.preViolations.filter((v) => !postKeys.has(violationIdentity(v))));
+    record.moved = computeMoved(record);
     for (const violation of record.introduced) {
-      if (!this.firstSeen.has(keyOf(violation))) {
-        this.firstSeen.set(keyOf(violation), label);
+      if (!this.firstSeen.has(violationIdentity(violation))) {
+        this.firstSeen.set(violationIdentity(violation), label);
         record.firstIntroduced.push(violation);
       }
     }
@@ -423,13 +476,14 @@ export class PipelineDebugTrace {
     record.accepted = accepted;
     record.rollback = rollback;
 
-    const preKeys = new Set(record.preViolations.map(keyOf));
-    const postKeys = new Set(record.postViolations.map(keyOf));
-    record.introduced = sortKeys(record.postViolations.filter((v) => !preKeys.has(keyOf(v))));
-    record.resolved = sortKeys(record.preViolations.filter((v) => !postKeys.has(keyOf(v))));
+    const preKeys = new Set(record.preViolations.map(violationIdentity));
+    const postKeys = new Set(record.postViolations.map(violationIdentity));
+    record.introduced = sortKeys(record.postViolations.filter((v) => !preKeys.has(violationIdentity(v))));
+    record.resolved = sortKeys(record.preViolations.filter((v) => !postKeys.has(violationIdentity(v))));
+    record.moved = computeMoved(record);
     for (const violation of record.introduced) {
-      if (!this.firstSeen.has(keyOf(violation))) {
-        this.firstSeen.set(keyOf(violation), stage);
+      if (!this.firstSeen.has(violationIdentity(violation))) {
+        this.firstSeen.set(violationIdentity(violation), stage);
         record.firstIntroduced.push(violation);
       }
     }
@@ -465,6 +519,12 @@ export class PipelineDebugTrace {
     }
     for (const violation of record.resolved) {
       emit(`  resolved ${violation.category}:${violation.key}`);
+    }
+    for (const violation of record.moved) {
+      emit(
+        `  moved ${violation.category}:${violation.signature}` +
+        ` ${violation.blockRef}`,
+      );
     }
     for (const violation of record.firstIntroduced) {
       emit(`firstIntroduced=${record.stage} ${violation.blockRef} ${violation.type}`);

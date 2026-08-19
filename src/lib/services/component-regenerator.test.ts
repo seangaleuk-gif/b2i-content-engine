@@ -91,7 +91,7 @@ describe("component regeneration boundaries", () => {
     ].join("\n\n");
     const replacementText = "Use a short plan. Test one idea. Improve it with feedback.";
     const chatWithRetry = vi.fn(async () => ({
-      content: JSON.stringify({ blocks: [{ type: "paragraph", text: replacementText }] }),
+      content: JSON.stringify({ blocks: [{ type: "paragraph", sentences: replacementText.match(/[^.!?]+[.!?]+/g)!.map((s) => ({ text: s.trim(), kind: "free_prose" })) }] }),
       usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
       model: "test",
       attemptsUsed: 0,
@@ -139,7 +139,10 @@ describe("component regeneration boundaries", () => {
     const chatWithRetry = vi.fn(async () => ({
       content: JSON.stringify({ blocks: [{
         type: "paragraph",
-        text: 'Use <a href="https://invented.example">this advice</a> before acting.',
+        sentences: [{
+          text: 'Use <a href="https://invented.example">this advice</a> before acting.',
+          kind: "free_prose",
+        }],
       }] }),
       usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
       model: "test",
@@ -174,3 +177,4 @@ describe("component regeneration boundaries", () => {
     )).rejects.toThrow(/contains raw HTML tags/);
   });
 });
+

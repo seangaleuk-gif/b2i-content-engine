@@ -25,12 +25,18 @@
 // contract collapses them deterministically by defect family + semantic
 // identity, never hiding genuinely distinct violations.
 
-import type { ArticleDocument, EditorialBlock } from "@/lib/blog/article-document";
+import type { ArticleDocument, EditorialBlock, SourceAttribution } from "@/lib/blog/article-document";
 import {
   extractPlainTextFromEditorialBlocks,
   fingerprintHtml,
   isNonEmptyStructuredContinuation,
 } from "@/lib/blog/article-document";
+import type { SentenceAccountingEntry } from "@/lib/blog/article-content";
+import {
+  buildEvidenceLedger,
+  scanFactualRisks,
+  validateAttributedSentenceFidelity,
+} from "@/lib/blog/factual-risk-scanner";
 import {
   analyzeSentenceCompleteness,
   isSourceCitationText,
@@ -40,8 +46,7 @@ import {
   isAuthoritativePunctuationOnlyResidue,
   lowercaseStartValidTokensFromKeyphrase,
   scanSentenceQualityText,
-} from "@/lib/blog/sentence-quality";
-import {
+} from "@/lib/blog/sentence-quality";import {
   findMalformedProseTextIssues,
   scanMalformedProseInBlocks,
 } from "@/lib/blog/publication-quality";
@@ -61,6 +66,7 @@ export type ProducerHardRule =
   | "malformed-prose"
   | "structure"
   | "coherence"
+  | "source-provenance"
   | "component-specific";
 
 export interface ProducerComponentContext {
@@ -71,8 +77,22 @@ export interface ProducerComponentContext {
   /** Focus keyphrase — enables the authoritative lowercase-sentence-start
    *  allowance and the imperative/finite-predicate leaves that need it. */
   keyphrase?: string;
+  /** Case-insensitive proper-name spans (e.g. "DON DON DONKI") extracted from
+   *  the research/source evidence for this component. Supplied to the shared
+   *  sentence-quality scanner so a named-entity repeated token is licensed. */
+  licensedRepeatedWordSpans?: ReadonlySet<string>;
   /** FAQ only: allowed entry-count range. Omitted → count not checked. */
   faqRange?: { min: number; max: number };
+  /** Source-first provenance context: the SOURCE-X-CLAIM-Y IDs supplied to
+   *  THIS producer (section-owned claims). Empty/absent for synthesis-only
+   *  components — any attribution there is invalid. */
+  ownedEvidenceIds?: ReadonlySet<string>;
+  /** Approved research rows for the declared-evidence fidelity check. */
+  research?: Array<{ title?: string; snippet?: string; url?: string }>;
+  /** Synthesis-only components (introduction, conclusion, FAQ) keep the
+   *  stricter contract: BOTH sourceAttributions and freeProseSentences must
+   *  be empty — they may not introduce research facts at all. */
+  synthesisOnly?: boolean;
 }
 
 export interface ProducerCandidate {
@@ -82,6 +102,15 @@ export interface ProducerCandidate {
   faqEntries?: Array<{ question: string; answer: string }>;
   /** Raw model output — diagnostics only, never used in validation. */
   html?: string;
+  /** Internal-only source→prose provenance from the producer response. */
+  sourceAttributions?: SourceAttribution[];
+  /** Internal-only free-prose accounting: sentences that are advice, opinion,
+   *  rhetoric or hypothetical examples (no evidence IDs, never facts). */
+  freeProseSentences?: string[];
+  /** Structurally-coupled per-sentence accounting: every sentence exists once
+   *  in the blocks carrying its own kind + optional evidenceIds (the primary
+   *  representation for editorial-block JSON producers). */
+  sentenceAccounting?: SentenceAccountingEntry[];
 }
 
 export interface ProducerViolation {
@@ -129,7 +158,8 @@ const RULE_PRIORITY: Record<ProducerHardRule, number> = {
   "sentence-quality": 3,
   coherence: 4,
   structure: 5,
-  "component-specific": 6,
+  "source-provenance": 6,
+  "component-specific": 7,
 };
 
 /** Coherence rules proven safe at component scope: they need only the
@@ -294,7 +324,10 @@ function scanSentenceQuality(
   const violations: ProducerViolation[] = [];
   for (const block of blocks) {
     for (const text of proseTextsForBlock(block)) {
-      for (const issue of scanSentenceQualityText(text, { validLowercaseTokens })) {
+      for (const issue of scanSentenceQualityText(text, {
+        validLowercaseTokens,
+        licensedRepeatedWordSpans: context.licensedRepeatedWordSpans,
+      })) {
         // Fragments are owned by the sentence-completeness/malformed leaves.
         if (issue.code === "fragment") continue;
         violations.push({
@@ -475,7 +508,10 @@ function scanFaq(
           text: issue.text,
         });
       }
-      for (const issue of scanSentenceQualityText(answer, { validLowercaseTokens })) {
+      for (const issue of scanSentenceQualityText(answer, {
+        validLowercaseTokens,
+        licensedRepeatedWordSpans: context.licensedRepeatedWordSpans,
+      })) {
         if (issue.code === "fragment") continue;
         violations.push({
           rule: "sentence-quality",
@@ -547,6 +583,296 @@ function fingerprintForCandidate(candidate: ProducerCandidate): string {
     return fingerprintHtml(JSON.stringify(candidate.faqEntries));
   }
   return fingerprintHtml(JSON.stringify(candidate.html ?? ""));
+}
+
+// ── Source-first provenance validation (shared by every factual-capable
+//    producer: sections, regeneration, compaction; synthesis-only components
+//    may not attribute at all) ──
+// Each declared attribution must:
+//  1. quote a sentence that EXACTLY exists in the candidate's own blocks;
+//  2. use only SOURCE-X-CLAIM-Y IDs supplied to this producer (owned);
+//  3. pass the existing entailment/fidelity authority against the DECLARED
+//     evidence only — never reassigned heuristically from the whole ledger.
+// Violations are hard at the producer boundary and drive the existing
+// repair/retry seam — invalid provenance never silently passes.
+
+function candidateProseTexts(candidate: ProducerCandidate): string[] {
+  const texts: string[] = [];
+  for (const block of candidate.blocks ?? []) {
+    texts.push(...proseTextsForBlock(block));
+  }
+  return texts;
+}
+
+function normalizedContainment(texts: string[], sentence: string): boolean {
+  const normalized = sentence.replace(/\s+/g, " ").trim().replace(/[.!?]+$/, "").toLowerCase();
+  return texts.some((text) =>
+    text.replace(/\s+/g, " ").trim().replace(/[.!?]+$/, "").toLowerCase().includes(normalized),
+  );
+}
+
+export function validateProducerSourceAttributions(
+  candidate: ProducerCandidate,
+  context: ProducerComponentContext,
+): ProducerViolation[] {
+  const violations: ProducerViolation[] = [];
+  const attributions = candidate.sourceAttributions ?? [];
+  if (attributions.length === 0) return violations;
+
+  const ownedEvidenceIds = context.ownedEvidenceIds ?? new Set<string>();
+  const ledger = buildEvidenceLedger(context.research);
+  const ledgerIds = new Set(ledger.map((entry) => entry.evidenceId));
+  const proseTexts = candidateProseTexts(candidate);
+  const allProse = proseTexts.join(" ");
+
+  for (let i = 0; i < attributions.length; i++) {
+    const attribution = attributions[i];
+    const label = `sourceAttributions[${i}]`;
+    if (typeof attribution?.sentence !== "string" || !attribution.sentence.trim()) {
+      violations.push({
+        rule: "source-provenance",
+        code: "attribution-missing-sentence",
+        componentId: context.componentId,
+        message: `${label} must declare a non-empty sentence`,
+      });
+      continue;
+    }
+    const sentence = attribution.sentence.trim();
+    let structurallyValid = true;
+    if (!normalizedContainment(proseTexts, sentence) && tokenOverlapRatioForProvenance(sentence, allProse) < 0.5) {
+      violations.push({
+        rule: "source-provenance",
+        code: "attributed-sentence-not-in-blocks",
+        componentId: context.componentId,
+        message: `${label} quotes a sentence that does not exist in the generated blocks`,
+        text: sentence.slice(0, 160),
+      });
+      structurallyValid = false;
+    }
+    if (!Array.isArray(attribution.evidenceIds) || attribution.evidenceIds.length === 0) {
+      violations.push({
+        rule: "source-provenance",
+        code: "attribution-missing-evidence",
+        componentId: context.componentId,
+        message: `${label} must declare at least one evidenceId`,
+      });
+      structurallyValid = false;
+      continue;
+    }
+    for (const id of attribution.evidenceIds) {
+      if (!ledgerIds.has(id)) {
+        violations.push({
+          rule: "source-provenance",
+          code: "attribution-unknown-evidence",
+          componentId: context.componentId,
+          message: `${label} declares unknown evidence id ${id}`,
+        });
+        structurallyValid = false;
+      } else if (!ownedEvidenceIds.has(id)) {
+        violations.push({
+          rule: "source-provenance",
+          code: "attribution-not-owned",
+          componentId: context.componentId,
+          message: `${label} declares evidence id ${id} which is not assigned to this producer`,
+        });
+        structurallyValid = false;
+      }
+    }
+    if (structurallyValid) {
+      const fidelity = validateAttributedSentenceFidelity(sentence, attribution.evidenceIds, ledger);
+      if (!fidelity.supported) {
+        violations.push({
+          rule: "source-provenance",
+          code: "attribution-fidelity",
+          componentId: context.componentId,
+          message: `${label} sentence is not entailed by its declared evidence: ${fidelity.reason}`,
+          text: sentence.slice(0, 160),
+        });
+      }
+    }
+  }
+  return violations;
+}
+
+/** Text units that must be accounted for in the per-sentence provenance
+ *  contract: paragraph/subheading/quote prose and each list item. Table cells
+ *  are structural data containers (deterministic patterns backstop them). */
+function accountableTextsForBlock(block: EditorialBlock): string[] {
+  if (block.type === "table") return [];
+  if (block.type === "list") return block.items.map((item) => item.map((node) => node.text ?? "").join(""));
+  return [textForBlock(block)];
+}
+
+function normalizeAccountingText(text: string): string {
+  return (text ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.!?]+$/, "")
+    .toLowerCase();
+}
+
+/**
+ * COMPLETE per-sentence provenance accounting via STRUCTURALLY-COUPLED
+ * sentences: each generated prose sentence exists exactly once in the producer
+ * response carrying its own kind — source_fact (owned evidence IDs, existing
+ * declared-source fidelity) or free_prose (advice/opinion/rhetoric/
+ * hypothetical only, never a concrete external-world fact). Completeness is
+ * STRUCTURAL — there is no separate sentence-matching/repetition step: a
+ * sentence object that was written into a block IS accounted. A legacy sidecar
+ * representation is also accepted (expander path) and runs the same per-entry
+ * checks. Invalid entries drive the existing producer repair/retry seam.
+ *
+ * Synthesis-only components keep their stricter contract: no provenance may
+ * be declared at all.
+ */
+export function validateProducerSentenceAccounting(
+  candidate: ProducerCandidate,
+  context: ProducerComponentContext,
+): ProducerViolation[] {
+  const violations: ProducerViolation[] = [];
+
+  if (context.synthesisOnly) {
+    const hasAttribution = (candidate.sourceAttributions ?? []).length > 0
+      || (candidate.sentenceAccounting?.some((entry) => entry.kind === "source_fact") ?? false);
+    if (hasAttribution) {
+      violations.push({
+        rule: "source-provenance",
+        code: "synthesis-only-attribution",
+        componentId: context.componentId,
+        message: "synthesis-only component must not declare research provenance",
+      });
+    }
+    return violations;
+  }
+
+  // Unified per-entry accounting: the structural sentence objects are the
+  // primary representation; the legacy sidecar path is accepted for producers
+  // whose response is not editorial-block JSON (section expansion).
+  const accounting: Array<{ sentence: string; kind: "source_fact" | "free_prose"; evidenceIds: string[] }> =
+    candidate.sentenceAccounting && candidate.sentenceAccounting.length > 0
+      ? candidate.sentenceAccounting
+      : [
+          ...(candidate.sourceAttributions ?? []).map((entry) => ({
+            sentence: entry.sentence,
+            kind: "source_fact" as const,
+            evidenceIds: entry.evidenceIds,
+          })),
+          ...(candidate.freeProseSentences ?? []).map((sentence) => ({
+            sentence,
+            kind: "free_prose" as const,
+            evidenceIds: [] as string[],
+          })),
+        ];
+
+  const blockTexts = candidate.blocks?.flatMap(accountableTextsForBlock) ?? [];
+  const normalizedBlocks = blockTexts.map(normalizeAccountingText);
+  const ledger = buildEvidenceLedger(context.research);
+  const ledgerIds = new Set(ledger.map((entry) => entry.evidenceId));
+  const ownedEvidenceIds = context.ownedEvidenceIds ?? new Set<string>();
+
+  for (let i = 0; i < accounting.length; i++) {
+    const entry = accounting[i];
+    const label = `sentence[${i}]`;
+    const sentence = (entry?.sentence ?? "").trim();
+    if (!sentence) {
+      violations.push({
+        rule: "source-provenance",
+        code: "accounting-missing-sentence",
+        componentId: context.componentId,
+        message: `${label} must declare a non-empty sentence`,
+      });
+      continue;
+    }
+    const normalized = normalizeAccountingText(sentence);
+    if (!normalizedBlocks.some((text) => text.includes(normalized))) {
+      violations.push({
+        rule: "source-provenance",
+        code: "accounted-sentence-not-in-blocks",
+        componentId: context.componentId,
+        message: `${label} quotes a sentence that does not exist in the generated blocks`,
+        text: sentence.slice(0, 160),
+      });
+    }
+
+    if (entry.kind === "source_fact") {
+      // Existing declared-source validation: owned evidence IDs + fidelity.
+      const evidenceIds = Array.isArray(entry.evidenceIds) ? entry.evidenceIds : [];
+      if (evidenceIds.length === 0) {
+        violations.push({
+          rule: "source-provenance",
+          code: "attribution-missing-evidence",
+          componentId: context.componentId,
+          message: `${label} source_fact sentence must declare at least one evidenceId`,
+        });
+        continue;
+      }
+      let structurallyValid = true;
+      for (const id of evidenceIds) {
+        if (!ledgerIds.has(id)) {
+          violations.push({
+            rule: "source-provenance",
+            code: "attribution-unknown-evidence",
+            componentId: context.componentId,
+            message: `${label} declares unknown evidence id ${id}`,
+          });
+          structurallyValid = false;
+        } else if (!ownedEvidenceIds.has(id)) {
+          violations.push({
+            rule: "source-provenance",
+            code: "attribution-not-owned",
+            componentId: context.componentId,
+            message: `${label} declares evidence id ${id} which is not assigned to this producer`,
+          });
+          structurallyValid = false;
+        }
+      }
+      if (structurallyValid) {
+        const fidelity = validateAttributedSentenceFidelity(sentence, evidenceIds, ledger);
+        if (!fidelity.supported) {
+          violations.push({
+            rule: "source-provenance",
+            code: "attribution-fidelity",
+            componentId: context.componentId,
+            message: `${label} sentence is not entailed by its declared evidence: ${fidelity.reason}`,
+            text: sentence.slice(0, 160),
+          });
+        }
+      }
+    } else {
+      // free_prose: no evidence IDs, and the deterministic pattern layer is
+      // the boundary judge for concrete external-world facts.
+      if (Array.isArray(entry.evidenceIds) && entry.evidenceIds.length > 0) {
+        violations.push({
+          rule: "source-provenance",
+          code: "free-prose-has-evidence",
+          componentId: context.componentId,
+          message: `${label} free_prose sentence must not declare evidenceIds`,
+        });
+      }
+      const patternScan = scanFactualRisks(
+        `<!-- wp:paragraph --><p>${sentence}</p><!-- /wp:paragraph -->`,
+        context.keyphrase ?? "",
+        [],
+      );
+      if (patternScan.claims.length > 0) {
+        violations.push({
+          rule: "source-provenance",
+          code: "free-prose-asserts-concrete-fact",
+          componentId: context.componentId,
+          message: `${label} asserts a concrete external-world fact (${patternScan.claims.map((c) => c.category).join(", ")}) — account it as source_fact or remove the fact`,
+          text: sentence.slice(0, 160),
+        });
+      }
+    }
+  }
+  return violations;
+}
+
+function tokenOverlapRatioForProvenance(a: string, b: string): number {
+  const tokensA = a.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 4);
+  if (tokensA.length === 0) return 0;
+  const tokensB = new Set(b.toLowerCase().split(/[^\p{L}\p{N}]+/u));
+  return tokensA.filter((token) => tokensB.has(token)).length / tokensA.length;
 }
 
 // ── Main entry ──

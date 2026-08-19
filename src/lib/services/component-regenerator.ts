@@ -13,8 +13,10 @@ import {
 } from "@/lib/services/text-utils";
 import { FLESCH_MIN, FLESCH_MAX } from "@/lib/services/generation-constants";
 import { englishTitleRange, englishMetaRange, computeKeyphraseTargets, getKeyphraseContentWordCount } from "@/lib/content-standards";
-import { formatOwnedEvidencePacket } from "@/lib/blog/claim-ownership";
-import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress } from "@/lib/blog/article-content";
+import { formatOwnedEvidencePacket, evidenceForSection } from "@/lib/blog/claim-ownership";
+import { validateProducerSentenceAccounting } from "@/lib/blog/producer-content-contract";
+import { parseWordPressEditorialBlocks, type SourceAttribution } from "@/lib/blog/article-document";
+import { normalizeAiEditorialPayload, renderEditorialBlocksToWordPress, type SentenceAccountingEntry } from "@/lib/blog/article-content";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
 
 // ── Types ──
@@ -233,16 +235,36 @@ export function validateComponents(
 // ── Regeneration functions ──
 
 
-function parseStructuredEditorialResponse(content: string, componentId: string): string {
+export interface RegeneratedComponent {
+  /** Rendered WordPress HTML of the regenerated blocks. */
+  html: string;
+  /** Internal-only source provenance declared by the regenerator response. */
+  sourceAttributions?: SourceAttribution[];
+  /** Internal-only free-prose accounting (advice/opinion/hypothetical). */
+  freeProseSentences?: string[];
+  /** Structurally-coupled per-sentence provenance (section regeneration). */
+  sentenceAccounting?: SentenceAccountingEntry[];
+}
+
+function parseStructuredEditorialResponse(
+  content: string,
+  componentId: string,
+  requireSentenceKinds = false,
+): RegeneratedComponent {
   const payload = robustJsonParse(content, componentId);
-  const normalized = normalizeAiEditorialPayload(payload, componentId);
+  const normalized = normalizeAiEditorialPayload(payload, componentId, { requireSentenceKinds });
   if (normalized.recoveries.length > 0) {
     console.warn(`[editorial-payload-normalization] component=${componentId} recoveries=${JSON.stringify(normalized.recoveries)}`);
   }
   if (normalized.errors.length > 0 || normalized.blocks.length === 0) {
     throw new Error(`${componentId} returned invalid structured blocks: ${normalized.errors.join("; ") || "empty block list"}`);
   }
-  return renderEditorialBlocksToWordPress(normalized.blocks);
+  return {
+    html: renderEditorialBlocksToWordPress(normalized.blocks),
+    sourceAttributions: normalized.sourceAttributions,
+    freeProseSentences: normalized.freeProseSentences,
+    sentenceAccounting: normalized.sentenceAccounting,
+  };
 }
 
 export async function regenerateTitle(
@@ -308,16 +330,18 @@ export async function regenerateIntroduction(
   meta: string,
   keyword: string,
   wordTarget: number,
-): Promise<string> {
+): Promise<RegeneratedComponent> {
   const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.introduction);
-  const userMsg = `Rewrite the introduction for this blog (target ${wordTarget} words). Return structured JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}.\n\nThis introduction is synthesis-only. Do not include statistics, dates, currencies, quotations, performance benchmarks, survey findings, posting frequencies or platform-availability claims. Frame the topic without repeating precise evidence owned by body sections.\n\nTitle: ${title}\nMeta: ${meta}\nKeyword: ${keyword}`;
+  const userMsg = `Rewrite the introduction for this blog (target ${wordTarget} words). Return structured JSON: {"blocks": [{"type": "paragraph", "text": "..."}]}.\n\nThis introduction is synthesis-only. Do not include statistics, dates, currencies, quotations, performance benchmarks, survey findings, posting frequencies or platform-availability claims. Frame the topic without repeating precise evidence owned by body sections. Return sourceAttributions: [] and freeProseSentences: [] (synthesis-only).\n\nTitle: ${title}\nMeta: ${meta}\nKeyword: ${keyword}`;
 
   const res = await ctx.chatWithRetry(
     [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],
     { responseFormat: { type: "json_object" }, maxTokens: 4096 }
   );
 
-  return parseStructuredEditorialResponse(res.content, "regenerated-introduction");
+  const component = parseStructuredEditorialResponse(res.content, "regenerated-introduction");
+  assertSynthesisOnlyProvenance(component, "regenerated-introduction");
+  return component;
 }
 
 export async function regenerateSection(
@@ -330,11 +354,11 @@ export async function regenerateSection(
   keyphraseTarget: number,
   keyphrase: string,
   sectionId?: string,
-): Promise<string> {
+): Promise<RegeneratedComponent> {
   const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.section);
   const sectionResearchPrompt = sectionId && ctx.promptContext.claimOwnership
-    ? `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${formatOwnedEvidencePacket(ctx.promptContext.claimOwnership, sectionId)}\nUse only assigned evidence. Preserve its complete meaning and natural named attribution. Never print evidence IDs. Do not move or repeat another section's evidence.`
-    : `\n\nNo precise evidence packet is assigned to this regeneration. Do not introduce statistics, dates, currencies, quotations, performance benchmarks, survey findings, posting frequencies or platform-availability claims.`;
+    ? `\n\nCLAIM OWNERSHIP LEDGER — evidence below belongs ONLY to this section:\n${formatOwnedEvidencePacket(ctx.promptContext.claimOwnership, sectionId)}\nUse only assigned evidence. Preserve its complete meaning and natural named attribution. Never print evidence IDs. Do not move or repeat another section's evidence.\nDo not introduce any concrete external-world fact — statistic, number, price, date, platform capability, company behaviour, payment or advertising mechanic, or market claim — that is not present in the approved claims above. Advice, guidance, opinion and hypothetical examples are allowed as free prose but must never assert external-world facts.\nDeclare source provenance for every source-backed factual sentence via sourceAttributions (see the contract below).`
+    : `\n\nNo precise evidence packet is assigned to this regeneration. Do not introduce statistics, dates, currencies, quotations, performance benchmarks, survey findings, posting frequencies or platform-availability claims. Return sourceAttributions: [] and freeProseSentences: [].`;
   const userMsg = `Return section BODY content only. Do NOT return the H2 heading. Start directly with a paragraph or list. The application will insert the heading.\n\nSection heading for context only (do NOT repeat):\n"${heading}"\n\nRewrite the body content for this section. Target exactly ${wordTarget} words. Include the keyphrase "${keyphrase}" naturally (target ${keyphraseTarget} across full article). Return structured editorial blocks; the application renders WordPress HTML.\n\nArticle title: ${title}\nPrevious heading: ${prevHeading}\nNext heading: ${nextHeading}\n\nGUIDANCE:\n- Do NOT repeat statistics, examples, or explanations from other sections.\n- Focus exclusively on the content for THIS heading.${sectionResearchPrompt}\n\n${EDITORIAL_BLOCK_JSON_CONTRACT}`;
 
   const res = await ctx.chatWithRetry(
@@ -342,7 +366,59 @@ export async function regenerateSection(
     { responseFormat: { type: "json_object" }, maxTokens: 8192 }
   );
 
-  return parseStructuredEditorialResponse(res.content, `regenerated-section-${sectionId || "unowned"}`);
+  const component = parseStructuredEditorialResponse(res.content, `regenerated-section-${sectionId || "unowned"}`, true);
+  if (sectionId && ctx.promptContext.claimOwnership) {
+    const ownedEvidenceIds = new Set(
+      evidenceForSection(ctx.promptContext.claimOwnership, sectionId).map((entry) => entry.evidenceId),
+    );
+    const violations = validateProducerSentenceAccounting(
+      {
+        blocks: parseBlocksOf(component),
+        sentenceAccounting: component.sentenceAccounting,
+      },
+      {
+        componentId: sectionId,
+        componentType: "section",
+        scope: "complete-component",
+        keyphrase,
+        ownedEvidenceIds,
+        research: ctx.promptContext.research,
+        synthesisOnly: false,
+      },
+    );
+    if (violations.length > 0) {
+      throw new Error(
+        `Regenerated section ${sectionId} failed source provenance: ` +
+        violations.map((v) => `${v.code}: ${v.message}`).join("; "),
+      );
+    }
+  } else {
+    // A regenerated SECTION is always factual-capable — it may carry its own
+    // free_prose classification even without an ownership ledger entry. With
+    // no owned evidence available, every sentence must be free_prose.
+    const violations = validateProducerSentenceAccounting(
+      {
+        blocks: parseBlocksOf(component),
+        sentenceAccounting: component.sentenceAccounting,
+      },
+      {
+        componentId: sectionId ?? `section-${heading}`,
+        componentType: "section",
+        scope: "complete-component",
+        keyphrase,
+        ownedEvidenceIds: new Set(),
+        research: ctx.promptContext.research,
+        synthesisOnly: false,
+      },
+    );
+    if (violations.length > 0) {
+      throw new Error(
+        `Regenerated section ${sectionId ?? "unowned"} failed source provenance: ` +
+        violations.map((v) => `${v.code}: ${v.message}`).join("; "),
+      );
+    }
+  }
+  return component;
 }
 
 export async function regenerateConclusion(
@@ -350,7 +426,7 @@ export async function regenerateConclusion(
   title: string,
   wordTarget: number,
   articleSummary = "",
-): Promise<string> {
+): Promise<RegeneratedComponent> {
   const systemPrompt = buildSystemPrompt(ctx.promptContext, STAGE_SYSTEM_PROMPTS.conclusion);
   const userMsg = `Rewrite the conclusion (target ${wordTarget} words).
 
@@ -358,6 +434,7 @@ Summarize only ideas already established in the supplied article context.
 Do not introduce statistics, dates, platform features, posting frequencies, research, links, offers or new recommendations.
 Do not include a CTA, signup copy, FAQ content or a heading.
 Return structured JSON blocks, using concise paragraphs: {"blocks": [{"type": "paragraph", "text": "..."}]}.
+This conclusion is synthesis-only: return sourceAttributions: [].
 
 Title: ${title}
 Article context:
@@ -368,7 +445,27 @@ ${articleSummary.slice(0, 6000)}`;
     { responseFormat: { type: "json_object" }, maxTokens: 4096 }
   );
 
-  return parseStructuredEditorialResponse(res.content, "regenerated-conclusion");
+  const component = parseStructuredEditorialResponse(res.content, "regenerated-conclusion");
+  assertSynthesisOnlyProvenance(component, "regenerated-conclusion");
+  return component;
+}
+
+function assertSynthesisOnlyProvenance(component: RegeneratedComponent, label: string): void {
+  if (component.sourceAttributions && component.sourceAttributions.length > 0) {
+    throw new Error(
+      `${label} is synthesis-only but declared sourceAttributions — invalid provenance`,
+    );
+  }
+  if (component.freeProseSentences && component.freeProseSentences.length > 0) {
+    throw new Error(
+      `${label} is synthesis-only but declared freeProseSentences — invalid accounting`,
+    );
+  }
+}
+
+function parseBlocksOf(component: RegeneratedComponent): import("@/lib/blog/article-document").EditorialBlock[] {
+  const parsed = parseWordPressEditorialBlocks(component.html, "provenance-check");
+  return parsed.blocks;
 }
 
 // ── Main regeneration loop ──
@@ -448,7 +545,7 @@ export async function runComponentRegeneration(
               keyphrase,
               ctx.promptContext.claimOwnership?.sectionIds[secIdx],
             );
-            currentBlog = replaceSectionInBlog(currentBlog, secIdx, newBody);
+            currentBlog = replaceSectionInBlog(currentBlog, secIdx, newBody.html);
           }
           break;
         }
@@ -485,7 +582,7 @@ export async function runComponentRegeneration(
               keyphrase,
               ctx.promptContext.claimOwnership?.sectionIds[worst.index],
             );
-            currentBlog = replaceSectionInBlog(currentBlog, worst.index, newBody);
+            currentBlog = replaceSectionInBlog(currentBlog, worst.index, newBody.html);
           }
           break;
         }
@@ -510,3 +607,4 @@ export async function runComponentRegeneration(
 
   return { blog: currentBlog, title: currentTitle, meta: currentMeta, warnings, logs };
 }
+

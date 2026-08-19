@@ -1,0 +1,588 @@
+{
+  "schema": "pipeline-failure-snapshot/v1",
+  "timestamp": "2026-08-18T06:00:19.205Z",
+  "build": "b2i-english-2026-08-20-2",
+  "projectId": "24",
+  "stage": "malformed-prose-repair",
+  "keyphrase": {
+    "pre": {
+      "occurrences": 2,
+      "density": 0
+    },
+    "post": {
+      "occurrences": 2,
+      "density": 0
+    }
+  },
+  "contract": {
+    "label": "malformed-prose-repair",
+    "valid": false,
+    "violations": [],
+    "ownedViolations": []
+  },
+  "rollback": {
+    "action": "restore-snapshot",
+    "result": "success"
+  },
+  "fingerprints": {
+    "pre": "637228357",
+    "post": "637228357"
+  },
+  "wordCount": {
+    "pre": 553,
+    "post": 553
+  },
+  "changedBlocks": [],
+  "firstIntroduced": [],
+  "deltas": {},
+  "documents": {
+    "preStage": {
+      "metadata": {
+        "title": "Hong Kong Gym Marketing: Building a Community That Trains Together",
+        "slug": "hong-kong-gym-marketing",
+        "metaDescription": "A practical guide to hong kong gym marketing for owners who want a loyal community of members who train with them for years.",
+        "excerpt": "Hong Kong gym marketing guide.",
+        "targetWordCount": 1500,
+        "focusKeyphrase": "hong kong gym marketing"
+      },
+      "languageSwitcher": null,
+      "introduction": {
+        "id": "intro",
+        "status": "generated",
+        "blocks": [
+          {
+            "id": "intro-wp-0",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Hong Kong gym marketing works best when it treats members as part of a community rather than a crowd on a schedule. People join a gym for the training, and they stay because of the people around them."
+              }
+            ]
+          },
+          {
+            "id": "intro-wp-1",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "A gym that feels welcoming from the front desk to the last set of the evening gives members a reason to keep showing up. This guide walks through the practical pieces of building that feeling."
+              }
+            ]
+          }
+        ]
+      },
+      "sections": [
+        {
+          "id": "section-0",
+          "heading": "Attracting New Members With a Clear Welcome",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-0-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "New members choose a gym they understand before they even visit. A clear price list, honest class schedule and simple tour answer the questions people ask first."
+                }
+              ]
+            },
+            {
+              "id": "section-0-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "The first phone call or message sets the standard for the whole relationship. A friendly reply that answers a real question beats a polished advertisement."
+                }
+              ]
+            },
+            {
+              "id": "section-0-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Welcome visits work best when they show the actual routine. Give prospects a short tour that includes the busy hours, the quiet corners and the people training."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "section-1",
+          "heading": "Making the First Visit Feel Easy",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-1-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "A first visit should remove friction rather than add it. Simple sign-in, clear changing rooms and a short introduction to the floor make newcomers comfortable."
+                }
+              ]
+            },
+            {
+              "id": "section-1-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Assign a friendly staff member to guide the first session. Someone who explains the equipment and checks in afterwards turns uncertainty into confidence."
+                }
+              ]
+            },
+            {
+              "id": "section-1-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Ask how the first visit felt and listen to the answer. A small fix based on honest feedback makes the next visit noticeably smoother."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "section-2",
+          "heading": "Building Community Around Your Gym",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-2-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "A gym community grows when members see the same friendly faces and feel part of something bigger. Small group habits, shared goals and honest coaching all feed that sense of belonging."
+                }
+              ]
+            },
+            {
+              "id": "section-2-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "New members often feel unsure during their first weeks. A structured introduction to the floor, the machines and the class schedule removes that uncertainty quickly."
+                }
+              ]
+            },
+            {
+              "id": "section-2-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Encourage habits that bring members together in a natural way. The list below covers simple routines that most gyms can start without a big budget."
+                }
+              ]
+            },
+            {
+              "id": "section-2-wp-3",
+              "type": "list",
+              "ordered": false,
+              "items": [
+                [
+                  {
+                    "type": "text",
+                    "text": "Local visibility – a strong presence on maps and review pages brings in nearby members."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Class culture – energetic sessions make the gym a place people want to be."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Trial passes – a short guest pass gives newcomers a safe way to start."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Community events – small competitions and social sessions build friendly bonds."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Consistent coaching – the same faces on the floor create a dependable routine."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Social proof – reviews and member stories build trust before someone even steps in."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Follow-up habits – a quick check-in after a trial visit keeps the connection warm."
+                  }
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "id": "section-3",
+          "heading": "Keeping Members Engaged Month After Month",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-3-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Retention inside the gym matters as much as the welcome at the door. Members who feel coached, challenged and appreciated stay through the slower months."
+                }
+              ]
+            },
+            {
+              "id": "section-3-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Celebrate the small milestones that matter to real members. A note about a completed month or a new personal best keeps motivation visible."
+                }
+              ]
+            },
+            {
+              "id": "section-3-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Ask members what they enjoy most and protect that part of the experience. The class, the coach or the quiet morning hour that brings someone back is worth defending."
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "visibleFaq": [],
+      "conclusion": {
+        "id": "conclusion",
+        "status": "generated",
+        "blocks": [
+          {
+            "id": "conclusion-wp-0",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Hong Kong gym marketing is really about the everyday experience inside the building. Attract members with honesty, keep them with community and earn their loyalty one visit at a time."
+              }
+            ]
+          },
+          {
+            "id": "conclusion-wp-1",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Start with the welcome, build the culture and let the members do the talking. A gym people believe in grows by itself."
+              }
+            ]
+          }
+        ]
+      },
+      "cta": null,
+      "faqSchema": null,
+      "insertedLinks": []
+    },
+    "rejectedCandidate": {
+      "metadata": {
+        "title": "Hong Kong Gym Marketing: Building a Community That Trains Together",
+        "slug": "hong-kong-gym-marketing",
+        "metaDescription": "A practical guide to hong kong gym marketing for owners who want a loyal community of members who train with them for years.",
+        "excerpt": "Hong Kong gym marketing guide.",
+        "targetWordCount": 1500,
+        "focusKeyphrase": "hong kong gym marketing"
+      },
+      "languageSwitcher": null,
+      "introduction": {
+        "id": "intro",
+        "status": "generated",
+        "blocks": [
+          {
+            "id": "intro-wp-0",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Hong Kong gym marketing works best when it treats members as part of a community rather than a crowd on a schedule. People join a gym for the training, and they stay because of the people around them."
+              }
+            ]
+          },
+          {
+            "id": "intro-wp-1",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "A gym that feels welcoming from the front desk to the last set of the evening gives members a reason to keep showing up. This guide walks through the practical pieces of building that feeling."
+              }
+            ]
+          }
+        ]
+      },
+      "sections": [
+        {
+          "id": "section-0",
+          "heading": "Attracting New Members With a Clear Welcome",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-0-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "New members choose a gym they understand before they even visit. A clear price list, honest class schedule and simple tour answer the questions people ask first."
+                }
+              ]
+            },
+            {
+              "id": "section-0-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "The first phone call or message sets the standard for the whole relationship. A friendly reply that answers a real question beats a polished advertisement."
+                }
+              ]
+            },
+            {
+              "id": "section-0-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Welcome visits work best when they show the actual routine. Give prospects a short tour that includes the busy hours, the quiet corners and the people training."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "section-1",
+          "heading": "Making the First Visit Feel Easy",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-1-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "A first visit should remove friction rather than add it. Simple sign-in, clear changing rooms and a short introduction to the floor make newcomers comfortable."
+                }
+              ]
+            },
+            {
+              "id": "section-1-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Assign a friendly staff member to guide the first session. Someone who explains the equipment and checks in afterwards turns uncertainty into confidence."
+                }
+              ]
+            },
+            {
+              "id": "section-1-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Ask how the first visit felt and listen to the answer. A small fix based on honest feedback makes the next visit noticeably smoother."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "section-2",
+          "heading": "Building Community Around Your Gym",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-2-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "A gym community grows when members see the same friendly faces and feel part of something bigger. Small group habits, shared goals and honest coaching all feed that sense of belonging."
+                }
+              ]
+            },
+            {
+              "id": "section-2-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "New members often feel unsure during their first weeks. A structured introduction to the floor, the machines and the class schedule removes that uncertainty quickly."
+                }
+              ]
+            },
+            {
+              "id": "section-2-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Encourage habits that bring members together in a natural way. The list below covers simple routines that most gyms can start without a big budget."
+                }
+              ]
+            },
+            {
+              "id": "section-2-wp-3",
+              "type": "list",
+              "ordered": false,
+              "items": [
+                [
+                  {
+                    "type": "text",
+                    "text": "Local visibility – a strong presence on maps and review pages brings in nearby members."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Class culture – energetic sessions make the gym a place people want to be."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Trial passes – a short guest pass gives newcomers a safe way to start."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Community events – small competitions and social sessions build friendly bonds."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Consistent coaching – the same faces on the floor create a dependable routine."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Social proof – reviews and member stories build trust before someone even steps in."
+                  }
+                ],
+                [
+                  {
+                    "type": "text",
+                    "text": "Follow-up habits – a quick check-in after a trial visit keeps the connection warm."
+                  }
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "id": "section-3",
+          "heading": "Keeping Members Engaged Month After Month",
+          "headingLevel": 2,
+          "sectionType": "main",
+          "status": "generated",
+          "blocks": [
+            {
+              "id": "section-3-wp-0",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Retention inside the gym matters as much as the welcome at the door. Members who feel coached, challenged and appreciated stay through the slower months."
+                }
+              ]
+            },
+            {
+              "id": "section-3-wp-1",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Celebrate the small milestones that matter to real members. A note about a completed month or a new personal best keeps motivation visible."
+                }
+              ]
+            },
+            {
+              "id": "section-3-wp-2",
+              "type": "paragraph",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Ask members what they enjoy most and protect that part of the experience. The class, the coach or the quiet morning hour that brings someone back is worth defending."
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "visibleFaq": [],
+      "conclusion": {
+        "id": "conclusion",
+        "status": "generated",
+        "blocks": [
+          {
+            "id": "conclusion-wp-0",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Hong Kong gym marketing is really about the everyday experience inside the building. Attract members with honesty, keep them with community and earn their loyalty one visit at a time."
+              }
+            ]
+          },
+          {
+            "id": "conclusion-wp-1",
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Start with the welcome, build the culture and let the members do the talking. A gym people believe in grows by itself."
+              }
+            ]
+          }
+        ]
+      },
+      "cta": null,
+      "faqSchema": null,
+      "insertedLinks": []
+    }
+  }
+}

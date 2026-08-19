@@ -91,19 +91,34 @@ describe("producer-contract shadow harness", () => {
 });
 
 describe("producer-contract shadow: no component-replacement or post-assembly wiring", () => {
+  // Stage 3W: regeneration/compaction/expansion are NOW wired to the shared
+  // source-provenance helper by architecture (source-first provenance
+  // completion). The remaining post-assembly quality paths must stay unwired:
+  // SEO normalization, editorial polish and Stage 3Q never import the
+  // producer contract.
   const mustStayUnwired = [
-    "src/lib/services/component-regenerator.ts",
-    "src/lib/services/section-expander.ts",
-    "src/lib/pipeline/blog-generation-pipeline.ts",
     "src/lib/blog/final-seo-normalizer.ts",
     "src/lib/pipeline/editorial-polish.ts",
     "src/lib/pipeline/full-document-editorial.ts",
   ];
 
-  it("F: no regeneration/expansion/trim/post-assembly module imports the producer contract", () => {
+  it("F: SEO/editorial-polish/3Q modules do not import the producer contract", () => {
     for (const file of mustStayUnwired) {
       const source = fs.readFileSync(path.resolve(file), "utf8");
       expect(source, file).not.toContain("producer-content-contract");
+    }
+  });
+
+  it("W: every factual-capable producer imports the shared source-provenance helper", () => {
+    const mustBeWired = [
+      "src/lib/services/blog-generation-service.ts",
+      "src/lib/services/component-regenerator.ts",
+      "src/lib/services/section-expander.ts",
+      "src/lib/pipeline/blog-generation-pipeline.ts",
+    ];
+    for (const file of mustBeWired) {
+      const source = fs.readFileSync(path.resolve(file), "utf8");
+      expect(source, file).toContain("validateProducerSentenceAccounting");
     }
   });
 });

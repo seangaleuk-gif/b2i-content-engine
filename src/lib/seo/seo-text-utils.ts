@@ -98,6 +98,33 @@ export function calculateFleschReadingEase(text: string): number {
  *  Avoids false positives from abbreviations, decimals, URLs, file extensions. */
 const NO_SPLIT_BEFORE = /\b(?:Mr|Ms|Mrs|Dr|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|inc|ltd|co|corp|ave|blvd|rd|st|sq|dept|univ|inst|assn|tel|ext|no|vol|pg|pp|ed|par|chap|sec|fig|ref|e\.g|i\.e|viz|al)\.$/i;
 
+/** A dot that joins labels of one contiguous domain-like token is NEVER a
+ *  sentence boundary: example.com, sub.example.com, example.co.uk,
+ *  example.com.hk, app.shop. Generic — no fixed TLD list. Real sentence
+ *  endings immediately AFTER a domain (the dot following the last label,
+ *  which is followed by whitespace or end-of-text) are unaffected, and domain
+ *  casing is preserved because a domain label is never classified as a
+ *  lowercase sentence start. */
+const DOMAIN_LABEL = "[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?";
+
+export function isDomainInternalDot(text: string, index: number): boolean {
+  if (text[index] !== ".") return false;
+  // The character immediately after the dot must continue the domain token.
+  if (!/^[a-zA-Z0-9]/.test(text[index + 1] ?? "")) return false;
+  // Scan the maximal contiguous domain-character run containing this dot.
+  let start = index;
+  while (start > 0 && /[a-zA-Z0-9.-]/.test(text[start - 1])) start--;
+  let end = index + 1;
+  while (end < text.length && /[a-zA-Z0-9.-]/.test(text[end])) end++;
+  const run = text.slice(start, end).replace(/\.+$/, "");
+  if (run.includes("..")) return false;
+  // The run must be a multi-label domain token (label.label[.label...]).
+  const domainRe = new RegExp(
+    `^(?:${DOMAIN_LABEL}\\.)+${DOMAIN_LABEL}$`,
+  );
+  return domainRe.test(run);
+}
+
 /** Return UTF-16 offsets immediately after real sentence-ending punctuation. */
 export function findSentenceBoundaryOffsets(text: string): number[] {
   const boundaries: number[] = [];
@@ -107,6 +134,7 @@ export function findSentenceBoundaryOffsets(text: string): number[] {
     if (!/[.!?！？。]/.test(char)) continue;
     const current = text.slice(sentenceStart, i + 1);
     if (char === "." && NO_SPLIT_BEFORE.test(current)) continue;
+    if (char === "." && isDomainInternalDot(text, i)) continue;
     // Closing quotation marks/brackets belong to the sentence that ends at
     // this punctuation. Returning a boundary before them can strand a closing
     // quote as its own sentence and lets downstream paragraph splitters or

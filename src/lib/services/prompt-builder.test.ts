@@ -42,7 +42,7 @@ describe("prompt-builder stage format scoping", () => {
   it("section stage asks for structured editorial blocks", () => {
     const prompt = buildSystemPrompt(minimalContext, STAGE_SYSTEM_PROMPTS.section);
     expect(prompt).toContain("structured editorial blocks");
-    expect(prompt).toContain('{"type":"list","ordered":false,"items":["First item","Second item"]}');
+    expect(prompt).toContain('{"type":"list","ordered":false,"items":[{"text":"First item","kind":"free_prose"}]}');
     expect(prompt).toContain("never put a list item in \"text\"");
     expect(prompt).not.toContain("Every heading must be <!-- wp:heading");
   });

@@ -18,8 +18,8 @@ import {
 } from "@/lib/blog/article-document";
 import type { InlineContent } from "@/lib/blog/article-content";
 import { validateEditorialBlocks } from "@/lib/blog/article-content";
-import { computeKeyphraseDensity } from "@/lib/content-standards";
-import { extractReadableText, splitSentences } from "@/lib/seo/seo-text-utils";
+import { computeKeyphraseDensity, paragraphSentenceLimit } from "@/lib/content-standards";
+import { extractParagraphTexts, extractReadableText, countSentences, splitSentences } from "@/lib/seo/seo-text-utils";
 import { createNumberExpressionRegex } from "@/lib/services/translation-number-grammar";
 import type { ChatMessage, ChatOptions } from "@/lib/services/deepseek";
 import { analyzeQuotationIntegrity } from "@/lib/blog/quotation-integrity";
@@ -88,6 +88,15 @@ export interface PolishRequest {
   repetitionTargets?: RepetitionPairTarget[];
   /** Complete canonical document supplied read-only by the final-document owner. */
   fullDocumentContext?: unknown;
+  /** Blocking publishability findings that drive a surgical semantic repair. */
+  semanticFindings?: Array<{
+    findingId: string;
+    category: string;
+    publishability: string;
+    confidence: number;
+    message: string;
+    blockIds: string[];
+  }>;
 }
 
 export interface CandidateValidation {
@@ -111,6 +120,8 @@ export interface EditorialPolishOptions {
   repetitionTargets?: RepetitionPairTarget[];
   /** Complete canonical document supplied read-only; never an editable surface. */
   fullDocumentContext?: unknown;
+  /** Blocking publishability findings that drive a surgical semantic repair. */
+  semanticFindings?: PolishRequest["semanticFindings"];
 }
 
 export type EditorialPolishMode =
@@ -118,7 +129,8 @@ export type EditorialPolishMode =
   | "repetition"
   | "malformed"
   | "weakened"
-  | "prose-only";
+  | "prose-only"
+  | "semantic";
 
 export interface EditorialPolishResult {
   accepted: boolean;
@@ -297,6 +309,9 @@ export function buildPolishPrompt(request: PolishRequest): ChatMessage[] {
   const repetitionContext = request.mode === "repetition" && request.repetitionTargets
     ? request.repetitionTargets
     : [];
+  const semanticTargets = request.mode === "semantic" && request.semanticFindings
+    ? request.semanticFindings
+    : [];
   const modeInstruction = request.mode === "repetition"
     ? `\nThis is a targeted repetition-repair pass. Every supplied block is the deterministically selected later occurrence from a near-duplicate pair; the earlier paragraph is preserved and is NOT editable. The repetitionContext payload lists, for each supplied block, the preserved partner paragraph, the duplicated idea that must be removed from your block, and the required word-set overlap limit. Rewrite each supplied block so it shares fewer than half of its content words with its preserved partner: introduce a different purpose, example, action or transition — never merely synonyms of the preserved paragraph. If the preserved paragraph owns the focus keyphrase, do not repeat the exact keyphrase in your replacement.`
     : request.mode === "malformed"
@@ -305,7 +320,9 @@ export function buildPolishPrompt(request: PolishRequest): ChatMessage[] {
         ? `\nThis is a targeted post-cleanup continuity pass. The supplied blocks belong only to components where deterministic factual or ownership cleanup removed sentences. Repair abrupt transitions, isolated setup lines, lost-example lead-ins and choppy paragraph flow. Do not add facts, numbers, quotations, sources or claims.`
         : request.mode === "prose-only"
           ? `\nThis is a fact-free editorial fallback after a broader candidate was rejected for touching protected facts. Every supplied block has been deterministically confirmed to contain no number, URL, attribution or factual-risk claim. Improve only repetition, robotic wording, choppy prose, transitions and useful non-factual depth. The accepted candidate must raise the article to its editorial quality threshold without inventing facts.`
-      : "";
+          : request.mode === "semantic"
+            ? `\nThis is a surgical blocking-defect repair pass. Every supplied block carries one or more proven blocking publishability findings in semanticFindings. Repair EXACTLY the described defect in each block: resolve the orphan deictic reference (rewrite so the deictic opener refers to a surviving antecedent, or replace it with a self-contained sentence), fix the pronoun/antecedent or subject/verb number agreement, repair the broken local transition or cohesion defect, or remove the local duplication. Make the MINIMAL change that removes the defect — do not rewrite the whole paragraph, do not reorder content, do not add facts, numbers, quotations, sources, links or new claims, and do not touch blocks that are not supplied. Keep the sentence count of each block unchanged unless the defect itself is the joining of two sentences. If a defect genuinely cannot be repaired without a fact, leave the block byte-identical and omit it from your edits.`
+            : "";
   const systemPrompt = `You are the senior copy editor for a Hong Kong-focused SEO article.
 
 Read all supplied blocks before proposing edits. The article was generated section by section, so make it read as one coherent, professionally written article.
@@ -349,6 +366,9 @@ If no block needs editing, return {"edits":[]}.`;
       : {}),
     ...(request.mode === "malformed"
       ? { malformedIssuesByBlockId: request.malformedIssuesByBlockId ?? {} }
+      : {}),
+    ...(request.mode === "semantic" && semanticTargets.length > 0
+      ? { semanticFindings: semanticTargets }
       : {}),
     ...(repetitionContext.length > 0
       ? {
@@ -1092,6 +1112,15 @@ export function repairDeterministicMalformedProse(
   allowBlockRemoval = false,
   keyphrase = "",
 ): DeterministicMalformedRepairResult {
+  // Stage 3N safety guard: the deterministic repair must never increase the
+  // number of long (>3 sentence) paragraphs. A repair that mis-segments a
+  // domain/TLD internal dot ("MarketResearch.com" → "MarketResearch.Com") can
+  // turn a 3-sentence paragraph into a 4-sentence one; if the repaired
+  // document would introduce a new long paragraph, the WHOLE repair is rolled
+  // back so the defect can never be carried downstream. This is a comparative
+  // guard, not a late paragraph split.
+  const original = structuredClone(doc);
+  const baselineLongParagraphs = countExcessiveSentenceParagraphs(doc);
   const repairedBlockIds: string[] = [];
   const removedBlockIds: string[] = [];
   // Dash-opened lowercase continuations are repaired deterministically before
@@ -1209,11 +1238,32 @@ export function repairDeterministicMalformedProse(
     removedBlockIds.push(issueBlock.blockId);
   }
 
+  // Stage 3N comparative safety guard: a repair that introduces a new long
+  // paragraph is rolled back entirely (no partial repair, no silent carry).
+  if (countExcessiveSentenceParagraphs(doc) > baselineLongParagraphs) {
+    Object.assign(doc, structuredClone(original));
+    return {
+      repairedBlockIds: [],
+      removedBlockIds: [],
+      unresolved: findMalformedEditableBlocks(doc),
+    };
+  }
+
   return {
     repairedBlockIds,
     removedBlockIds,
     unresolved: findMalformedEditableBlocks(doc),
   };
+}
+
+/** Authoritative long-paragraph count of a canonical document (the same
+ *  extractParagraphTexts + countSentences + paragraphSentenceLimit formula
+ *  final validation uses). */
+function countExcessiveSentenceParagraphs(doc: ArticleDocument): number {
+  const html = renderArticleDocument(doc);
+  return extractParagraphTexts(html).filter(
+    (text) => countSentences(text) > paragraphSentenceLimit(),
+  ).length;
 }
 
 export interface RepetitionFallbackApplied {
@@ -1700,6 +1750,7 @@ export async function runEditorialPolish(
     malformedIssuesByBlockId: options.malformedIssuesByBlockId,
     repetitionTargets: options.repetitionTargets,
     fullDocumentContext: options.fullDocumentContext,
+    semanticFindings: options.semanticFindings,
   };
   if (request.blocks.length === 0) {
     return resultForFailure(articleDoc, keyphrase, "No editable blocks matched the repair scope", 0, 0, 0);
